@@ -37,8 +37,10 @@ pub struct Runner {
     sched: Ptr,
     /// (sched, cpu backend) for pinning expert-chain ops to CPU
     sched_cpu: Option<(Ptr, Ptr)>,
-    /// per-step throwaway ggml context (graph nodes), freed after each step
+    /// persistent ggml context (graph nodes), reset per step
     cur_ctx: Ptr,
+    /// per-step cache of mix()'s block-stack prefix concat, keyed by block ptrs
+    mix_prefix: std::cell::UnsafeCell<Option<(usize, Ptr)>>,
     dump_list: std::cell::UnsafeCell<Vec<(String, Ptr)>>,
     /// persistent device buffer for step inputs (ids/pos/onehot/sink)
     in_buf: Option<Buf>,
@@ -372,6 +374,7 @@ impl Runner {
         Self {
             sched_cpu: Some((sched, cpu)),
             cur_ctx: Ptr(std::ptr::null_mut()),
+            mix_prefix: std::cell::UnsafeCell::new(None),
             dump_list: std::cell::UnsafeCell::new(Vec::new()),
             in_buf: None,
             rt, sched, dev_buf, cpu_buf, w, pinned, moe_args, cfg: cfg.clone(), layers,
@@ -423,11 +426,21 @@ impl Runner {
     fn mix(&self, blocks: &[Ptr], cur: Ptr, query: Ptr) -> Ptr {
         let c = self.cur_ctx;
         let n_embd = self.cfg.n_embd as i64;
-        let mut states = t::reshape3(c, cur, n_embd, 1, 1);
-        // upstream prepends each block in vector order -> newest first, cur last
-        for b in blocks.iter() {
-            states = t::concat(c, t::reshape3(c, *b, n_embd, 1, 1), states, 1);
-        }
+        // same block stack is re-mixed ~4x per visit (res/ffn/msg/output):
+        // cache the [b_n..b_1] prefix so only one concat adds `cur` per call
+        let key = blocks.iter().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b.0 as usize));
+        let prefix = match unsafe { *self.mix_prefix.get() } {
+            Some((k, p)) if k == key => p,
+            _ => {
+                let mut p = t::reshape3(c, if blocks.is_empty() { cur } else { blocks[0] }, n_embd, 1, 1);
+                for b in &blocks[1..] {
+                    p = t::concat(c, t::reshape3(c, *b, n_embd, 1, 1), p, 1);
+                }
+                unsafe { *self.mix_prefix.get() = Some((key, p)) };
+                p
+            }
+        };
+        let mut states = if blocks.is_empty() { prefix } else { t::concat(c, prefix, t::reshape3(c, cur, n_embd, 1, 1), 1) };
         states = t::rms_norm(c, states, 1e-6);
         let n_rows = t::ne(query, 1);
         let queries = t::repeat(c, query, t::new(c, F32, &[n_embd, n_rows, 1]));
@@ -705,6 +718,7 @@ impl Runner {
         } else {
             unsafe { inkwell_ggml::ink_ctx_reset(self.cur_ctx.0) };
         }
+        unsafe { *self.mix_prefix.get() = None };
         let c = self.cur_ctx;
         let n_embd = self.cfg.n_embd as i64;
         let (hd, nh, hkv) = (128i64, 24i64, 8i64);
