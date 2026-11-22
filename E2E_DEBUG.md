@@ -1,7 +1,13 @@
-# E2E debug state (runner.rs) — 2026-11-22
-## Status: graph builds all 48 visits; sched compute fails.
-Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin ./target/debug/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run 2>&1 | tail -20
-Debug sched: GGML_SCHED_DEBUG=2
+# E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
+Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
+
+## Current: ~100ms/tok (~10 t/s contended) vs upstream 6.15 t/s. Target 15 t/s (66ms).
+- CUDA graphs REPLAY: persistent ctx + n_kv padded to 64 + -inf mask; embd_row on GPU → 1 split.
+- Device MoE: resolve/alloc/gather in-stream; misses repoint to arena (1 PCIe read). budget=vfree-1.5G, k=65-78.
+- RAM fix: madvise(DONTNEED) after expert pin (~4GB freed).
+- Custom dense GEMV: mmq() routes Q8_0 (type8) mul_mats to inkwell_mmvq_q8_0_i8 inside the graph (CUSTOM=210/tok).
+- CAVEAT: kern_sum under graphs only counts capture-phase launches — use wall time.
+- Remaining ~: MoE GEMVs ~34ms, gather ~10.6ms, mmv_f ~4.3ms, mmvq type13/14 ~6.7ms, swarm ~7ms.
 
 ## Current blocker
 sched allocs 6915 MiB CUDA0 graph buffer (all expert leafs copied to GPU) → OOM.
