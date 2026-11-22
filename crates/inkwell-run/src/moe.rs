@@ -151,11 +151,13 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
     let dn_ptrs = st.dn_ptrs.lock().expect("dn_ptrs");
     unsafe {
         let mut caches = a.caches.lock().expect("caches");
+        if std::env::var("INKWELL_MOE_NOCACHE").is_ok() { *caches = None; }
         if let Some((gc, dc)) = caches.as_mut() {
             let dbg = std::env::var("INKWELL_MOE_CHECK").is_ok();
             for (c, ptrs, host) in [(&*gc, &*gu_ptrs, a.gu_host), (&*dc, &*dn_ptrs, a.dn_host)] {
                 cu::memset_dev_async(c.missq_dev.dev_ptr(), 0, 4);
                 cu::moe_resolve_async(ids_dev, c.map_dev.dev_ptr().cast(),
+                    c.lru_dev.dev_ptr().cast(), c.stamp_dev.dev_ptr().cast_const().cast(),
                     c.dev.dev_ptr() as u64, host as u64, c.esz as i64,
                     ptrs.dev_ptr().cast(), c.missq_dev.dev_ptr().cast(), N_SLOTS);
                 cu::moe_alloc_async(c.missq_dev.dev_ptr().cast_const().cast(),
@@ -163,15 +165,19 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
                     c.stamp_dev.dev_ptr().cast(), c.rev_dev.dev_ptr().cast(),
                     c.dev.dev_ptr() as u64, host as u64, c.esz as i64,
                     ptrs.dev_ptr().cast(), c.work_dev.dev_ptr().cast(), c.k);
-                cu::moe_gather_async(c.missq_dev.dev_ptr().cast_const().cast(),
-                    c.work_dev.dev_ptr().cast_const().cast(), c.esz as i64);
                 if dbg { cu::sync_check("dispatch"); }
             }
+            // repoint+gather before the GEMVs: each miss pays exactly one PCIe
+            // pass (the gather); the GEMV then reads the fresh arena slot.
+            for c in [&*gc, &*dc] {
+                cu::moe_gather_async(c.missq_dev.dev_ptr().cast_const().cast(),
+                    c.work_dev.dev_ptr().cast_const().cast(), c.esz as i64);
+            }
         } else {
-            cu::moe_resolve_async(ids_dev, std::ptr::null(),
+            cu::moe_resolve_async(ids_dev, std::ptr::null(), std::ptr::null_mut(), std::ptr::null(),
                 0, a.gu_host as u64, a.gu_stride as i64,
                 gu_ptrs.dev_ptr().cast(), std::ptr::null_mut(), N_SLOTS);
-            cu::moe_resolve_async(ids_dev, std::ptr::null(),
+            cu::moe_resolve_async(ids_dev, std::ptr::null(), std::ptr::null_mut(), std::ptr::null(),
                 0, a.dn_host as u64, a.dn_stride as i64,
                 dn_ptrs.dev_ptr().cast(), std::ptr::null_mut(), N_SLOTS);
         }

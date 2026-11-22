@@ -554,6 +554,7 @@ pub unsafe fn side_sync_to_main() {
 
 extern "C" {
     fn ink_launch_moe_resolve(ids: *const i32, map: *const i32,
+        lru: *mut u64, stamp: *const u64,
         arena: u64, host: u64, esz: i64,
         ptrs: *mut u64, missq: *mut i32, nslots: i32, stream: *mut c_void);
     fn ink_launch_moe_alloc(missq: *const i32, map: *mut i32,
@@ -563,7 +564,6 @@ extern "C" {
     fn ink_launch_moe_gather(missq: *const i32, work: *const u64, esz: i64,
         stream: *mut c_void);
     fn cudaMemsetAsync(dst: *mut c_void, v: i32, bytes: usize, stream: *mut c_void) -> i32;
-
 }
 
 /// Set the stream all `*_async` helpers below launch on.
@@ -582,10 +582,11 @@ fn stream() -> *mut c_void { INK_STREAM.load(std::sync::atomic::Ordering::Relaxe
 /// # Safety
 /// `ids`/`map`/`ptrs`/`missq` are device pointers; `host` may be a host-mapped pointer.
 pub unsafe fn moe_resolve_async(ids: *const i32, map: *const i32,
+    lru: *mut u64, stamp: *const u64,
     arena: u64, host: u64, esz: i64,
     ptrs: *mut u64, missq: *mut i32, nslots: usize) {
     unsafe {
-        ink_launch_moe_resolve(ids, map, arena, host, esz, ptrs, missq,
+        ink_launch_moe_resolve(ids, map, lru, stamp, arena, host, esz, ptrs, missq,
             nslots as i32, stream());
     }
 }
@@ -608,6 +609,10 @@ pub unsafe fn moe_alloc_async(missq: *const i32, map: *mut i32,
 ///
 /// # Safety
 /// `missq`/`work` are device pointers; work srcs may be host-mapped.
+/// Gather enqueued on the side stream (overlaps next GEMVs on the main stream).
+///
+/// # Safety
+/// `missq`/`work` device-valid; call [`mark_dispatch_ready`] first.
 pub unsafe fn moe_gather_async(missq: *const i32, work: *const u64, esz: i64) {
     unsafe { ink_launch_moe_gather(missq, work, esz, stream()) }
 }
@@ -631,4 +636,39 @@ pub unsafe fn sync_check(tag: &str) {
         let e = cudaGetLastError();
         if e != 0 { eprintln!("CUDAERR@{tag}: {e}"); }
     }
+}
+
+
+fn gather_ready_event() -> *mut c_void {
+    use std::sync::OnceLock;
+    static E: OnceLock<usize> = OnceLock::new();
+    *E.get_or_init(|| { let mut e = std::ptr::null_mut(); assert_eq!(unsafe { cudaEventCreateWithFlags(&mut e, 2) }, 0); e as usize }) as *mut c_void
+}
+fn gather_done_event() -> *mut c_void {
+    use std::sync::OnceLock;
+    static E: OnceLock<usize> = OnceLock::new();
+    *E.get_or_init(|| { let mut e = std::ptr::null_mut(); assert_eq!(unsafe { cudaEventCreateWithFlags(&mut e, 2) }, 0); e as usize }) as *mut c_void
+}
+/// Stream0 → side: the gather inputs (missq/work) are ready.
+///
+/// # Safety
+/// Event plumbing only.
+pub unsafe fn mark_dispatch_ready() {
+    let e = gather_ready_event();
+    assert_eq!(unsafe { cudaEventRecord(e, stream()) }, 0);
+    assert_eq!(unsafe { cudaStreamWaitEvent(side_stream(), e, 0) }, 0);
+}
+/// Side → stream0 (next visit): all gather writes are visible.
+///
+/// # Safety
+/// Event plumbing only.
+pub unsafe fn mark_gather_done() {
+    assert_eq!(unsafe { cudaEventRecord(gather_done_event(), side_stream()) }, 0);
+}
+/// Make the main stream wait for the previous visit's gathers.
+///
+/// # Safety
+/// Event plumbing only.
+pub unsafe fn wait_gather_done() {
+    assert_eq!(unsafe { cudaStreamWaitEvent(stream(), gather_done_event(), 0) }, 0);
 }

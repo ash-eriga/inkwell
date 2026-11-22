@@ -956,6 +956,7 @@ extern "C" void ink_launch_mmvq_iq2_s_moe(const void* const* Wp,
 // All stream-ordered: resolve -> alloc -> gather -> GEMVs read VRAM.
 
 extern "C" __global__ void inkwell_moe_resolve(const int* ids, const int* map,
+    unsigned long long* lru, const unsigned long long* stamp,
     unsigned long long arena, unsigned long long host, long long esz,
     unsigned long long* ptrs, int* missq, int nslots) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
@@ -964,6 +965,7 @@ extern "C" __global__ void inkwell_moe_resolve(const int* ids, const int* map,
     const int m = map ? map[e] : -1;
     ptrs[s] = m >= 0 ? arena + (unsigned long long)m * esz
                      : host + (unsigned long long)e * esz;
+    if (m >= 0 && lru && stamp) lru[m] = *stamp;  // touch: selected experts are hot
     if (m < 0 && map) {
         const int q = atomicAdd(missq, 1);
         if (q < 8) { missq[2 + 2*q] = s; missq[2 + 2*q + 1] = e; }
@@ -1023,10 +1025,11 @@ extern "C" __global__ void inkwell_moe_gather(const int* missq,
 }
 
 extern "C" void ink_launch_moe_resolve(const int* ids, const int* map,
+    unsigned long long* lru, const unsigned long long* stamp,
     unsigned long long arena, unsigned long long host, long long esz,
     unsigned long long* ptrs, int* missq, int nslots, void* stream) {
     inkwell_moe_resolve<<<(nslots + 127)/128, 128, 0, (cudaStream_t)stream>>>(
-        ids, map, arena, host, esz, ptrs, missq, nslots);
+        ids, map, lru, stamp, arena, host, esz, ptrs, missq, nslots);
 }
 extern "C" void ink_launch_moe_alloc(const int* missq, int* map,
     unsigned long long* lru, unsigned long long* stamp, int* rev,
