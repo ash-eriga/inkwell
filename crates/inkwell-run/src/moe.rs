@@ -215,7 +215,10 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
                 cu::mmvq_iq2_xxs_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
             T_IQ2_XXS => cu::mmvq_iq2_xxs_moe_i8_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
             T_IQ1_S => cu::mmvq_iq1_s_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
-            T_IQ2_XS => cu::mmvq_iq2_xs_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
+            T_IQ2_XS if std::env::var_os("INKWELL_IQ2XS_FP").is_some() => {
+                cu::mmvq_iq2_xs_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS)
+            }
+            T_IQ2_XS => cu::mmvq_iq2_xs_moe_i8_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
             T_IQ2_S => cu::mmvq_iq2_s_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
             t => panic!("gate_up type {t}"),
         }

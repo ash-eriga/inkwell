@@ -38,6 +38,7 @@ extern "C" {
     fn ink_launch_mmvq_q8_0_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q8_0_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_q6_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_xs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q5_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq1_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -488,6 +489,13 @@ pub unsafe fn mmvq_q8_0_i8_async(w: *const c_void, x: *const c_void, y: *mut f32
 /// `w`/`x`/`y` are device pointers.
 pub unsafe fn mmvq_q6_k_i8_async(w: *const c_void, x: *const c_void, y: *mut f32, nrows: usize, ncols: usize) {
     unsafe { ink_launch_mmvq_q6_k_i8(w, x.cast(), y, nrows as i64, ncols as i64, stream()) };
+}
+
+/// MoE IQ2_XS GEMV (dp4a, opt-in).
+/// # Safety
+/// `wp`/`x`/`y` are device pointers.
+pub unsafe fn mmvq_iq2_xs_moe_i8_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_xs_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 /// Single-tensor dense Q5_K GEMV (dp4a). Zeroes `y` internally.
 /// # Safety
