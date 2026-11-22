@@ -101,9 +101,17 @@ struct Staging {
     gu: Mutex<cu::DevBuf>,      // [N_SLOTS][2*N_FF] f32
     hid: Mutex<cu::DevBuf>,     // [N_SLOTS][N_FF] f32
     dn: Mutex<cu::DevBuf>,      // [N_SLOTS][N_EMBD] f32
+    xh: Mutex<cu::DevBuf>,      // [N_SLOTS][N_EMBD] f32 — EXL3 hadamard staging
+    exl3_stage: Mutex<cu::DevBuf>, // [N_SLOTS×3][672768] staged expert weights
+    sdescs_g: Mutex<cu::DevBuf>,   // staged desc tables (indexed by ids[slot])
+    sdescs_u: Mutex<cu::DevBuf>,
+    sdescs_d: Mutex<cu::DevBuf>,
 }
 
 static STAGING: OnceLock<Staging> = OnceLock::new();
+
+/// Eagerly allocate staging buffers (must run before CUDA-graph capture).
+pub fn warm_staging() { staging(); }
 
 fn staging() -> &'static Staging {
     STAGING.get_or_init(|| Staging {
@@ -113,6 +121,11 @@ fn staging() -> &'static Staging {
         gu: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 2 * N_FF * 4)),
         hid: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_FF * 4)),
         dn: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_EMBD * 4)),
+        xh: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_EMBD * 4)),
+        exl3_stage: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 3 * 672768)),
+        sdescs_g: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
+        sdescs_u: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
+        sdescs_d: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
     })
 }
 
@@ -257,4 +270,59 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
 #[must_use]
 pub fn moe_cb_addr() -> usize {
     moe_cb as usize
+}
+
+/// Per-expert EXL3 descriptor tables for one layer visit: pinned u64[128][4]
+/// `{trellis_ptr, suh_ptr, svh_ptr, ka | halfk<<8}` — kernels read the desc
+/// then stream the trellis over PCIe zero-copy.
+#[derive(Debug)]
+pub struct MoeArgsExl3 {
+    /// gate_proj descriptors
+    pub descs_g: cu::PinnedBuf,
+    /// up_proj descriptors
+    pub descs_u: cu::PinnedBuf,
+    /// down_proj descriptors
+    pub descs_d: cu::PinnedBuf,
+}
+
+/// `ggml_custom_op_t` for the EXL3 MoE path.
+///
+/// # Safety
+/// Called by ggml with `dst->src[]` = `[x, ids, w]` and `userdata = &MoeArgsExl3`.
+#[expect(clippy::cast_ptr_alignment, reason = "ggml tensors are f32/i32 aligned")]
+unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_void) {
+    let a = unsafe { &*ud.cast::<MoeArgsExl3>() };
+    let st = staging();
+    unsafe { cu::set_stream(inkwell_ggml::cuda_stream()) };
+    let src = |i: i32| unsafe {
+        let t = inkwell_ggml::ink_tensor_src(dst, i);
+        inkwell_ggml::ink_tensor_data(t)
+    };
+    let x_dev = src(0) as *const f32;
+    let ids_dev = src(1) as *const i32;
+    let w_dev = src(2) as *const f32;
+    if std::env::var("INKWELL_MOE_SKIP").is_ok() {
+        unsafe { cu::memset_dev_async(inkwell_ggml::ink_tensor_data(dst), 0, N_EMBD * 4) };
+        return;
+    }
+    let mut gu = st.gu.lock().expect("gu");
+    let mut hid = st.hid.lock().expect("hid");
+    let mut dn = st.dn.lock().expect("dn");
+    let mut xh = st.xh.lock().expect("xh");
+    unsafe {
+        cu::exl3_moe_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
+            x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
+            dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),
+            N_SLOTS as i32,
+            st.exl3_stage.lock().expect("stg").dev_ptr(),
+            st.sdescs_g.lock().expect("sg").dev_ptr(),
+            st.sdescs_u.lock().expect("su").dev_ptr(),
+            st.sdescs_d.lock().expect("sd").dev_ptr());
+    }
+}
+
+/// Callback address for the EXL3 MoE custom op.
+#[must_use]
+pub fn moe_cb_exl3_addr() -> usize {
+    moe_cb_exl3 as usize
 }

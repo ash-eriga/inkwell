@@ -19,6 +19,7 @@ mod madv {
 
 use crate::ops::{t, Buf, Ptr, Rt};
 use inkwell_gguf::GgufFile;
+use inkwell_st as _st;
 use inkwell_core::InklingConfig;
 use std::collections::HashMap;
 
@@ -40,6 +41,10 @@ struct L {
     ffn_norm: Option<Ptr>, ffn_gate_inp: Option<Ptr>, ffn_exp_probs_b: Option<Ptr>,
     gate_up_scale: Option<Ptr>, down_scale: Option<Ptr>,
     moe: Option<usize>,
+    /// EXL3 weight descriptor index per short name (REXL3 only)
+    exl3: HashMap<&'static str, usize>,
+    /// EXL3 MoE binding index (REXL3 only)
+    moe_exl3: Option<usize>,
     msg_query: Option<Ptr>, ctrl_down: [Option<Ptr>; 4], ctrl_gain: [Option<Ptr>; 4], ctrl_forget: [Option<Ptr>; 4],
 }
 
@@ -65,8 +70,16 @@ pub struct Runner {
     w: HashMap<String, Ptr>,
     /// pinned+mapped expert weight copies (zero-copy GEMV over PCIe)
     pinned: Vec<inkwell_cuda::PinnedBuf>,
+    /// VRAM-resident expert weight blobs (REXL3)
+    expert_dev: Vec<inkwell_cuda::DevBuf>,
     /// per-layer MoE weight bindings consumed by the custom op
     moe_args: Vec<Box<crate::moe::MoeArgs>>,
+    /// EXL3 weight descriptors (device-resident trellis+suh+svh)
+    exl3_w: Vec<Box<Exl3W>>,
+    /// EXL3 MoE bindings per visit
+    moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>>,
+    /// unembed as EXL3 (REXL3)
+    output_exl3: Option<usize>,
     cfg: InklingConfig,
     layers: Vec<L>,
     // globals
@@ -87,6 +100,76 @@ fn gguf_dims(t: &inkwell_gguf::TensorInfo) -> Vec<i64> {
 }
 
 const CTRL_NAMES: [&str; 4] = ["q", "k", "v", "ffn"];
+
+/// One EXL3 weight: device-resident trellis + suh + svh + scratch.
+#[derive(Debug)]
+pub struct Exl3W {
+    /// trellis i16 payload on device
+    pub trel: inkwell_cuda::DevBuf,
+    /// suh fp16 on device
+    pub suh: inkwell_cuda::DevBuf,
+    /// svh fp16 on device
+    pub svh: inkwell_cuda::DevBuf,
+    /// integer K part
+    pub ka: usize,
+    /// half-K flag
+    pub halfk: bool,
+    /// input dim k / output dim n
+    pub k: usize,
+    pub n: usize,
+    /// device scratch: xh[k] + t[n] f32
+    pub scratch: inkwell_cuda::DevBuf,
+}
+
+/// `ggml_custom_op_t`: EXL3 trellis GEMV `y = svh . H (Wt^T H (suh . x))`.
+///
+/// # Safety
+/// `userdata` = `&Exl3W`; `dst->src[0]` = x (f32 device).
+unsafe extern "C" fn exl3_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let w = unsafe { &*ud.cast::<Exl3W>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let x = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let x_dev = unsafe { inkwell_ggml::ink_tensor_data(x) } as *const f32;
+    let y = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
+    unsafe {
+        inkwell_cuda::exl3_gemv_async(w.trel.dev_ptr(), w.suh.dev_ptr(), w.svh.dev_ptr(),
+            x_dev, y, w.k, w.n, w.ka, w.halfk, w.scratch.dev_ptr().cast());
+    }
+}
+
+/// Callback address for the EXL3 GEMV custom op.
+#[must_use]
+pub fn exl3_cb_addr() -> usize {
+    exl3_cb as usize
+}
+
+/// bf16 bytes -> f32 bytes; `T`: transpose first (HF `[in,out]` -> ggml `[in,out]` col-major).
+fn bf16_to_f32_t(d: &[u8], shape: &[u64]) -> Vec<u8> {
+    let (r, c) = (shape[0] as usize, shape[1] as usize);
+    let mut f = vec![0f32; r * c];
+    for (i, ch) in d.chunks_exact(2).enumerate() {
+        let bits = u32::from(ch[0]) | (u32::from(ch[1]) << 8);
+        f[i] = f32::from_bits(bits << 16);
+    }
+    // A[r][c] row-major -> B[c][r] row-major = ggml dims [r,c] col-major
+    let mut out = vec![0f32; r * c];
+    for a in 0..r {
+        for b in 0..c {
+            out[b * r + a] = f[a * c + b];
+        }
+    }
+    unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), r * c * 4) }.to_vec()
+}
+
+/// bf16 bytes -> f32 bytes.
+fn bf16_to_f32(d: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; d.len() * 2];
+    for (i, ch) in d.chunks_exact(2).enumerate() {
+        let bits = u32::from(ch[0]) | (u32::from(ch[1]) << 8);
+        out[i * 4..i * 4 + 4].copy_from_slice(&(bits << 16).to_le_bytes());
+    }
+    out
+}
 
 impl Runner {
     /// Load the model: tensors → device buffer (dense) / cpu buffer (experts).
@@ -393,10 +476,331 @@ impl Runner {
             mix_prefix: std::cell::UnsafeCell::new(None),
             dump_list: std::cell::UnsafeCell::new(Vec::new()),
             in_buf: None,
-            rt, sched, dev_buf, cpu_buf, w, pinned, moe_args, cfg: cfg.clone(), layers,
+            rt, sched, dev_buf, cpu_buf, w, pinned, expert_dev: Vec::new(), moe_args,
+            exl3_w: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
+            cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, max_ctx, swa, visits,
             n_full,
+        }
+    }
+
+    /// Load a SAGE-REXL3 safetensors repo (dir with `model.safetensors.index.json`).
+    /// Dense tensors -> F32 ggml; attention/expert projections -> EXL3 descriptors.
+    ///
+    /// # Panics
+    /// On missing tensors or alloc failure.
+    #[must_use]
+    #[expect(clippy::too_many_lines)]
+    pub fn load_st(repo: &inkwell_st::StRepo, cfg: &InklingConfig, max_ctx: i64) -> Self {
+        let rt = Rt::cuda();
+        let cpu = Ptr(unsafe { inkwell_ggml::ink_backend_cpu(4) });
+        let cuda = unsafe { inkwell_ggml::ink_backend_cuda(0) };
+        let buft_dev = rt.device_buft();
+        let buft_cpu = Ptr(unsafe { inkwell_ggml::ink_cpu_buft() });
+        let sched = Ptr(unsafe {
+            let mut bs = [cuda, cpu.0];
+            let mut bufts = [buft_dev.0, buft_cpu.0];
+            inkwell_ggml::ink_sched_new(bs.as_mut_ptr(), bufts.as_mut_ptr(), 2, 32768)
+        });
+
+        let lp = |il: usize, name: &str| format!("model.llm.layers.{il}.{name}");
+        let tp = |name: &str| repo.tensor(name).unwrap_or_else(|| panic!("missing {name}"));
+        let dtp = |name: &str| repo.data(name).unwrap_or_else(|| panic!("missing data {name}"));
+
+        // ---- device byte budget: all dense F32 + headroom ----
+        let mut dev_bytes = 300usize << 20;
+        for (n, t) in &repo.tensors {
+            let (name, ti) = (n.as_str(), &t.1);
+            if name.contains(".experts.") || name.contains(".trellis") || name.contains(".suh")
+                || name.contains(".svh") || name.contains(".mul1") || name == "model.llm.embed.weight"
+                || name.contains("visual") { continue; }
+            dev_bytes += (ti.elems() * 4) as usize + 256;
+        }
+        let dev_buf = rt.buf(buft_dev, dev_bytes);
+        let cpu_buf = rt.buf(buft_cpu, 2304 * 4 + 256);
+        for b in [dev_buf.0, cpu_buf.0] {
+            unsafe { inkwell_ggml::ink_buf_set_usage(b.0, 1) };
+        }
+        let mut off_dev = 0usize;
+
+        /// upload a dense tensor as F32 ggml tensor, dims = reversed HF shape (drop ==1 middles)
+        macro_rules! dense {
+            ($name:expr) => {{
+                let ti = tp($name);
+                let mut dims: Vec<i64> = ti.shape.iter().rev().map(|&d| d as i64).collect();
+                dims.retain(|&d| d != 1);
+                let bytes = if ti.dtype == "BF16" { bf16_to_f32(dtp($name)) }
+                    else { assert_eq!(ti.dtype, "F32"); dtp($name).to_vec() };
+                let ten = t::new(rt.ctx(), F32, &dims);
+                let o = (off_dev + 127) & !127;
+                dev_buf.assign(ten, o);
+                unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                off_dev = o + t::nbytes(ten);
+                ten
+            }};
+        }
+
+        /// build an Exl3W from `<base>.{trellis,suh,svh}` on device
+        fn exl3_of(repo: &inkwell_st::StRepo, base: &str) -> Box<Exl3W> {
+            let tr = repo.tensor(&format!("{base}.trellis")).unwrap_or_else(|| panic!("{base}.trellis"));
+            let (k, n) = ((tr.shape[0] * 16) as usize, (tr.shape[1] * 16) as usize);
+            let k16 = tr.shape[2] as usize;
+            let (ka, halfk) = (k16 / 16, k16 % 16 != 0);
+            let mut trel = inkwell_cuda::DevBuf::new_bytes(tr.nbytes() as usize);
+            trel.write_bytes(repo.data(&format!("{base}.trellis")).unwrap());
+            let su = repo.tensor(&format!("{base}.suh")).unwrap();
+            let mut suh = inkwell_cuda::DevBuf::new_bytes(su.nbytes() as usize);
+            suh.write_bytes(repo.data(&format!("{base}.suh")).unwrap());
+            let sv = repo.tensor(&format!("{base}.svh")).unwrap();
+            let mut svh = inkwell_cuda::DevBuf::new_bytes(sv.nbytes() as usize);
+            svh.write_bytes(repo.data(&format!("{base}.svh")).unwrap());
+            Box::new(Exl3W { trel, suh, svh, ka, halfk, k, n,
+                scratch: inkwell_cuda::DevBuf::new(k + n) })
+        }
+
+        // ---- globals ----
+        let embd_src: (*const u8, i32, usize) = (dtp("model.llm.embed.weight").as_ptr(), -2, 2304 * 2);
+        let tok_embd = Ptr(std::ptr::null_mut());
+        let tok_norm = dense!("model.llm.embed_norm.weight");
+        let output_norm = dense!("model.llm.norm.weight");
+        let output_res_query = dense!("model.llm.attn_res.output_query");
+        let mut exl3_w: Vec<Box<Exl3W>> = Vec::new();
+        let output_exl3 = Some(exl3_w.len());
+        exl3_w.push(exl3_of(repo, "model.llm.unembed"));
+        let output = Ptr(std::ptr::null_mut());
+        let out_head = None;
+        let embd_row = t::new(rt.ctx(), F32, &[2304, 1, 1, 1]);
+        { let o = (off_dev + 127) & !127; dev_buf.assign(embd_row, o); off_dev = o + t::nbytes(embd_row); }
+        unsafe { inkwell_ggml::ink_sched_set_tensor_backend(sched.0, embd_row.0, cuda) };
+
+        // ---- middle_cycle queries: loop_msg_query(il) cols = [q[2i], kv[2i], kv[2i+1], q[2i+1]] ----
+        let mcq = dtp("model.llm.middle_cycle_cross_pass_queries");
+        let mckv = dtp("model.llm.middle_cycle_cross_pass_kv_queries");
+        let row: fn(&[u8], usize) -> &[u8] = |b, r| &b[r * 2304 * 4..(r + 1) * 2304 * 4];
+
+        // ---- per-layer ----
+        let mut layers = Vec::with_capacity(24);
+        let mut pinned: Vec<inkwell_cuda::PinnedBuf> = Vec::new();
+        let mut expert_dev: Vec<inkwell_cuda::DevBuf> = Vec::new();
+        let mut moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>> = Vec::new();
+        let conv = |il: usize| il % 6 == 5;
+        for il in 0..24usize {
+            let mut l = L {
+                attn_norm: (!conv(il)).then(|| dense!(&lp(il, "attn_norm.weight"))),
+                attn_q_inp_norm: conv(il).then(|| dense!(&lp(il, "q_input_norm.weight"))),
+                attn_k_inp_norm: conv(il).then(|| dense!(&lp(il, "k_input_norm.weight"))),
+                attn_v_inp_norm: conv(il).then(|| dense!(&lp(il, "v_input_norm.weight"))),
+                attn_rel_bias: Some({
+                    // HF stores [in,out]=[16,1024]; ggml wants dims [16,1024] col-major → transpose
+                    let ti = tp(&lp(il, "attn.rel_logits_proj.proj"));
+                    let bytes = bf16_to_f32_t(dtp(&lp(il, "attn.rel_logits_proj.proj")), &ti.shape);
+                    let ten = t::new(rt.ctx(), F32, &[16, 1024]);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(ten, o);
+                    unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                    off_dev = o + t::nbytes(ten);
+                    ten
+                }),
+                attn_rel_bias_pad: Some({
+                    let n0 = 16usize; let n1 = 1024usize;
+                    let np = t::new(rt.ctx(), F32, &[n0 as i64, n1 as i64 + 1, 1, 1]);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(np, o);
+                    let bytes = bf16_to_f32_t(dtp(&lp(il, "attn.rel_logits_proj.proj")), &[16, 1024]);
+                    let mut dst = vec![0u8; n0 * (n1 + 1) * 4];
+                    dst[..n0 * n1 * 4].copy_from_slice(&bytes);
+                    unsafe { t::set(np, dst.as_ptr(), 0, dst.len()) };
+                    off_dev = o + t::nbytes(np);
+                    np
+                }),
+                attn_rel_clip: Some(dense!(&lp(il, "attn.rel_l2_clip.scale"))),
+                attn_q_clip: Some(dense!(&lp(il, "attn.q_l2_clip.scale"))),
+                attn_sink_proj: Some(dense!(&lp(il, "attn.attn_sink_proj.weight"))),
+                attn_k_conv: if conv(il) {
+                    // HF static_w is [4,1024] [tap,ch] — ggml [4,1024] col-major wants taps contiguous per ch -> transpose
+                    let bytes = bf16_to_f32_t(dtp(&lp(il, "attn.k_sconv.static_w")), &[4, 1024]);
+                    let ten = t::new(rt.ctx(), F32, &[4, 1024]);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(ten, o);
+                    unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                    off_dev = o + t::nbytes(ten);
+                    Some(ten)
+                } else { Some(dense!(&lp(il, "attn.k_sconv.weight"))) },
+                attn_v_conv: if conv(il) {
+                    let bytes = bf16_to_f32_t(dtp(&lp(il, "attn.v_sconv.static_w")), &[4, 1024]);
+                    let ten = t::new(rt.ctx(), F32, &[4, 1024]);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(ten, o);
+                    unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                    off_dev = o + t::nbytes(ten);
+                    Some(ten)
+                } else { Some(dense!(&lp(il, "attn.v_sconv.weight"))) },
+                attn_k_conv_proj: conv(il).then(|| dense!(&lp(il, "attn.k_sconv.weight_proj"))),
+                attn_v_conv_proj: conv(il).then(|| dense!(&lp(il, "attn.v_sconv.weight_proj"))),
+                attn_post_conv: Some(dense!(&lp(il, "attn_sconv.weight"))),
+                ffn_post_conv: Some(dense!(&lp(il, "mlp_sconv.weight"))),
+                ffn_norm: Some(dense!(&lp(il, "mlp_norm.weight"))),
+                ffn_gate_inp: Some(dense!(&lp(il, "mlp.gate.weight"))),
+                ffn_exp_probs_b: Some(dense!(&lp(il, "mlp.gate.bias"))),
+                attn_res_query: (il >= 1).then(|| {
+                    let q = tp(&format!("model.llm.attn_res.attn_queries.{}", il - 1));
+                    let dims: Vec<i64> = q.shape.iter().rev().map(|&d| d as i64).collect();
+                    let ten = t::new(rt.ctx(), F32, &dims);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(ten, o);
+                    let b = dtp(&format!("model.llm.attn_res.attn_queries.{}", il - 1));
+                    unsafe { t::set(ten, b.as_ptr(), 0, b.len()) };
+                    off_dev = o + t::nbytes(ten);
+                    ten
+                }),
+                ffn_res_query: Some(dense!(&format!("model.llm.attn_res.mlp_queries.{il}"))),
+                msg_query: (il >= 6 && il < 18).then(|| {
+                    let i = il - 6;
+                    let ten = t::new(rt.ctx(), F32, &[2304, 4]);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(ten, o);
+                    // cols [q[2i], kv[2i], kv[2i+1], q[2i+1]] contiguous col-major
+                    let mut buf = Vec::with_capacity(4 * 2304 * 4);
+                    buf.extend_from_slice(row(mcq, 2 * i));
+                    buf.extend_from_slice(row(mckv, 2 * i));
+                    buf.extend_from_slice(row(mckv, 2 * i + 1));
+                    buf.extend_from_slice(row(mcq, 2 * i + 1));
+                    unsafe { t::set(ten, buf.as_ptr(), 0, buf.len()) };
+                    off_dev = o + t::nbytes(ten);
+                    ten
+                }),
+                ..Default::default()
+            };
+            // exl3 attn projections
+            for (key, hf) in [("wq", "attn.wq_du"), ("gate", "attn.gate_attn"), ("wk", "attn.wk_dv"),
+                ("wv", "attn.wv_dv"), ("rel", "attn.wr_du"), ("wo", "attn.wo_ud")] {
+                l.exl3.insert(key, exl3_w.len());
+                exl3_w.push(exl3_of(repo, &lp(il, hf)));
+            }
+            // loop controllers
+            if il >= 6 && il < 18 {
+                for (ci, cn) in CTRL_NAMES.iter().enumerate() {
+                    let hn = match *cn { "q" => "attn", "ffn" => "mlp", x => x };
+                    l.ctrl_down[ci] = Some(dense!(&lp(il, &format!("controllers.{hn}.down_weight"))));
+                    l.ctrl_gain[ci] = Some(dense!(&lp(il, &format!("controllers.{hn}.gain_weight"))));
+                    l.ctrl_forget[ci] = Some(dense!(&lp(il, &format!("controllers.{hn}.forget_weight"))));
+                }
+            }
+            // ---- experts: VRAM blob + 3 desc tables (pinned host staging) ----
+            {
+                let pre = lp(il, "mlp.experts");
+                let mut total = 0usize;
+                for e in 0..128usize {
+                    for proj in ["gate_proj", "up_proj", "down_proj"] {
+                        for part in ["trellis", "suh", "svh"] {
+                            total += tp(&format!("{pre}.{e}.{proj}.{part}")).nbytes() as usize;
+                        }
+                    }
+                }
+                if il == 6 { let (f0, _) = inkwell_cuda::mem_info(); eprintln!("MEM before experts: {f0}"); }
+                let mut host = vec![0u8; total];
+                let mut descs: Vec<u64> = vec![0; 3 * 128 * 4];
+                let mut off = 0usize;
+                for e in 0..128usize {
+                    for (pi, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+                        let base = format!("{pre}.{e}.{proj}");
+                        for (ai, part) in ["trellis", "suh", "svh"].iter().enumerate() {
+                            let b = dtp(&format!("{base}.{part}"));
+                            host[off..off + b.len()].copy_from_slice(b);
+                            unsafe { madv::dontneed(b.as_ptr(), b.len()) };
+                            descs[pi * 512 + e * 4 + ai] = off as u64; // patched after upload
+                            off += b.len();
+                        }
+                        let k16 = tp(&format!("{base}.trellis")).shape[2] as usize;
+                        descs[pi * 512 + e * 4 + 3] = (k16 / 16) as u64 | (((k16 % 16 != 0) as u64) << 8);
+                    }
+                }
+                let (f_free, _) = inkwell_cuda::mem_info();
+                let base = if (f_free as usize) > total + (1408usize << 20) {
+                    let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
+                    blob.write_bytes(&host);
+                    drop(host);
+                    let b = blob.dev_ptr() as u64;
+                    expert_dev.push(blob);
+                    b
+                } else {
+                    let pb = inkwell_cuda::host_alloc_mapped(total);
+                    unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), pb.host, total) };
+                    let b = pb.dev as u64;
+                    pinned.push(pb);
+                    b
+                };
+                for d in descs.chunks_exact_mut(4) {
+                    d[0] += base; d[1] += base; d[2] += base;
+                }
+                let mk = |pi: usize| {
+                    let pb = inkwell_cuda::host_alloc_mapped(128 * 32);
+                    unsafe { std::ptr::copy_nonoverlapping(descs[pi * 512..].as_ptr().cast::<u8>(), pb.host, 128 * 32) };
+                    pb
+                };
+                l.moe_exl3 = Some(moe_args_exl3.len());
+                moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
+                    descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
+                }));
+            }
+            l.proj0_off = [-1; 3];
+            layers.push(l);
+        }
+        eprintln!("load_st: dev={}MiB exl3_w={} pinned={}MiB", dev_bytes >> 20, exl3_w.len(),
+            pinned.iter().map(|p| 0usize).sum::<usize>());
+
+        // visits + KV arenas (same as GGUF path)
+        let (start, end, np, nphys) = (6usize, 18usize, 3usize, 24usize);
+        let mut visits = Vec::new();
+        for il in 0..start { visits.push((il, il)); }
+        for pass in 0..np {
+            for ip in start..end {
+                let slot = if pass == 0 { ip } else { nphys + (pass - 1) * (end - start) + (ip - start) };
+                visits.push((ip, slot));
+            }
+        }
+        for il in end..nphys { visits.push((il, il)); }
+        let n_full = visits.iter().filter(|(il, _)| il % 6 == 5).count();
+
+        let (hd, hkv, swa) = (128i64, 8i64, 1024i64);
+        let n_slots = nphys + (np - 1) * (end - start);
+        let mut k_arena = Vec::new();
+        let mut v_arena = Vec::new();
+        let mut conv_state = Vec::new();
+        let n_sconv = (2 * hd * hkv + 2 * 2304) as usize;
+        for slot in 0..n_slots {
+            let il_phys = if slot < nphys { slot } else { start + (slot - nphys) % (end - start) };
+            let full = il_phys % 6 == 5;
+            let cap = if full { max_ctx } else { swa };
+            k_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
+            v_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
+            conv_state.push(t::new(rt.ctx(), F32, &[3, n_sconv as i64]));
+        }
+        let kv_bytes: usize = k_arena.iter().chain(v_arena.iter()).map(|x| t::nbytes(*x) + 256).sum::<usize>()
+            + conv_state.iter().map(|x| t::nbytes(*x) + 256).sum::<usize>();
+        let kv_buf = rt.buf(buft_dev, kv_bytes);
+        let mut o = 0usize;
+        for x in k_arena.iter().chain(v_arena.iter()).chain(conv_state.iter()) {
+            o = (o + 127) & !127;
+            kv_buf.assign(*x, o);
+            o += t::nbytes(*x);
+        }
+        std::mem::forget(kv_buf);
+
+        crate::moe::warm_staging(); // staging buffers must exist before CUDA-graph capture
+        Self {
+            sched_cpu: Some((sched, cpu)),
+            cur_ctx: Ptr(std::ptr::null_mut()),
+            mix_prefix: std::cell::UnsafeCell::new(None),
+            dump_list: std::cell::UnsafeCell::new(Vec::new()),
+            in_buf: None,
+            rt, sched, dev_buf, cpu_buf,
+            w: HashMap::new(), pinned, expert_dev,
+            moe_args: Vec::new(), exl3_w, moe_args_exl3, output_exl3,
+            cfg: cfg.clone(), layers,
+            tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
+            k_arena, v_arena, conv_state, max_ctx, swa, visits, n_full,
         }
     }
 }
@@ -406,6 +810,19 @@ impl Runner {
 impl Runner {
     /// layer helpers
     fn is_swa_layer(&self, il: usize) -> bool { il % 6 != 5 }
+
+    /// GEMV dispatch: EXL3 descriptor or ggml mmq.
+    fn proj(&self, c: Ptr, l: &L, key: &'static str, w: Option<Ptr>, x: Ptr) -> Ptr {
+        match l.exl3.get(key) {
+            Some(&i) => {
+                let e = &*self.exl3_w[i];
+                let mut args = [x.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [e.n as i64, 1, 1, 1], &mut args,
+                    exl3_cb_addr(), (e as *const Exl3W).cast_mut().cast()) })
+            }
+            None => t::mmq(c, w.expect(key), x),
+        }
+    }
 
     fn norm(&self, x: Ptr, w: Ptr) -> Ptr {
         let c = self.cur_ctx;
@@ -424,7 +841,7 @@ impl Runner {
             let mut v = vec![0f32; n as usize];
             unsafe { t::get(*t0, v.as_mut_ptr().cast(), 0, (n*4) as usize) };
             let sum: f32 = v.iter().sum();
-            eprintln!("DBG {name} ne={n} sum={sum:.6} first3={:?}", &v[..3]);
+            eprintln!("DBG {name} ne={n} sum={sum:.6} first3={:?}", &v[..8]);
         }
         unsafe { (*self.dump_list.get()).clear(); }
     }
@@ -489,6 +906,7 @@ impl Runner {
         let dst = t::view3(c, state, 3, ch, 1, t::nb(state, 1), t::nb(state, 2), region_off * t::nb(state, 1));
         stores.push(t::cpy(c, tail, dst));
         // conv
+        eprintln!("CONVX slot={slot} ch={ch} w=[{},{}] x_in=[{},{},{}]", t::ne(w,0), t::ne(w,1), t::ne(x_in,0), t::ne(x_in,1), t::ne(x_in,2));
         let mut out = t::reshape2(c, t::ssm_conv(c, t::reshape3(c, x, n_conv, ch, 1), w), ch, 1);
         if let Some(dyn_w) = dynamic {
             let n_heads = t::ne(dyn_w, 0) / n_conv;
@@ -540,6 +958,12 @@ impl Runner {
                 *inp = self.control(*inp, m, l, j);
             }
         }
+        if il == 0 && std::env::var("INKWELL_DUMP").is_ok() {
+            let nw = l.attn_norm.expect("attn_norm");
+            let mut nv = vec![0f32; 8];
+            unsafe { t::get(nw, nv.as_mut_ptr().cast(), 0, 32) };
+            eprintln!("DBG attn_norm_w first8={nv:?} n0={}", t::ne(nw, 0));
+        }
         if is_swa && messages.is_some() {
             for inp in inputs.iter_mut() { *inp = self.norm(*inp, l.attn_norm.expect("attn_norm")); }
         } else if is_swa {
@@ -556,35 +980,36 @@ impl Runner {
         let (q, gate_lin, r_pre) = if let Some(cat) = l.proj0_cat {
             let out = t::mmq(c, cat, inputs[0]);
             // ggml_view_1d offset is in BYTES in this fork — out is F32 (row idx * 4)
-            let slice = |off: i64, n: i64, w: Option<Ptr>| {
-                if off >= 0 { t::view1(c, out, n, off * 4) } else { t::mmq(c, w.expect("proj"), inputs[0]) }
+            let slice = |off: i64, n: i64, key: &'static str, w: Option<Ptr>| {
+                if off >= 0 { t::view1(c, out, n, off * 4) } else { self.proj(c, l, key, w, inputs[0]) }
             };
             (
-                slice(l.proj0_off[0], 3072, l.wq),
-                slice(l.proj0_off[1], 3072, l.wqkv_gate),
-                slice(l.proj0_off[2], 384, l.attn_rel),
+                slice(l.proj0_off[0], 3072, "wq", l.wq),
+                slice(l.proj0_off[1], 3072, "gate", l.wqkv_gate),
+                slice(l.proj0_off[2], 384, "rel", l.attn_rel),
             )
         } else {
             (
-                t::mmq(c, l.wq.expect("wq"), inputs[0]),
-                t::mmq(c, l.wqkv_gate.expect("gate"), inputs[0]),
-                t::mmq(c, l.attn_rel.expect("rel"), inputs[0]),
+                self.proj(c, l, "wq", l.wq, inputs[0]),
+                self.proj(c, l, "gate", l.wqkv_gate, inputs[0]),
+                self.proj(c, l, "rel", l.attn_rel, inputs[0]),
             )
         };
         let k_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
         let v_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
-        let k = self.convolve(t::mmq(c, l.wk.expect("wk"), inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores);
+        let k = self.convolve(self.proj(c, l, "wk", l.wk, inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores);
         let gqa = (hd * hkv) as i64;
-        let v = self.convolve(t::mmq(c, l.wv.expect("wv"), inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores);
+        let v = self.convolve(self.proj(c, l, "wv", l.wv, inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores);
         let r = r_pre;
         if il == 0 {
             self.dump("rel_raw", r); self.dump("inputs0", inputs[0]);
-            // weight raw bytes check
-            let wp = l.attn_rel.unwrap();
-            let nbytes = t::nbytes(wp);
-            let mut vb = vec![0u8; nbytes.min(64) as usize];
-            unsafe { t::get(wp, vb.as_mut_ptr().cast(), 0, vb.len()) };
-            eprintln!("DBG attn_rel nbytes={nbytes} head={:?}", &vb[..16]);
+            // weight raw bytes check (GGUF path only)
+            if let Some(wp) = l.attn_rel {
+                let nbytes = t::nbytes(wp);
+                let mut vb = vec![0u8; nbytes.min(64) as usize];
+                unsafe { t::get(wp, vb.as_mut_ptr().cast(), 0, vb.len()) };
+                eprintln!("DBG attn_rel nbytes={nbytes} head={:?}", &vb[..16]);
+            }
         }
 
         let q = self.clip(t::reshape3(c, q, hd, nh, 1), l.attn_q_clip, self.cfg.qk_clip);
@@ -637,7 +1062,7 @@ impl Runner {
         let mut cur = out;
         cur = t::mul(c, cur, t::sigmoid(c, gate_lin));
         if il == 0 { self.dump("kqv_out-0", out); }
-        cur = self.convolve(t::mmq(c, l.wo.expect("wo"), cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores);
+        cur = self.convolve(self.proj(c, l, "wo", l.wo, cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores);
 
         // residual / push block
         if ip % (self.cfg.attn_res_block_size as usize) == 0 {
@@ -671,6 +1096,18 @@ impl Runner {
         // custom op: 8 expert GEMVs on GPU over zero-copy pinned weights +
         // fused SITU + per-expert scales + weighted sum — all in one callback
         if il == 0 { self.dump("moe_in-0", fcur); self.dump("moe_ids-0", ids); self.dump("moe_w-0", weights3); }
+        if let Some(mi) = l.moe_exl3 {
+            let m = &self.moe_args_exl3[mi];
+            let mut args: Vec<*mut std::ffi::c_void> = vec![fcur.0, ids.0, weights3.0];
+            let ffn_out = Ptr(unsafe {
+                inkwell_ggml::custom_4d(c.0, F32, [n_embd, 1, 1, 1], &mut args,
+                    crate::moe::moe_cb_exl3_addr(), (&**m as *const crate::moe::MoeArgsExl3).cast_mut().cast())
+            });
+            self.set_cpu(ffn_out);
+            let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores);
+            if il == 0 { self.dump("ffn_out-0", fcur); }
+            return t::add(c, ffn_inp, fcur);
+        }
         let m = &self.moe_args[l.moe.expect("moe")];
         let mut args: Vec<*mut std::ffi::c_void> = vec![fcur.0, ids.0, weights3.0];
         if m.has_sgu {
@@ -810,8 +1247,16 @@ impl Runner {
         {
             let (src, ty, stride) = self.embd_src;
             let mut row = vec![0f32; 2304];
-            let rc = unsafe { inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row.as_mut_ptr(), 2304) };
-            assert_eq!(rc, 0, "dequant embd row");
+            if ty == -2 {
+                // bf16 rows (safetensors path)
+                let s = unsafe { src.add(id as usize * stride) } as *const u16;
+                for (i, r) in row.iter_mut().enumerate() {
+                    *r = f32::from_bits(u32::from(unsafe { *s.add(i) }) << 16);
+                }
+            } else {
+                let rc = unsafe { inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row.as_mut_ptr(), 2304) };
+                assert_eq!(rc, 0, "dequant embd row");
+            }
             unsafe { t::set(self.embd_row, row.as_ptr().cast(), 0, 2304 * 4) };
         }
         let mut cur = self.embd_row;
@@ -866,7 +1311,14 @@ impl Runner {
         self.dump("result_norm", cur);
         let own_head = self.out_head.is_some();
         if !own_head {
-            cur = t::mmq(c, self.output, cur);
+            cur = if let Some(oi) = self.output_exl3 {
+                let e = &*self.exl3_w[oi];
+                let mut args = [cur.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [e.n as i64, 1, 1, 1], &mut args,
+                    exl3_cb_addr(), (e as *const Exl3W).cast_mut().cast()) })
+            } else {
+                t::mmq(c, self.output, cur)
+            };
             if self.cfg.softcap != 0.0 {
                 let cap = self.cfg.softcap;
                 cur = t::scale(c, t::tanh(c, t::scale(c, cur, 1.0 / cap)), cap);

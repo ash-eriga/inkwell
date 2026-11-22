@@ -25,3 +25,6 @@ unwrap_used = "warn"                     # use ?, or expect("why this cannot fai
 expect_used = "allow"                    # expect with a reason is the sanctioned form
 panic_in_result_fn = "warn"              # a fn returning Result shouldn't also panic
 missing_panics_doc = "warn"              #
+
+[profile.release]
+incremental = true

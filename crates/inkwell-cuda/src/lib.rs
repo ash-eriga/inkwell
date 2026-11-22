@@ -46,6 +46,8 @@ extern "C" {
     fn ink_launch_mmvq_nvfp4_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_situ_pair(gu: *const f32, sgu: *const f32, hid: *mut f32, beta: f32, lin_beta: f32, ncols: i64, nslots: i64, stream: *mut c_void);
+    fn ink_launch_exl3_gemv(trel: *const c_void, suh: *const c_void, svh: *const c_void, x: *const f32, y: *mut f32, k: i64, n: i64, ka: i64, halfk: i64, scratch: *mut f32, stream: *mut c_void);
+    fn ink_launch_exl3_moe(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -651,6 +653,24 @@ static INK_STREAM: std::sync::atomic::AtomicPtr<c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 pub unsafe fn set_stream(s: *mut c_void) {
     INK_STREAM.store(s, std::sync::atomic::Ordering::Relaxed);
+}
+/// EXL3 trellis GEMV: y = svh . H (What^T . H (suh . x)) for one weight.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+pub unsafe fn exl3_gemv_async(trel: *const c_void, suh: *const c_void, svh: *const c_void,
+    x: *const f32, y: *mut f32, k: usize, n: usize, ka: usize, halfk: bool, scratch: *mut f32) {
+    unsafe { ink_launch_exl3_gemv(trel, suh, svh, x, y, k as i64, n as i64, ka as i64, halfk as i64, scratch, stream()) };
+}
+/// EXL3 MoE per-slot expert chain (gate+up -> situ -> down -> wsum).
+///
+/// # Safety
+/// desc tables are pinned host-mapped u64[128][4] arrays.
+pub unsafe fn exl3_moe_async(dg: *const c_void, du: *const c_void, dd: *const c_void,
+    ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32,
+    w: *const f32, out: *mut f32, nslots: i32,
+    staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void) {
+    unsafe { ink_launch_exl3_moe(dg, du, dd, ids, x, xh, gu, hid, dn, w, out, nslots, stream(), staging, sdescs_g, sdescs_u, sdescs_d) };
 }
 fn stream() -> *mut c_void { INK_STREAM.load(std::sync::atomic::Ordering::Relaxed) }
 
