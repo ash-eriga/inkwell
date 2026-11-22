@@ -42,7 +42,7 @@ impl Rt {
         }
     }
 
-    /// Host pinned buffer type (for experts streamed over PCIe).
+    /// Host pinned buffer type (for experts streamed over `PCIe`).
     #[must_use]
     pub fn host_buft() -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_cuda_host_buft() })
@@ -110,14 +110,20 @@ impl Buf {
 }
 
 /// Tensor creation + ops, all taking `rt`.
+///
+/// `c` = the ggml context pointer.
 #[expect(clippy::too_many_arguments)]
+#[expect(clippy::many_single_char_names, reason = "ggml arg names are short by convention")]
 pub mod t {
     use super::Ptr;
 
     /// Create tensor `ne[..]` of ggml `ty` (use ggml type ids).
+    ///
+    /// # Panics
+    /// If `ne.len() > i32::MAX`.
     #[must_use]
     pub fn new(c: Ptr, ty: i32, ne: &[i64]) -> Ptr {
-        Ptr(unsafe { inkwell_ggml::ink_tensor(c.0, ty, ne.len() as i32, ne.as_ptr()) })
+        Ptr(unsafe { inkwell_ggml::ink_tensor(c.0, ty, i32::try_from(ne.len()).expect("nd"), ne.as_ptr()) })
     }
 
     macro_rules! op2 {
@@ -142,12 +148,12 @@ pub mod t {
     pub fn concat(c: Ptr, a: Ptr, b: Ptr, dim: i32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_concat(c.0, a.0, b.0, dim) })
     }
-    /// mul_mat_id expert gather.
+    /// `mul_mat_id` expert gather.
     #[must_use]
     pub fn mul_mat_id(c: Ptr, as_: Ptr, b: Ptr, ids: Ptr) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_mul_mat_id(c.0, as_.0, b.0, ids.0) })
     }
-    /// add_id.
+    /// `add_id`.
     #[must_use]
     pub fn add_id(c: Ptr, a: Ptr, b: Ptr, ids: Ptr) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_add_id(c.0, a.0, b.0, ids.0) })
@@ -157,7 +163,7 @@ pub mod t {
     pub fn set_rows(c: Ptr, a: Ptr, b: Ptr, idx: Ptr) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_set_rows(c.0, a.0, b.0, idx.0) })
     }
-    /// argsort_top_k.
+    /// `argsort_top_k`.
     #[must_use]
     pub fn argsort_top_k(c: Ptr, a: Ptr, k: i32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_argsort_top_k(c.0, a.0, k) })
@@ -180,12 +186,12 @@ pub mod t {
     op1!(gelu, ink_gelu);
     op1!(gelu_quick, ink_gelu_quick);
     op1!(softplus, ink_softplus);
-    /// sum_rows.
+    /// `sum_rows`.
     #[must_use]
     pub fn sum_rows(c: Ptr, a: Ptr) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_sum_rows(c.0, a.0) })
     }
-    /// dup.
+    /// `dup`.
     #[must_use]
     pub fn dup(c: Ptr, a: Ptr) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_dup(c.0, a.0) })
@@ -193,22 +199,22 @@ pub mod t {
     op1!(cont, ink_cont);
     op1!(transpose, ink_transpose);
 
-    /// rms_norm.
+    /// `rms_norm`.
     #[must_use]
     pub fn rms_norm(c: Ptr, a: Ptr, eps: f32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_rms_norm(c.0, a.0, eps) })
     }
-    /// scale.
+    /// `scale`.
     #[must_use]
     pub fn scale(c: Ptr, a: Ptr, s: f32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_scale(c.0, a.0, s) })
     }
-    /// scale_bias.
+    /// `scale_bias`.
     #[must_use]
     pub fn scale_bias(c: Ptr, a: Ptr, s: f32, b: f32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_scale_bias(c.0, a.0, s, b) })
     }
-    /// clamp.
+    /// `clamp`.
     #[must_use]
     pub fn clamp(c: Ptr, a: Ptr, lo: f32, hi: f32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_clamp(c.0, a.0, lo, hi) })
@@ -258,7 +264,7 @@ pub mod t {
     pub fn pad(c: Ptr, a: Ptr, p0: i32, p1: i32, p2: i32, p3: i32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_pad(c.0, a.0, p0, p1, p2, p3) })
     }
-    /// cast.
+    /// `cast`.
     #[must_use]
     pub fn cast(c: Ptr, a: Ptr, ty: i32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_cast(c.0, a.0, ty) })
@@ -286,7 +292,7 @@ pub mod t {
     pub fn output(t: Ptr) {
         unsafe { inkwell_ggml::ink_set_output(t.0) };
     }
-    /// nbytes.
+    /// `nbytes`.
     #[must_use]
     pub fn nbytes(t: Ptr) -> usize {
         unsafe { inkwell_ggml::ink_tensor_nbytes(t.0) }
