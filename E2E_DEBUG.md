@@ -139,3 +139,21 @@ Check: ggml-cpu type_traits_cpu[t].vec_dot_type for types 16,17,19,22,23,40,42;
   amortize. Path forward if attempted: sign-apply via vset/vneg SIMD video
   ops or restructure to 16-val groups sharing sign work. Low priority vs
   swarm (~30ms/tok in cpy/concat/mix rebuild).
+
+## Structural push for 15 t/s (contended GPU, apps running)
+
+Decomposition (nsys): MoE experts ~74ms/tok was 2/3 of ~149ms. Fixes:
+
+- `862a35d` miss = 1 PCIe pass (ptr repointed at VRAM slot after promote; was 2x)
+- `a80c828` dn promote + ptr upload on side stream, overlapped with gu GEMV
+- `2bd1d29` eager promote uses>=1 (loop visits x3 => subsequent hits in VRAM)
+- `225dde6` PERSISTENT ggml ctx + reset/step: fresh ctx per step made tensor
+  addresses differ => CUDA-graph key never repeated => ~7100 raw
+  launches/token (~33ms host API). Now graphs capture+replay.
+- After: MoE ~31ms/tok (was 74). decode runs ~6.1-10.4s/64tok (noise: desktop
+  contention) ~8.5-10.5 t/s vs upstream recipe 6.15.
+
+Remaining buckets: dense mmvq_q t8 ~9.4ms, mmv_f ~4.4, swarm ~7, attn/conv ~8,
+lm_head ~4.3, ~96 backend splits (custom ops are CPU-only in ggml => D2H of
+x/ids + sync readback of output per visit). Device-side resolve would kill
+the split round-trips.
