@@ -212,9 +212,10 @@ fn dump_graph(cfg: &inkwell_core::InklingConfig) {
         sched.visits.iter().map(|v| v.ops.len()).max().unwrap_or(0));
 }
 
-#[expect(clippy::enum_glob_use, reason = "exhaustive enum dispatch")]
 fn op_name(op: &inkwell_graph::Op) -> &'static str {
-    use inkwell_graph::Op::*;
+    use inkwell_graph::Op::{Attn, Clip, DepthMix, Embed, GateMul, Head, LoopControl,
+        LoopMessage, MoeExperts, MoeRoute, Norm, Proj, PushBlock, RelBiasTable,
+        Residual, ShortConv, TauScale, VNorm};
     match op {
         Embed => "embed", LoopControl { .. } => "loop_ctrl",
         DepthMix { .. } => "depth_mix", Norm { .. } => "norm", VNorm => "vnorm",
