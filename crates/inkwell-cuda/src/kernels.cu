@@ -658,6 +658,59 @@ extern "C" void ink_launch_mmvq_q2_0_moe_i8(const void* const* Wp,
     dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
     inkwell_mmvq_q2_0_moe_i8<<<g, 512, (size_t)ncols + (size_t)(ncols / 64) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
+
+// IQ1_S via DP4A: the grid lookup already yields the 8 vals as int8 bytes in
+// two u32s -> dp4a weight packs directly. The delta offset is not integer,
+// so it is applied as delta * sum(x_int8) via dp4a(x, 0x01010101).
+__global__ void inkwell_mmvq_iq1_s_moe_i8(const void* const* __restrict__ Wp, const float* __restrict__ x,
+                                        float* __restrict__ y, int64_t nrows, int64_t ncols, int64_t x_stride) {
+    const int slot = blockIdx.y;
+    extern __shared__ int8_t qx[];
+    float* sx = (float*)(qx + ncols);
+    x += slot * x_stride;
+    const int nblk = (int)(ncols / 64);
+    for (int b = (int)threadIdx.x >> 4; b < nblk; b += (int)(blockDim.x >> 4)) {
+        const int t = threadIdx.x & 15;
+        float m = 0.f;
+        for (int i = t; i < 64; i += 16) m = fmaxf(m, fabsf(x[b * 64 + i]));
+        for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (t == 0) sx[b] = m / 127.f;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) {
+        const float sc = sx[i >> 6];
+        qx[i] = (int8_t)(sc > 0.f ? (int)rintf(x[i] / sc) : 0);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int64_t row = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= nrows) return;
+    const block_iq1_s* w = (const block_iq1_s*)((const uint8_t*)Wp[slot])
+                           + row * (ncols / 256);
+    const int ngroups = (int)(ncols / 8);
+    float acc = 0.f;
+    for (int g = lane; g < ngroups; g += 32) {
+        const int b = g / 32, gb = g % 32;
+        const int ib = gb / 4, il = gb % 4;
+        const float delta = (w[b].qh[ib] & 0x8000) ? -1.f - IQ1S_DELTA : -1.f + IQ1S_DELTA;
+        const float dsx = fp16_to_f32(w[b].d) * (2 * ((w[b].qh[ib] >> 12) & 7) + 1) * sx[g >> 3];
+        const uint32_t grid = iq1s_grid_gpu[w[b].qs[4 * ib + il] | (((w[b].qh[ib] >> 3 * il) & 7) << 8)];
+        const uint32_t w0 = grid & 0x0f0f0f0fu;
+        const uint32_t w1 = (grid >> 4) & 0x0f0f0f0fu;
+        const uint32_t* xp = (const uint32_t*)(qx + g * 8);
+        int isum = __dp4a((int)xp[0], (int)w0, __dp4a((int)xp[1], (int)w1, 0));
+        const int sumx = __dp4a((int)xp[0], 0x01010101, __dp4a((int)xp[1], 0x01010101, 0));
+        acc += dsx * ((float)isum + delta * (float)sumx);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[slot * nrows + row] = acc;
+}
+extern "C" void ink_launch_mmvq_iq1_s_moe_i8(const void* const* Wp,
+                                             const float* x, float* y, long long nrows, long long ncols,
+                                             long long x_stride, int nslots, void* stream) {
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_iq1_s_moe_i8<<<g, 512, (size_t)ncols + (size_t)(ncols / 64) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+}
 extern "C" void ink_launch_situ_pair(const float* gu, const float* sgu, float* hid,
                                      float beta, float lin_beta, long long ncols, long long nslots, void* stream) {
     int64_t n = nslots * ncols;
