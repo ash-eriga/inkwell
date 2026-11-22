@@ -129,3 +129,13 @@ Check: ggml-cpu type_traits_cpu[t].vec_dot_type for types 16,17,19,22,23,40,42;
   sums — precompute during quantize pass).
 - Remaining: iq1_s/iq2_xxs/iq2_xs/iq2_s/iq4_xs dp4a variants; swarm
   cpy/concat (~30ms/tok); mix() states rebuild per call (~600 CONCAT/tok).
+
+## DP4A sweep — verdicts per format (2026-11-22)
+
+- q2_0_i8, nvfp4_i8: WIRED (43%/17% gains).
+- iq1_s_i8: rejected — 8-val groups don't amortize x-quant pass.
+- iq2_xxs/xs/s: sign-masks separate from magnitudes; per-lane sign application
+  in dp4a needs byte-select tricks (__vnegss4/LOP3) — group of 8 doesn't
+  amortize. Path forward if attempted: sign-apply via vset/vneg SIMD video
+  ops or restructure to 16-val groups sharing sign work. Low priority vs
+  swarm (~30ms/tok in cpy/concat/mix rebuild).
