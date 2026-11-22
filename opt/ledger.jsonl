@@ -13,3 +13,7 @@
 {"ts":"2026-11-22T19:53:40-03:00","exp":"margin_1050","ms_tok":143,"text":" is s ","note":"pinned 3609->3053MiB"}
 {"ts":"2026-11-22T19:57:52-03:00","exp":"CORRECTION","note":"decode-print covers n_gen tok: ms/tok=X/n_gen. real: ~216-280ms/tok (4-4.6t/s) vs gguf 104. prior entries /8 were wrong units"}
 {"ts":"2026-11-22T20:01:45-03:00","exp":"steady_state","ms_tok":222,"note":"GENS=8 1777ms; nsys: dense gemv 149ms/run dominant"}
+{"ts":"2026-11-22","exp":"cuda-graph key FNV hash (ops/type/ne[0]/data ptrs) + prop-field exclusion (src ptrs, view_src, name, CUSTOM userdata); warmup completes, replay active; dispatch CPU ~140ms->2ms/tok","ms_tok":176,"verdict":"keep"}
+{"ts":"2026-11-22","exp":"expert alloc reserve 1150->1050MiB + on_dev descs skip moe_stage for VRAM layers (~1GB experts resident)","ms_tok":176,"verdict":"keep"}
+{"ts":"2026-11-22","exp":"gemv_dp4a split-K gridDim.y ~512 blocks + atomicAdd","gemv_dp4a_ms":229,"verdict":"keep"}
+{"ts":"2026-11-22","exp":"gemv_moe variants: split-K memset+atomics (643ms, worse), 16thr warp-per-tile (worse), TB=8 tk batching (1.458s, worse), __ldg no-shared (22s, catastrophic) — kept 4tile/64thr shared-ring","verdict":"revert"}
