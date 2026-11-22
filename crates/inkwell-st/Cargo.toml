@@ -1,0 +1,12 @@
+[package]
+name = "inkwell-st"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+serde_json = "1"
+thiserror = "2"
+
+[lints]
+workspace = true

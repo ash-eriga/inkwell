@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/inkwell-gguf", "crates/inkwell-core", "crates/inkwell-tokenizer", "crates/inkwell-model",
+members = ["crates/inkwell-gguf", "crates/inkwell-st", "crates/inkwell-core", "crates/inkwell-tokenizer", "crates/inkwell-model",
     "crates/inkwell-kv",
     "crates/inkwell-pager",
     "crates/inkwell-sampler",

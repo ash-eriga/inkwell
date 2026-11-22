@@ -1542,3 +1542,128 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
         (const float*)mask, (float*)out, (int)nh, (int)hkv, (int)n_kv, (int)hd,
         (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
 }
+
+#include <cuda_fp16.h>
+// ===================== EXL3 trellis GEMV (sm_61, mul1 codebook) =====================
+// W = diag(suh) H What H diag(svh); y = svh . H (What^T-ish GEMV over decoded tiles).
+// Decomposition: xh = H128*(suh*x); t[n] = sum_k xh[k]*What[k,n]; y = svh*H128*t.
+// No tensor cores on Pascal: decode + scalar FMA. mul1 codebook only (all tensors
+// in the SAGE pack are mul1-marked). K = trellis.shape[2]/16; half-integer K uses
+// step widths KA + bit(i) of 0xAAAA (odd positions get +1 bit).
+// tile_perm: ring position i=8t+j -> tile element r=(t%4)*2+(j&1)+(j&2?8:0),
+// c=t/4+(j&4?8:0).
+
+__device__ __forceinline__ uint32_t exl3_window(const uint32_t* __restrict__ ring,
+                                                int i, int ka, int halfk) {
+    const int r_bits = halfk ? 256 * ka + 128 : 256 * ka;
+    const int s_i = halfk ? (i + 1) * ka + ((i + 1) >> 1) : (i + 1) * ka; // inclusive prefix
+    const int b0 = s_i - 16 + (s_i < 16 ? r_bits : 0);
+    const int nw = r_bits >> 5;
+    const int i0 = b0 >> 5;
+    const int s0 = 48 - (b0 & 31);
+    const uint64_t v = ((uint64_t)ring[i0] << 32) | (uint64_t)ring[(i0 + 1) % nw];
+    return (uint32_t)(v >> s0) & 0xffffu;
+}
+
+__device__ __forceinline__ float exl3_mul1(uint32_t w) {
+    w *= 0x83DCD12Du;
+    const uint32_t s = __dp4a(w, 0x01010101u, 0x6400u); // bytesum + fp16 bits 0x6400
+    const __half h = __ushort_as_half((uint16_t)s);
+    return __half2float(__hfma(h, __ushort_as_half(0x1eee), __ushort_as_half(0xc931)));
+}
+
+// xh = H128 * (suh .* x): block per 128-block, butterfly in smem, /sqrt(128).
+__global__ void inkwell_exl3_had_in(const float* __restrict__ x,
+                                    const uint16_t* __restrict__ suh,
+                                    float* __restrict__ xh, int k) {
+    extern __shared__ float sm[];
+    const int blk = blockIdx.x;
+    const int t = threadIdx.x;
+    const int base = blk * 128;
+    float v = (base + t < k) ? x[base + t] * __half2float(__ushort_as_half(suh[base + t])) : 0.f;
+    sm[t] = v;
+    __syncthreads();
+    for (int s = 1; s < 128; s <<= 1) {
+        const float u = (t & s) ? sm[t - s] - sm[t] : sm[t] + sm[t + s];
+        __syncthreads();
+        sm[t] = u;
+        __syncthreads();
+    }
+    if (base + t < k) xh[base + t] = sm[t] * 0.08838834764831845f; // 1/sqrt(128)
+}
+
+// t[n] = sum_k xh[k] * What[k,n]. grid.x = tn tiles; 256 threads, thread i = ring pos i.
+__device__ __forceinline__ int r_bits_words(int ka, int halfk) {
+    return (halfk ? 256 * ka + 128 : 256 * ka) / 32;
+}
+
+__global__ void inkwell_exl3_gemv(const uint32_t* __restrict__ trel,
+                                  const float* __restrict__ xh,
+                                  float* __restrict__ t,
+                                  int tk, int tn, int ka, int halfk) {
+    __shared__ float xhs[16];
+    __shared__ float acc[16];
+    const int tn_i = blockIdx.x;
+    const int i = threadIdx.x;
+    const int tt = i >> 3, j = i & 7;
+    const int r = (tt & 3) * 2 + (j & 1) + ((j & 2) ? 8 : 0);
+    const int c = (tt >> 2) + ((j & 4) ? 8 : 0);
+    if (i < 16) acc[i] = 0.f;
+    __syncthreads();
+    const uint32_t* tile_base = trel;
+    for (int tk_i = 0; tk_i < tk; ++tk_i) {
+        if (i < 16) xhs[i] = xh[tk_i * 16 + i];
+        __syncthreads();
+        const uint32_t* ring = tile_base + (size_t)(tk_i * tn + tn_i) * (size_t)(r_bits_words(ka, halfk));
+        const float wv = exl3_mul1(exl3_window(ring, i, ka, halfk));
+        atomicAdd(&acc[c], xhs[r] * wv);
+        __syncthreads();
+    }
+    if (i < 16) t[tn_i * 16 + i] = acc[i];
+}
+
+// y = svh .* (H128 * t): block per 128-block.
+__global__ void inkwell_exl3_had_out(const float* __restrict__ t,
+                                     const uint16_t* __restrict__ svh,
+                                     float* __restrict__ y, int n) {
+    extern __shared__ float sm[];
+    const int blk = blockIdx.x;
+    const int th = threadIdx.x;
+    const int base = blk * 128;
+    sm[th] = (base + th < n) ? t[base + th] : 0.f;
+    __syncthreads();
+    for (int s = 1; s < 128; s <<= 1) {
+        const float u = (th & s) ? sm[th - s] - sm[th] : sm[th] + sm[th + s];
+        __syncthreads();
+        sm[th] = u;
+        __syncthreads();
+    }
+    if (base + th < n) y[base + th] = sm[th] * 0.08838834764831845f
+        * __half2float(__ushort_as_half(svh[base + th]));
+}
+
+extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const void* svh,
+                                     const float* x, float* y,
+                                     long long k, long long n, long long ka, long long halfk,
+                                     float* scratch, void* stream) {
+    const int tk = (int)(k / 16), tn = (int)(n / 16);
+    inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+        x, (const uint16_t*)suh, scratch /* xh */, (int)k);
+    inkwell_exl3_gemv<<<tn, 256, 0, (cudaStream_t)stream>>>(
+        (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
+    inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
+        scratch + k, (const uint16_t*)svh, y, (int)n);
+}
+
+__global__ void inkwell_exl3_dbg_dec(const uint32_t* __restrict__ trel,
+                                     float* __restrict__ out, int ka, int halfk) {
+    const int i = threadIdx.x;
+    out[i] = exl3_mul1(exl3_window(trel, i, ka, halfk));
+}
+extern "C" void ink_launch_exl3_dbg(const void* trel, float* out, long long ka, long long halfk, void* stream) {
+    inkwell_exl3_dbg_dec<<<1, 256, 0, (cudaStream_t)stream>>>((const uint32_t*)trel, out, (int)ka, (int)halfk);
+}
+extern "C" void ink_launch_exl3_dbg_had(const float* x, const void* suh, float* out, long long k, void* stream) {
+    inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+        x, (const uint16_t*)suh, out, (int)k);
+}
