@@ -887,7 +887,6 @@ impl Runner {
         t::output(cur);
 
         // graph
-        let tb = std::time::Instant::now();
         let g = Ptr(unsafe { inkwell_ggml::ink_graph_new(c.0, 32768) });
         t::build_forward(g, cur);
         for s in &stores {
@@ -896,17 +895,13 @@ impl Runner {
         for (_, ptr) in unsafe { &*self.dump_list.get() } {
             t::build_forward(g, *ptr);
         }
-        let t_build = tb.elapsed();
         if std::env::var_os("INKWELL_OPCNT").is_some() {
             unsafe { inkwell_ggml::ink_graph_op_counts(g.0) };
         }
-        let tc = std::time::Instant::now();
         unsafe {
             assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
             self.dump_all();
         }
-        eprintln!("DBG time build={:?} compute={:?}", t_build, tc.elapsed());
-        unsafe { inkwell_ggml::ink_tensor_debug(cur.0) };
         let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
         if let Some((w, x_dev, y_dev)) = self.out_head.as_mut() {
             let mut normed = vec![0f32; self.cfg.n_embd as usize];
