@@ -1654,28 +1654,36 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
                                        const float* __restrict__ xh,
                                        float* __restrict__ t,
                                        int tk, int tn, int ka, int halfk) {
-    __shared__ float xhs[16];
-    const int tn_i = blockIdx.x;
-    const int c = threadIdx.x; // 16 threads, one output column each
+    const int g = threadIdx.x >> 4;      // 4 tiles per block
+    const int c = threadIdx.x & 15;      // column within tile
+    const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
-    __shared__ uint32_t rings[32];
+    __shared__ float xhs[16];
+    __shared__ uint32_t rings[4 * 32];
+    const bool live = tn_i < tn;
     float s = 0.f;
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
-        xhs[c] = xh[tk_i * 16 + c];
-        const uint32_t* ring = trel + (size_t)(tk_i * tn + tn_i) * (size_t)w;
-        for (int j = c; j < w; j += 16) rings[j] = ring[j];
+        if (threadIdx.x < 16) xhs[c] = xh[tk_i * 16 + c];
+        if (live) {
+            const uint32_t* ring = trel + (size_t)(tk_i * tn + tn_i) * (size_t)w;
+            uint32_t* rg = rings + g * 32;
+            for (int j = c; j < w; j += 16) rg[j] = ring[j];
+        }
         __syncthreads();
+        if (live) {
+            const uint32_t* rg = rings + g * 32;
 #pragma unroll
-        for (int r = 0; r < 16; ++r) {
-            // invert the tile_perm map: i = f(r, c)
-            const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
-                        | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-            const uint32_t win = exl3_window(rings, i, ka, halfk);
-            s += xhs[r] * exl3_mul1(win); // fp16 hfma per element — spec-exact
+            for (int r = 0; r < 16; ++r) {
+                // invert the tile_perm map: i = f(r, c)
+                const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                            | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+                const uint32_t win = exl3_window(rg, i, ka, halfk);
+                s += xhs[r] * exl3_mul1(win); // fp16 hfma per element — spec-exact
+            }
         }
         __syncthreads();
     }
-    t[tn_i * 16 + c] = s;
+    if (live) t[tn_i * 16 + c] = s;
 }
 
 __global__ void inkwell_exl3_gemv_dp4a_dbg(const uint32_t* __restrict__ trel,
@@ -1718,7 +1726,7 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
     const int tk = (int)(k / 16), tn = (int)(n / 16);
     inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
         x, (const uint16_t*)suh, scratch /* xh */, (int)k);
-    inkwell_exl3_gemv_dp4a<<<tn, 16, 0, (cudaStream_t)stream>>>(
+    inkwell_exl3_gemv_dp4a<<<(tn + 3) / 4, 64, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
     inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
         scratch + k, (const uint16_t*)svh, y, (int)n);
