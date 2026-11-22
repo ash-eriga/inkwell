@@ -1,6 +1,14 @@
 # E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
 Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
 
+## Round 6c: q8_0 gold test + pair-load verdict
+
+- GOLD_Q80=1 bench: CPU-ref (identical x-quant + int dot) vs kernel, nrows=256:
+  old 2.50e-6, pair 2.09e-6 — pair repack proven CORRECT.
+- Timing nrows=4608 ncols=2304: old 0.142ms, pair 0.137ms — only ~4%.
+- VERDICT: pair-load reverted permanently — gain too small to justify reorder drift.
+- The gold harness now exists for dense kernels (extend to q5_k/q6_k when needed).
+
 ## Round 6b: remaining levers ranked (nsys)
 
 - mmv_f residual = mix() states attention (states*queries -> softmax -> states^T*scores):

@@ -23,6 +23,7 @@ extern "C" {
     fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq4_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_q8_0_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
 }
 
 fn alloc(bytes: usize) -> *mut c_void {
@@ -35,6 +36,7 @@ fn alloc(bytes: usize) -> *mut c_void {
 
 fn main() {
     if std::env::var("GOLD_ATTN").is_ok() { gold_attn(); return; }
+    if std::env::var("GOLD_Q80").is_ok() { gold_q80(); return; }
     const NR: i64 = 2304; // gu rows (2*ff) and down rows = embd
     const NC: i64 = 2304; // max cols (down=1152 also tested)
     const NS: i32 = 8;
@@ -216,3 +218,89 @@ fn gold_attn() {
     println!("attn gold ok");
 }
 
+
+// CPU-ref vs kernel for dense q8_0_i8: replicates per-32 x-quant (sc=max/127, rint)
+// then y[r] = sum_b d_b * sx_b * (xi . qs). block_q8_0 = {u16 d; i8 qs[32]}.
+fn gold_q80() {
+    let (nrows, ncols) = (256i64, 2304i64);
+    let nblk = (ncols / 32) as usize;
+    let mut w = vec![0u8; (nrows as usize) * nblk * 34];
+    for (i, b) in w.iter_mut().enumerate() {
+        *b = (((i * 7 + 3) % 251) as u8).wrapping_add(1);
+    }
+    // keep d a small positive fp16 (~2^-6 pattern), qs bytes arbitrary above
+    for r in 0..(nrows as usize) {
+        for b in 0..nblk {
+            let o = (r * nblk + b) * 34;
+            w[o] = 0x00; w[o + 1] = 0x2C; // fp16 ~0.09375
+        }
+    }
+    let x: Vec<f32> = (0..ncols).map(|i| ((i * 13) % 29) as f32 * 0.01 - 0.14).collect();
+    let mut y = vec![0f32; nrows as usize];
+    let mut dx: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        let dw = alloc(w.len());
+        cudaMemcpy(dw, w.as_ptr().cast(), w.len(), 1);
+        dx = alloc(x.len() * 4);
+        cudaMemcpy(dx, x.as_ptr().cast(), x.len() * 4, 1);
+        let dy = alloc(nrows as usize * 4);
+        ink_launch_mmvq_q8_0_i8(dw.cast(), dx.cast(), dy.cast(), nrows, ncols, std::ptr::null_mut());
+        cudaDeviceSynchronize();
+        cudaMemcpy(y.as_mut_ptr().cast(), dy, nrows as usize * 4, 2);
+    }
+    // CPU ref with identical x-quant + integer dot
+    let mut sx = vec![0f32; nblk];
+    let mut xi = vec![0i32; ncols as usize];
+    for b in 0..nblk {
+        let mut m = 0f32;
+        for i in 0..32 { m = m.max(x[b * 32 + i].abs()); }
+        sx[b] = m / 127.0;
+        for i in 0..32 {
+            xi[b * 32 + i] = if sx[b] > 0.0 { (x[b * 32 + i] / sx[b]).round() as i32 } else { 0 };
+        }
+    }
+    let dval = f16_to_f32(0x2C00);
+    let mut maxrel = 0f32;
+    for r in 0..(nrows as usize) {
+        let mut ref_ = 0f32;
+        for b in 0..nblk {
+            let mut isum = 0i64;
+            for i in 0..32 {
+                isum += xi[b * 32 + i] as i64 * (w[(r * nblk + b) * 34 + 2 + i] as i8) as i64;
+            }
+            ref_ += dval * sx[b] * isum as f32;
+        }
+        let rel = (y[r] - ref_).abs() / ref_.abs().max(1.0);
+        if rel > maxrel { maxrel = rel; }
+    }
+    assert!(maxrel < 5e-3, "q8_0 gold maxrel={maxrel}");
+    println!("q8_0 gold ok (maxrel {maxrel:.2e})");
+    // timing at realistic nrows
+    let nr2 = 4608i64;
+    let w2 = vec![0u8; (nr2 as usize) * nblk * 34];
+    let dw2 = alloc(w2.len());
+    unsafe {
+        cudaMemcpy(dw2, w2.as_ptr().cast(), w2.len(), 1);
+        let dy2 = alloc(nr2 as usize * 4);
+        ink_launch_mmvq_q8_0_i8(dw2.cast(), dx.cast(), dy2.cast(), nr2, ncols, std::ptr::null_mut());
+        cudaDeviceSynchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..200 {
+            ink_launch_mmvq_q8_0_i8(dw2.cast(), dx.cast(), dy2.cast(), nr2, ncols, std::ptr::null_mut());
+        }
+        cudaDeviceSynchronize();
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / 200.0;
+        let mib = (nr2 as f64) * (nblk as f64) * 34.0 / 1048576.0;
+        println!("q8_0_i8 nrows={nr2} ncols={ncols}: {ms:.3} ms ({mib:.1} MiB -> {:.1} GB/s)", mib / ms * 1000.0);
+    }
+}
+
+fn f16_to_f32(h: u16) -> f32 {
+    let h = h as u32;
+    let s = ((h & 0x8000) << 16) as i32;
+    let e = ((h >> 10) & 0x1F) as i32;
+    let m = (h & 0x3FF) as u32;
+    if e == 0 { return (s as f32) * (m as f32) * (2f32).powi(-24); }
+    let f = (1.0 + m as f32 / 1024.0) * (2f32).powi(e - 15);
+    if s != 0 { -f } else { f }
+}
