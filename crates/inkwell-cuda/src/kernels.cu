@@ -465,7 +465,7 @@ __global__ void inkwell_mmvq_nvfp4_moe(const void* const* __restrict__ Wp, const
         // byte covers vals [sub*16 + j, sub*16 + j + 8]
         const float d = ue4m3_to_f32(w[b].d[sub]);
         const uint8_t q = w[b].qs[sub * 8 + j];
-        const float* xv = x + b * 64 + sub * 16 + j;
+        const float* xv = xs + b * 64 + sub * 16 + j;
         acc += d * kvalues_fp4[q & 0x0F] * xv[0]
              + d * kvalues_fp4[q >> 4]  * xv[8];
     }
