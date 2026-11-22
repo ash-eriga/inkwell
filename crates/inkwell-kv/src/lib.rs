@@ -16,7 +16,7 @@ use inkwell_core::InklingConfig;
 /// Element type of a KV arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvType {
-    /// scale-free E4M3 — legal because of qk_clip/rel_clip bounds
+    /// scale-free E4M3 — legal because of `qk_clip`/`rel_clip` bounds
     F8E4m3,
     /// brain float 16
     Bf16,
@@ -26,6 +26,7 @@ pub enum KvType {
 
 impl KvType {
     /// Bytes per stored element.
+    #[must_use]
     pub const fn elem_size(self) -> usize {
         match self {
             Self::F8E4m3 => 1,
@@ -91,6 +92,16 @@ pub struct Visit {
 }
 
 /// Complete KV layout for a model + context budget.
+/// Whether loop passes share a KV arena per layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Share {
+    /// one arena per (layer, pass) — upstream behaviour
+    PerPass,
+    /// one arena per loop layer, passes share
+    LoopShared,
+}
+
+/// Complete KV layout for a model + context budget.
 #[derive(Debug)]
 pub struct KvPlan {
     /// physical arenas (deduplicated when `share_loop`)
@@ -98,7 +109,7 @@ pub struct KvPlan {
     /// all 48 visits in execution order
     pub visits: Vec<Visit>,
     /// whether loop passes share one arena per layer
-    pub share_loop: bool,
+    pub share: Share,
     /// sliding window from config
     pub swa_window: usize,
 }
@@ -110,7 +121,7 @@ impl KvPlan {
     /// write to the same arena (upstream `loop_share_cache` PR); when
     /// false each pass gets its own arena like upstream llama.cpp.
     #[must_use]
-    pub fn new(cfg: &InklingConfig, max_ctx: usize, ty: KvType, share_loop: bool) -> Self {
+    pub fn new(cfg: &InklingConfig, max_ctx: usize, ty: KvType, share: Share) -> Self {
         let n_kv = cfg.n_head_kv as usize;
         let head_dim = cfg.head_dim as usize;
         let bytes_per_token = 2 * n_kv * head_dim * ty.elem_size();
@@ -119,7 +130,7 @@ impl KvPlan {
         // arena id per (layer, pass-or-shared)
         let mut map: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
         let mut arena_for = |layer: u32, pass: u32, full: bool| -> usize {
-            let key = (layer, if share_loop { 0 } else { pass });
+            let key = (layer, if share == Share::LoopShared { 0 } else { pass });
             *map.entry(key).or_insert_with(|| {
                 let kind = if full {
                     ArenaKind::Full { capacity: max_ctx }
@@ -157,7 +168,7 @@ impl KvPlan {
             visits.push(Visit { index: visits.len(), layer, pass: 0, arena, full });
         }
 
-        Self { arenas, visits, share_loop, swa_window: 1024 }
+        Self { arenas, visits, share, swa_window: 1024 }
     }
 
     /// Total KV bytes across all arenas.

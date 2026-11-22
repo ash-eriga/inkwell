@@ -25,7 +25,7 @@ fn main() {
     );
 
     if let Some("--kv") = args.next().as_deref() {
-        dump_kv(&g, &cfg);
+        dump_kv(&cfg);
         return;
     }
     if let Some("--model") = args.next().as_deref() {
@@ -66,16 +66,15 @@ fn bench_tok(g: &inkwell_gguf::GgufFile, iters: u32) {
     println!("decode: {:?} total, {:.0} tok/s", d, (iters as usize*ids.len()) as f64/d.as_secs_f64());
 }
 
-fn dump_kv(g: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig) {
-    let _ = g;
-    use inkwell_kv::{KvPlan, KvType};
+use inkwell_kv::{KvPlan, KvType, Share};
+fn dump_kv(cfg: &inkwell_core::InklingConfig) {
     println!("{:>10} {:>6} {:>7} {:>8} {:>10} {:>10} {:>6}", "ctx", "kv", "loop", "arenas", "swa MiB", "full MiB", "total");
     for ctx in [4_096usize, 32_768, 131_072, 262_144] {
         for (ty, tn) in [(KvType::F8E4m3, "fp8"), (KvType::Bf16, "bf16")] {
-            for share in [false, true] {
+            for share in [Share::PerPass, Share::LoopShared] {
                 let p = KvPlan::new(cfg, ctx, ty, share);
                 println!("{:>10} {:>6} {:>7} {:>8} {:>10} {:>10} {:>6}",
-                    ctx, tn, if share {"shared"} else {"passes"}, p.arenas.len(),
+                    ctx, tn, if share == Share::LoopShared {"shared"} else {"passes"}, p.arenas.len(),
                     p.swa_bytes()/1_048_576, p.full_bytes()/1_048_576, p.total_bytes()/1_048_576);
             }
         }
