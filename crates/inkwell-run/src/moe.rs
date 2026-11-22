@@ -102,7 +102,7 @@ impl Cache {
     /// Promote misses into VRAM (evict LRU); copies are stream-ordered.
     /// Re-points `ptrs` at the cache slot so this call's GEMV reads VRAM
     /// instead of re-streaming the same expert over PCIe (halves miss traffic).
-    fn promote(&mut self, misses: &[(usize, i32)], host: *mut u8, ptrs: &mut [usize; N_SLOTS]) {
+    fn promote(&mut self, misses: &[(usize, i32)], host: *mut u8, ptrs: &mut [usize; N_SLOTS], side: bool) {
         for &(s, e) in misses {
             if self.k() == 0 { break; }
             let e = e as usize;
@@ -114,11 +114,9 @@ impl Cache {
                 self.map[old] = -1;
             }
             unsafe {
-                cu::memcpy_h2d_async(
-                    self.dev.dev_ptr().cast::<u8>().add(victim * self.esz).cast(),
-                    host.add(e * self.esz).cast_const().cast(),
-                    self.esz,
-                );
+                let d = self.dev.dev_ptr().cast::<u8>().add(victim * self.esz).cast();
+                let h = host.add(e * self.esz).cast_const().cast();
+                if side { cu::memcpy_h2d_async_side(d, h, self.esz) } else { cu::memcpy_h2d_async(d, h, self.esz) }
             }
             ptrs[s] = unsafe { self.dev.dev_ptr().cast::<u8>().add(victim * self.esz) } as usize;
             self.map[e] = victim as i32;
@@ -213,11 +211,13 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
         let mut caches = a.caches.lock().expect("caches");
         if let Some((gc, dc)) = caches.as_mut() {
             gc.resolve(&ids_v, a.gu_host, &mut ptrs, &mut gu_misses);
-            gc.promote(&gu_misses, a.gu_host, &mut ptrs);
+            gc.promote(&gu_misses, a.gu_host, &mut ptrs, false);
             gu_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
             dc.resolve(&ids_v, a.dn_host, &mut ptrs, &mut dn_misses);
-            dc.promote(&dn_misses, a.dn_host, &mut ptrs);
-            dn_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
+            // dn promotion + ptr upload run on the side stream, overlapped with
+            // the gu GEMV; stream 0 waits before the dn GEMV launch
+            dc.promote(&dn_misses, a.dn_host, &mut ptrs, true);
+            dn_ptrs.write_bytes_async_side(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
         } else {
             for (s, &e) in ids_v.iter().enumerate() {
                 ptrs[s] = unsafe { a.gu_host.add(e as usize * a.gu_stride) } as usize;
@@ -273,6 +273,7 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
             t => panic!("gate_up type {t}"),
         }
         cu::situ_pair_async(&mut hid, &gu, if sgu_h.is_null() { std::ptr::null() } else { sgu.dev_ptr().cast_const() }, 4.0, 25.0, N_FF, N_SLOTS);
+        cu::side_sync_to_main();
         match a.dn_type {
             T_Q2_0 => cu::mmvq_q2_0_moe_i8_async(dn_ptrs.dev_ptr().cast_const(), hid.dev_ptr().cast_const(), &mut dn, N_EMBD, N_FF, N_FF, N_SLOTS),
             T_NVFP4 => cu::mmvq_nvfp4_moe_i8_async(dn_ptrs.dev_ptr().cast_const(), hid.dev_ptr().cast_const(), &mut dn, N_EMBD, N_FF, N_FF, N_SLOTS),

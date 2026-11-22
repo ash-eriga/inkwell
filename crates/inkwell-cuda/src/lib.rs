@@ -14,6 +14,10 @@ extern "C" {
     fn cudaFree(p: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
     fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> i32;
+    fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
+    fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
+    fn cudaEventRecord(e: *mut c_void, s: *mut c_void) -> i32;
+    fn cudaStreamWaitEvent(s: *mut c_void, e: *mut c_void, flags: u32) -> i32;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     fn cudaHostAlloc(pp: *mut *mut c_void, size: usize, flags: u32) -> i32;
     fn cudaHostRegister(p: *mut c_void, bytes: usize, flags: u32) -> i32;
@@ -284,6 +288,11 @@ impl DevBuf {
     }
 
     /// Async HtoD byte upload on stream 0 (caller syncs).
+    /// Same as [`Self::write_bytes_async`] on the side stream.
+    pub fn write_bytes_async_side(&self, src: &[u8]) {
+        let rc = unsafe { cudaMemcpyAsync(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1, side_stream()) };
+        assert_eq!(rc, 0, "cudaMemcpyAsync HtoD side");
+    }
     pub fn write_bytes_async(&self, src: &[u8]) {
         let rc = unsafe { cudaMemcpyAsync(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1, std::ptr::null_mut()) };
         assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");
@@ -504,4 +513,41 @@ pub fn mem_info() -> (usize, usize) {
 pub unsafe fn memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
     let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, std::ptr::null_mut()) };
     assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");
+}
+/// Secondary stream + event for overlapping MoE expert promotion with compute.
+fn side_stream() -> *mut c_void {
+    use std::sync::OnceLock;
+    static S: OnceLock<usize> = OnceLock::new();
+    *S.get_or_init(|| {
+        let mut s = std::ptr::null_mut();
+        assert_eq!(unsafe { cudaStreamCreateWithFlags(&mut s, 1) }, 0);
+        s as usize
+    }) as *mut c_void
+}
+fn side_event() -> *mut c_void {
+    use std::sync::OnceLock;
+    static E: OnceLock<usize> = OnceLock::new();
+    *E.get_or_init(|| {
+        let mut e = std::ptr::null_mut();
+        assert_eq!(unsafe { cudaEventCreateWithFlags(&mut e, 2) }, 0);
+        e as usize
+    }) as *mut c_void
+}
+/// Async HtoD copy on the side stream.
+///
+/// # Safety
+/// `dst`/`src` valid for `bytes`.
+pub unsafe fn memcpy_h2d_async_side(dst: *mut c_void, src: *const c_void, bytes: usize) {
+    let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, side_stream()) };
+    assert_eq!(rc, 0, "cudaMemcpyAsync HtoD side");
+}
+/// Record the side stream's event and make stream 0 wait on it.
+///
+/// # Safety
+/// Stream/event plumbing only.
+pub unsafe fn side_sync_to_main() {
+    let s = side_stream();
+    let e = side_event();
+    assert_eq!(unsafe { cudaEventRecord(e, s) }, 0);
+    assert_eq!(unsafe { cudaStreamWaitEvent(std::ptr::null_mut(), e, 0) }, 0);
 }
