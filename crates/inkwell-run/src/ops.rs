@@ -158,7 +158,7 @@ pub mod t {
     pub fn add_id(c: Ptr, a: Ptr, b: Ptr, ids: Ptr) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_add_id(c.0, a.0, b.0, ids.0) })
     }
-    /// set_rows(dst, src, idx).
+    /// `set_rows` (dst, src, idx).
     #[must_use]
     pub fn set_rows(c: Ptr, a: Ptr, b: Ptr, idx: Ptr) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_set_rows(c.0, a.0, b.0, idx.0) })
@@ -269,12 +269,12 @@ pub mod t {
     pub fn cast(c: Ptr, a: Ptr, ty: i32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_cast(c.0, a.0, ty) })
     }
-    /// soft_max_ext.
+    /// `soft_max_ext`.
     #[must_use]
     pub fn soft_max(c: Ptr, a: Ptr, mask: Ptr, scale: f32, mb: f32) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_soft_max_ext(c.0, a.0, mask.0, scale, mb) })
     }
-    /// flash_attn_ext + sinks.
+    /// `flash_attn_ext` + sinks.
     #[must_use]
     pub fn flash_attn(c: Ptr, q: Ptr, k: Ptr, v: Ptr, mask: Ptr, sinks: Ptr, scale: f32, mb: f32, lsc: f32) -> Ptr {
         let t = Ptr(unsafe { inkwell_ggml::ink_flash_attn_ext(c.0, q.0, k.0, v.0, mask.0, scale, mb, lsc) });
@@ -311,7 +311,7 @@ pub mod t {
     pub unsafe fn get(t: Ptr, dst: *mut u8, off: usize, n: usize) {
         unsafe { inkwell_ggml::ink_tensor_get(t.0, dst.cast(), off, n) };
     }
-    /// build_forward_expand.
+    /// `build_forward_expand`.
     pub fn build_forward(g: Ptr, out: Ptr) {
         unsafe { inkwell_ggml::ink_build_forward(g.0, out.0) };
     }
