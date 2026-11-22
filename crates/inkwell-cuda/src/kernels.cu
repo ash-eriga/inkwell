@@ -1569,7 +1569,11 @@ __device__ __forceinline__ float exl3_mul1(uint32_t w) {
     w *= 0x83DCD12Du;
     const uint32_t s = __dp4a(w, 0x01010101u, 0x6400u); // bytesum + fp16 bits 0x6400
     const __half h = __ushort_as_half((uint16_t)s);
-    return __half2float(__hfma(h, __ushort_as_half(0x1eee), __ushort_as_half(0xc931)));
+    // fp32 fma + single fp16 rounding == __hfma(h, k_inv, k_bias) exactly
+    const float hf = __half2float(h);
+    return __half2float(__float2half(
+        __fmaf_rn(hf, __half2float(__ushort_as_half(0x1eee)),
+                  __half2float(__ushort_as_half(0xc931)))));
 }
 
 // xh = H128 * (suh .* x): block per 128-block, butterfly in smem, /sqrt(128).
@@ -1653,18 +1657,20 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     __shared__ float xhs[16];
     const int tn_i = blockIdx.x;
     const int c = threadIdx.x; // 16 threads, one output column each
-    const int w = r_bits_words(ka, halfk);
+    const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
+    __shared__ uint32_t rings[32];
     float s = 0.f;
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
         xhs[c] = xh[tk_i * 16 + c];
-        __syncthreads();
         const uint32_t* ring = trel + (size_t)(tk_i * tn + tn_i) * (size_t)w;
+        for (int j = c; j < w; j += 16) rings[j] = ring[j];
+        __syncthreads();
 #pragma unroll
         for (int r = 0; r < 16; ++r) {
             // invert the tile_perm map: i = f(r, c)
             const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
                         | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-            const uint32_t win = exl3_window(ring, i, ka, halfk);
+            const uint32_t win = exl3_window(rings, i, ka, halfk);
             s += xhs[r] * exl3_mul1(win); // fp16 hfma per element — spec-exact
         }
         __syncthreads();
@@ -1763,7 +1769,6 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
                                       const float* __restrict__ xh,
                                       float* __restrict__ t,
                                       int tk, int tn, int k, int n) {
-    __shared__ float xhs[16];
     const int slot = blockIdx.y;
     const uint64_t* d = descs + ids[slot] * 4;
     const uint32_t* tile_base = (const uint32_t*)(uintptr_t)d[0];
@@ -1771,17 +1776,20 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     const int halfk = (int)((d[3] >> 8) & 1);
     const int tn_i = blockIdx.x;
     const int c = threadIdx.x; // 16 threads, one output column each
-    const int w = r_bits_words(ka, halfk);
+    const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
+    __shared__ float xhs[16];
+    __shared__ uint32_t rings[32];
     float s = 0.f;
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
         xhs[c] = xh[slot * k + tk_i * 16 + c];
-        __syncthreads();
         const uint32_t* ring = tile_base + (size_t)(tk_i * tn + tn_i) * (size_t)w;
+        for (int j = c; j < w; j += 16) rings[j] = ring[j];
+        __syncthreads();
 #pragma unroll
         for (int r = 0; r < 16; ++r) {
             const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
                         | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-            s += xhs[r] * exl3_mul1(exl3_window(ring, i, ka, halfk));
+            s += xhs[r] * exl3_mul1(exl3_window(rings, i, ka, halfk));
         }
         __syncthreads();
     }
@@ -1884,4 +1892,14 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     dim3 dout(ND / 128, nslots);
     inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
+}
+
+extern "C" void ink_launch_exl3_stage(const void* descs_g, const void* descs_u,
+                                    const void* descs_d, const int* ids,
+                                    void* staging, void* sg, void* su, void* sd,
+                                    void* stream) {
+    cudaStream_t st = (cudaStream_t)stream;
+    inkwell_exl3_moe_stage<<<24, 256, 0, st>>>(
+        (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+        ids, (uint8_t*)staging, (uint64_t*)sg, (uint64_t*)su, (uint64_t*)sd);
 }
