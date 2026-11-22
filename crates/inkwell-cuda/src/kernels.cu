@@ -380,9 +380,7 @@ __global__ void inkwell_mmvq_q2_0_moe(const void* const* __restrict__ Wp,
     float acc = 0.f;
     for (int u = lane; u < nunits; u += 32) {
         const int b = u >> 2, ub = u & 3;           // 4 units per 64-val block
-        const uint16_t qlo = *(const uint16_t*)&w[b].qs[ub * 4];
-        const uint16_t qhi = *(const uint16_t*)&w[b].qs[ub * 4 + 2];
-        const uint32_t q = (uint32_t)qlo | ((uint32_t)qhi << 16);
+        const uint32_t q = *(const uint32_t*)&w[b].qs[ub * 4];
         const float d = fp16_to_f32(w[b].d);
         const float* xv = xs + u * 16;
 #pragma unroll

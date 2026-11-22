@@ -174,3 +174,9 @@ extern "C" ggml_tensor* ink_custom_4d(ggml_context* c, int type, int64_t ne0, in
 }
 extern "C" void* ink_tensor_data(ggml_tensor* t) { return t->data; }
 extern "C" ggml_tensor* ink_tensor_src(ggml_tensor* t, int i) { return t->src[i]; }
+extern "C" void ink_graph_op_counts(ggml_cgraph* g) {
+    int cnt[GGML_OP_COUNT] = {0};
+    for (int i = 0; i < ggml_graph_n_nodes(g); i++) cnt[(int)ggml_graph_node(g, i)->op]++;
+    for (int i = 0; i < GGML_OP_COUNT; i++)
+        if (cnt[i]) fprintf(stderr, "OPCNT %s = %d\n", ggml_op_name((enum ggml_op)i), cnt[i]);
+}

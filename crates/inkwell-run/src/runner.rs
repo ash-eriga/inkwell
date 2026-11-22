@@ -840,6 +840,9 @@ impl Runner {
             t::build_forward(g, *ptr);
         }
         let t_build = tb.elapsed();
+        if std::env::var_os("INKWELL_OPCNT").is_some() {
+            unsafe { inkwell_ggml::ink_graph_op_counts(g.0) };
+        }
         let tc = std::time::Instant::now();
         unsafe {
             assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
