@@ -903,7 +903,7 @@ extern "C" void ink_launch_mmvq_iq4_xs_moe(const void* const* Wp,
                                            const float* x, float* y, long long nrows, long long ncols,
                                            long long x_stride, int nslots, void* stream) {
     dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
-    inkwell_mmvq_iq4_xs_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    inkwell_mmvq_iq4_xs_moe<<<g, 1024, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 
 // ---------------- IQ2_S (82B/256): {u16 d; u8 qs[64]; u8 qh[8]; u8 scales[8]} --
