@@ -24,6 +24,10 @@ fn main() {
         total / 1_048_576
     );
 
+    if let Some("--samplebench") = args.next().as_deref() {
+        sample_bench(&cfg);
+        return;
+    }
     if let Some("--pager") = args.next().as_deref() {
         bench_pager(&g, &cfg);
         return;
@@ -160,4 +164,27 @@ fn bench_pager(g: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig) {
         println!("{:>10} {:>8} {:>10.1} {:>12.2} {:>12.1}",
             cache_mib, p.n_slots(), hits, mb_tok, 10_000.0 / mb_tok);
     }
+}
+
+#[expect(clippy::cast_precision_loss, reason = "bench counters")]
+fn sample_bench(cfg: &inkwell_core::InklingConfig) {
+    use inkwell_sampler::{Rng, Sampler};
+    use std::time::Instant;
+    let nv = cfg.vocab as usize;
+    let logits: Vec<f32> = (0..nv).map(|i| ((i * 2_654_435_761) % 1000) as f32 / 1000.0).collect();
+    let mut rng = Rng::new(42);
+    let smp = Sampler { top_k: 40, top_p: 0.95, min_p: 0.05, temperature: 0.8 };
+    // warmup
+    let mut acc = 0u64;
+    for _ in 0..1000 { acc += u64::from(smp.sample(&logits, &mut rng)); }
+    let t = Instant::now();
+    let iters = 10_000;
+    for _ in 0..iters { acc += u64::from(smp.sample(&logits, &mut rng)); }
+    let d = t.elapsed();
+    println!("sample(topk40,topp.95,minp.05,temp.8) x{} over {} vocab: {:?}/sample ({:.0}/s) [{}]",
+        iters, nv, d / u32::try_from(iters).unwrap_or(1), f64::from(iters) / d.as_secs_f64(), acc % 97);
+    let g = Sampler { temperature: 0.0, ..Sampler::default() };
+    let t = Instant::now();
+    for _ in 0..iters { acc += u64::from(g.sample(&logits, &mut rng)); }
+    println!("greedy x{}: {:?}/sample [{acc}]", iters, t.elapsed() / u32::try_from(iters).unwrap_or(1));
 }

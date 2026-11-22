@@ -94,12 +94,24 @@ impl Sampler {
     #[expect(clippy::cast_possible_truncation, reason = "vocab < u32::MAX")]
     #[must_use]
     pub fn sample(&self, logits: &[f32], rng: &mut Rng) -> u32 {
-        // top-k then temperature on survivors, then top-p/min-p
+        // top-k then temperature on survivors, then top-p/min-p.
+        // Greedy path: linear argmax, no sort.
+        if self.temperature == 0.0 {
+            let mut bi = 0usize;
+            for (i, &l) in logits.iter().enumerate() {
+                if l > logits[bi] {
+                    bi = i;
+                }
+            }
+            return bi as u32;
+        }
         let mut cand: Vec<(u32, f32)> = logits.iter().enumerate().map(|(i, &l)| (i as u32, l)).collect();
-        cand.sort_by(|a, b| b.1.total_cmp(&a.1));
-        if self.top_k > 0 {
+        if self.top_k > 0 && self.top_k < cand.len() {
+            // partial select: only the k best need sorting
+            cand.select_nth_unstable_by(self.top_k, |a, b| b.1.total_cmp(&a.1));
             cand.truncate(self.top_k);
         }
+        cand.sort_by(|a, b| b.1.total_cmp(&a.1));
         let t = self.temperature;
         if t == 0.0 {
             return cand[0].0;

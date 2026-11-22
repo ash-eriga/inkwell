@@ -14,6 +14,7 @@ inkwell-tokenizer = { path = "../crates/inkwell-tokenizer" }
 inkwell-model = { path = "../crates/inkwell-model" }
 inkwell-kv = { path = "../crates/inkwell-kv" }
 inkwell-pager = { path = "../crates/inkwell-pager" }
+inkwell-sampler = { path = "../crates/inkwell-sampler" }
 
 [lints]
 workspace = true

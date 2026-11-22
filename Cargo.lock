@@ -52,6 +52,7 @@ dependencies = [
  "inkwell-kv",
  "inkwell-model",
  "inkwell-pager",
+ "inkwell-sampler",
  "inkwell-tokenizer",
 ]
 
