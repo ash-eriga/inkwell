@@ -1183,3 +1183,73 @@ extern "C" void ink_launch_mmvq_q8_0_moe_i8(const void* const* Wp,
     cudaMemsetAsync(y, 0, (size_t)nslots * nrows * 4, (cudaStream_t)stream);
     inkwell_mmvq_q8_0_moe_i8<<<g, 512, ((size_t)ncols + 8) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
+
+// Q6_K via DP4A: val n = ((ql_nib | qh_bits<<4) - 32) in int8; x int8 per 16-vals.
+// block_q6_K { u8 ql[128] (lo/hi nibbles for n<128/>=128), u8 qh[64] (2b each for
+// quarters n/64), i8 scales[16], u16 d } = 210B / 256 vals.
+struct block_q6_k { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; };
+__global__ void inkwell_mmvq_q6_k_i8(const void* __restrict__ W,
+                                     const float* __restrict__ x,
+                                     float* __restrict__ y,
+                                     int64_t nrows, int64_t ncols) {
+    extern __shared__ int8_t qx[];
+    float* sx = (float*)(qx + ncols);
+    const int nxb = (int)(ncols / 16);
+    for (int b = (int)threadIdx.x >> 4; b < nxb; b += (int)(blockDim.x >> 4)) {
+        const int t = threadIdx.x & 15;
+        float m = fabsf(x[b * 16 + t]);
+        for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (t == 0) sx[b] = m / 127.f;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) {
+        const float sc = sx[i >> 4];
+        qx[i] = (int8_t)(sc > 0.f ? (int)rintf(x[i] / sc) : 0);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int half = (threadIdx.x >> 5) & 1;
+    const int64_t row = (int64_t)blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
+    if (row >= nrows) return;
+    const block_q6_k* w = (const block_q6_k*)W + row * (ncols / 256);
+    const int ngroups = (int)(ncols / 16);   // 16-val groups
+    float acc = 0.f;
+#pragma unroll 1
+    for (int G = lane + half * 32; G < ngroups; G += 64) {
+        const int b = G >> 4;                // 256-val superblock
+        const int g = G & 15;                // group inside
+        // real Q6_K interleave per 128-val half (dequantize_q6_K):
+        const int ql_off = 64 * (g >> 3) + 16 * (g & 1) + 32 * ((g >> 1) & 1);
+        const int qh_off = 32 * (g >> 3) + 16 * (g & 1);
+        const int hish = ((g >> 2) & 1) * 4;   // nibble: lo for s<2, hi for s>=2
+        const int qsh  = 2 * ((g & 7) >> 1);   // qh bit shift per segment
+        const uint16_t* qlp = (const uint16_t*)(w[b].ql + ql_off);
+        const uint16_t* qhp = (const uint16_t*)(w[b].qh + qh_off);
+        const uint32_t* xp = (const uint32_t*)(qx + G * 16);
+        int isum = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q = (uint32_t)qlp[2 * j] | ((uint32_t)qlp[2 * j + 1] << 16);
+            const uint32_t h = (uint32_t)qhp[2 * j] | ((uint32_t)qhp[2 * j + 1] << 16);
+            uint32_t wpack = 0;
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const int nib = (int)((q >> (8 * v + hish)) & 0xF);
+                const int hb  = (int)((h >> (8 * v + qsh)) & 3);
+                wpack |= (uint32_t)(uint8_t)((nib | (hb << 4)) - 32) << (8 * v);
+            }
+            isum = __dp4a((int)xp[j], (int)wpack, isum);
+        }
+        const int sc = w[b].scales[8 * (g >> 3) + (g & 1) + 2 * ((g & 7) >> 1)];
+        acc += fp16_to_f32(w[b].d) * (float)sc * sx[G] * (float)isum;
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) atomicAdd(&y[row], acc);
+}
+extern "C" void ink_launch_mmvq_q6_k_i8(const void* W,
+                                        const float* x, float* y,
+                                        long long nrows, long long ncols, void* stream) {
+    dim3 g((unsigned)((nrows + 7) / 8));
+    cudaMemsetAsync(y, 0, (size_t)nrows * 4, (cudaStream_t)stream);
+    inkwell_mmvq_q6_k_i8<<<g, 512, ((size_t)ncols + 16) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+}
