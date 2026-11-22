@@ -10,3 +10,6 @@ path = "src/main.rs"
 [dependencies]
 inkwell-gguf = { path = "../crates/inkwell-gguf" }
 inkwell-core = { path = "../crates/inkwell-core" }
+
+[lints]
+workspace = true

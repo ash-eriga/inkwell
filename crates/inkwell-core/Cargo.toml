@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 inkwell-gguf = { path = "../inkwell-gguf" }
 thiserror = "2"
+
+[lints]
+workspace = true

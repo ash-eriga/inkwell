@@ -1,3 +1,5 @@
+//! `inkwell` CLI: inspect a GGUF and print the Inkling-2 model config.
+
 use inkwell_core::InklingConfig;
 use inkwell_gguf::GgufFile;
 
@@ -17,6 +19,6 @@ fn main() {
     println!(
         "tensors: {}, weights {} MiB",
         g.tensors.len(),
-        total / 1048576
+        total / 1_048_576
     );
 }

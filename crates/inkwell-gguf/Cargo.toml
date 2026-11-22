@@ -7,3 +7,6 @@ edition = "2021"
 bytemuck = "1"
 thiserror = "2"
 memmap2 = "0.9"
+
+[lints]
+workspace = true

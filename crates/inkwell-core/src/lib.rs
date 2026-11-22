@@ -4,28 +4,49 @@
 
 use inkwell_gguf::{GgufFile, MetaValue};
 
+/// Static config of an `inkling2_loop` checkpoint, read from GGUF metadata.
 #[derive(Debug)]
 pub struct InklingConfig {
-    pub n_layer: u32,        // logical layers (24)
-    pub n_loop: u32,         // loop passes for middle layers (3)
-    pub loop_start: u32,     // 6
-    pub loop_end: u32,       // 18 (exclusive)
-    pub loop_gate_rank: u32, // 64
-    pub n_embd: u32,         // 2304
-    pub n_head: u32,         // 24
-    pub n_head_kv: u32,      // 8
-    pub head_dim: u32,       // 128
-    pub n_rel: u32,          // 16
-    pub rel_extent: u32,     // 1024
-    pub swa: u32,            // 1024
-    pub n_expert: u32,       // 128
-    pub n_expert_used: u32,  // 8
-    pub expert_ff: u32,      // 1152
-    pub vocab: u32,          // 201024
-    pub ctx_train: u32,      // 1048576
-    pub qk_clip: f32,        // 22.627
-    pub rel_clip: f32,       // 8.0
-    pub softcap: f32,        // 30.0
+    /// logical layers (24)
+    pub n_layer: u32,
+    /// loop passes for middle layers (3)
+    pub n_loop: u32,
+    /// 6
+    pub loop_start: u32,
+    /// 18 (exclusive)
+    pub loop_end: u32,
+    /// 64
+    pub loop_gate_rank: u32,
+    /// 2304
+    pub n_embd: u32,
+    /// 24
+    pub n_head: u32,
+    /// 8
+    pub n_head_kv: u32,
+    /// 128
+    pub head_dim: u32,
+    /// 16
+    pub n_rel: u32,
+    /// 1024
+    pub rel_extent: u32,
+    /// 1024
+    pub swa: u32,
+    /// 128
+    pub n_expert: u32,
+    /// 8
+    pub n_expert_used: u32,
+    /// 1152
+    pub expert_ff: u32,
+    /// 201024
+    pub vocab: u32,
+    /// 1048576
+    pub ctx_train: u32,
+    /// 22.627
+    pub qk_clip: f32,
+    /// 8.0
+    pub rel_clip: f32,
+    /// 30.0
+    pub softcap: f32,
 }
 
 fn get<'a>(m: &'a std::collections::HashMap<String, MetaValue>, k: &str) -> &'a MetaValue {
@@ -34,7 +55,7 @@ fn get<'a>(m: &'a std::collections::HashMap<String, MetaValue>, k: &str) -> &'a 
 fn u32v(v: &MetaValue) -> u32 {
     match v {
         MetaValue::U32(x) => *x,
-        MetaValue::I32(x) => *x as u32,
+        MetaValue::I32(x) => u32::try_from(*x).expect("i32 meta fits u32"),
         _ => panic!("not u32"),
     }
 }
@@ -52,7 +73,12 @@ fn arr(m: &std::collections::HashMap<String, MetaValue>, k: &str, i: usize) -> u
 }
 
 impl InklingConfig {
-    /// Read inkling2_loop config from GGUF metadata.
+    /// Read `inkling2_loop` config from GGUF metadata.
+    ///
+    /// # Panics
+    ///
+    /// On missing or mistyped metadata keys.
+    #[must_use]
     pub fn from_gguf(g: &GgufFile) -> Self {
         let m = &g.meta;
         let p = "inkling2_loop.";
@@ -81,7 +107,8 @@ impl InklingConfig {
         }
     }
 
-    /// Layer-visits per token: 0..6, then (6..18) x n_loop, then 18..24.
+    /// Layer-visits per token: 0..6, then (6..18) x `n_loop`, then 18..24.
+    #[must_use]
     pub fn n_visits(&self) -> u32 {
         self.loop_start
             + (self.loop_end - self.loop_start) * self.n_loop
