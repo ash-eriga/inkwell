@@ -54,6 +54,8 @@ pub struct Runner {
     layers: Vec<L>,
     // globals
     tok_embd: Ptr, embd_src: (*const u8, i32, usize), embd_row: Ptr, tok_norm: Ptr, output: Ptr, output_norm: Ptr, output_res_query: Ptr,
+    // own lm_head path: device ptr to output.weight + work buffers (Some iff type==IQ4_XS)
+    out_head: Option<(inkwell_cuda::DevBuf, inkwell_cuda::DevBuf, inkwell_cuda::DevBuf)>,
     // per-visit KV arenas + conv states (visit → tensors)
     k_arena: Vec<Ptr>, v_arena: Vec<Ptr>, conv_state: Vec<Ptr>,
     max_ctx: i64,
@@ -262,6 +264,25 @@ impl Runner {
         let tok_embd = Ptr(std::ptr::null_mut()); // embd stays host-side
         let tok_norm = opt("token_embd_norm.weight").unwrap_or_else(|| opt("output_norm.weight").expect("tok_norm"));
         let output = get("output.weight");
+        let out_head = {
+            let tinfo = gg.tensors.get("output.weight");
+            if tinfo.map(|t| t.ggml_type as i32) == Some(23) {
+                Some(unsafe {
+                    (
+                        {
+                            // Wp array lives on device: kernel derefs Wp[slot] on GPU
+                            let mut wp_dev = inkwell_cuda::DevBuf::new_bytes(8);
+                            wp_dev.write_bytes(&(inkwell_ggml::ink_tensor_data(output.0) as usize).to_ne_bytes());
+                            wp_dev
+                        },
+                        inkwell_cuda::DevBuf::new(2304),
+                        inkwell_cuda::DevBuf::new(201024),
+                    )
+                })
+            } else {
+                None
+            }
+        };
         let output_norm = get("output_norm.weight");
         let output_res_query = get("output_res_query.weight");
 
@@ -315,7 +336,7 @@ impl Runner {
             dump_list: std::cell::UnsafeCell::new(Vec::new()),
             in_buf: None,
             rt, sched, dev_buf, cpu_buf, w, pinned, moe_args, cfg: cfg.clone(), layers,
-            tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query,
+            tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, max_ctx, swa, visits,
             n_full,
         }
@@ -742,10 +763,13 @@ impl Runner {
         cur = t::reshape2(c, self.mix(&blocks, cur, self.output_res_query), n_embd, 1);
         cur = self.norm(cur, self.output_norm);
         self.dump("result_norm", cur);
-        cur = t::mul_mat(c, self.output, cur);
-        if self.cfg.softcap != 0.0 {
-            let cap = self.cfg.softcap;
-            cur = t::scale(c, t::tanh(c, t::scale(c, cur, 1.0 / cap)), cap);
+        let own_head = self.out_head.is_some();
+        if !own_head {
+            cur = t::mul_mat(c, self.output, cur);
+            if self.cfg.softcap != 0.0 {
+                let cap = self.cfg.softcap;
+                cur = t::scale(c, t::tanh(c, t::scale(c, cur, 1.0 / cap)), cap);
+            }
         }
         t::output(cur);
 
@@ -768,7 +792,20 @@ impl Runner {
         eprintln!("DBG time build={:?} compute={:?}", t_build, tc.elapsed());
         unsafe { inkwell_ggml::ink_tensor_debug(cur.0) };
         let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
-        unsafe { t::get(cur, logits.as_mut_ptr().cast(), 0, logits.len() * 4) };
+        if let Some((w, x_dev, y_dev)) = self.out_head.as_mut() {
+            let mut normed = vec![0f32; self.cfg.n_embd as usize];
+            unsafe { t::get(cur, normed.as_mut_ptr().cast(), 0, normed.len() * 4) };
+            x_dev.write(&normed);
+            unsafe {
+                inkwell_cuda::mmvq_iq4_xs_moe(
+                    w.dev_ptr(), x_dev.dev_ptr(), y_dev, 201024, 2304, 2304, 1);
+            }
+            inkwell_cuda::softcap(y_dev, self.cfg.softcap);
+            let all = y_dev.read();
+            logits.copy_from_slice(&all[..self.cfg.vocab_unpadded as usize]);
+        } else {
+            unsafe { t::get(cur, logits.as_mut_ptr().cast(), 0, logits.len() * 4) };
+        }
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         // release the cached split plan so the next step's graph gets re-allocated
         unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
