@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 inkwell-ggml = { path = "../inkwell-ggml" }
+inkwell-cuda = { path = "../inkwell-cuda" }
 inkwell-gguf = { path = "../inkwell-gguf" }
 inkwell-model = { path = "../inkwell-model" }
 inkwell-core = { path = "../inkwell-core" }

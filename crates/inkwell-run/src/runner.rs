@@ -685,6 +685,7 @@ impl Runner {
         t::output(cur);
 
         // graph
+        let tb = std::time::Instant::now();
         let g = Ptr(unsafe { inkwell_ggml::ink_graph_new(c.0, 32768) });
         t::build_forward(g, cur);
         for s in &stores {
@@ -693,10 +694,13 @@ impl Runner {
         for (_, ptr) in unsafe { &*self.dump_list.get() } {
             t::build_forward(g, *ptr);
         }
+        let t_build = tb.elapsed();
+        let tc = std::time::Instant::now();
         unsafe {
             assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
             self.dump_all();
         }
+        eprintln!("DBG time build={:?} compute={:?}", t_build, tc.elapsed());
         unsafe { inkwell_ggml::ink_tensor_debug(cur.0) };
         let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
         unsafe { t::get(cur, logits.as_mut_ptr().cast(), 0, logits.len() * 4) };

@@ -17,6 +17,7 @@ extern "C" {
 }
 
 extern "C" {
+    fn ink_launch_dequant_iq2_xxs(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
     fn inkwell_rmsnorm_launch(x: *const f32, w: *const f32, y: *mut f32, n: i32, eps: f32);
     fn inkwell_clip_launch(x: *mut f32, scale: *const f32, dim: i32, rows: i32, thr: f32);
     fn inkwell_gate_mul_launch(y: *mut f32, a: *const f32, b: *const f32, n: i32);
@@ -78,6 +79,15 @@ pub fn add(y: &mut DevBuf, a: &DevBuf, b: &DevBuf) {
 }
 
 
+/// Dequantize IQ2_XXS blocks (66 bytes per 256 values) on GPU.
+/// `src` = raw quant bytes, `dst` = `nblocks*256` floats.
+#[expect(clippy::cast_possible_wrap, reason = "nblocks < i64::MAX")]
+pub fn dequant_iq2_xxs(src: &DevBuf, dst: &mut DevBuf) {
+    let nblocks = (dst.len / 256) as i64;
+    unsafe { ink_launch_dequant_iq2_xxs(src.ptr.cast_const().cast(), dst.ptr, nblocks, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
 /// Kernels are launched through `extern "C"` wrappers in
 /// `kernels.cu` (`__global__` isn't callable across FFI).
 #[derive(Debug)]
@@ -97,6 +107,25 @@ impl DevBuf {
         let mut ptr = std::ptr::null_mut();
         assert_eq!(unsafe { cudaMalloc(&raw mut ptr, len * 4) }, 0, "cudaMalloc");
         Self { ptr: ptr.cast(), len }
+    }
+
+    /// Allocate `bytes` raw bytes on device (quant payloads).
+    ///
+    /// # Panics
+    /// On `cudaMalloc` failure.
+    #[must_use]
+    pub fn new_bytes(bytes: usize) -> Self {
+        let mut ptr = std::ptr::null_mut();
+        assert_eq!(unsafe { cudaMalloc(&raw mut ptr, bytes) }, 0, "cudaMalloc");
+        Self { ptr: ptr.cast(), len: bytes / 4 }
+    }
+
+    /// Copy raw bytes → device.
+    ///
+    /// # Panics
+    /// On copy error.
+    pub fn write_bytes(&mut self, src: &[u8]) {
+        assert_eq!(unsafe { cudaMemcpy(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1) }, 0);
     }
 
     /// Copy host slice → device.

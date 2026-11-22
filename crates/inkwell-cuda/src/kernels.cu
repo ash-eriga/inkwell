@@ -103,3 +103,41 @@ void inkwell_add_launch(float* y, const float* a, const float* b, int n) {
     inkwell_add<<<(n + 255) / 256, 256>>>(y, a, b, n);
 }
 }
+
+// ---------------- quantized dequant kernels (own port, golden-tested vs ggml) --
+#include <cstdint>
+#include "iq_luts.h"
+
+struct block_iq2_xxs { uint16_t d; uint16_t qs[32]; }; // ggml_half = u16 bits
+
+__device__ __forceinline__ float fp16_to_f32(uint16_t h) {
+    unsigned int s = (h & 0x8000) << 16;
+    unsigned int e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    unsigned int f;
+    if (e == 0) f = s | ((m == 0) ? 0u : (unsigned int)__float_as_uint((float)m * 5.9604644775390625e-8f));
+    else if (e == 31) f = s | 0x7f800000u | (m << 13);
+    else f = s | ((e + 112) << 23) | (m << 13);
+    return __uint_as_float(f);
+}
+
+__global__ void inkwell_dequant_iq2_xxs(const void* __restrict__ vx, float* __restrict__ y, int64_t nblocks) {
+    const block_iq2_xxs* x = (const block_iq2_xxs*)vx;
+    const int64_t ibs = blockIdx.x;
+    const int tid = threadIdx.x;            // 32 threads per block
+    const int il = tid / 8, ib = tid % 8;
+    float* yy = y + ibs * 256;
+    float* yl = yy + 32 * ib + 8 * il;
+    const uint16_t* q2 = x[ibs].qs + 4 * ib;
+    const uint8_t* aux8 = (const uint8_t*)q2;
+    const uint8_t* grid = (const uint8_t*)(iq2xxs_grid + aux8[il]);
+    const uint32_t aux32 = q2[2] | ((uint32_t)q2[3] << 16);
+    const float d = fp16_to_f32(x[ibs].d) * (0.5f + (aux32 >> 28)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        yl[j] = d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f);
+}
+
+extern "C" void ink_launch_dequant_iq2_xxs(const void* vx, float* y, long long nblocks, void* stream) {
+    inkwell_dequant_iq2_xxs<<<(unsigned)nblocks, 32, 0, (cudaStream_t)stream>>>(vx, y, nblocks);
+}

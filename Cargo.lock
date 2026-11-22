@@ -120,6 +120,7 @@ name = "inkwell-run"
 version = "0.1.0"
 dependencies = [
  "inkwell-core",
+ "inkwell-cuda",
  "inkwell-ggml",
  "inkwell-gguf",
  "inkwell-kv",
