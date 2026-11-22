@@ -43,6 +43,7 @@ fn main() {
     }
 }
 
+#[expect(clippy::cast_precision_loss, reason = "benchmark throughput counters")]
 #[allow(dead_code)]
 fn bench_tok(g: &inkwell_gguf::GgufFile, iters: u32) {
     use inkwell_tokenizer::Tokenizer;
