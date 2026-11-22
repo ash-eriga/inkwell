@@ -31,6 +31,7 @@ extern "C" {
     fn ink_launch_mmvq_q2_0_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq1_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_nvfp4_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_situ_pair(gu: *const f32, sgu: *const f32, hid: *mut f32, beta: f32, lin_beta: f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -434,6 +435,12 @@ pub unsafe fn mmvq_iq1_s_moe_async(wp: *const c_void, x: *const c_void, y: &mut 
     unsafe { ink_launch_mmvq_iq1_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
 }
 
+/// DP4A variant: x quantized to int8 per 64-val block (~0.1% error).
+/// # Safety
+/// See [`mmvq_nvfp4_moe`].
+pub unsafe fn mmvq_nvfp4_moe_i8_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_nvfp4_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
 /// Same as [`mmvq_nvfp4_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_nvfp4_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {

@@ -272,7 +272,7 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
         cu::situ_pair_async(&mut hid, &gu, if sgu_h.is_null() { std::ptr::null() } else { sgu.dev_ptr().cast_const() }, 4.0, 25.0, N_FF, N_SLOTS);
         match a.dn_type {
             T_Q2_0 => cu::mmvq_q2_0_moe_async(dn_ptrs.dev_ptr().cast_const(), hid.dev_ptr().cast_const(), &mut dn, N_EMBD, N_FF, N_FF, N_SLOTS),
-            T_NVFP4 => cu::mmvq_nvfp4_moe_async(dn_ptrs.dev_ptr().cast_const(), hid.dev_ptr().cast_const(), &mut dn, N_EMBD, N_FF, N_FF, N_SLOTS),
+            T_NVFP4 => cu::mmvq_nvfp4_moe_i8_async(dn_ptrs.dev_ptr().cast_const(), hid.dev_ptr().cast_const(), &mut dn, N_EMBD, N_FF, N_FF, N_SLOTS),
             t => panic!("down type {t}"),
         }
         cu::expert_wsum_async(outp.dev_ptr(), &dn, w.dev_ptr().cast_const(), if sdn_h.is_null() { std::ptr::null() } else { sdn.dev_ptr().cast_const() }, N_EMBD, N_SLOTS);
