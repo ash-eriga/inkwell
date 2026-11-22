@@ -24,6 +24,11 @@ fn main() {
         total / 1_048_576
     );
 
+    if let Some("--model") = args.next().as_deref() {
+        let g: &'static inkwell_gguf::GgufFile = Box::leak(Box::new(g));
+        dump_model(g);
+        return;
+    }
     if let Some("--tokbench") = args.next().as_deref() {
         bench_tok(&g, 1000);
         return;
@@ -48,10 +53,18 @@ fn bench_tok(g: &inkwell_gguf::GgufFile, iters: u32) {
     let mut n = 0;
     for _ in 0..iters { n += tok.encode(text).len(); }
     let d = t.elapsed();
-    println!("encode: {} chars -> {} toks/iter, {:?} total, {:.0} tok/s", text.len(), n/iters.max(1) as usize, d, n as f64/d.as_secs_f64());
+    println!("encode: {} chars -> {} toks/iter, {:?} total, {:.0} tok/s", text.len(), n/(iters.max(1) as usize), d, n as f64/d.as_secs_f64());
     let ids = tok.encode(text);
     let t = Instant::now();
     for _ in 0..iters { std::hint::black_box(tok.decode(&ids).expect("d")); }
     let d = t.elapsed();
     println!("decode: {:?} total, {:.0} tok/s", d, (iters as usize*ids.len()) as f64/d.as_secs_f64());
+}
+
+#[expect(clippy::cast_precision_loss, reason = "MiB totals fit f64 mantissa")]
+#[allow(dead_code)]
+fn dump_model(g: &'static inkwell_gguf::GgufFile) {
+    let m = inkwell_model::ModelWeights::from_gguf(g).expect("model");
+    println!("layers: {} | global ok", m.layers.len());
+    println!("total: {} MiB | experts: {} MiB ({:.1}%)", m.total_bytes()/1_048_576, m.expert_bytes()/1_048_576, 100.0 * m.expert_bytes() as f64 / m.total_bytes() as f64);
 }

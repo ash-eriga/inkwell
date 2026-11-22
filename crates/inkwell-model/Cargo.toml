@@ -1,0 +1,12 @@
+[package]
+name = "inkwell-model"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inkwell-gguf = { path = "../inkwell-gguf" }
+inkwell-core = { path = "../inkwell-core" }
+thiserror = "2"
+
+[lints]
+workspace = true

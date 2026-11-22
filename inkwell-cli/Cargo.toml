@@ -11,6 +11,7 @@ path = "src/main.rs"
 inkwell-gguf = { path = "../crates/inkwell-gguf" }
 inkwell-core = { path = "../crates/inkwell-core" }
 inkwell-tokenizer = { path = "../crates/inkwell-tokenizer" }
+inkwell-model = { path = "../crates/inkwell-model" }
 
 [lints]
 workspace = true
