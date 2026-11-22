@@ -11,8 +11,9 @@ Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-g
   (48 visits x ~3 matrices; iq2_xxs ~500us, others 250-460us). misses_total=0 after
   warmup — cache hit ~100% (loop x3 revisits reuse experts; gather is front-loaded
   in early tokens). THE WALL IS NOW PURE GEMV BANDWIDTH (~22-60 GB/s vs 200 target).
-  Next: raise GEMV throughput within same launch structure (wider loads/ILP), or
-  revisit iq2_xxs i8 with better accuracy scheme. mmv_f ~9.5us avg x1500, type13/14 ~6.7ms, swarm ~10ms.
+  iq2xxs_i8 exists behind INKWELL_IQ2XXS_I8=1 (1024thr; ~100GB/s vs fp ~72;
+  text coherent but ~1.6% logit noise on that tensor — opt-in). Block-size
+  sweep: i8 kernels prefer 512, iq4_xs prefers 1024. mmv_f ~9.5us avg x1500, type13/14 ~6.7ms, swarm ~10ms.
 
 ## Current blocker
 sched allocs 6915 MiB CUDA0 graph buffer (all expert leafs copied to GPU) → OOM.
