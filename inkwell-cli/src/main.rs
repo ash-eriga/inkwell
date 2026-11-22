@@ -212,6 +212,7 @@ fn dump_graph(cfg: &inkwell_core::InklingConfig) {
         sched.visits.iter().map(|v| v.ops.len()).max().unwrap_or(0));
 }
 
+#[expect(clippy::enum_glob_use, reason = "exhaustive enum dispatch")]
 fn op_name(op: &inkwell_graph::Op) -> &'static str {
     use inkwell_graph::Op::*;
     match op {
