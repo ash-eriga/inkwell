@@ -1,0 +1,9 @@
+[package]
+name = "inkwell-gguf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = "1"
+thiserror = "2"
+memmap2 = "0.9"

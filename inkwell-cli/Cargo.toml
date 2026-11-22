@@ -1,0 +1,12 @@
+[package]
+name = "inkwell-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "inkwell"
+path = "src/main.rs"
+
+[dependencies]
+inkwell-gguf = { path = "../crates/inkwell-gguf" }
+inkwell-core = { path = "../crates/inkwell-core" }

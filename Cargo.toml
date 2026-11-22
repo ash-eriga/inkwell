@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/inkwell-gguf", "crates/inkwell-core", "inkwell-cli"]
+resolver = "2"

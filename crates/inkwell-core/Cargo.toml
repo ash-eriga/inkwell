@@ -1,0 +1,8 @@
+[package]
+name = "inkwell-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inkwell-gguf = { path = "../inkwell-gguf" }
+thiserror = "2"
