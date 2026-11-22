@@ -9,6 +9,7 @@ extern "C" {
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
     fn cudaDeviceSynchronize() -> i32;
     fn ink_launch_mmvq_iq2_xxs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_xxs(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xxs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -76,6 +77,19 @@ fn main() {
                 if name == "iq2xxs_i8" && nc == 2304 {
                     let yref = alloc((NR as usize) * 4 * NS as usize);
                     let ynew = alloc((NR as usize) * 4 * NS as usize);
+                    {   // sanity: fp-moe slot0 vs dense-fp (unchanged reference kernel)
+                        let yd = alloc((NR as usize) * 4);
+                        ink_launch_mmvq_iq2_xxs(wp[0], x.cast(), yd.cast(), NR, nc, std::ptr::null_mut());
+                        ink_launch_mmvq_iq2_xxs_moe(wpa.cast(), x.cast(), yref.cast(), NR, nc, nc, NS, std::ptr::null_mut());
+                        cudaDeviceSynchronize();
+                        let mut a2 = vec![0f32; NR as usize]; let mut b2 = vec![0f32; NR as usize];
+                        cudaMemcpy(a2.as_mut_ptr().cast(), yref, NR as usize * 4, 2);
+                        cudaMemcpy(b2.as_mut_ptr().cast(), yd, NR as usize * 4, 2);
+                        let mut md2 = 0f32;
+                        for i in 0..NR as usize { md2 = md2.max((a2[i]-b2[i]).abs()); }
+                        println!("  fp-moe vs fp-dense maxdiff={:.3e}", md2);
+                        cudaFree(yd);
+                    }
                     ink_launch_mmvq_iq2_xxs_moe(wpa.cast(), x.cast(), yref.cast(), NR, nc, nc, NS, std::ptr::null_mut());
                     ink_launch_mmvq_iq2_xxs_moe_i8(wpa.cast(), x.cast(), ynew.cast(), NR, nc, nc, NS, std::ptr::null_mut());
                     cudaDeviceSynchronize();
