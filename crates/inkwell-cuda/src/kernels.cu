@@ -335,8 +335,11 @@ __device__ __forceinline__ float unit_iq2xxs(const block_iq2_xxs* w, const float
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
     float a = 0.f;
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
-        a += d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f) * xs[j * NU + g];
+    for (int j = 0; j < 8; j += 2) {
+        const float2 xv = *(const float2*)(xs + (j >> 1) * NU + 2 * g);
+        a += d * grid[j]     * ((signs & kmask_iq2xs[j])     ? -1.f : 1.f) * xv.x
+           + d * grid[j + 1] * ((signs & kmask_iq2xs[j + 1]) ? -1.f : 1.f) * xv.y;
+    }
     return a;
 }
 
@@ -349,8 +352,11 @@ __global__ void inkwell_mmvq_iq2_xxs_moe(const void* const* __restrict__ Wp,
     const int slot = blockIdx.y;
     extern __shared__ float xs[];
     x += slot * x_stride;
-    const int NU = (int)(ncols / 8) + 1;             // padded stride, kills bank conflicts
-    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) xs[(i & 7) * NU + (i >> 3)] = x[i];
+    // paired layout: value i (j=i&7, g=i>>3) lives at (j/2)*NU + 2g + (j&1)
+    // so the dot reads x as float2; NU even keeps float2 alignment.
+    const int NU = (int)(ncols / 8) + 2;
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x)
+        xs[((i & 7) >> 1) * NU + ((i >> 3) << 1) + (i & 1)] = x[i];
     __syncthreads();
     const int lane = threadIdx.x & 31;
     const int half = (threadIdx.x >> 5) & 1;
@@ -647,6 +653,7 @@ __global__ void inkwell_mmvq_q2_0_moe_i8(const void* const* __restrict__ Wp,
                           + row * (ncols / 64);
     const int nunits = (int)(ncols / 16);
     float acc = 0.f;
+#pragma unroll 1
     for (int u = lane + half * 32; u < nunits; u += 64) {
         const int b = u >> 2, ub = u & 3;
         const uint32_t q = (uint32_t)*(const uint16_t*)&w[b].qs[ub * 4]
