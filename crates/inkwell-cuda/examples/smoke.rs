@@ -1,5 +1,5 @@
 //! GPU smoke test: rmsnorm + clip on the GTX 1060.
-#[expect(clippy::cast_precision_loss, clippy::nonminimal_bool)]
+#[expect(clippy::cast_precision_loss, clippy::many_single_char_names)]
 fn main() {
     let n = 2304usize;
     println!("devices: {}", inkwell_cuda::device_count());
