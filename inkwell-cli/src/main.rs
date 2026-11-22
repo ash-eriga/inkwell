@@ -24,6 +24,10 @@ fn main() {
         total / 1_048_576
     );
 
+    if let Some("--spec") = args.next().as_deref() {
+        bench_spec();
+        return;
+    }
     if let Some("--graph") = args.next().as_deref() {
         dump_graph(&cfg);
         return;
@@ -226,5 +230,19 @@ fn op_name(op: &inkwell_graph::Op) -> &'static str {
         Residual => "residual", MoeRoute => "moe_route",
         MoeExperts => "moe_exps", LoopMessage => "loop_msg",
         Head => "head",
+    }
+}
+
+/// Spec-decode projection: emitted tokens per weight read at varying
+/// acceptance, crossed with the pager's stream/token.
+fn bench_spec() {
+    println!("{:>14} {:>14} {:>14} {:>12}", "draft k", "acc/round", "tok/read", "t/s proj");
+    // one weight read per round covers the whole draft (union of
+    // expert selections ~1.3x a single pass at 63% pager hit ~325 MiB)
+    const OVERLAP: f64 = 1.3;
+    for (k, acc) in [(4u32, 1.6f64), (4, 2.0), (8, 2.5), (8, 3.2), (8, 4.0)] {
+        let tok_per_read = acc + 1.0; // accepted + bonus token
+        let tps = tok_per_read * 10_000.0 / (325.0 * OVERLAP);
+        println!("{:>14} {:>14.1} {:>14.1} {:>12.1}", k, acc, tok_per_read, tps);
     }
 }

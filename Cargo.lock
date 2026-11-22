@@ -54,6 +54,7 @@ dependencies = [
  "inkwell-model",
  "inkwell-pager",
  "inkwell-sampler",
+ "inkwell-spec",
  "inkwell-tokenizer",
 ]
 
@@ -108,6 +109,14 @@ dependencies = [
 [[package]]
 name = "inkwell-sampler"
 version = "0.1.0"
+
+[[package]]
+name = "inkwell-spec"
+version = "0.1.0"
+dependencies = [
+ "inkwell-core",
+ "inkwell-kv",
+]
 
 [[package]]
 name = "inkwell-tokenizer"

@@ -1,0 +1,11 @@
+[package]
+name = "inkwell-spec"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+inkwell-core = { path = "../inkwell-core" }
+inkwell-kv = { path = "../inkwell-kv" }

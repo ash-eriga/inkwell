@@ -3,7 +3,8 @@ members = ["crates/inkwell-gguf", "crates/inkwell-core", "crates/inkwell-tokeniz
     "crates/inkwell-kv",
     "crates/inkwell-pager",
     "crates/inkwell-sampler",
-    "crates/inkwell-graph", "inkwell-cli"]
+    "crates/inkwell-graph",
+    "crates/inkwell-spec", "inkwell-cli"]
 resolver = "2"
 
 

@@ -16,6 +16,7 @@ inkwell-kv = { path = "../crates/inkwell-kv" }
 inkwell-pager = { path = "../crates/inkwell-pager" }
 inkwell-sampler = { path = "../crates/inkwell-sampler" }
 inkwell-graph = { path = "../crates/inkwell-graph" }
+inkwell-spec = { path = "../crates/inkwell-spec" }
 
 [lints]
 workspace = true
