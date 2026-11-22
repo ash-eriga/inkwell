@@ -296,7 +296,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig) {
     let t1 = Instant::now();
     let mut id = ids[ids.len() - 1];
     let mut gen_ids = Vec::new();
-    for g in 0..8 {
+    for g in 0..64 {
         logits = r.step(id, pos);
         pos += 1;
         let (best, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
