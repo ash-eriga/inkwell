@@ -2,11 +2,13 @@
 
 use inkwell_core::InklingConfig;
 use inkwell_gguf::GgufFile;
+use inkwell_tokenizer::Tokenizer;
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: inkwell <model.gguf>");
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
+        .expect("usage: inkwell <model.gguf> [--tok <text>]");
     let g = GgufFile::open(&path).expect("open gguf");
     let cfg = InklingConfig::from_gguf(&g);
     println!("{cfg:?}");
@@ -21,4 +23,13 @@ fn main() {
         g.tensors.len(),
         total / 1_048_576
     );
+
+    if let Some("--tok") = args.next().as_deref() {
+        let text = args.next().expect("--tok <text>");
+        let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
+        let ids = tok.encode(&text);
+        println!("n={} ids={ids:?}", ids.len());
+        let back = tok.decode(&ids).expect("decode");
+        println!("roundtrip: {back:?}");
+    }
 }

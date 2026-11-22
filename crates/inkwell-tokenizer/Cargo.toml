@@ -1,0 +1,12 @@
+[package]
+name = "inkwell-tokenizer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inkwell-gguf = { path = "../inkwell-gguf" }
+fancy-regex = "0.14"
+thiserror = "2"
+
+[lints]
+workspace = true
