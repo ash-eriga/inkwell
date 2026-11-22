@@ -582,6 +582,7 @@ impl Runner {
         // ---- per-layer ----
         let mut layers = Vec::with_capacity(24);
         let mut pinned: Vec<inkwell_cuda::PinnedBuf> = Vec::new();
+        let mut pinned_bytes = 0usize;
         let mut expert_dev: Vec<inkwell_cuda::DevBuf> = Vec::new();
         let mut moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>> = Vec::new();
         let conv = |il: usize| il % 6 == 5;
@@ -717,6 +718,7 @@ impl Runner {
                     }
                 }
                 let (f_free, _) = inkwell_cuda::mem_info();
+                eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
                 let base = if (f_free as usize) > total + (1408usize << 20) {
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
                     blob.write_bytes(&host);
@@ -727,6 +729,7 @@ impl Runner {
                 } else {
                     let pb = inkwell_cuda::host_alloc_mapped(total);
                     unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), pb.host, total) };
+                    pinned_bytes += total;
                     let b = pb.dev as u64;
                     pinned.push(pb);
                     b
@@ -748,7 +751,7 @@ impl Runner {
             layers.push(l);
         }
         eprintln!("load_st: dev={}MiB exl3_w={} pinned={}MiB", dev_bytes >> 20, exl3_w.len(),
-            pinned.iter().map(|p| 0usize).sum::<usize>());
+            pinned_bytes >> 20);
 
         // visits + KV arenas (same as GGUF path)
         let (start, end, np, nphys) = (6usize, 18usize, 3usize, 24usize);
