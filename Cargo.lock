@@ -49,6 +49,7 @@ version = "0.1.0"
 dependencies = [
  "inkwell-core",
  "inkwell-gguf",
+ "inkwell-kv",
  "inkwell-model",
  "inkwell-tokenizer",
 ]
@@ -68,6 +69,13 @@ dependencies = [
  "bytemuck",
  "memmap2",
  "thiserror",
+]
+
+[[package]]
+name = "inkwell-kv"
+version = "0.1.0"
+dependencies = [
+ "inkwell-core",
 ]
 
 [[package]]
