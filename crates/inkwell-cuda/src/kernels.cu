@@ -596,6 +596,68 @@ extern "C" void ink_launch_mmvq_nvfp4_moe_i8(const void* const* Wp,
     dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
     inkwell_mmvq_nvfp4_moe_i8<<<g, 512, (size_t)ncols + (size_t)(ncols / 64) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
+
+// Q2_0 via DP4A: code -> {-1,0,1,2} fits int8; byte j packs vals 4j..4j+3 in
+// natural order. Decode each qs byte into 4 int8 lanes with shifts (4 ops)
+// then __dp4a. x quantized to int8 per 64-val block like the nvfp4 path.
+__device__ __forceinline__ uint32_t q20_byte_to_i8x4(uint32_t b) {
+    uint32_t v = 0;
+    v |= (uint32_t)(uint8_t)((int)(b & 3) - 1);
+    v |= (uint32_t)(uint8_t)((int)((b >> 2) & 3) - 1) << 8;
+    v |= (uint32_t)(uint8_t)((int)((b >> 4) & 3) - 1) << 16;
+    v |= (uint32_t)(uint8_t)((int)((b >> 6) & 3) - 1) << 24;
+    return v;
+}
+__global__ void inkwell_mmvq_q2_0_moe_i8(const void* const* __restrict__ Wp,
+                                         const float* __restrict__ x,
+                                         float* __restrict__ y,
+                                         int64_t nrows, int64_t ncols, int64_t x_stride) {
+    const int slot = blockIdx.y;
+    extern __shared__ int8_t qx[];
+    float* sx = (float*)(qx + ncols);
+    x += slot * x_stride;
+    const int nblk = (int)(ncols / 64);
+    for (int b = (int)threadIdx.x >> 4; b < nblk; b += (int)(blockDim.x >> 4)) {
+        const int t = threadIdx.x & 15;
+        float m = 0.f;
+        for (int i = t; i < 64; i += 16) m = fmaxf(m, fabsf(x[b * 64 + i]));
+        for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (t == 0) sx[b] = m / 127.f;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) {
+        const float sc = sx[i >> 6];
+        qx[i] = (int8_t)(sc > 0.f ? (int)rintf(x[i] / sc) : 0);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int64_t row = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= nrows) return;
+    const block_q2_0* w = (const block_q2_0*)((const uint8_t*)Wp[slot])
+                          + row * (ncols / 64);
+    const int nunits = (int)(ncols / 16);
+    float acc = 0.f;
+    for (int u = lane; u < nunits; u += 32) {
+        const int b = u >> 2, ub = u & 3;
+        const uint32_t q = (uint32_t)*(const uint16_t*)&w[b].qs[ub * 4]
+                         | ((uint32_t)*(const uint16_t*)&w[b].qs[ub * 4 + 2] << 16);
+        const float dsx = fp16_to_f32(w[b].d) * sx[b];
+        const uint32_t* xp = (const uint32_t*)(qx + u * 16);
+        int isum = __dp4a((int)xp[0], (int)q20_byte_to_i8x4(q & 0xFF),
+                   __dp4a((int)xp[1], (int)q20_byte_to_i8x4((q >> 8) & 0xFF),
+                   __dp4a((int)xp[2], (int)q20_byte_to_i8x4((q >> 16) & 0xFF),
+                   __dp4a((int)xp[3], (int)q20_byte_to_i8x4(q >> 24), 0))));
+        acc += dsx * (float)isum;
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[slot * nrows + row] = acc;
+}
+extern "C" void ink_launch_mmvq_q2_0_moe_i8(const void* const* Wp,
+                                            const float* x, float* y, long long nrows, long long ncols,
+                                            long long x_stride, int nslots, void* stream) {
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_q2_0_moe_i8<<<g, 512, (size_t)ncols + (size_t)(ncols / 64) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+}
 extern "C" void ink_launch_situ_pair(const float* gu, const float* sgu, float* hid,
                                      float beta, float lin_beta, long long ncols, long long nslots, void* stream) {
     int64_t n = nslots * ncols;

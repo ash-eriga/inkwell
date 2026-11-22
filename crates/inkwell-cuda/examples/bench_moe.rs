@@ -10,6 +10,7 @@ extern "C" {
     fn cudaDeviceSynchronize() -> i32;
     fn ink_launch_mmvq_iq2_xxs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_q2_0_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq1_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -30,9 +31,10 @@ fn main() {
     const NR: i64 = 2304; // gu rows (2*ff) and down rows = embd
     const NC: i64 = 2304; // max cols (down=1152 also tested)
     const NS: i32 = 8;
-    let cases: [(&str, unsafe extern "C" fn(*const *const c_void, *const f32, *mut f32, i64, i64, i64, i32, *mut c_void), usize); 8] = [
+    let cases: [(&str, unsafe extern "C" fn(*const *const c_void, *const f32, *mut f32, i64, i64, i64, i32, *mut c_void), usize); 9] = [
         ("iq2_xxs", ink_launch_mmvq_iq2_xxs_moe, 66 * 256 / 256), // bytes per 64 vals
         ("q2_0", ink_launch_mmvq_q2_0_moe, 18),
+        ("q2_0_i8", ink_launch_mmvq_q2_0_moe_i8, 18),
         ("iq1_s", ink_launch_mmvq_iq1_s_moe, 50 * 256 / 256),
         ("nvfp4", ink_launch_mmvq_nvfp4_moe, 36),
         ("nvfp4_i8", ink_launch_mmvq_nvfp4_moe_i8, 36),
@@ -67,6 +69,21 @@ fn main() {
                 let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
                 let mib = (NS as usize * NR as usize * row_b) as f64 / 1048576.0;
                 println!("{name:8} ncols={nc:5} {ms:7.3} ms  ({mib:.1} MiB -> {:.1} GB/s)", mib / ms);
+                if name == "q2_0_i8" && nc == 2304 {
+                    let yref = alloc((NR as usize) * 4 * NS as usize);
+                    let ynew = alloc((NR as usize) * 4 * NS as usize);
+                    ink_launch_mmvq_q2_0_moe(wpa.cast(), x.cast(), yref.cast(), NR, nc, nc, NS, std::ptr::null_mut());
+                    ink_launch_mmvq_q2_0_moe_i8(wpa.cast(), x.cast(), ynew.cast(), NR, nc, nc, NS, std::ptr::null_mut());
+                    cudaDeviceSynchronize();
+                    let n = (NR * NS as i64) as usize;
+                    let mut a = vec![0f32; n]; let mut b = vec![0f32; n];
+                    cudaMemcpy(a.as_mut_ptr().cast(), yref, n * 4, 2);
+                    cudaMemcpy(b.as_mut_ptr().cast(), ynew, n * 4, 2);
+                    let mut md = 0f32; let mut denom = 0f32;
+                    for i in 0..n { md = md.max((a[i]-b[i]).abs()); denom = denom.max(a[i].abs()); }
+                    println!("  q2_0_i8 vs fp maxdiff={:.3e} (max |y|={:.2})", md, denom);
+                    cudaFree(yref); cudaFree(ynew);
+                }
                 if name == "nvfp4_i8" && nc == 2304 {
                     // correctness vs fp version: rerun both into separate y, compare
                     let yref = alloc((NR as usize) * 4 * NS as usize);
