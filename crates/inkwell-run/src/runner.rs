@@ -20,6 +20,8 @@ struct L {
     wq: Option<Ptr>, wk: Option<Ptr>, wv: Option<Ptr>, wo: Option<Ptr>,
     attn_rel: Option<Ptr>, attn_rel_bias: Option<Ptr>, attn_rel_bias_pad: Option<Ptr>, attn_rel_clip: Option<Ptr>, attn_q_clip: Option<Ptr>,
     attn_sink_proj: Option<Ptr>, wqkv_gate: Option<Ptr>,
+    // concat of same-type {q,gate,rel} projections sharing inputs[0]
+    proj0_cat: Option<Ptr>, proj0_off: [i64; 3],
     attn_k_conv: Option<Ptr>, attn_v_conv: Option<Ptr>, attn_post_conv: Option<Ptr>, ffn_post_conv: Option<Ptr>,
     attn_k_conv_proj: Option<Ptr>, attn_v_conv_proj: Option<Ptr>,
     ffn_norm: Option<Ptr>, ffn_gate_inp: Option<Ptr>, ffn_exp_probs_b: Option<Ptr>,
@@ -103,7 +105,7 @@ impl Runner {
             if !expert && !host_only { dev_bytes += nbytes as usize + 256; }
             plan.push((name, ti, expert, to_f32, host_only));
         }
-        dev_bytes += 8 << 20; // headroom for materialized views (padded rel_bias)
+        dev_bytes += 240 << 20; // headroom for materialized views (padded rel_bias)
         let dev_buf = rt.buf(buft_dev, dev_bytes);
         let cpu_buf = rt.buf(buft_cpu, cpu_bytes);
         // mark as weight buffers: the scheduler runs matmuls on the backend
@@ -257,6 +259,43 @@ impl Runner {
                 l.ctrl_down[c] = opt(&loop_p(&format!("{cn}_ctrl_down")));
                 l.ctrl_gain[c] = opt(&loop_p(&format!("{cn}_ctrl_gain")));
                 l.ctrl_forget[c] = opt(&loop_p(&format!("{cn}_ctrl_forget")));
+            }
+            // concat same-type {attn_q, attn_gate, attn_rel} -> one GEMV on inputs[0]
+            {
+                const MEMBERS: [(&str, i64); 3] =
+                    [("attn_q", 3072), ("attn_gate", 3072), ("attn_rel", 384)];
+                let tys: Vec<u32> = MEMBERS
+                    .iter()
+                    .map(|(n, _)| gg.tensors.get(&p(n)).map(|ti| ti.ggml_type).unwrap_or(u32::MAX))
+                    .collect();
+                let mut by_ty: HashMap<u32, Vec<usize>> = HashMap::new();
+                for (mi, &ty) in tys.iter().enumerate() {
+                    by_ty.entry(ty).or_default().push(mi);
+                }
+                l.proj0_off = [-1; 3];
+                let group = by_ty
+                    .values()
+                    .filter(|g| g.len() >= 2)
+                    .max_by_key(|g| g.iter().map(|&mi| MEMBERS[mi].1).sum::<i64>())
+                    .cloned();
+                if let Some(g) = group.filter(|_| std::env::var("INKWELL_NOCAT").is_err()) {
+                    let total: i64 = g.iter().map(|&mi| MEMBERS[mi].1).sum();
+                    let cat = t::new(rt.ctx(), tys[g[0]] as i32, &[2304, total]);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(cat, o);
+                    let mut boff = 0usize;
+                    for &mi in &g {
+                        let src = opt(&p(MEMBERS[mi].0)).expect("proj member");
+                        let n = t::nbytes(src);
+                        let mut host = vec![0u8; n];
+                        unsafe { t::get(src, host.as_mut_ptr(), 0, n) };
+                        unsafe { t::set(cat, host.as_ptr(), boff, n) };
+                        l.proj0_off[mi] = (boff / (n / MEMBERS[mi].1 as usize)) as i64;
+                        boff += n;
+                    }
+                    l.proj0_cat = Some(cat);
+                    off_dev = o + t::nbytes(cat);
+                }
             }
             layers.push(l);
         }
@@ -484,14 +523,31 @@ impl Runner {
             inputs[2] = self.norm(inputs[2], l.attn_v_inp_norm.expect("v_inp"));
         }
 
-        // projections
-        let q = t::mul_mat(c, l.wq.expect("wq"), inputs[0]);
+        // projections: concat {q,gate,rel} when types allowed it at load
+        let (q, gate_lin, r_pre) = if let Some(cat) = l.proj0_cat {
+            let out = t::mul_mat(c, cat, inputs[0]);
+            // ggml_view_1d offset is in BYTES in this fork — out is F32 (row idx * 4)
+            let slice = |off: i64, n: i64, w: Option<Ptr>| {
+                if off >= 0 { t::view1(c, out, n, off * 4) } else { t::mul_mat(c, w.expect("proj"), inputs[0]) }
+            };
+            (
+                slice(l.proj0_off[0], 3072, l.wq),
+                slice(l.proj0_off[1], 3072, l.wqkv_gate),
+                slice(l.proj0_off[2], 384, l.attn_rel),
+            )
+        } else {
+            (
+                t::mul_mat(c, l.wq.expect("wq"), inputs[0]),
+                t::mul_mat(c, l.wqkv_gate.expect("gate"), inputs[0]),
+                t::mul_mat(c, l.attn_rel.expect("rel"), inputs[0]),
+            )
+        };
         let k_dyn = if is_swa { None } else { Some(t::mul_mat(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
         let v_dyn = if is_swa { None } else { Some(t::mul_mat(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
         let k = self.convolve(t::mul_mat(c, l.wk.expect("wk"), inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores);
         let gqa = (hd * hkv) as i64;
         let v = self.convolve(t::mul_mat(c, l.wv.expect("wv"), inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores);
-        let r = t::mul_mat(c, l.attn_rel.expect("rel"), inputs[0]);
+        let r = r_pre;
         if il == 0 {
             self.dump("rel_raw", r); self.dump("inputs0", inputs[0]);
             // weight raw bytes check
@@ -559,7 +615,7 @@ impl Runner {
         let out = t::reshape2(c, t::cont(c, kqv), hd * nh, 1);
 
         let mut cur = out;
-        cur = t::mul(c, cur, t::sigmoid(c, t::mul_mat(c, l.wqkv_gate.expect("gate"), inputs[0])));
+        cur = t::mul(c, cur, t::sigmoid(c, gate_lin));
         if il == 0 { self.dump("kqv_out-0", out); }
         cur = self.convolve(t::mul_mat(c, l.wo.expect("wo"), cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores);
 
