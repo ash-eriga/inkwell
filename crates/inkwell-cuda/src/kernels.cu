@@ -1148,6 +1148,7 @@ __global__ void inkwell_mmvq_q8_0_i8(const void* __restrict__ W,
     if (row >= nrows) return;
     const block_q8_0* w = (const block_q8_0*)W + row * nblk;
     float acc = 0.f;
+#pragma unroll 2
     for (int b = lane + half * 32; b < nblk; b += 64) {
         const uint32_t q[8] = {
             (uint32_t)*(const uint16_t*)&w[b].qs[0]  | ((uint32_t)*(const uint16_t*)&w[b].qs[2]  << 16),
