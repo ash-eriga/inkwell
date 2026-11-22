@@ -637,7 +637,7 @@ __global__ void inkwell_mmvq_q2_0_moe_i8(const void* const* __restrict__ Wp,
                           + row * (ncols / 64);
     const int nunits = (int)(ncols / 16);
     float acc = 0.f;
-    for (int u = lane; u < nunits; u += 32) {
+    for (int u = lane; u < nunits; u += 64) {
         const int b = u >> 2, ub = u & 3;
         const uint32_t q = (uint32_t)*(const uint16_t*)&w[b].qs[ub * 4]
                          | ((uint32_t)*(const uint16_t*)&w[b].qs[ub * 4 + 2] << 16);
@@ -648,6 +648,21 @@ __global__ void inkwell_mmvq_q2_0_moe_i8(const void* const* __restrict__ Wp,
                    __dp4a((int)xp[2], (int)q20_byte_to_i8x4((q >> 16) & 0xFF),
                    __dp4a((int)xp[3], (int)q20_byte_to_i8x4(q >> 24), 0))));
         acc += dsx * (float)isum;
+        // second independent unit two warps ahead: ILP hides the dependent
+        // weight-load latency that single-unit strides serialize
+        const int u2 = u + 32; // second unit is lane+32 (stride 96 per iter)
+        if (u2 < nunits) {
+            const int b2 = u2 >> 2, ub2 = u2 & 3;
+            const uint32_t q2 = (uint32_t)*(const uint16_t*)&w[b2].qs[ub2 * 4]
+                              | ((uint32_t)*(const uint16_t*)&w[b2].qs[ub2 * 4 + 2] << 16);
+            const float dsx2 = fp16_to_f32(w[b2].d) * sx[b2];
+            const uint32_t* xp2 = (const uint32_t*)(qx + u2 * 16);
+            int isum2 = __dp4a((int)xp2[0], (int)q20_byte_to_i8x4(q2 & 0xFF),
+                       __dp4a((int)xp2[1], (int)q20_byte_to_i8x4((q2 >> 8) & 0xFF),
+                       __dp4a((int)xp2[2], (int)q20_byte_to_i8x4((q2 >> 16) & 0xFF),
+                       __dp4a((int)xp2[3], (int)q20_byte_to_i8x4(q2 >> 24), 0))));
+            acc += dsx2 * (float)isum2;
+        }
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if (lane == 0) y[slot * nrows + row] = acc;
