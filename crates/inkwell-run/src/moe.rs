@@ -65,13 +65,15 @@ pub struct Cache {
     pub stamp: u64,
     /// bytes per expert.
     pub esz: usize,
+    /// per-expert use count (promote at >=2).
+    pub uses: Vec<u8>,
 }
 
 impl Cache {
     /// New cache holding `k` experts of `esz` bytes.
     #[must_use]
     pub fn new(k: usize, esz: usize) -> Self {
-        Self { dev: cu::DevBuf::new_bytes(k * esz), map: vec![-1; 128], lru: vec![0; k], stamp: 0, esz }
+        Self { dev: cu::DevBuf::new_bytes(k * esz), map: vec![-1; 128], lru: vec![0; k], stamp: 0, esz, uses: vec![0; 128] }
     }
 
     /// `n_slots`.
@@ -84,13 +86,15 @@ impl Cache {
             let slot = self.map[e];
             if slot >= 0 {
                 unsafe { HITS += 1 };
+                self.uses[e] = self.uses[e].saturating_add(1);
                 ptrs[s] = unsafe { self.dev.dev_ptr().cast::<u8>().add(slot as usize * self.esz) } as usize;
                 self.stamp += 1;
                 self.lru[slot as usize] = self.stamp;
             } else {
                 unsafe { MISSES += 1 };
                 ptrs[s] = unsafe { host.add(e * self.esz) } as usize;
-                misses.push((s, e as i32));
+                self.uses[e] = self.uses[e].saturating_add(1);
+                if self.uses[e] >= 2 { misses.push((s, e as i32)); }
             }
         }
     }
@@ -184,17 +188,17 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
     let t_up = std::time::Instant::now();
     // uploads
     let mut x = st.x.lock().expect("x");
-    x.write_bytes(unsafe { std::slice::from_raw_parts(x_h.cast::<u8>(), N_EMBD * 4) });
+    x.write_bytes_async(unsafe { std::slice::from_raw_parts(x_h.cast::<u8>(), N_EMBD * 4) });
     let ids_v: Vec<i32> = unsafe { std::slice::from_raw_parts(ids_h, N_SLOTS).to_vec() };
     let mut w = st.w.lock().expect("w");
-    w.write_bytes(unsafe { std::slice::from_raw_parts(w_h.cast::<u8>(), N_SLOTS * 4) });
+    w.write_bytes_async(unsafe { std::slice::from_raw_parts(w_h.cast::<u8>(), N_SLOTS * 4) });
     let mut sgu = st.sgu.lock().expect("sgu");
     if !sgu_h.is_null() {
-        sgu.write_bytes(unsafe { std::slice::from_raw_parts(sgu_h.cast::<u8>(), N_SLOTS * 4) });
+        sgu.write_bytes_async(unsafe { std::slice::from_raw_parts(sgu_h.cast::<u8>(), N_SLOTS * 4) });
     }
     let mut sdn = st.sdn.lock().expect("sdn");
     if !sdn_h.is_null() {
-        sdn.write_bytes(unsafe { std::slice::from_raw_parts(sdn_h.cast::<u8>(), N_SLOTS * 4) });
+        sdn.write_bytes_async(unsafe { std::slice::from_raw_parts(sdn_h.cast::<u8>(), N_SLOTS * 4) });
     }
     // resolve per-slot weight pointers via the VRAM LRU caches
     let mut gu_misses: Vec<(usize, i32)> = Vec::new();
@@ -206,20 +210,20 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
         let mut caches = a.caches.lock().expect("caches");
         if let Some((gc, dc)) = caches.as_mut() {
             gc.resolve(&ids_v, a.gu_host, &mut ptrs, &mut gu_misses);
-            gu_ptrs.write_bytes(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
+            gu_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
             dc.resolve(&ids_v, a.dn_host, &mut ptrs, &mut dn_misses);
-            dn_ptrs.write_bytes(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
+            dn_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
             gc.promote(&gu_misses, a.gu_host);
             dc.promote(&dn_misses, a.dn_host);
         } else {
             for (s, &e) in ids_v.iter().enumerate() {
                 ptrs[s] = unsafe { a.gu_host.add(e as usize * a.gu_stride) } as usize;
             }
-            gu_ptrs.write_bytes(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
+            gu_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
             for (s, &e) in ids_v.iter().enumerate() {
                 ptrs[s] = unsafe { a.dn_host.add(e as usize * a.dn_stride) } as usize;
             }
-            dn_ptrs.write_bytes(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
+            dn_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
         }
     }
 

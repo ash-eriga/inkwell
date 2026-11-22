@@ -281,6 +281,12 @@ impl DevBuf {
         assert_eq!(unsafe { cudaMemcpy(self.ptr.cast(), src.as_ptr().cast(), src.len() * 4, 1) }, 0);
     }
 
+    /// Async HtoD byte upload on stream 0 (caller syncs).
+    pub fn write_bytes_async(&self, src: &[u8]) {
+        let rc = unsafe { cudaMemcpyAsync(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");
+    }
+
     /// Copy device → host vec.
     ///
     /// # Panics
