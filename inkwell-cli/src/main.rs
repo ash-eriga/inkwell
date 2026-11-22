@@ -9,8 +9,16 @@ fn main() {
     let path = args
         .next()
         .expect("usage: inkwell <model.gguf> [--tok <text>]");
-    let g = GgufFile::open(&path).expect("open gguf");
-    let cfg = InklingConfig::from_gguf(&g);
+    let st_dir = std::path::Path::new(&path).is_dir();
+    let g = if st_dir {
+        // tokenizer still lives in the GGUF sidecar
+        let gg = std::env::var("INKWELL_TOK_GGUF")
+            .unwrap_or_else(|_| format!("{path}/Inkling-2-Mini-UD-IQ2_XXS.gguf"));
+        GgufFile::open(&gg).expect("open gguf (tokenizer sidecar)")
+    } else {
+        GgufFile::open(&path).expect("open gguf")
+    };
+    let cfg = if st_dir { InklingConfig::rexl3() } else { InklingConfig::from_gguf(&g) };
     println!("{cfg:?}");
     println!("visits/token: {}", cfg.n_visits());
     let mut total = 0u64;
@@ -28,9 +36,10 @@ fn main() {
         // deep ggml graphs (48 visits) overflow the default 8MB stack in
         // ggml_build_forward_expand's recursive DFS — run on a big-stack thread
         let cfg2 = cfg.clone();
+        let p2 = path.clone();
         std::thread::Builder::new()
             .stack_size(512 * 1024 * 1024)
-            .spawn(move || run_e2e(&g, &cfg2))
+            .spawn(move || run_e2e(&g, &cfg2, &p2))
             .expect("spawn")
             .join()
             .expect("run_e2e panicked");
@@ -273,10 +282,15 @@ fn bench_spec() {
 }
 
 /// End-to-end decode: encode prompt tokens one at a time, then generate.
-fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig) {
+fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path: &str) {
     use inkwell_run::runner::Runner;
     use std::time::Instant;
-    let mut r = Runner::load(gg, cfg, 8192);
+    let mut r = if std::path::Path::new(path).is_dir() {
+        let repo = Box::leak(Box::new(inkwell_st::StRepo::open(std::path::Path::new(path)).expect("st repo")));
+        Runner::load_st(repo, cfg, 8192)
+    } else {
+        Runner::load(gg, cfg, 8192)
+    };
     eprintln!("runner loaded");
     // real prompt via our tokenizer (bit-identical to llama.cpp)
     let mut ids = inkwell_tokenizer::Tokenizer::from_gguf(gg)
@@ -296,7 +310,8 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig) {
     let t1 = Instant::now();
     let mut id = ids[ids.len() - 1];
     let mut gen_ids = Vec::new();
-    for g in 0..64 {
+    let n_gen: usize = std::env::var("INKWELL_GENS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    for g in 0..n_gen {
         logits = r.step(id, pos);
         pos += 1;
         let (best, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();

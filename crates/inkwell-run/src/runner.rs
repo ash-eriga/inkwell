@@ -55,6 +55,9 @@ pub struct Runner {
     sched: Ptr,
     /// (sched, cpu backend) for pinning expert-chain ops to CPU
     sched_cpu: Option<(Ptr, Ptr)>,
+    /// pooled userdata for fused conv-step custom ops (stable addresses)
+    conv_args: std::cell::UnsafeCell<Vec<Box<ConvStepArgs>>>,
+    conv_arg_idx: std::cell::Cell<usize>,
     /// persistent ggml context (graph nodes), reset per step
     cur_ctx: Ptr,
     /// per-step cache of mix()'s block-stack prefix concat, keyed by block ptrs
@@ -143,6 +146,32 @@ pub fn exl3_cb_addr() -> usize {
     exl3_cb as usize
 }
 
+/// userdata for the fused conv-step custom op.
+#[derive(Debug)]
+struct ConvStepArgs {
+    state: *mut f32,      // device ptr, conv_state[slot] base
+    region_off: i32,      // channel offset inside [3, n_sconv]
+    ch: i32,
+    n_heads: i32,         // 0 = no dynamic taps
+    scale: f32,
+}
+
+/// `ggml_custom_op_t`: fused conv shift + ssm_conv + taps + residual + scale.
+/// src[0]=x_in [ch], src[1]=w [4,ch], src[2]=dyn [4,nh] (optional).
+unsafe extern "C" fn conv_step_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<ConvStepArgs>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let src = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let dyn_p = if a.n_heads > 0 { src(2) } else { std::ptr::null() };
+    unsafe {
+        inkwell_cuda::conv_step_async(src(0), a.state, a.region_off, src(1), dyn_p,
+            a.ch, a.n_heads, a.scale,
+            inkwell_ggml::ink_tensor_data(dst).cast());
+    }
+}
+
 /// bf16 bytes -> f32 bytes; `T`: transpose first (HF `[in,out]` -> ggml `[in,out]` col-major).
 fn bf16_to_f32_t(d: &[u8], shape: &[u64]) -> Vec<u8> {
     let (r, c) = (shape[0] as usize, shape[1] as usize);
@@ -225,7 +254,7 @@ impl Runner {
                 continue;
             }
             if expert {
-                if pinned.is_empty() { let (f0,_) = inkwell_cuda::mem_info(); eprintln!("MEM before pinned: {f0}"); }
+                
                 // copy into cudaHostAlloc'd pinned+mapped memory (file-backed
                 // mmap cannot be registered — verified)
                 let pb = inkwell_cuda::host_alloc_mapped(ti.nbytes as usize);
@@ -472,6 +501,8 @@ impl Runner {
 
         Self {
             sched_cpu: Some((sched, cpu)),
+            conv_args: std::cell::UnsafeCell::new(Vec::new()),
+            conv_arg_idx: std::cell::Cell::new(0),
             cur_ctx: Ptr(std::ptr::null_mut()),
             mix_prefix: std::cell::UnsafeCell::new(None),
             dump_list: std::cell::UnsafeCell::new(Vec::new()),
@@ -794,6 +825,8 @@ impl Runner {
         crate::moe::warm_staging(); // staging buffers must exist before CUDA-graph capture
         Self {
             sched_cpu: Some((sched, cpu)),
+            conv_args: std::cell::UnsafeCell::new(Vec::new()),
+            conv_arg_idx: std::cell::Cell::new(0),
             cur_ctx: Ptr(std::ptr::null_mut()),
             mix_prefix: std::cell::UnsafeCell::new(None),
             dump_list: std::cell::UnsafeCell::new(Vec::new()),
@@ -895,35 +928,31 @@ impl Runner {
     }
 
     /// `dynamic` = per-head taps tensor (conv-gated layers).
-    fn convolve(&self, x_in: Ptr, w: Ptr, dynamic: Option<Ptr>, slot: usize, region_off: i64, stores: &mut Vec<Ptr>) -> Ptr {
+    fn convolve(&self, x_in: Ptr, w: Ptr, dynamic: Option<Ptr>, slot: usize, region_off: i64, _stores: &mut Vec<Ptr>) -> Ptr {
         let c = self.cur_ctx;
         let n_conv = 4i64;
-        let state = self.conv_state[slot];
         let ch = t::ne(x_in, 0); // x_in: [ch, 1]
-        // past view: [3, ch] at channel offset
-        let past = t::view3(c, state, 3, ch, 1, t::nb(state, 1), t::nb(state, 2), region_off * t::nb(state, 1));
-        let cur_t = t::cont(c, t::permute(c, x_in, 1, 0, 2, 3)); // [1, ch]
-        let x = t::cont(c, t::concat(c, past, cur_t, 0)); // [4, ch]
-        // store last 3 rows of x into state region
-        let tail = t::view3(c, x, 3, ch, 1, t::nb(x, 1), t::nb(x, 2), 1 * t::nb(x, 0));
-        let dst = t::view3(c, state, 3, ch, 1, t::nb(state, 1), t::nb(state, 2), region_off * t::nb(state, 1));
-        stores.push(t::cpy(c, tail, dst));
-        // conv
-        eprintln!("CONVX slot={slot} ch={ch} w=[{},{}] x_in=[{},{},{}]", t::ne(w,0), t::ne(w,1), t::ne(x_in,0), t::ne(x_in,1), t::ne(x_in,2));
-        let mut out = t::reshape2(c, t::ssm_conv(c, t::reshape3(c, x, n_conv, ch, 1), w), ch, 1);
-        if let Some(dyn_w) = dynamic {
-            let n_heads = t::ne(dyn_w, 0) / n_conv;
-            let taps = t::reshape3(c, dyn_w, n_conv, n_heads, 1);
-            for lag in 0..n_conv {
-                let tap = t::view3(c, taps, 1, n_heads, 1, t::nb(taps, 1), t::nb(taps, 2), lag * t::nb(taps, 0));
-                let win = t::view3(c, x, 1, ch, 1, t::nb(x, 1), t::nb(x, 2), (n_conv - 1 - lag) * t::nb(x, 0));
-                let win = t::reshape3(c, t::cont(c, t::permute(c, win, 1, 0, 2, 3)), ch / n_heads, n_heads, 1);
-                let term = t::reshape2(c, t::mul(c, win, tap), ch, 1);
-                out = t::add(c, out, term);
-            }
+        let n_heads = dynamic.map_or(0, |d| t::ne(d, 0) / n_conv) as i32;
+        let scale = 1.0 / ((if dynamic.is_some() { 2.0 } else { 1.0 }) * n_conv as f32 + 1.0).sqrt();
+        let idx = self.conv_arg_idx.get();
+        let pool = unsafe { &mut *self.conv_args.get() };
+        if idx >= pool.len() {
+            pool.push(Box::new(ConvStepArgs {
+                state: unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0) }.cast(),
+                region_off: region_off as i32,
+                ch: ch as i32,
+                n_heads,
+                scale,
+            }));
         }
-        let s = 1.0 / ((if dynamic.is_some() { 2.0 } else { 1.0 }) * n_conv as f32 + 1.0).sqrt();
-        t::scale(c, t::add(c, x_in, out), s)
+        let arg = &*pool[idx];
+        self.conv_arg_idx.set(idx + 1);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![x_in.0, w.0];
+        if let Some(d) = dynamic { args.push(d.0); }
+        Ptr(unsafe {
+            inkwell_ggml::custom_4d(c.0, F32, [ch, 1, 1, 1], &mut args,
+                conv_step_cb as usize, (arg as *const ConvStepArgs).cast_mut().cast())
+        })
     }
 
     /// loop control gate: (1-forget)*cur + gain*msg
@@ -1106,7 +1135,8 @@ impl Runner {
                 inkwell_ggml::custom_4d(c.0, F32, [n_embd, 1, 1, 1], &mut args,
                     crate::moe::moe_cb_exl3_addr(), (&**m as *const crate::moe::MoeArgsExl3).cast_mut().cast())
             });
-            self.set_cpu(ffn_out);
+            // EXL3 experts are device-side (VRAM staging + pinned DMA): do NOT pin
+            // ffn_out to CPU — that forced a backend split + host copies per layer.
             let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores);
             if il == 0 { self.dump("ffn_out-0", fcur); }
             return t::add(c, ffn_inp, fcur);
@@ -1170,6 +1200,7 @@ impl Runner {
             unsafe { inkwell_ggml::ink_ctx_reset(self.cur_ctx.0) };
         }
         unsafe { *self.mix_prefix.get() = None };
+        self.conv_arg_idx.set(0);
         let c = self.cur_ctx;
         let n_embd = self.cfg.n_embd as i64;
         let (hd, nh, hkv) = (128i64, 24i64, 8i64);
@@ -1341,10 +1372,13 @@ impl Runner {
         if std::env::var_os("INKWELL_OPCNT").is_some() {
             unsafe { inkwell_ggml::ink_graph_op_counts(g.0) };
         }
+        let prof = std::env::var_os("INKWELL_PROF").is_some();
+        let t0 = std::time::Instant::now();
         unsafe {
             assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
             self.dump_all();
         }
+        if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
         let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
         if let Some((w, x_dev, y_dev)) = self.out_head.as_mut() {
             let mut normed = vec![0f32; self.cfg.n_embd as usize];

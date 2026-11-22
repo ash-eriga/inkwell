@@ -1659,19 +1659,19 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
     __shared__ float xhs[16];
-    __shared__ uint32_t rings[4 * 32];
+    __shared__ uint32_t rings[4 * 80];
     const bool live = tn_i < tn;
     float s = 0.f;
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
         if (threadIdx.x < 16) xhs[c] = xh[tk_i * 16 + c];
         if (live) {
             const uint32_t* ring = trel + (size_t)(tk_i * tn + tn_i) * (size_t)w;
-            uint32_t* rg = rings + g * 32;
+            uint32_t* rg = rings + g * 80;
             for (int j = c; j < w; j += 16) rg[j] = ring[j];
         }
         __syncthreads();
         if (live) {
-            const uint32_t* rg = rings + g * 32;
+            const uint32_t* rg = rings + g * 80;
 #pragma unroll
             for (int r = 0; r < 16; ++r) {
                 const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
@@ -1785,7 +1785,7 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
     __shared__ float xhs[16];            // same xh slice for all 4 tiles
-    __shared__ uint32_t rings[4 * 32];
+    __shared__ uint32_t rings[4 * 80];
     float s = 0.f;
     const bool live = tn_i < tn;
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
@@ -1793,12 +1793,12 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
         if (threadIdx.x < 16) xhs[c] = xh[slot * k + tk_i * 16 + c];
         if (live) {
             const uint32_t* ring = tile_base + (size_t)(tk_i * tn + tn_i) * (size_t)w;
-            uint32_t* rg = rings + g * 32;
+            uint32_t* rg = rings + g * 80;
             for (int j = c; j < w; j += 16) rg[j] = ring[j];
         }
         __syncthreads();
         if (live) {
-            const uint32_t* rg = rings + g * 32;
+            const uint32_t* rg = rings + g * 80;
 #pragma unroll
             for (int r = 0; r < 16; ++r) {
                 const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
@@ -1836,8 +1836,9 @@ __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
 // Stage selected experts pinned-host → VRAM staging (coalesced uint4 copies,
 // latency hidden by occupancy). Rewrites staged desc tables (indexed by
 // ids[slot]) to point at staging; downstream kernels unchanged.
-// Per (slot,proj) layout: [trellis 663552][suh 4608][svh 4608] = 672768 B.
-#define EXL3_STAGE_PROJ 672768u
+// Per (slot,proj) layout: [trellis][suh][svh]; trellis bytes depend on
+// per-expert ka from the descriptor (10368 tiles × r_bits_words×4).
+#define EXL3_STAGE_PROJ 1004544u  // ka<=3 worst case
 __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
                                        const uint64_t* __restrict__ descs_u,
                                        const uint64_t* __restrict__ descs_d,
@@ -1851,16 +1852,19 @@ __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
     const uint64_t* src = (proj == 0 ? descs_g : (proj == 1 ? descs_u : descs_d));
     uint64_t* sd = (proj == 0 ? sdescs_g : (proj == 1 ? sdescs_u : sdescs_d));
     const uint64_t* d = src + ids[slot] * 4;
+    const int ka = (int)(d[3] & 0xff);
+    const int halfk = (int)((d[3] >> 8) & 1);
+    const int trel_b = 10368 * r_bits_words(ka, halfk) * 4;
     uint8_t* dst = staging + (size_t)(slot * 3 + proj) * EXL3_STAGE_PROJ;
     const int suh_b = (proj == 2 ? 2304 : 4608);  // down in=1152→2304B; gate/up in=2304→4608B
     const int svh_b = (proj == 2 ? 4608 : 2304);
     const uint4* s0 = (const uint4*)(uintptr_t)d[0];
     const uint4* s1 = (const uint4*)(uintptr_t)d[1];
     const uint4* s2 = (const uint4*)(uintptr_t)d[2];
-    const int n0 = 663552 / 16, n1 = suh_b / 16, n2 = svh_b / 16;
+    const int n0 = trel_b / 16, n1 = suh_b / 16, n2 = svh_b / 16;
     uint4* t0 = (uint4*)dst;
-    uint4* t1 = (uint4*)(dst + 663552);
-    uint4* t2 = (uint4*)(dst + 663552 + suh_b);
+    uint4* t1 = (uint4*)(dst + trel_b);
+    uint4* t2 = (uint4*)(dst + trel_b + suh_b);
     const int t = threadIdx.x;
     for (int i = t; i < n0; i += blockDim.x) t0[i] = s0[i];
     for (int i = t; i < n1; i += blockDim.x) t1[i] = s1[i];
@@ -1868,8 +1872,8 @@ __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
     if (t == 0) {
         uint64_t* o = sd + ids[slot] * 4;
         o[0] = (uint64_t)(uintptr_t)dst;
-        o[1] = (uint64_t)(uintptr_t)(dst + 663552);
-        o[2] = (uint64_t)(uintptr_t)(dst + 663552 + suh_b);
+        o[1] = (uint64_t)(uintptr_t)(dst + trel_b);
+        o[2] = (uint64_t)(uintptr_t)(dst + trel_b + suh_b);
         o[3] = d[3];
     }
 }
@@ -1917,4 +1921,45 @@ extern "C" void ink_launch_exl3_stage(const void* descs_g, const void* descs_u,
     inkwell_exl3_moe_stage<<<24, 256, 0, st>>>(
         (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
         ids, (uint8_t*)staging, (uint64_t*)sg, (uint64_t*)su, (uint64_t*)sd);
+}
+
+// Fused convolve step: reads state[3, n_sconv] region + x_in[ch], shifts
+// x[1..4] back into state, computes ssm_conv + optional per-head taps +
+// residual + scale — one kernel replaces ~150 ggml ops per conv site.
+extern "C" __global__ void inkwell_conv_step(
+    const float* __restrict__ x_in,     // [ch]
+    float* __restrict__ state,          // [3, n_sconv] base of this slot
+    int region_off,                     // channel offset in n_sconv
+    const float* __restrict__ w,        // [4, ch] conv taps
+    const float* __restrict__ dyn,      // [4, n_heads] or nullptr
+    int ch, int n_heads, float scale,
+    float* __restrict__ out)            // [ch]
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ch) return;
+    // state is [3, n_sconv] contiguous: element (row r, channel c) at
+    // st[3*region_off + 3*c + r]
+    float* st = state + 3 * (size_t)region_off;
+    const float x0 = st[3 * c], x1 = st[3 * c + 1], x2 = st[3 * c + 2];
+    const float x3 = x_in[c];
+    // shift: state = x[1..4]
+    st[3 * c] = x1; st[3 * c + 1] = x2; st[3 * c + 2] = x3;
+    // w is [4, ch] contiguous: element (tap j, channel c) at w[4*c + j]
+    float acc = w[4 * c] * x0 + w[4 * c + 1] * x1 + w[4 * c + 2] * x2 + w[4 * c + 3] * x3;
+    if (dyn) {
+        // dyn is [4, n_heads]: element (lag, h) at dyn[4*h + lag];
+        // lag 0 pairs with x[3] (cur), lag 3 with x[0] (oldest)
+        const int h = c / (ch / n_heads);
+        acc += dyn[4 * h] * x3 + dyn[4 * h + 1] * x2
+             + dyn[4 * h + 2] * x1 + dyn[4 * h + 3] * x0;
+    }
+    out[c] = (x3 + acc) * scale;
+}
+
+extern "C" void ink_launch_conv_step(const float* x_in, float* state, int region_off,
+        const float* w, const float* dyn, int ch, int n_heads, float scale,
+        float* out, void* stream) {
+    const int thr = ch < 256 ? ch : 256;
+    inkwell_conv_step<<<(ch + thr - 1) / thr, thr, 0, (cudaStream_t)stream>>>(
+        x_in, state, region_off, w, dyn, ch, n_heads, scale, out);
 }

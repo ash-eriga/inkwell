@@ -17,6 +17,7 @@ inkwell-pager = { path = "../crates/inkwell-pager" }
 inkwell-sampler = { path = "../crates/inkwell-sampler" }
 inkwell-graph = { path = "../crates/inkwell-graph" }
 inkwell-spec = { path = "../crates/inkwell-spec" }
+inkwell-st = { path = "../crates/inkwell-st" }
 
 inkwell-run = { path = "../crates/inkwell-run" }
 [lints]

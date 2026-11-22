@@ -15,3 +15,4 @@ inkwell-core = { path = "../inkwell-core" }
 inkwell-kv = { path = "../inkwell-kv" }
 inkwell-sampler = { path = "../inkwell-sampler" }
 inkwell-tokenizer = { path = "../inkwell-tokenizer" }
+inkwell-st = { path = "../inkwell-st" }

@@ -142,3 +142,23 @@ impl InklingConfig {
             + (self.n_layer - self.loop_end)
     }
 }
+
+/// `serde_json` available via inkwell-st? no — parse config.json with a tiny
+/// reader: fields are fixed constants of the Inkling-2-Mini SAGE checkpoint.
+impl InklingConfig {
+    /// Build config for the REXL3 safetensors checkpoint (`config.json` parsed
+    /// by the caller is unnecessary — the checkpoint fixes every field).
+    #[must_use]
+    pub fn rexl3() -> Self {
+        InklingConfig {
+            n_layer: 24, n_loop: 3, loop_start: 6, loop_end: 18, loop_gate_rank: 64,
+            n_embd: 2304, n_head: 24, n_head_kv: 8, head_dim: 128, n_rel: 16,
+            rel_extent: 1024, swa: 1024, n_expert: 128, n_expert_used: 8,
+            expert_ff: 1152, vocab: 201024, ctx_train: 1048576,
+            qk_clip: 22.627416997969522, rel_clip: 8.0, softcap: 30.0,
+            attn_res_block_size: 6, situ_beta: 4.0, situ_linear_beta: 25.0,
+            expert_weights_scale: 8.0, log_scale_alpha: 0.1, log_scale_floor: 8192,
+            sconv_l_cache: 4, vocab_unpadded: 200058, rms_eps: 1e-6,
+        }
+    }
+}

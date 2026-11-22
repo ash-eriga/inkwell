@@ -137,3 +137,59 @@ impl StFile {
         &self.mmap[lo..hi]
     }
 }
+
+/// A sharded safetensors repo: `model.safetensors.index.json` name → shard file.
+/// Single-file checkpoints pass the file itself.
+#[derive(Debug)]
+pub struct StRepo {
+    /// one opened file per shard
+    pub files: Vec<StFile>,
+    /// tensor name → (shard idx, tensor)
+    pub tensors: HashMap<String, (usize, StTensor)>,
+}
+
+impl StRepo {
+    /// Open a repo from a single `.safetensors` file or a directory holding
+    /// `*.safetensors` shards + `model.safetensors.index.json`.
+    ///
+    /// # Errors
+    /// `Io`/`Json`/`Malformed`/`Truncated` per `StFile::open`.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StError> {
+        let path = path.as_ref();
+        if path.is_file() {
+            let f = StFile::open(path)?;
+            let tensors = f.tensors.iter().map(|(n, t)| (n.clone(), (0usize, t.clone()))).collect();
+            return Ok(Self { files: vec![f], tensors });
+        }
+        let idx_p = path.join("model.safetensors.index.json");
+        let idx: Value = serde_json::from_slice(&std::fs::read(&idx_p)?)?;
+        let wm = idx
+            .get("weight_map")
+            .and_then(Value::as_object)
+            .ok_or_else(|| StError::Malformed("weight_map".into()))?;
+        let mut shards: Vec<String> = wm.values().filter_map(Value::as_str).map(str::to_owned).collect();
+        shards.sort();
+        shards.dedup();
+        let mut files = Vec::with_capacity(shards.len());
+        let mut tensors = HashMap::with_capacity(wm.len());
+        for (i, s) in shards.iter().enumerate() {
+            let f = StFile::open(path.join(s))?;
+            for (n, t) in &f.tensors {
+                tensors.insert(n.clone(), (i, t.clone()));
+            }
+            files.push(f);
+        }
+        Ok(Self { files, tensors })
+    }
+
+    /// Tensor bytes.
+    #[must_use]
+    pub fn data(&self, name: &str) -> Option<&[u8]> {
+        self.tensors.get(name).map(|(i, t)| self.files[*i].data(t))
+    }
+    /// Tensor metadata.
+    #[must_use]
+    pub fn tensor(&self, name: &str) -> Option<&StTensor> {
+        self.tensors.get(name).map(|(_, t)| t)
+    }
+}

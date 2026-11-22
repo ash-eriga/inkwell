@@ -122,7 +122,7 @@ fn staging() -> &'static Staging {
         hid: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_FF * 4)),
         dn: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_EMBD * 4)),
         xh: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_EMBD * 4)),
-        exl3_stage: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 3 * 672768)),
+        exl3_stage: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 3 * 1004544)),
         sdescs_g: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
         sdescs_u: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
         sdescs_d: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
@@ -141,7 +141,6 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
     unsafe { cu::set_stream(inkwell_ggml::cuda_stream()) };
     if std::env::var("INKWELL_MOE_PTRS").is_ok() {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        eprintln!("STREAM visit={} s={:?}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed), inkwell_ggml::cuda_stream());
     }
     // src data ptrs — DEVICE pointers on the CUDA backend
     let src = |i: i32| unsafe {
