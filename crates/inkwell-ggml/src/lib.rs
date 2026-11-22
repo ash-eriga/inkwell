@@ -2,7 +2,6 @@
 //! orchestration in Rust) and run them on the CUDA backend.
 #![allow(non_snake_case)]
 #![expect(missing_docs, reason = "extern decls mirror ggml.h signatures")]
-#![expect(clippy::missing_safety_doc, reason = "raw FFI surface; safe wrappers come with the runner")]
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -13,7 +12,8 @@ pub const Q8_0: i32 = 8;
 pub const Q6_K: i32 = 14;
 pub const IQ2_XXS: i32 = 16;
 
-pub extern "C" {
+extern "C" {
+    #![allow(dead_code)]
     #[allow(dead_code)]
     fn ink_ctx_new() -> *mut c_void;
     fn ink_ctx_free(c: *mut c_void);
@@ -79,8 +79,11 @@ pub extern "C" {
 }
 
 /// Probe: create a no-alloc ctx + cuda backend, compute a tiny
-/// rms_norm graph on device. Returns output row or empty on failure.
+/// `rms_norm` graph on device. Returns output row or empty on failure.
+/// # Panics
+/// On backend/alloc/compute failure.
 #[must_use]
+#[expect(clippy::cast_precision_loss, reason = "test values < 2^24")]
 pub fn smoke() -> Vec<f32> {
     unsafe {
         let ctx = ink_ctx_new();

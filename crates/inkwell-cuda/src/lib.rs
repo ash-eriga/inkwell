@@ -34,7 +34,7 @@ pub fn device_count() -> i32 {
 }
 
 /// `rms_norm(x)*w` (w optional); x and y may alias.
-#[expect(clippy::cast_possible_truncation, reason = "dim < i32::MAX")]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "dim < i32::MAX")]
 pub fn rmsnorm(x: &DevBuf, w: Option<&DevBuf>, y: &mut DevBuf, n: usize, eps: f32) {
     let wp = w.map_or(std::ptr::null(), |b| b.ptr.cast_const());
     unsafe { inkwell_rmsnorm_launch(x.ptr, wp, y.ptr, n as i32, eps) };
@@ -42,7 +42,7 @@ pub fn rmsnorm(x: &DevBuf, w: Option<&DevBuf>, y: &mut DevBuf, n: usize, eps: f3
 }
 
 /// L2-clip rows of `dim` to `thr`, optional per-channel scale.
-#[expect(clippy::cast_possible_truncation, reason = "dims < i32::MAX")]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "dims < i32::MAX")]
 pub fn clip(x: &mut DevBuf, scale: Option<&DevBuf>, dim: usize, rows: usize, thr: f32) {
     let sp = scale.map_or(std::ptr::null(), |b| b.ptr.cast_const());
     unsafe { inkwell_clip_launch(x.ptr, sp, dim as i32, rows as i32, thr) };
@@ -50,28 +50,28 @@ pub fn clip(x: &mut DevBuf, scale: Option<&DevBuf>, dim: usize, rows: usize, thr
 }
 
 /// y = a * sigmoid(b).
-#[expect(clippy::cast_possible_truncation, reason = "n < i32::MAX")]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "n < i32::MAX")]
 pub fn gate_mul(y: &mut DevBuf, a: &DevBuf, b: &DevBuf, n: usize) {
     unsafe { inkwell_gate_mul_launch(y.ptr, a.ptr, b.ptr, n as i32) };
     DevBuf::sync();
 }
 
 /// logits softcap in place.
-#[expect(clippy::cast_possible_truncation, reason = "n < i32::MAX")]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "n < i32::MAX")]
 pub fn softcap(x: &mut DevBuf, cap: f32) {
     unsafe { inkwell_softcap_launch(x.ptr, x.len as i32, cap) };
     DevBuf::sync();
 }
 
 /// `x *= sigmoid(beta*x)` in place (SITU silu family).
-#[expect(clippy::cast_possible_truncation, reason = "n < i32::MAX")]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "n < i32::MAX")]
 pub fn silu(x: &mut DevBuf, beta: f32) {
     unsafe { inkwell_silu_launch(x.ptr, x.len as i32, beta) };
     DevBuf::sync();
 }
 
 /// y = a + b.
-#[expect(clippy::cast_possible_truncation, reason = "n < i32::MAX")]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "n < i32::MAX")]
 pub fn add(y: &mut DevBuf, a: &DevBuf, b: &DevBuf) {
     unsafe { inkwell_add_launch(y.ptr, a.ptr, b.ptr, a.len as i32) };
     DevBuf::sync();
@@ -95,7 +95,7 @@ impl DevBuf {
     #[must_use]
     pub fn new(len: usize) -> Self {
         let mut ptr = std::ptr::null_mut();
-        assert_eq!(unsafe { cudaMalloc(&mut ptr, len * 4) }, 0, "cudaMalloc");
+        assert_eq!(unsafe { cudaMalloc(&raw mut ptr, len * 4) }, 0, "cudaMalloc");
         Self { ptr: ptr.cast(), len }
     }
 
