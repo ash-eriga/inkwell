@@ -380,7 +380,10 @@ __global__ void inkwell_mmvq_q2_0_moe(const void* const* __restrict__ Wp,
     float acc = 0.f;
     for (int u = lane; u < nunits; u += 32) {
         const int b = u >> 2, ub = u & 3;           // 4 units per 64-val block
-        const uint32_t q = *(const uint32_t*)&w[b].qs[ub * 4];
+        // NOTE: qs sits at byte offset 2 in the 18-byte block — a u32 load here
+        // is misaligned and faults on Pascal. Keep two aligned u16 reads.
+        const uint32_t q = (uint32_t)*(const uint16_t*)&w[b].qs[ub * 4]
+                         | ((uint32_t)*(const uint16_t*)&w[b].qs[ub * 4 + 2] << 16);
         const float d = fp16_to_f32(w[b].d);
         const float* xv = xs + u * 16;
 #pragma unroll

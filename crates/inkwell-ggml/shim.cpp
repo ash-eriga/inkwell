@@ -180,3 +180,4 @@ extern "C" void ink_graph_op_counts(ggml_cgraph* g) {
     for (int i = 0; i < GGML_OP_COUNT; i++)
         if (cnt[i]) fprintf(stderr, "OPCNT %s = %d\n", ggml_op_name((enum ggml_op)i), cnt[i]);
 }
+extern "C" int ink_is_contiguous(const ggml_tensor* t) { return ggml_is_contiguous(t) ? 1 : 0; }
