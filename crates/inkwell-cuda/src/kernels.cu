@@ -372,16 +372,18 @@ __global__ void inkwell_mmvq_q2_0_moe(const void* const* __restrict__ Wp,
     if (row >= nrows) return;
     const block_q2_0* w = (const block_q2_0*)((const uint8_t*)Wp[slot])
                           + row * (ncols / 64);
-    const int nbytes = (int)(ncols / 4);
+    const int nunits = (int)(ncols / 16);          // 16 vals = 4 qs bytes
     float acc = 0.f;
-    for (int bi = lane; bi < nbytes; bi += 32) {
-        const int b = bi / 16;
-        const uint8_t byte = w[b].qs[bi % 16];
+    for (int u = lane; u < nunits; u += 32) {
+        const int b = u >> 2, ub = u & 3;           // 4 units per 64-val block
+        const uint16_t qlo = *(const uint16_t*)&w[b].qs[ub * 4];
+        const uint16_t qhi = *(const uint16_t*)&w[b].qs[ub * 4 + 2];
+        const uint32_t q = (uint32_t)qlo | ((uint32_t)qhi << 16);
         const float d = fp16_to_f32(w[b].d);
-        const float* xv = xs + bi * 4;
+        const float* xv = xs + u * 16;
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
-            acc += d * (((byte >> (j * 2)) & 3) - 1) * xv[j];
+        for (int j = 0; j < 16; ++j)
+            acc += d * ((int)((q >> (8 * (j >> 2) + 2 * (j & 3))) & 3) - 1) * xv[j];
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if (lane == 0) y[slot * nrows + row] = acc;
@@ -606,15 +608,24 @@ __global__ void inkwell_mmvq_iq4_xs_moe(const void* const* __restrict__ Wp, cons
     if (row >= nrows) return;
     const block_iq4_xs* w = (const block_iq4_xs*)((const uint8_t*)Wp[slot])
                             + row * (ncols / 256);
-    const int nvals = (int)ncols;
+    const int nunits = (int)(ncols / 16);          // 16 vals = 16 qs bytes
     float acc = 0.f;
-    for (int p = lane; p < nvals; p += 32) {
-        const int b = p >> 8, ib = (p & 255) >> 5, jm = p & 31;
-        const int j = jm < 16 ? jm : jm - 16;
-        const int nib = jm < 16 ? (w[b].qs[ib * 16 + j] & 0x0F) : (w[b].qs[ib * 16 + j] >> 4);
+    for (int u = lane; u < nunits; u += 32) {
+        const int b = u >> 4, ub = u & 15;          // 16 units per 256-val block
+        const int ib = ub >> 1, half = ub & 1;      // unit covers half of a 32-val ib
+        const uint2 qa = *(const uint2*)&w[b].qs[ib * 16];
+        const uint2 qb = *(const uint2*)&w[b].qs[ib * 16 + 8];
         const int ls = ((w[b].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xF) | (((w[b].scales_h >> (2 * ib)) & 3) << 4);
         const float dl = fp16_to_f32(w[b].d) * (ls - 32);
-        acc += dl * (float)kvalues_iq4nl[nib] * xs[p];
+        const float* xv = xs + u * 16;
+        const unsigned long long qs64[2] = {
+            (unsigned long long)qa.x | ((unsigned long long)qa.y << 32),
+            (unsigned long long)qb.x | ((unsigned long long)qb.y << 32)};
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int byte = (int)((qs64[j >> 3] >> (8 * (j & 7))) & 0xFF);
+            acc += dl * (float)kvalues_iq4nl[half ? (byte >> 4) : (byte & 0xF)] * xv[j];
+        }
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if (lane == 0) y[slot * nrows + row] = acc;
