@@ -1,0 +1,7 @@
+{"ts":"2026-11-22T17:53:03-03:00","config":"baseline-iq2xxs","i":1,"decode_s":6.184390191,"ms_tok":96.6,"tok_s":10.35,"golden":"yes"}
+{"ts":"2026-11-22T17:53:34-03:00","config":"baseline-iq2xxs","i":2,"decode_s":6.5421125,"ms_tok":102.2,"tok_s":9.78,"golden":"yes"}
+{"ts":"2026-11-22T17:54:06-03:00","config":"baseline-iq2xxs","i":3,"decode_s":7.104626086,"ms_tok":111.0,"tok_s":9.01,"golden":"yes"}
+{"ts":"2026-11-22T17:54:43-03:00","config":"baseline-iq2xxs","i":4,"decode_s":7.454116853,"ms_tok":116.5,"tok_s":8.59,"golden":"yes"}
+{"ts":"2026-11-22T17:55:12-03:00","config":"baseline-iq2xxs","i":5,"decode_s":6.491402347,"ms_tok":101.4,"tok_s":9.86,"golden":"yes"}
+{"ts":"2026-11-22T17:55:43-03:00","config":"baseline-iq2xxs","i":6,"decode_s":6.65362226,"ms_tok":104.0,"tok_s":9.62,"golden":"yes"}
+{"ts":"2026-11-22T19:44:12-03:00","exp":"exl3_gemv_percol_fp16exact+staging","ms_tok":1171,"text":" the capital and capital in the","note":"cos=1.0/maxdiff=0.0000 gold; MoE ~1.03s/tok remains bottleneck (86ms/call, staged)"}
