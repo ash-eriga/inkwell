@@ -18,6 +18,7 @@ ggml_context* ink_ctx_new() {
     return ggml_init(p);
 }
 void ink_ctx_free(ggml_context* c) { ggml_free(c); }
+void ink_ctx_reset(ggml_context* c) { ggml_reset(c); }
 
 ggml_tensor* ink_tensor(ggml_context* c, int type, int nd, const int64_t* ne) {
     switch (nd) {

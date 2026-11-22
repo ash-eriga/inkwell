@@ -17,6 +17,7 @@ extern "C" {
     #[allow(dead_code)]
     pub fn ink_ctx_new() -> *mut c_void;
     pub fn ink_ctx_free(c: *mut c_void);
+    pub fn ink_ctx_reset(c: *mut c_void);
     pub fn ink_tensor(c: *mut c_void, ty: c_int, nd: c_int, ne: *const i64) -> *mut c_void;
     pub fn ink_view_1d(c: *mut c_void, a: *mut c_void, n: i64, off: i64) -> *mut c_void;
     pub fn ink_view_2d(c: *mut c_void, a: *mut c_void, n0: i64, n1: i64, rs: i64, off: i64) -> *mut c_void;

@@ -698,7 +698,13 @@ impl Runner {
     /// # Panics
     /// On graph/alloc/compute failure.
     pub fn step(&mut self, id: u32, pos: i64) -> Vec<f32> {
-        self.cur_ctx = Ptr(unsafe { inkwell_ggml::ink_ctx_new() });
+        // persistent ctx + reset: tensor addresses repeat every token so the
+        // CUDA graph cache key (nodes[0]) matches and capture can warm up
+        if self.cur_ctx.0.is_null() {
+            self.cur_ctx = Ptr(unsafe { inkwell_ggml::ink_ctx_new() });
+        } else {
+            unsafe { inkwell_ggml::ink_ctx_reset(self.cur_ctx.0) };
+        }
         let c = self.cur_ctx;
         let n_embd = self.cfg.n_embd as i64;
         let (hd, nh, hkv) = (128i64, 24i64, 8i64);
@@ -868,7 +874,6 @@ impl Runner {
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         // release the cached split plan so the next step's graph gets re-allocated
         unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
-        unsafe { inkwell_ggml::ink_ctx_free(self.cur_ctx.0) };
         logits
     }
 }
