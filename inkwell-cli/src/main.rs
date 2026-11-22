@@ -97,10 +97,10 @@ fn dump_model(g: &'static inkwell_gguf::GgufFile) {
 /// each slot of the previous token's selection is reused with
 /// probability RHO (temporal locality), else uniform. Draft-window
 /// prefetch uses the same predictor as upstream (`prev_sel`).
-#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss, reason = "simulation counters bounded below u32::MAX / f64 mantissa")]
 const RHO: u64 = 55; // % chance an expert repeats from previous token
 const N_TOK: u64 = 300;
 
+#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss, reason = "simulation counters bounded below u32::MAX / f64 mantissa")]
 fn bench_pager(g: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig) {
     use inkwell_model::ModelWeights;
     use inkwell_pager::{ExpertLayout, Pager};
