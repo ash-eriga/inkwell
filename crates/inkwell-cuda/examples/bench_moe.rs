@@ -17,6 +17,7 @@ extern "C" {
     fn ink_launch_mmvq_iq1_s_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_s_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -35,7 +36,7 @@ fn main() {
     const NR: i64 = 2304; // gu rows (2*ff) and down rows = embd
     const NC: i64 = 2304; // max cols (down=1152 also tested)
     const NS: i32 = 8;
-    let cases: [(&str, unsafe extern "C" fn(*const *const c_void, *const f32, *mut f32, i64, i64, i64, i32, *mut c_void), usize); 12] = [
+    let cases: [(&str, unsafe extern "C" fn(*const *const c_void, *const f32, *mut f32, i64, i64, i64, i32, *mut c_void), usize); 13] = [
         ("iq2_xxs", ink_launch_mmvq_iq2_xxs_moe, 66 * 256 / 256), // bytes per 64 vals
         ("iq2xxs_i8", ink_launch_mmvq_iq2_xxs_moe_i8, 66),
         ("q2_0", ink_launch_mmvq_q2_0_moe, 18),
@@ -46,6 +47,7 @@ fn main() {
         ("nvfp4_i8", ink_launch_mmvq_nvfp4_moe_i8, 36),
         ("iq2_xs", ink_launch_mmvq_iq2_xs_moe, 74 * 256 / 256),
         ("iq2xs_i8", ink_launch_mmvq_iq2_xs_moe_i8, 74),
+        ("iq2s_i8", ink_launch_mmvq_iq2_s_moe_i8, 82),
         ("iq2_s", ink_launch_mmvq_iq2_s_moe, 82 * 256 / 256),
         ("iq4_xs", ink_launch_mmvq_iq4_xs_moe, 136 * 256 / 256),
     ];
