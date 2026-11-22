@@ -105,3 +105,14 @@ Check: ggml-cpu type_traits_cpu[t].vec_dot_type for types 16,17,19,22,23,40,42;
   kernels/dspark.cu (722 LOC) is the reference impl of Inkling2's DSpark drafter
   (Markov head + screen + recurrence, NVFP4 products/Q8_0 context proj, own cuda graphs).
   inkwell-spec crate already has verify/rollback loop + ngram reference drafter.
+
+## 2026-11-22 — micro-gargalos round 2 (commits df6380c..59216b6)
+
+- **Concat projections** (df6380c): per layer, same-type {attn_q 3072, attn_gate 3072, attn_rel 384} byte-concatenated at load into one weight → 1 mul_mat + view1 slices in step(). INKWELL_NOCAT=1 disables (control). dev_bytes headroom +240MB for cat+pad tensors.
+- **GOTCHA: `ggml_view_1d` offset = BYTES in this fork** (not elements!) — slices use row*4 for F32. Proven by `examples/cat_test.rs` (standalone mul_mat+view1 repro).
+- **GOTCHA: no u32 loads at odd block offsets** — qs at byte 2 of 18B q2_0 block is misaligned → sticky CUDA fault surfacing later in moe_cb DtoH (panic lib.rs:268). Two u16 reads are the aligned way.
+- **op histogram** `INKWELL_OPCNT=1` (shim ink_graph_op_counts): per token — RESHAPE 1574, VIEW 1195, CONT 1103, MUL_MAT 1014, MUL 714, CONCAT 596, ADD 536, RMS_NORM 514, PERMUTE 496, SCALE 435, CPY 193, TRANSPOSE 168.
+- nsys shares (~8 tok, contended desktop): MoE kernels ~55%, dense GEMV ~22%, misc swarm ~23% (concat_cont ~14ms/tok, cpy ~16ms, bin_bcast ~19ms — batch-dim ops split ~8 launches/node).
+- Attention already batched (mul_mat over ne2/ne3 heads) — the 4170 mmvf launches/tok = batch-split nodes, not per-head calls.
+- FAILED experiment kept for reference: KV write `cont(permute)` → reshape elision caused a sticky crash even after revert (was actually the misaligned q2_0 u32 — untangle when retrying).
+- Next targets: concat/cpy swarm via fewer graph ops (mix states rebuild per call, ~600 CONCAT), clip 9→fewer ops, dn-expert low GB/s (q2_0 27, nvfp4 45).
