@@ -18,6 +18,8 @@ extern "C" {
 
 extern "C" {
     fn ink_launch_dequant_iq2_xxs(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_xxs(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
+    fn ink_launch_mmvq_q2_0(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn inkwell_rmsnorm_launch(x: *const f32, w: *const f32, y: *mut f32, n: i32, eps: f32);
     fn inkwell_clip_launch(x: *mut f32, scale: *const f32, dim: i32, rows: i32, thr: f32);
     fn inkwell_gate_mul_launch(y: *mut f32, a: *const f32, b: *const f32, n: i32);
@@ -78,6 +80,21 @@ pub fn add(y: &mut DevBuf, a: &DevBuf, b: &DevBuf) {
     DevBuf::sync();
 }
 
+
+/// GEMV `y[r] = dequant(W[r,:]) . x` for IQ2_XXS weights.
+/// `w` = raw quant rows, `x` = f32 activations, `y` = `nrows` out.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub fn mmvq_iq2_xxs(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
+    unsafe { ink_launch_mmvq_iq2_xxs(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// GEMV `y[r] = dequant(W[r,:]) . x` for Q2_0 weights.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub fn mmvq_q2_0(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
+    unsafe { ink_launch_mmvq_q2_0(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
 
 /// Dequantize IQ2_XXS blocks (66 bytes per 256 values) on GPU.
 /// `src` = raw quant bytes, `dst` = `nblocks*256` floats.

@@ -141,3 +141,68 @@ __global__ void inkwell_dequant_iq2_xxs(const void* __restrict__ vx, float* __re
 extern "C" void ink_launch_dequant_iq2_xxs(const void* vx, float* y, long long nblocks, void* stream) {
     inkwell_dequant_iq2_xxs<<<(unsigned)nblocks, 32, 0, (cudaStream_t)stream>>>(vx, y, nblocks);
 }
+
+// ---------------- fused dequant+dot GEMV (own) --------------------------------
+// y[r] = sum_c dequant(W[r,c]) * x[c]; one warp per row.
+
+struct block_q2_0 { uint16_t d; uint8_t qs[16]; }; // 64 vals, 18 bytes
+
+__global__ void inkwell_mmvq_iq2_xxs(const void* __restrict__ W,
+                                     const float* __restrict__ x,
+                                     float* __restrict__ y,
+                                     int64_t nrows, int64_t ncols) {
+    const int64_t row = blockIdx.x;
+    const int lane = threadIdx.x;                    // 32 lanes
+    const int nb_row = (int)(ncols / 256);           // blocks per row
+    const block_iq2_xxs* w = (const block_iq2_xxs*)W + row * nb_row;
+    const int ngroups = (int)(ncols / 8);            // 8-vals per group
+    float acc = 0.f;
+    for (int g = lane; g < ngroups; g += 32) {
+        const int b = g / 32, gb = g % 32;           // block, group-in-block
+        const int ib = gb / 4, il = gb % 4;
+        const uint16_t* q2 = w[b].qs + 4 * ib;
+        const uint8_t* aux8 = (const uint8_t*)q2;
+        const uint8_t* grid = (const uint8_t*)(iq2xxs_grid + aux8[il]);
+        const uint32_t aux32 = q2[2] | ((uint32_t)q2[3] << 16);
+        const float d = fp16_to_f32(w[b].d) * (0.5f + (aux32 >> 28)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+        const float* xv = x + g * 8;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            acc += d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f) * xv[j];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[row] = acc;
+}
+
+__global__ void inkwell_mmvq_q2_0(const void* __restrict__ W,
+                                  const float* __restrict__ x,
+                                  float* __restrict__ y,
+                                  int64_t nrows, int64_t ncols) {
+    const int64_t row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nb_row = (int)(ncols / 64);
+    const block_q2_0* w = (const block_q2_0*)W + row * nb_row;
+    const int nbytes = (int)(ncols / 4);             // 4 vals per byte
+    float acc = 0.f;
+    for (int bi = lane; bi < nbytes; bi += 32) {
+        const int b = bi / 16;
+        const uint8_t byte = w[b].qs[bi % 16];
+        const float d = fp16_to_f32(w[b].d);
+        const float* xv = x + bi * 4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            acc += d * (((byte >> (j * 2)) & 3) - 1) * xv[j];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[row] = acc;
+}
+
+extern "C" void ink_launch_mmvq_iq2_xxs(const void* W, const float* x, float* y,
+                                        long long nrows, long long ncols, void* stream) {
+    inkwell_mmvq_iq2_xxs<<<(unsigned)nrows, 32, 0, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+}
+extern "C" void ink_launch_mmvq_q2_0(const void* W, const float* x, float* y,
+                                     long long nrows, long long ncols, void* stream) {
+    inkwell_mmvq_q2_0<<<(unsigned)nrows, 32, 0, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+}
