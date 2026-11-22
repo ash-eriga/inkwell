@@ -118,12 +118,19 @@ impl Tokenizer {
     }
 
     /// Vocabulary size.
+    ///
+    /// # Panics
+    /// If the vocabulary exceeds `u32::MAX` tokens (never in practice).
     #[must_use]
     pub fn n_tokens(&self) -> u32 {
         u32::try_from(self.tokens.len()).expect("vocab < 4G")
     }
 
     /// Encode text to token ids (no BOS — inkling2 has none by default).
+    ///
+    /// # Panics
+    /// If BPE produces a merged symbol missing from the vocabulary — that
+    /// would mean the merges list is inconsistent with the tokens list.
     #[must_use]
     pub fn encode(&self, text: &str) -> Vec<u32> {
         // GPT-4o pre-split runs on the RAW text (llama.cpp order): the
