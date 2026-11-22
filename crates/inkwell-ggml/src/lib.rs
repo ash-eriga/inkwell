@@ -71,6 +71,9 @@ extern "C" {
     pub fn ink_backend_cuda(dev: c_int) -> *mut c_void;
     pub fn ink_backend_cpu(threads: c_int) -> *mut c_void;
     pub fn ink_sched_new(backends: *mut *mut c_void, bufts: *mut *mut c_void, n: c_int, graph_size: usize) -> *mut c_void;
+    pub fn ink_custom_4d(c: *mut c_void, ty: i32, ne0: i64, ne1: i64, ne2: i64, ne3: i64, args: *mut *mut c_void, n_args: i32, fun: usize, userdata: *mut c_void) -> *mut c_void;
+    pub fn ink_tensor_data(t: *mut c_void) -> *mut c_void;
+    pub fn ink_tensor_src(t: *mut c_void, i: i32) -> *mut c_void;
     pub fn ink_sched_set_tensor_backend(s: *mut c_void, t: *mut c_void, b: *mut c_void);
     pub fn ink_sched_compute(s: *mut c_void, g: *mut c_void) -> c_int;
     pub fn ink_sched_reset(s: *mut c_void);
@@ -96,6 +99,26 @@ extern "C" {
     pub fn ink_tensor_nbytes(t: *mut c_void) -> usize;
     pub fn ink_ne(t: *mut c_void, i: c_int) -> i64;
     pub fn ink_nb(t: *mut c_void, i: c_int) -> i64;
+}
+
+/// Custom op: callback `fun(dst, ith, nth, userdata)` runs on the CPU
+/// backend thread; `userdata` is passed verbatim.
+///
+/// # Safety
+/// `fun` must be a valid `extern "C" fn` address; `userdata` must stay
+/// valid for the op's lifetime.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn custom_4d(c: *mut c_void, ty: i32, ne: [i64; 4], args: &mut [*mut c_void], fun: usize, userdata: *mut c_void) -> *mut c_void {
+    unsafe { ink_custom_4d(c, ty, ne[0], ne[1], ne[2], ne[3], args.as_mut_ptr(), args.len() as i32, fun, userdata) }
+}
+
+/// Raw `data` pointer of a tensor (host-side view).
+///
+/// # Safety
+/// Valid only while the tensor's buffer is alive.
+#[must_use]
+pub unsafe fn tensor_data(t: *mut c_void) -> *mut c_void {
+    unsafe { ink_tensor_data(t) }
 }
 
 /// Probe: create a no-alloc ctx + cuda backend, compute a tiny

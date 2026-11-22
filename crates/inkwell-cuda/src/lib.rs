@@ -13,6 +13,9 @@ extern "C" {
     fn cudaGetDeviceCount(c: *mut i32) -> i32;
     fn cudaFree(p: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
+    fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> i32;
+    fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+    fn cudaHostAlloc(pp: *mut *mut c_void, size: usize, flags: u32) -> i32;
     fn cudaHostRegister(p: *mut c_void, bytes: usize, flags: u32) -> i32;
     fn cudaHostGetDevicePointer(dst: *mut *mut c_void, src: *mut c_void, flags: u32) -> i32;
     fn cudaDeviceSynchronize() -> i32;
@@ -24,8 +27,15 @@ extern "C" {
     fn ink_launch_mmvq_nvfp4(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq1_s(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xxs(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
-    fn ink_launch_mmvq_iq2_xxs_moe(w: *const c_void, ids: *const i32, row_bytes: i64, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, nslots: i32, stream: *mut c_void);
-    fn ink_launch_mmvq_q2_0_moe(w: *const c_void, ids: *const i32, row_bytes: i64, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_xxs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_q2_0_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_iq1_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_nvfp4_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_situ_pair(gu: *const f32, sgu: *const f32, hid: *mut f32, beta: f32, lin_beta: f32, ncols: i64, nslots: i64, stream: *mut c_void);
+    fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_iq4_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_swiglu_pair(y: *mut f32, gu: *const f32, nslots: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn inkwell_rmsnorm_launch(x: *const f32, w: *const f32, y: *mut f32, n: i32, eps: f32);
@@ -147,8 +157,8 @@ pub unsafe fn mmvq_iq2_xxs_host(w: *mut c_void, x: &DevBuf, y: &mut DevBuf, nrow
 /// # Safety
 /// `w` and `ids` must be device-accessible pointers.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
-pub unsafe fn mmvq_iq2_xxs_moe(w: *mut c_void, ids: &DevBuf, row_bytes: usize, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq2_xxs_moe(w, ids.ptr.cast(), row_bytes as i64, x.ptr, y.ptr, nrows as i64, ncols as i64, nslots as i32, std::ptr::null_mut()) };
+pub unsafe fn mmvq_iq2_xxs_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_xxs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
     DevBuf::sync();
 }
 
@@ -157,8 +167,8 @@ pub unsafe fn mmvq_iq2_xxs_moe(w: *mut c_void, ids: &DevBuf, row_bytes: usize, x
 /// # Safety
 /// See [`mmvq_iq2_xxs_moe`].
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
-pub unsafe fn mmvq_q2_0_moe(w: *mut c_void, ids: &DevBuf, row_bytes: usize, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_q2_0_moe(w, ids.ptr.cast(), row_bytes as i64, x.ptr, y.ptr, nrows as i64, ncols as i64, nslots as i32, std::ptr::null_mut()) };
+pub unsafe fn mmvq_q2_0_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_q2_0_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
     DevBuf::sync();
 }
 
@@ -208,9 +218,13 @@ pub fn dequant_iq2_xxs(src: &DevBuf, dst: &mut DevBuf) {
 #[derive(Debug)]
 pub struct DevBuf {
     ptr: *mut f32,
+
     /// element count
     pub len: usize,
 }
+
+unsafe impl Send for DevBuf {}
+unsafe impl Sync for DevBuf {}
 
 impl DevBuf {
     /// Allocate `len` floats on device.
@@ -239,6 +253,21 @@ impl DevBuf {
     ///
     /// # Panics
     /// On copy error.
+    /// Copy `self` (device) → `dst` (host), then sync.
+    ///
+    /// # Panics
+    /// On `cudaMemcpy` failure.
+    /// Raw device pointer for kernels that take `*mut c_void`.
+    #[must_use]
+    pub fn dev_ptr(&self) -> *mut c_void {
+        self.ptr.cast()
+    }
+
+    pub fn read_bytes(&self, dst: &mut [u8]) {
+        let rc = unsafe { cudaMemcpy(dst.as_mut_ptr().cast(), self.ptr.cast::<std::ffi::c_void>(), dst.len(), 2) }; // DtoH
+        assert_eq!(rc, 0, "cudaMemcpy DtoH");
+    }
+
     pub fn write_bytes(&mut self, src: &[u8]) {
         assert_eq!(unsafe { cudaMemcpy(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1) }, 0);
     }
@@ -277,4 +306,182 @@ impl Drop for DevBuf {
     fn drop(&mut self) {
         unsafe { cudaFree(self.ptr.cast()) };
     }
+}
+
+/// Batched IQ1_S expert GEMV.
+///
+/// # Safety
+/// See [`mmvq_iq2_xxs_moe`].
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq1_s_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq1_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Batched NVFP4 expert GEMV.
+///
+/// # Safety
+/// See [`mmvq_iq2_xxs_moe`].
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_nvfp4_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_nvfp4_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// SITU gate·up activation with optional per-expert scales.
+///
+/// # Panics
+/// On launch failure.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub fn situ_pair(hid: &mut DevBuf, gu: &DevBuf, sgu: Option<&DevBuf>, beta: f32, lin_beta: f32, ncols: usize, nslots: usize) {
+    let s = sgu.map_or(std::ptr::null(), |b| b.ptr);
+    unsafe { ink_launch_situ_pair(gu.ptr, s, hid.ptr, beta, lin_beta, ncols as i64, nslots as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Weighted sum across expert slots: `out[c] = Σ w[s]·sd[s]·dn[s][c]`.
+///
+/// # Panics
+/// On launch failure.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub fn expert_wsum(out: &mut DevBuf, dn: &DevBuf, w: &DevBuf, sd: Option<&DevBuf>, ncols: usize, nslots: usize) {
+    let s = sd.map_or(std::ptr::null(), |b| b.ptr);
+    unsafe { ink_launch_expert_wsum(dn.ptr, w.ptr, s, out.ptr, ncols as i64, nslots as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Batched IQ2_XS expert GEMV.
+///
+/// # Safety
+/// See [`mmvq_iq2_xxs_moe`].
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_xs_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Batched IQ2_S expert GEMV.
+///
+/// # Safety
+/// See [`mmvq_iq2_xxs_moe`].
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_s_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Batched IQ4_XS expert GEMV.
+///
+/// # Safety
+/// See [`mmvq_iq2_xxs_moe`].
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq4_xs_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq4_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// `cudaHostAlloc` pinned+mapped buffer (UVA → same ptr on device on Pascal).
+///
+/// # Panics
+/// On allocation failure.
+#[must_use]
+pub fn host_alloc_mapped(bytes: usize) -> PinnedBuf {
+    let mut p: *mut c_void = std::ptr::null_mut();
+    // cudaHostAllocDefault — UVA makes it device-addressable.
+    let rc = unsafe { cudaHostAlloc(&mut p, bytes, 0) };
+    assert_eq!(rc, 0, "cudaHostAlloc({bytes}) = {rc}");
+    let mut dp: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { cudaHostGetDevicePointer(&mut dp, p, 0) };
+    assert_eq!(rc, 0, "cudaHostGetDevicePointer = {rc}");
+    PinnedBuf { host: p.cast(), dev: dp }
+}
+
+/// Pinned host buffer usable as a device pointer (zero-copy over PCIe).
+#[derive(Debug)]
+pub struct PinnedBuf {
+    /// Host-accessible pointer.
+    pub host: *mut u8,
+    /// Device-accessible pointer to the same memory.
+    pub dev: *mut c_void,
+}
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
+
+// ---- async variants: no device sync, for chained launches ----
+
+/// Same as [`mmvq_iq2_xxs_moe`] but does not synchronize; caller must sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_xxs_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_xxs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
+
+/// Same as [`mmvq_q2_0_moe`] but does not synchronize; caller must sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_q2_0_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_q2_0_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
+
+/// Same as [`mmvq_iq1_s_moe`] but does not synchronize; caller must sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq1_s_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq1_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
+
+/// Same as [`mmvq_nvfp4_moe`] but does not synchronize; caller must sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_nvfp4_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_nvfp4_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
+
+/// Same as [`mmvq_iq2_xs_moe`] but does not synchronize; caller must sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_xs_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
+
+/// Same as [`mmvq_iq2_s_moe`] but does not synchronize; caller must sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_s_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
+
+/// Same as [`mmvq_iq4_xs_moe`] but does not synchronize; caller must sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq4_xs_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq4_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+}
+
+/// Async `situ_pair` — no sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+/// # Safety
+/// `sgu` may be null; pointers valid for `ncols*nslots` elements.
+pub unsafe fn situ_pair_async(hid: &mut DevBuf, gu: &DevBuf, sgu: *const c_void, beta: f32, lin_beta: f32, ncols: usize, nslots: usize) {
+    unsafe { ink_launch_situ_pair(gu.ptr, sgu.cast(), hid.ptr, beta, lin_beta, ncols as i64, nslots as i64, std::ptr::null_mut()) };
+}
+
+/// Async `expert_wsum` — no sync.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+/// # Safety
+/// `sd` may be null; `w` valid for `nslots`, `out` for `ncols`.
+pub unsafe fn expert_wsum_async(out: *mut c_void, dn: &DevBuf, w: *const c_void, sd: *const c_void, ncols: usize, nslots: usize) {
+    unsafe { ink_launch_expert_wsum(dn.ptr, w.cast(), sd.cast(), out.cast(), ncols as i64, nslots as i64, std::ptr::null_mut()) };
+}
+
+/// Free/total VRAM in bytes.
+#[must_use]
+pub fn mem_info() -> (usize, usize) {
+    let mut f = 0usize;
+    let mut t = 0usize;
+    assert_eq!(unsafe { cudaMemGetInfo(&raw mut f, &raw mut t) }, 0, "cudaMemGetInfo");
+    (f, t)
+}
+
+/// Async HtoD copy on stream 0 (ordered with kernels).
+///
+/// # Safety
+/// `dst`/`src` valid for `bytes`.
+pub unsafe fn memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
+    let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, std::ptr::null_mut()) };
+    assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");
 }

@@ -1,8 +1,9 @@
 //! Decode-time (n_tokens = 1, single sequence) forward runner.
 //!
-//! Weights: dense tensors on the CUDA buffer; `*_exps` expert tensors on
-//! a CPU buffer — the scheduler then runs `mul_mat_id` on CPU just like
-//! `-ncmoe` in the baseline. KV + conv state live in per-visit device arenas.
+//! Weights: dense tensors on the CUDA buffer; `*_exps` expert tensors live in
+//! pinned+mapped host memory and stream over PCIe into own GEMV kernels via a
+//! `GGML_OP_CUSTOM` per MoE visit (Strata-style zero-copy offload).
+//! KV + conv state live in per-visit device arenas.
 use crate::ops::{t, Buf, Ptr, Rt};
 use inkwell_gguf::GgufFile;
 use inkwell_core::InklingConfig;
@@ -22,8 +23,8 @@ struct L {
     attn_k_conv: Option<Ptr>, attn_v_conv: Option<Ptr>, attn_post_conv: Option<Ptr>, ffn_post_conv: Option<Ptr>,
     attn_k_conv_proj: Option<Ptr>, attn_v_conv_proj: Option<Ptr>,
     ffn_norm: Option<Ptr>, ffn_gate_inp: Option<Ptr>, ffn_exp_probs_b: Option<Ptr>,
-    gate_up_exps: Option<Ptr>, down_exps: Option<Ptr>,
     gate_up_scale: Option<Ptr>, down_scale: Option<Ptr>,
+    moe: Option<usize>,
     msg_query: Option<Ptr>, ctrl_down: [Option<Ptr>; 4], ctrl_gain: [Option<Ptr>; 4], ctrl_forget: [Option<Ptr>; 4],
 }
 
@@ -45,10 +46,14 @@ pub struct Runner {
     cpu_buf: Buf,
     /// name → tensor
     w: HashMap<String, Ptr>,
+    /// pinned+mapped expert weight copies (zero-copy GEMV over PCIe)
+    pinned: Vec<inkwell_cuda::PinnedBuf>,
+    /// per-layer MoE weight bindings consumed by the custom op
+    moe_args: Vec<Box<crate::moe::MoeArgs>>,
     cfg: InklingConfig,
     layers: Vec<L>,
     // globals
-    tok_embd: Ptr, tok_norm: Ptr, output: Ptr, output_norm: Ptr, output_res_query: Ptr,
+    tok_embd: Ptr, embd_src: (*const u8, i32, usize), embd_row: Ptr, tok_norm: Ptr, output: Ptr, output_norm: Ptr, output_res_query: Ptr,
     // per-visit KV arenas + conv states (visit → tensors)
     k_arena: Vec<Ptr>, v_arena: Vec<Ptr>, conv_state: Vec<Ptr>,
     max_ctx: i64,
@@ -84,16 +89,17 @@ impl Runner {
 
         // classify + create tensors
         let mut dev_bytes = 0usize;
-        let mut cpu_bytes = 0usize;
-        let mut plan: Vec<(&String, &inkwell_gguf::TensorInfo, bool, bool)> = Vec::new();
+        let mut cpu_bytes = 2304 * 4 + 256; // embd_row tensor
+        let mut plan: Vec<(&String, &inkwell_gguf::TensorInfo, bool, bool, bool)> = Vec::new();
         for (name, ti) in &gg.tensors {
             let expert = name.contains("exps") && !name.contains("probs") && !name.contains("scale");
-            // upstream dequantizes tok_embd+output to F32 at load
-            let to_f32 = name == "token_embd.weight" || name == "output.weight";
+            // keep quantized (IQ2_XXS): embd handled host-side, output via mmvq
+            let to_f32 = false;
+            let host_only = name == "token_embd.weight";
             let n_el: u64 = ti.dims.iter().product();
             let nbytes = if to_f32 { n_el * 4 } else { ti.nbytes };
-            if expert { cpu_bytes += nbytes as usize + 256; } else { dev_bytes += nbytes as usize + 256; }
-            plan.push((name, ti, expert, to_f32));
+            if !expert && !host_only { dev_bytes += nbytes as usize + 256; }
+            plan.push((name, ti, expert, to_f32, host_only));
         }
         let dev_buf = rt.buf(buft_dev, dev_bytes);
         let cpu_buf = rt.buf(buft_cpu, cpu_bytes);
@@ -105,7 +111,31 @@ impl Runner {
         let mut off_dev = 0usize;
         let mut off_cpu = 0usize;
         let mut w = HashMap::new();
-        for (name, ti, expert, to_f32) in plan {
+        let mut pinned: Vec<inkwell_cuda::PinnedBuf> = Vec::new();
+        // layer → (gu pinned idx, dn pinned idx, gu stride, dn stride)
+        let mut moe_w: HashMap<usize, (usize, usize, usize, usize)> = HashMap::new();
+        let mut embd_src: (*const u8, i32, usize) = (std::ptr::null(), 0, 0);
+        for (name, ti, expert, to_f32, host_only) in plan {
+            if host_only {
+                let src = unsafe { gg.mmap.as_ptr().add(gg.data_start as usize + ti.offset as usize) };
+                embd_src = (src, ti.ggml_type as i32, ti.nbytes as usize / 201024usize);
+                continue;
+            }
+            if expert {
+                if pinned.is_empty() { let (f0,_) = inkwell_cuda::mem_info(); eprintln!("MEM before pinned: {f0}"); }
+                // copy into cudaHostAlloc'd pinned+mapped memory (file-backed
+                // mmap cannot be registered — verified)
+                let pb = inkwell_cuda::host_alloc_mapped(ti.nbytes as usize);
+                let src = unsafe { gg.mmap.as_ptr().add(gg.data_start as usize + ti.offset as usize) };
+                unsafe { std::ptr::copy_nonoverlapping(src, pb.host, ti.nbytes as usize) };
+                let layer: usize = name.split('.').nth(1).expect("blk.N").parse().expect("layer idx");
+                let idx = pinned.len();
+                pinned.push(pb);
+                let e = moe_w.entry(layer).or_insert((usize::MAX, usize::MAX, 0, 0));
+                let stride = ti.nbytes as usize / 128;
+                if name.contains("gate_up") { e.0 = idx; e.2 = stride; } else { e.1 = idx; e.3 = stride; }
+                continue;
+            }
             let ty = if to_f32 { F32 } else { ti.ggml_type as i32 };
             let tensor = t::new(rt.ctx(), ty, &gguf_dims(ti));
             let (buf, off) = if expert { (&cpu_buf, &mut off_cpu) } else { (&dev_buf, &mut off_dev) };
@@ -122,16 +152,49 @@ impl Runner {
                 unsafe { t::set(tensor, src, 0, ti.nbytes as usize) };
             }
             *off = o + t::nbytes(tensor);
-            if expert {
-                unsafe { inkwell_ggml::ink_sched_set_tensor_backend(sched.0, tensor.0, cpu.0) };
-            }
             w.insert(name.clone(), tensor);
         }
+
+        let (f1,_) = inkwell_cuda::mem_info();
+        eprintln!("MEM after weights: {f1}");
+        // small CPU tensor carrying the dequantized embedding row each step
+        let embd_row = t::new(rt.ctx(), F32, &[2304, 1, 1, 1]);
+        { let o = (off_cpu + 127) & !127; cpu_buf.assign(embd_row, o); }
+        unsafe { inkwell_ggml::ink_sched_set_tensor_backend(sched.0, embd_row.0, cpu.0) };
 
         let get = |n: &str| -> Ptr {
             *w.get(n).unwrap_or_else(|| panic!("missing {n}"))
         };
         let opt = |n: &str| -> Option<Ptr> { w.get(n).copied() };
+
+        let mut moe_args: Vec<Box<crate::moe::MoeArgs>> = Vec::new();
+        let mut moe_pos: HashMap<usize, usize> = HashMap::new();
+        // VRAM LRU expert cache: size from free VRAM after dense weights.
+        let (vfree, _vtotal) = inkwell_cuda::mem_info();
+        let budget = vfree.saturating_sub(1 << 30).min(3 << 30); // ≤3 GiB, keep 1 GiB headroom
+        let budget_per_layer = budget / 24;
+        for i in 0..24usize {
+            let Some(&(gi, di, gs, ds)) = moe_w.get(&i) else { continue };
+            let gu_ti = gg.tensors.get(&format!("blk.{i}.ffn_gate_up_exps.weight")).expect("gu ti");
+            let dn_ti = gg.tensors.get(&format!("blk.{i}.ffn_down_exps.weight")).expect("dn ti");
+            moe_pos.insert(i, moe_args.len());
+            let k = (budget_per_layer / (gs + ds)).min(128);
+            let caches = (k > 0).then(|| {
+                std::sync::Mutex::new(Some((
+                    crate::moe::Cache::new(k, gs),
+                    crate::moe::Cache::new(k, ds),
+                )))
+            }).unwrap_or_else(|| std::sync::Mutex::new(None));
+            if i == 0 { eprintln!("VRAM cache: vfree={vfree} k={k} experts/layer ({:.1} MiB/layer)", k as f64 * (gs + ds) as f64 / 1e6); }
+            moe_args.push(Box::new(crate::moe::MoeArgs {
+                gu_w: pinned[gi].dev, gu_stride: gs, gu_type: gu_ti.ggml_type as i32,
+                dn_w: pinned[di].dev, dn_stride: ds, dn_type: dn_ti.ggml_type as i32,
+                has_sgu: gg.tensors.contains_key(&format!("blk.{i}.ffn_gate_up_exps.scale")),
+                has_sdn: gg.tensors.contains_key(&format!("blk.{i}.ffn_down_exps.scale")),
+                gu_host: pinned[gi].host, dn_host: pinned[di].host,
+                caches,
+            }));
+        }
 
         let mut layers = Vec::with_capacity(24);
         for i in 0..24usize {
@@ -164,8 +227,7 @@ impl Runner {
                 ffn_norm: opt(&p("ffn_norm")),
                 ffn_gate_inp: opt(&p("ffn_gate_inp")),
                 ffn_exp_probs_b: opt(&pb("exp_probs_b")),
-                gate_up_exps: opt(&p("ffn_gate_up_exps")),
-                down_exps: opt(&p("ffn_down_exps")),
+                moe: moe_pos.get(&i).copied(),
                 gate_up_scale: opt(&format!("blk.{i}.ffn_gate_up_exps.scale")),
                 down_scale: opt(&format!("blk.{i}.ffn_down_exps.scale")),
                 msg_query: opt(&p("loop_msg_query")),
@@ -179,7 +241,7 @@ impl Runner {
             layers.push(l);
         }
 
-        let tok_embd = get("token_embd.weight");
+        let tok_embd = Ptr(std::ptr::null_mut()); // embd stays host-side
         let tok_norm = opt("token_embd_norm.weight").unwrap_or_else(|| opt("output_norm.weight").expect("tok_norm"));
         let output = get("output.weight");
         let output_norm = get("output_norm.weight");
@@ -234,8 +296,8 @@ impl Runner {
             cur_ctx: Ptr(std::ptr::null_mut()),
             dump_list: std::cell::UnsafeCell::new(Vec::new()),
             in_buf: None,
-            rt, sched, dev_buf, cpu_buf, w, cfg: cfg.clone(), layers,
-            tok_embd, tok_norm, output, output_norm, output_res_query,
+            rt, sched, dev_buf, cpu_buf, w, pinned, moe_args, cfg: cfg.clone(), layers,
+            tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query,
             k_arena, v_arena, conv_state, max_ctx, swa, visits,
             n_full,
         }
@@ -491,34 +553,21 @@ impl Runner {
         weights = t::scale(c, weights, self.cfg.expert_weights_scale);
         let weights3 = weights;
 
-        let n_ff = 1152i64;
-        let mut gate_up = t::mul_mat_id(c, l.gate_up_exps.expect("gu"), fcur, ids); // [2*n_ff, 8, 1]
-        if let Some(ws) = l.gate_up_scale {
-            // per-expert scale: get_rows over expert dim -> [1, 8, 1], broadcasts dim0
-            let s = t::get_rows(c, t::reshape3(c, ws, 1, 128, 1), ids);
-            gate_up = t::mul(c, gate_up, s);
+        // custom op: 8 expert GEMVs on GPU over zero-copy pinned weights +
+        // fused SITU + per-expert scales + weighted sum — all in one callback
+        if il == 0 { self.dump("moe_in-0", fcur); self.dump("moe_ids-0", ids); self.dump("moe_w-0", weights3); }
+        let m = &self.moe_args[l.moe.expect("moe")];
+        let mut args: Vec<*mut std::ffi::c_void> = vec![fcur.0, ids.0, weights3.0];
+        if m.has_sgu {
+            args.push(t::get_rows(c, t::reshape3(c, l.gate_up_scale.expect("s"), 1, 128, 1), ids).0);
         }
-        self.set_cpu(gate_up); // experts live on the CPU backend (like -ncmoe)
-        let gate = t::view3(c, gate_up, n_ff, 8, 1, t::nb(gate_up, 1), t::nb(gate_up, 2), 0);
-        let up = t::view3(c, gate_up, n_ff, 8, 1, t::nb(gate_up, 1), t::nb(gate_up, 2), n_ff * t::nb(gate_up, 0));
-        let act = t::mul(c,
-            t::scale(c, t::tanh(c, t::scale(c, gate, 1.0 / self.cfg.situ_beta)), self.cfg.situ_beta),
-            t::sigmoid(c, gate));
-        let up2 = t::scale(c, t::tanh(c, t::scale(c, up, 1.0 / self.cfg.situ_linear_beta)), self.cfg.situ_linear_beta);
-        let hid = t::mul(c, act, up2); // [n_ff, 8, 1]
-        self.set_cpu(hid);
-        let mut down = t::mul_mat_id(c, l.down_exps.expect("down"), hid, ids); // [n_embd, 8, 1]
-        if let Some(ws) = l.down_scale {
-            let s = t::get_rows(c, t::reshape3(c, ws, 1, 128, 1), ids);
-            down = t::mul(c, down, s);
+        if m.has_sdn {
+            args.push(t::get_rows(c, t::reshape3(c, l.down_scale.expect("s"), 1, 128, 1), ids).0);
         }
-        self.set_cpu(down);
-        let experts = t::mul(c, down, weights3); // [n_embd, 8, 1]
-        let mut ffn_out = t::view2(c, experts, n_embd, 1, t::nb(experts, 2), 0);
-        for i in 1..8i64 {
-            let ei = t::view2(c, experts, n_embd, 1, t::nb(experts, 2), i * t::nb(experts, 1));
-            ffn_out = t::add(c, ffn_out, ei);
-        }
+        let ffn_out = Ptr(unsafe {
+            inkwell_ggml::custom_4d(c.0, F32, [n_embd, 1, 1, 1], &mut args,
+                crate::moe::moe_cb_addr(), (&**m as *const crate::moe::MoeArgs).cast_mut().cast())
+        });
         self.set_cpu(ffn_out);
 
         let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores);
@@ -617,19 +666,17 @@ impl Runner {
 
         let step = Step { ids, kv_idx_full, kv_idx_swa, pos: pos_t, rel_pos_full, rel_pos_swa, sink_zero, tau, pos_val: pos };
 
-        // embed
-        // embd row: static view slice (get_rows is misbehaving; id is compile-time here)
-        let nb1 = t::nb(self.tok_embd, 1);
-        let mut cur = t::cont(c, t::view2(c, self.tok_embd, n_embd, 1, nb1, id as i64 * nb1));
+        // embed: dequantize the row host-side (embd stays quantized, ~230 MiB not 1.85 GiB)
+        {
+            let (src, ty, stride) = self.embd_src;
+            let mut row = vec![0f32; 2304];
+            let rc = unsafe { inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row.as_mut_ptr(), 2304) };
+            assert_eq!(rc, 0, "dequant embd row");
+            unsafe { t::set(self.embd_row, row.as_ptr().cast(), 0, 2304 * 4) };
+        }
+        let mut cur = self.embd_row;
         let _ = ids;
         self.dump("embd_raw", cur);
-        // static-slice alternative to get_rows (debug)
-        let nb1 = t::nb(self.tok_embd, 1);
-        let alt = t::cont(c, t::view2(c, self.tok_embd, n_embd, 1, nb1, 371 * nb1));
-        self.dump("embd_view371", alt);
-        { let mut iv=[0i32;1]; unsafe { t::get(ids, iv.as_mut_ptr().cast(), 0, 4) }; eprintln!("DBG ids={:?}", iv); }
-        { let mut rv=[0f32;2304]; unsafe { t::get(self.tok_embd, rv.as_mut_ptr().cast(), 371*2304*4, 2304*4) };
-          eprintln!("DBG embd_row371 sum={} first3={:?}", rv.iter().sum::<f32>(), &rv[..3]); }
         cur = self.norm(cur, self.tok_norm);
         self.dump("embd0", cur);
 

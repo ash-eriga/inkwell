@@ -167,3 +167,10 @@ int ink_dequant(int type, const void* src, float* dst, int64_t nelems) {
     return 0;
 }
 } // extern "C"
+
+extern "C" ggml_tensor* ink_custom_4d(ggml_context* c, int type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+                           ggml_tensor** args, int n_args, ggml_custom_op_t fun, void* userdata) {
+    return ggml_custom_4d(c, (ggml_type)type, ne0, ne1, ne2, ne3, args, n_args, fun, 1, userdata);
+}
+extern "C" void* ink_tensor_data(ggml_tensor* t) { return t->data; }
+extern "C" ggml_tensor* ink_tensor_src(ggml_tensor* t, int i) { return t->src[i]; }
