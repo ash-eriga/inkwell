@@ -1,6 +1,14 @@
 # E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
 Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
 
+## Round 6: q8_0 pair-load revert
+
+- Pair-of-blocks u32 repack for dense q8_0_i8: correct repack verified by hand, but
+  accumulation-order change drifts logits ~0.4% -> flips a borderline token
+  (Chinese golden -> Vietnamese variant). REVERTED; needs a dedicated CPU-vs-kernel
+  gold test (like GOLD_ATTN) before any accumulation-order change.
+- Lesson: golden text is sensitive to fp reorder — bench maxdiff alone insufficient.
+
 ## Round 5: fused decode attention
 
 - inkwell_attn_decode: 1 block/head (24), warp-per-kv-pos scores, smem softmax with
