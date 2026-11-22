@@ -21,8 +21,10 @@ extern "C" {
     pub fn ink_view_1d(c: *mut c_void, a: *mut c_void, n: i64, off: i64) -> *mut c_void;
     pub fn ink_view_2d(c: *mut c_void, a: *mut c_void, n0: i64, n1: i64, rs: i64, off: i64) -> *mut c_void;
     pub fn ink_view_3d(c: *mut c_void, a: *mut c_void, n0: i64, n1: i64, n2: i64, s1: i64, s2: i64, off: i64) -> *mut c_void;
+    pub fn ink_view_4d(c: *mut c_void, a: *mut c_void, n0: i64, n1: i64, n2: i64, n3: i64, s1: i64, s2: i64, s3: i64, off: i64) -> *mut c_void;
     pub fn ink_set_name(t: *mut c_void, name: *const c_char) -> *mut c_void;
     pub fn ink_set_output(t: *mut c_void);
+    pub fn ink_set_input(t: *mut c_void);
     pub fn ink_mul_mat(c: *mut c_void, a: *mut c_void, b: *mut c_void) -> *mut c_void;
     pub fn ink_mul(c: *mut c_void, a: *mut c_void, b: *mut c_void) -> *mut c_void;
     pub fn ink_add(c: *mut c_void, a: *mut c_void, b: *mut c_void) -> *mut c_void;
@@ -54,6 +56,7 @@ extern "C" {
     pub fn ink_fill(c: *mut c_void, a: *mut c_void, v: f32) -> *mut c_void;
     pub fn ink_sum_rows(c: *mut c_void, a: *mut c_void) -> *mut c_void;
     pub fn ink_cast(c: *mut c_void, a: *mut c_void, ty: c_int) -> *mut c_void;
+    pub fn ink_dequant(ty: c_int, src: *const c_void, dst: *mut f32, nelems: i64) -> c_int;
     pub fn ink_flash_attn_ext(c: *mut c_void, q: *mut c_void, k: *mut c_void, v: *mut c_void, mask: *mut c_void, scale: f32, mb: f32, lsc: f32) -> *mut c_void;
     pub fn ink_flash_attn_ext_add_sinks(t: *mut c_void, sinks: *mut c_void);
     pub fn ink_flash_attn_ext_set_n_kv_max(t: *mut c_void, n: i32);
@@ -70,6 +73,7 @@ extern "C" {
     pub fn ink_sched_new(backends: *mut *mut c_void, bufts: *mut *mut c_void, n: c_int, graph_size: usize) -> *mut c_void;
     pub fn ink_sched_set_tensor_backend(s: *mut c_void, t: *mut c_void, b: *mut c_void);
     pub fn ink_sched_compute(s: *mut c_void, g: *mut c_void) -> c_int;
+    pub fn ink_sched_reset(s: *mut c_void);
     pub fn ink_alloc_ctx_tensors_buft(c: *mut c_void, buft: *mut c_void) -> *mut c_void;
     pub fn ink_alloc_ctx_tensors(c: *mut c_void, b: *mut c_void) -> *mut c_void;
     pub fn ink_cuda_buft(dev: c_int) -> *mut c_void;
@@ -77,12 +81,14 @@ extern "C" {
     pub fn ink_cuda_host_buft() -> *mut c_void;
     pub fn ink_buf_alloc(buft: *mut c_void, bytes: usize) -> *mut c_void;
     pub fn ink_buf_base(b: *mut c_void) -> *mut c_void;
+    pub fn ink_buf_set_usage(b: *mut c_void, usage: i32);
+    pub fn ink_tensor_debug(t: *mut c_void) -> i32;
     pub fn ink_buf_set(b: *mut c_void, off: usize, src: *const c_void, n: usize);
     pub fn ink_tensor_set(t: *mut c_void, src: *const c_void, off: usize, n: usize);
     pub fn ink_tensor_get(t: *mut c_void, dst: *mut c_void, off: usize, n: usize);
     pub fn ink_tensor_assign(t: *mut c_void, buf: *mut c_void, off: usize);
     pub fn ink_gallocr(buft: *mut c_void) -> *mut c_void;
-    pub fn ink_graph_new(c: *mut c_void) -> *mut c_void;
+    pub fn ink_graph_new(c: *mut c_void, size: i64) -> *mut c_void;
     pub fn ink_build_forward(g: *mut c_void, out: *mut c_void);
     pub fn ink_alloc_graph(galloc: *mut c_void, g: *mut c_void) -> bool;
     pub fn ink_compute(backend: *mut c_void, g: *mut c_void) -> c_int;
@@ -118,7 +124,7 @@ pub fn smoke() -> Vec<f32> {
         let y = ink_rms_norm(ctx, x_t, 1e-6);
         let out = ink_mul(ctx, y, w_t);
         ink_set_output(out);
-        let g = ink_graph_new(ctx);
+        let g = ink_graph_new(ctx, 2048);
         ink_build_forward(g, out);
         let galloc = ink_gallocr(buft);
         assert!(ink_alloc_graph(galloc, g), "alloc graph");

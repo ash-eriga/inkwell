@@ -18,5 +18,6 @@ inkwell-sampler = { path = "../crates/inkwell-sampler" }
 inkwell-graph = { path = "../crates/inkwell-graph" }
 inkwell-spec = { path = "../crates/inkwell-spec" }
 
+inkwell-run = { path = "../crates/inkwell-run" }
 [lints]
 workspace = true

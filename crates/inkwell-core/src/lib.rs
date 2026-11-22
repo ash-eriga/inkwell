@@ -5,7 +5,7 @@
 use inkwell_gguf::{GgufFile, MetaValue};
 
 /// Static config of an `inkling2_loop` checkpoint, read from GGUF metadata.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InklingConfig {
     /// logical layers (24)
     pub n_layer: u32,

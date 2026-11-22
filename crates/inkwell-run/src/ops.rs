@@ -68,7 +68,7 @@ impl Rt {
     /// New graph.
     #[must_use]
     pub fn graph(&self) -> Ptr {
-        Ptr(unsafe { inkwell_ggml::ink_graph_new(self.ctx.0) })
+        Ptr(unsafe { inkwell_ggml::ink_graph_new(self.ctx.0, 32768) })
     }
 
     /// Alloc + compute a graph.
@@ -100,7 +100,8 @@ impl Drop for Rt {
 
 /// A ggml buffer (device or host-pinned).
 #[derive(Debug)]
-pub struct Buf(Ptr);
+#[derive(Clone, Copy)]
+pub struct Buf(pub Ptr);
 
 impl Buf {
     /// Point `t`'s data at `self[offset..]`.
@@ -258,6 +259,9 @@ pub mod t {
     #[must_use]
     pub fn view3(c: Ptr, a: Ptr, n0: i64, n1: i64, n2: i64, s1: i64, s2: i64, off: i64) -> Ptr {
         Ptr(unsafe { inkwell_ggml::ink_view_3d(c.0, a.0, n0, n1, n2, s1, s2, off) })
+    }
+    pub fn view4(c: Ptr, a: Ptr, n0: i64, n1: i64, n2: i64, n3: i64, s1: i64, s2: i64, s3: i64, off: i64) -> Ptr {
+        Ptr(unsafe { inkwell_ggml::ink_view_4d(c.0, a.0, n0, n1, n2, n3, s1, s2, s3, off) })
     }
     /// pad: [p0 p1 p2 p3] extra elements per dim.
     #[must_use]

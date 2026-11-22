@@ -12,7 +12,7 @@ extern "C" {
 
 ggml_context* ink_ctx_new() {
     ggml_init_params p = { GGML_DEFAULT_N_THREADS*0 + 1u<<20, nullptr, true };
-    p.mem_size = (size_t)4 << 20;
+    p.mem_size = (size_t)64 << 20;
     p.mem_buffer = nullptr;
     p.no_alloc = true;
     return ggml_init(p);
@@ -38,8 +38,14 @@ ggml_tensor* ink_view_3d(ggml_context* c, ggml_tensor* a, int64_t n0, int64_t n1
                          int64_t s1, int64_t s2, int64_t off) {
     return ggml_view_3d(c, a, n0, n1, n2, s1, s2, off);
 }
+
+ggml_tensor* ink_view_4d(ggml_context* c, ggml_tensor* a, int64_t n0, int64_t n1, int64_t n2, int64_t n3,
+                         int64_t s1, int64_t s2, int64_t s3, int64_t off) {
+    return ggml_view_4d(c, a, n0, n1, n2, n3, s1, s2, s3, off);
+}
 ggml_tensor* ink_set_name(ggml_tensor* t, const char* name) { ggml_set_name(t, name); return t; }
 void ink_set_output(ggml_tensor* t) { ggml_set_output(t); }
+void ink_set_input(ggml_tensor* t) { t->flags |= GGML_TENSOR_FLAG_INPUT; }
 
 // ---- ops ----
 ggml_tensor* ink_mul_mat(ggml_context* c, ggml_tensor* a, ggml_tensor* b) { return ggml_mul_mat(c, a, b); }
@@ -99,6 +105,13 @@ ggml_backend_buffer_t ink_buf_alloc(ggml_backend_buffer_type_t buft, size_t byte
     return ggml_backend_buft_alloc_buffer(buft, bytes);
 }
 void* ink_buf_base(ggml_backend_buffer_t b) { return ggml_backend_buffer_get_base(b); }
+int ink_tensor_debug(ggml_tensor* t) {
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    fprintf(stderr, "TDBG op=%d view_src=%p buf=%p data=%p flags=%d\n",
+        (int)t->op, (void*)t->view_src, (void*)buf, t->data, (int)t->flags);
+    return (int)t->op;
+}
+void ink_buf_set_usage(ggml_backend_buffer_t b, int usage) { ggml_backend_buffer_set_usage(b, (enum ggml_backend_buffer_usage)usage); }
 void ink_buf_set(ggml_backend_buffer_t b, size_t off, const void* src, size_t n) {
     ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     // write via tensor-less path: ggml buffers don't expose set; use cudaMemcpy via tensor set instead
@@ -115,7 +128,7 @@ void ink_tensor_assign(ggml_tensor* t, ggml_backend_buffer_t buf, size_t off) {
     t->data = (char*)ggml_backend_buffer_get_base(buf) + off;
 }
 ggml_gallocr_t ink_gallocr(ggml_backend_buffer_type_t buft) { return ggml_gallocr_new(buft); }
-ggml_cgraph* ink_graph_new(ggml_context* c) { return ggml_new_graph(c); }
+ggml_cgraph* ink_graph_new(ggml_context* c, int64_t size) { return ggml_new_graph_custom(c, size, false); }
 void ink_build_forward(ggml_cgraph* g, ggml_tensor* out) { ggml_build_forward_expand(g, out); }
 bool ink_alloc_graph(ggml_gallocr_t galloc, ggml_cgraph* g) { return ggml_gallocr_alloc_graph(galloc, g); }
 int ink_compute(ggml_backend_t backend, ggml_cgraph* g) { return (int)ggml_backend_graph_compute(backend, g); }
@@ -136,6 +149,7 @@ ggml_backend_sched_t ink_sched_new(ggml_backend_t* backends, ggml_backend_buffer
 void ink_sched_set_tensor_backend(ggml_backend_sched_t s, ggml_tensor* t, ggml_backend_t b) {
     ggml_backend_sched_set_tensor_backend(s, t, b);
 }
+void ink_sched_reset(ggml_backend_sched_t s) { ggml_backend_sched_reset(s); }
 int ink_sched_compute(ggml_backend_sched_t s, ggml_cgraph* g) {
     return (int)ggml_backend_sched_graph_compute(s, g);
 }
@@ -144,5 +158,12 @@ ggml_backend_buffer_t ink_alloc_ctx_tensors_buft(ggml_context* c, ggml_backend_b
 }
 ggml_backend_buffer_t ink_alloc_ctx_tensors(ggml_context* c, ggml_backend_t b) {
     return ggml_backend_alloc_ctx_tensors(c, b);
+}
+// dequantize `nelems` of `type` from src into dst (f32); returns 0 ok, -1 no traits
+int ink_dequant(int type, const void* src, float* dst, int64_t nelems) {
+    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type)type);
+    if (!tt || !tt->to_float) return -1;
+    tt->to_float(src, dst, nelems);
+    return 0;
 }
 } // extern "C"

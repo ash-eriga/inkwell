@@ -24,6 +24,18 @@ fn main() {
         total / 1_048_576
     );
 
+    if let Some("--run") = args.next().as_deref() {
+        // deep ggml graphs (48 visits) overflow the default 8MB stack in
+        // ggml_build_forward_expand's recursive DFS — run on a big-stack thread
+        let cfg2 = cfg.clone();
+        std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(move || run_e2e(&g, &cfg2))
+            .expect("spawn")
+            .join()
+            .expect("run_e2e panicked");
+        return;
+    }
     if let Some("--types") = args.next().as_deref() {
         let mut census = std::collections::BTreeMap::new();
         for (name, t) in &g.tensors {
@@ -258,4 +270,54 @@ fn bench_spec() {
         let tps = tok_per_read * 10_000.0 / (325.0 * OVERLAP);
         println!("{k:>14} {acc:>14.1} {tok_per_read:>14.1} {tps:>12.1}");
     }
+}
+
+/// End-to-end decode: encode prompt tokens one at a time, then generate.
+fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig) {
+    use inkwell_run::runner::Runner;
+    use std::time::Instant;
+    let mut r = Runner::load(gg, cfg, 8192);
+    eprintln!("runner loaded");
+    // real prompt via our tokenizer (bit-identical to llama.cpp)
+    let mut ids = inkwell_tokenizer::Tokenizer::from_gguf(gg)
+        .expect("tokenizer")
+        .encode("The capital of France is");
+    // upstream adds no BOS for this model (add_bos=false)
+    let t0 = Instant::now();
+    let mut pos = 0i64;
+    let mut logits = Vec::new();
+    for &id in &ids[..ids.len() - 1] {
+        logits = r.step(id, pos);
+        pos += 1;
+    }
+    eprintln!("encode {} tok in {:?}", ids.len() - 1, t0.elapsed());
+    eprintln!("prompt-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]);
+    // last prompt token → first generated
+    let t1 = Instant::now();
+    let mut id = ids[ids.len() - 1];
+    let mut gen_ids = Vec::new();
+    for g in 0..8 {
+        logits = r.step(id, pos);
+        pos += 1;
+        let (best, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+        if g == 0 { eprintln!("gen0-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]); }
+        eprintln!("gen {g}: id={id} next={best} top5={:?}",
+            top(&logits, 5));
+        id = best as u32;
+        gen_ids.push(id);
+    }
+    let text = inkwell_tokenizer::Tokenizer::from_gguf(gg)
+        .expect("tokenizer")
+        .decode(&gen_ids)
+        .unwrap_or_else(|_| "<decode error>".into());
+    eprintln!("generated text: {text:?}");
+    eprintln!("decode 8 tok in {:?}", t1.elapsed());
+}
+
+fn top(l: &[f32], n: usize) -> Vec<(usize, f32)> {
+    let mut v: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
+    v.select_nth_unstable_by(n, |a, b| b.1.total_cmp(&a.1));
+    v.truncate(n);
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    v
 }
