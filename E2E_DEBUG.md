@@ -1,6 +1,15 @@
 # E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
 Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
 
+## Round 5: fused decode attention
+
+- inkwell_attn_decode: 1 block/head (24), warp-per-kv-pos scores, smem softmax with
+  sink term (BUG: sink was added per-thread -> 256x den; caught by GOLD_ATTN bench
+  CPU-vs-kernel test), fused V accumulate. ~16us/launch, replaces ~12 ops/visit
+  (kq GEMV, scale, bias add, sink concat, softmax, slice, V transpose+GEMV).
+- mmv_f launches dropped ~35k -> ~1.4k instances/run; attn path ~2.3ms vs ~8-9ms.
+- Remaining big: iq4_xs moe 4.84ms x68, gather warmup, q8_0/q2_0/iq2xxs/iq2_xs GEMVs.
+
 ## Round 4 (2026-11-22 night): i-quants all dp4a
 
 - iq2_xs i8 (+30-40%), iq2_s i8 (+50%) — same smask[256]+vsubss4 sign trick as iq2xxs_i8; per-32 x-quant. Defaults on; opt-outs INKWELL_IQ2XS_FP / INKWELL_IQ2S_FP / INKWELL_IQ2XXS_FP.
