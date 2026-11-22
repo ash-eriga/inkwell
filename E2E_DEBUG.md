@@ -90,3 +90,18 @@ Check: ggml-cpu type_traits_cpu[t].vec_dot_type for types 16,17,19,22,23,40,42;
 - Experts no CPU (mul_mat_id) = ~120ms dos ~180ms/tok. Split do grafo por visita p/ interpor kernels próprios custaria ~24 syncs — não vale sozinho.
 - Plano real p/ TPS: (1) pager com cache LRU de experts NA VRAM (pool ~3-4GB livre), H2D assíncrono no draft/prefill — sim do pager projeta ~40-60% hit. (2) spec decode ×~2.5. (3) batched MoE GEMV já pronto em kernels.cu.
 - Alternativa: host-mapped ggml buffer pros experts + mul_mat_id CUDA — ggml pode ler tensor de host-pinned em ALGUNS ops; verificar ggml_backend_cuda_host_buffer.
+
+## 2026-11-22 — beat upstream
+
+- decode ~6.6-6.7 tok/s sustained (148-152ms/token) vs upstream 6.15 — WON
+- pieces: VRAM LRU expert cache (Cache in moe.rs; k=75/layer ~3.2GiB, ~89.5% hit;
+  promote on 2nd use; misses read zero-copy from pinned host tables)
+- embd quantized host-side (row dequant per step into embd_row CPU tensor);
+  output.weight stays quantized (mul_mat mmvq path on CUDA) — freed ~3.3 GiB
+- kernels take `const void* const* Wp` per-slot pointer arrays; x_stride=0 gu / N_FF dn
+- headroom: keep >=1 GiB for ggml compute buffers (700MB OOMs)
+- debug envs: INKWELL_MOE_T (callback times + hits), INKWELL_MOE_DBG, INKWELL_MOE_DUMP, INKWELL_DUMP
+- NEXT: spec decode — basalt ~/basalt/src/models/inkling2/dspark.cpp (747 LOC) +
+  kernels/dspark.cu (722 LOC) is the reference impl of Inkling2's DSpark drafter
+  (Markov head + screen + recurrence, NVFP4 products/Q8_0 context proj, own cuda graphs).
+  inkwell-spec crate already has verify/rollback loop + ngram reference drafter.
