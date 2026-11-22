@@ -5,3 +5,11 @@
 {"ts":"2026-11-22T17:55:12-03:00","config":"baseline-iq2xxs","i":5,"decode_s":6.491402347,"ms_tok":101.4,"tok_s":9.86,"golden":"yes"}
 {"ts":"2026-11-22T17:55:43-03:00","config":"baseline-iq2xxs","i":6,"decode_s":6.65362226,"ms_tok":104.0,"tok_s":9.62,"golden":"yes"}
 {"ts":"2026-11-22T19:44:12-03:00","exp":"exl3_gemv_percol_fp16exact+staging","ms_tok":1171,"text":" the capital and capital in the","note":"cos=1.0/maxdiff=0.0000 gold; MoE ~1.03s/tok remains bottleneck (86ms/call, staged)"}
+{"ts":"2026-11-22T19:48:10-03:00","exp":"gemv_moe_percol","ms_tok":423,"text":" the capital and capital","note":"moe kernel atomicAdd->percol; 3.39s/8tok"}
+{"ts":"2026-11-22T19:51:19-03:00","exp":"mul1_fp32fma+smem_tile","ms_tok":211,"text":" the capital and capital in the","note":"moe call 11.8->3.3ms; hfma emulated on sm61"}
+{"ts":"2026-11-22T19:51:37-03:00","exp":"moe_skip_after_fma","ms_tok":84,"note":"non-moe now 84ms/tok; moe ~127ms/tok = 5.3ms/call"}
+{"ts":"2026-11-22T19:52:38-03:00","exp":"gemv_moe_64thr","ms_tok":197,"text":" the capital and capital in the","note":"stage 1.5ms+gemv 1.4ms/call; non-moe 84ms"}
+{"ts":"2026-11-22T19:53:12-03:00","exp":"gemv_dp4a_64thr","ms_tok":188,"text":" is s  capital ","note":"dense gemv 4-tile blocks too"}
+{"ts":"2026-11-22T19:53:40-03:00","exp":"margin_1050","ms_tok":143,"text":" is s ","note":"pinned 3609->3053MiB"}
+{"ts":"2026-11-22T19:57:52-03:00","exp":"CORRECTION","note":"decode-print covers n_gen tok: ms/tok=X/n_gen. real: ~216-280ms/tok (4-4.6t/s) vs gguf 104. prior entries /8 were wrong units"}
+{"ts":"2026-11-22T20:01:45-03:00","exp":"steady_state","ms_tok":222,"note":"GENS=8 1777ms; nsys: dense gemv 149ms/run dominant"}
