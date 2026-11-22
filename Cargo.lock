@@ -71,6 +71,10 @@ name = "inkwell-cuda"
 version = "0.1.0"
 
 [[package]]
+name = "inkwell-ggml"
+version = "0.1.0"
+
+[[package]]
 name = "inkwell-gguf"
 version = "0.1.0"
 dependencies = [
