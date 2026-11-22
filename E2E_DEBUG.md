@@ -116,3 +116,16 @@ Check: ggml-cpu type_traits_cpu[t].vec_dot_type for types 16,17,19,22,23,40,42;
 - Attention already batched (mul_mat over ne2/ne3 heads) — the 4170 mmvf launches/tok = batch-split nodes, not per-head calls.
 - FAILED experiment kept for reference: KV write `cont(permute)` → reshape elision caused a sticky crash even after revert (was actually the misaligned q2_0 u32 — untangle when retrying).
 - Next targets: concat/cpy swarm via fewer graph ops (mix states rebuild per call, ~600 CONCAT), clip 9→fewer ops, dn-expert low GB/s (q2_0 27, nvfp4 45).
+
+## 2026-11-22 — DP4A int8 family (commits 41e428e, ce952d4)
+
+- `mmvq_nvfp4_moe_i8` / `mmvq_q2_0_moe_i8`: x quantized to int8 per 64-val block
+  (per-block symmetric sx in smem), weights decode to int8 lanes → `__dp4a`.
+  nvfp4 +15-25%, q2_0 +43% @2304. ~0.05-0.1% logit noise (same class as q8_1).
+- GOTCHA: nvfp4 nibble packs are interleaved {qlo.lo, qhi.lo, qlo.hi, qhi.hi}
+  → vals {0-3,4-7,8-11,12-15}; wrong pack order = 4% logit error (caught by
+  bench golden vs fp kernel — ALWAYS bench-compare vs fp version).
+- iq1_s next: per-8-val group = 2 dp4a + delta*sum(x_i8) term (needs per-8 x
+  sums — precompute during quantize pass).
+- Remaining: iq1_s/iq2_xxs/iq2_xs/iq2_s/iq4_xs dp4a variants; swarm
+  cpy/concat (~30ms/tok); mix() states rebuild per call (~600 CONCAT/tok).
