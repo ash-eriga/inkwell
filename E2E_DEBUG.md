@@ -1,6 +1,15 @@
 # E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
 Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
 
+## Round 4 (2026-11-22 night): i-quants all dp4a
+
+- iq2_xs i8 (+30-40%), iq2_s i8 (+50%) — same smask[256]+vsubss4 sign trick as iq2xxs_i8; per-32 x-quant. Defaults on; opt-outs INKWELL_IQ2XS_FP / INKWELL_IQ2S_FP / INKWELL_IQ2XXS_FP.
+- 2-warps-per-row on i-quant i8 kernels REGRESSED (iq2s 0.336->0.382) — 1 warp/row kept.
+- iq1_s i8 remains rejected (-23%, delta-shift doesn't amortize).
+- kernels.cu got 8x self-concatenated during a failed write — restored from HEAD; watch for it.
+- mmv_f (~5.4ms/tok, ~600 launches) = manual attention mul_mats (K*Q, V*attn, rel_bias table) + mix() states F32 GEMVs — next structural target: fused decode-attention kernel (per visit) or route via ggml flash_attn_ext with mask=rel_bias + softcap mb/lsc params (ops.rs already wraps it).
+- decode ~95-100ms/tok contended; MoE i8 ~35ms, dense i8 ~13ms, mmv_f ~5.4, swarm ~6, rest attn/conv/misc.
+
 ## Round 3 (2026-11-22 night): real per-kernel split (nsys, graphs off, ~64 tok)
 
 | kernel | ms/tok | note |
