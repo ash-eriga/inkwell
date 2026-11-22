@@ -94,7 +94,7 @@ impl Cache {
                 unsafe { MISSES += 1 };
                 ptrs[s] = unsafe { host.add(e * self.esz) } as usize;
                 self.uses[e] = self.uses[e].saturating_add(1);
-                if self.uses[e] >= 2 { misses.push((s, e as i32)); }
+                if self.uses[e] >= 1 { misses.push((s, e as i32)); }
             }
         }
     }
