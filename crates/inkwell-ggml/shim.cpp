@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "ggml-cpu.h"
 #include <cstdio>
 #include <cstring>
 
@@ -123,4 +124,25 @@ size_t ink_tensor_nbytes(ggml_tensor* t) { return ggml_nbytes(t); }
 int64_t ink_ne(ggml_tensor* t, int i) { return t->ne[i]; }
 int64_t ink_nb(ggml_tensor* t, int i) { return t->nb[i]; }
 
+// ---- scheduler (cuda + cpu split for expert offload) ----
+ggml_backend_t ink_backend_cpu(int threads) {
+    ggml_backend_t b = ggml_backend_cpu_init();
+    if (threads > 0) ggml_backend_cpu_set_n_threads(b, threads);
+    return b;
+}
+ggml_backend_sched_t ink_sched_new(ggml_backend_t* backends, ggml_backend_buffer_type_t* bufts, int n, size_t graph_size) {
+    return ggml_backend_sched_new(backends, bufts, n, graph_size, false, true);
+}
+void ink_sched_set_tensor_backend(ggml_backend_sched_t s, ggml_tensor* t, ggml_backend_t b) {
+    ggml_backend_sched_set_tensor_backend(s, t, b);
+}
+int ink_sched_compute(ggml_backend_sched_t s, ggml_cgraph* g) {
+    return (int)ggml_backend_sched_graph_compute(s, g);
+}
+ggml_backend_buffer_t ink_alloc_ctx_tensors_buft(ggml_context* c, ggml_backend_buffer_type_t buft) {
+    return ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
+}
+ggml_backend_buffer_t ink_alloc_ctx_tensors(ggml_context* c, ggml_backend_t b) {
+    return ggml_backend_alloc_ctx_tensors(c, b);
+}
 } // extern "C"

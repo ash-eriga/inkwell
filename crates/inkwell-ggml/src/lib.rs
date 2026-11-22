@@ -66,6 +66,12 @@ extern "C" {
     pub fn ink_gelu_quick(c: *mut c_void, a: *mut c_void) -> *mut c_void;
     pub fn ink_add_id(c: *mut c_void, a: *mut c_void, b: *mut c_void, ids: *mut c_void) -> *mut c_void;
     pub fn ink_backend_cuda(dev: c_int) -> *mut c_void;
+    pub fn ink_backend_cpu(threads: c_int) -> *mut c_void;
+    pub fn ink_sched_new(backends: *mut *mut c_void, bufts: *mut *mut c_void, n: c_int, graph_size: usize) -> *mut c_void;
+    pub fn ink_sched_set_tensor_backend(s: *mut c_void, t: *mut c_void, b: *mut c_void);
+    pub fn ink_sched_compute(s: *mut c_void, g: *mut c_void) -> c_int;
+    pub fn ink_alloc_ctx_tensors_buft(c: *mut c_void, buft: *mut c_void) -> *mut c_void;
+    pub fn ink_alloc_ctx_tensors(c: *mut c_void, b: *mut c_void) -> *mut c_void;
     pub fn ink_cuda_buft(dev: c_int) -> *mut c_void;
     pub fn ink_cpu_buft() -> *mut c_void;
     pub fn ink_cuda_host_buft() -> *mut c_void;
