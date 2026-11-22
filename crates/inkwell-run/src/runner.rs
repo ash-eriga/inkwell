@@ -18,7 +18,7 @@ struct L {
     attn_norm: Option<Ptr>, attn_q_inp_norm: Option<Ptr>, attn_k_inp_norm: Option<Ptr>, attn_v_inp_norm: Option<Ptr>,
     attn_res_query: Option<Ptr>, ffn_res_query: Option<Ptr>,
     wq: Option<Ptr>, wk: Option<Ptr>, wv: Option<Ptr>, wo: Option<Ptr>,
-    attn_rel: Option<Ptr>, attn_rel_bias: Option<Ptr>, attn_rel_clip: Option<Ptr>, attn_q_clip: Option<Ptr>,
+    attn_rel: Option<Ptr>, attn_rel_bias: Option<Ptr>, attn_rel_bias_pad: Option<Ptr>, attn_rel_clip: Option<Ptr>, attn_q_clip: Option<Ptr>,
     attn_sink_proj: Option<Ptr>, wqkv_gate: Option<Ptr>,
     attn_k_conv: Option<Ptr>, attn_v_conv: Option<Ptr>, attn_post_conv: Option<Ptr>, ffn_post_conv: Option<Ptr>,
     attn_k_conv_proj: Option<Ptr>, attn_v_conv_proj: Option<Ptr>,
@@ -101,6 +101,7 @@ impl Runner {
             if !expert && !host_only { dev_bytes += nbytes as usize + 256; }
             plan.push((name, ti, expert, to_f32, host_only));
         }
+        dev_bytes += 8 << 20; // headroom for materialized views (padded rel_bias)
         let dev_buf = rt.buf(buft_dev, dev_bytes);
         let cpu_buf = rt.buf(buft_cpu, cpu_bytes);
         // mark as weight buffers: the scheduler runs matmuls on the backend
@@ -214,6 +215,23 @@ impl Runner {
                 wo: opt(&p("attn_output")),
                 attn_rel: opt(&p("attn_rel")),
                 attn_rel_bias: opt(&p("attn_rel_bias")),
+                attn_rel_bias_pad: opt(&p("attn_rel_bias")).map(|b| {
+                    // pad(b, 0,1,0,0) materialized once: appends a zero column [n0, n1+1]
+                    let n0 = t::ne(b, 0) as usize;
+                    let n1 = t::ne(b, 1) as usize;
+                    let esz = t::nbytes(b) / (n0 * n1);
+                    assert_eq!(esz, 4, "rel_bias not f32");
+                    let np = t::new(rt.ctx(), F32, &[n0 as i64, n1 as i64 + 1, 1, 1]);
+                    let o = (off_dev + 127) & !127;
+                    dev_buf.assign(np, o);
+                    let mut src = vec![0u8; n0 * n1 * esz];
+                    let mut dst = vec![0u8; n0 * (n1 + 1) * esz];
+                    unsafe { t::get(b, src.as_mut_ptr(), 0, src.len()) };
+                    dst[..n0 * n1 * esz].copy_from_slice(&src);
+                    unsafe { t::set(np, dst.as_ptr(), 0, dst.len()) };
+                    off_dev = o + t::nbytes(np);
+                    np
+                }),
                 attn_rel_clip: opt(&p("attn_rel_clip")),
                 attn_q_clip: opt(&p("attn_q_clip")),
                 attn_sink_proj: opt(&p("attn_sink_proj")),
@@ -492,7 +510,7 @@ impl Runner {
 
         // rel bias (upstream): table = mm(pad(rel_bias), r) - sinks; gather by distance
         let sinks = t::mul_mat(c, l.attn_sink_proj.expect("sink"), inputs[0]); // [nh, 1]
-        let table = t::mul_mat(c, t::pad(c, l.attn_rel_bias.expect("relbias"), 0, 1, 0, 0), r); // [ext+1, nh, 1]
+        let table = t::mul_mat(c, l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias"), r); // [ext+1, nh, 1]
         let table = t::sub(c, table, t::reshape3(c, sinks, 1, nh, 1));
         let table = t::cont(c, t::permute(c, table, 1, 0, 2, 3)); // [nh, ext+1, 1]
         let rel_pos = if is_swa { step.rel_pos_swa } else { step.rel_pos_full };
