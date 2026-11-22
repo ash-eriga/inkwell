@@ -13,6 +13,7 @@ inkwell-core = { path = "../crates/inkwell-core" }
 inkwell-tokenizer = { path = "../crates/inkwell-tokenizer" }
 inkwell-model = { path = "../crates/inkwell-model" }
 inkwell-kv = { path = "../crates/inkwell-kv" }
+inkwell-pager = { path = "../crates/inkwell-pager" }
 
 [lints]
 workspace = true

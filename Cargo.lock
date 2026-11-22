@@ -51,6 +51,7 @@ dependencies = [
  "inkwell-gguf",
  "inkwell-kv",
  "inkwell-model",
+ "inkwell-pager",
  "inkwell-tokenizer",
 ]
 
@@ -85,6 +86,14 @@ dependencies = [
  "inkwell-core",
  "inkwell-gguf",
  "thiserror",
+]
+
+[[package]]
+name = "inkwell-pager"
+version = "0.1.0"
+dependencies = [
+ "inkwell-core",
+ "inkwell-model",
 ]
 
 [[package]]

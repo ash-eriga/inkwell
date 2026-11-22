@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/inkwell-gguf", "crates/inkwell-core", "crates/inkwell-tokenizer", "crates/inkwell-model",
-    "crates/inkwell-kv", "inkwell-cli"]
+    "crates/inkwell-kv",
+    "crates/inkwell-pager", "inkwell-cli"]
 resolver = "2"
 
 
