@@ -1,6 +1,14 @@
 # E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
 Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
 
+## Round 6b: remaining levers ranked (nsys)
+
+- mmv_f residual = mix() states attention (states*queries -> softmax -> states^T*scores):
+  same shape as attn_decode (hd=2304, n_kv=n_blk, nh=1, no mask/sink). ~1.5ms/tok — low ROI.
+- q6_k_i8 dense 113us x114, q5_k_i8 99us x54 — biggest dense items; same
+  reorder-drift hazard as q8_0 pairs — need gold tests first.
+- MoE GEMVs remain the wall (~40ms); 2x needs megakernels (vetoed) or smaller quant.
+
 ## Round 6: q8_0 pair-load revert
 
 - Pair-of-blocks u32 repack for dense q8_0_i8: correct repack verified by hand, but
