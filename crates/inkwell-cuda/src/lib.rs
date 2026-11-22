@@ -32,6 +32,7 @@ extern "C" {
     fn ink_launch_mmvq_iq1_s(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xxs(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xxs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_xxs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q8_0_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -448,6 +449,12 @@ unsafe impl Sync for PinnedBuf {}
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xxs_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
     unsafe { ink_launch_mmvq_iq2_xxs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
+}
+
+/// int8-dp4a variant of [`mmvq_iq2_xxs_moe_async`]; async.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_xxs_moe_i8_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_xxs_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// Same as [`mmvq_q2_0_moe`] but does not synchronize; caller must sync.

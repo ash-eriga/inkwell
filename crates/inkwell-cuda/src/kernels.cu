@@ -784,7 +784,7 @@ extern "C" void ink_launch_mmvq_iq2_xxs_moe_i8(const void* const* Wp,
                                                const float* x, float* y, long long nrows, long long ncols,
                                                long long x_stride, int nslots, void* stream) {
     dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
-    inkwell_mmvq_iq2_xxs_moe_i8<<<g, 512, (size_t)ncols + (size_t)(ncols / 64) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    inkwell_mmvq_iq2_xxs_moe_i8<<<g, 1024, (size_t)ncols + (size_t)(ncols / 64) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 extern "C" void ink_launch_situ_pair(const float* gu, const float* sgu, float* hid,
                                      float beta, float lin_beta, long long ncols, long long nslots, void* stream) {
