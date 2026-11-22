@@ -1,9 +1,11 @@
-//! Dump attention pattern metadata for architecture inspection.
+//! Dump all architecture metadata keys.
 fn main() {
     let g = inkwell_gguf::GgufFile::open(std::env::args().nth(1).expect("path")).expect("gguf");
-    for (k, v) in &g.meta {
-        if k.contains("sliding") || k.contains("swa") {
-            println!("{k} = {v:?}");
+    let mut keys: Vec<_> = g.meta.keys().collect();
+    keys.sort();
+    for k in keys {
+        if k.starts_with("inkling") || k.starts_with("general") {
+            println!("{k} = {:?}", g.meta[k]);
         }
     }
 }

@@ -24,6 +24,10 @@ fn main() {
         total / 1_048_576
     );
 
+    if let Some("--graph") = args.next().as_deref() {
+        dump_graph(&cfg);
+        return;
+    }
     if let Some("--samplebench") = args.next().as_deref() {
         sample_bench(&cfg);
         return;
@@ -187,4 +191,38 @@ fn sample_bench(cfg: &inkwell_core::InklingConfig) {
     let t = Instant::now();
     for _ in 0..iters { acc += u64::from(g.sample(&logits, &mut rng)); }
     println!("greedy x{}: {:?}/sample [{acc}]", iters, t.elapsed() / u32::try_from(iters).unwrap_or(1));
+}
+
+fn dump_graph(cfg: &inkwell_core::InklingConfig) {
+    let sched = inkwell_graph::build_schedule(cfg);
+    let mut hist: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut total = 0usize;
+    for v in &sched.visits {
+        for op in &v.ops {
+            *hist.entry(op_name(op)).or_default() += 1;
+            total += 1;
+        }
+    }
+    println!("visits: {} | ops total: {}", sched.visits.len(), total);
+    let mut h: Vec<_> = hist.into_iter().collect();
+    h.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (n, c) in h { println!("  {n:>14}: {c}"); }
+    println!("per-visit ops: min {} max {}",
+        sched.visits.iter().map(|v| v.ops.len()).min().unwrap_or(0),
+        sched.visits.iter().map(|v| v.ops.len()).max().unwrap_or(0));
+}
+
+fn op_name(op: &inkwell_graph::Op) -> &'static str {
+    use inkwell_graph::Op::*;
+    match op {
+        Embed => "embed", LoopControl { .. } => "loop_ctrl",
+        DepthMix { .. } => "depth_mix", Norm { .. } => "norm", VNorm => "vnorm",
+        Proj { .. } => "proj", Clip { .. } => "clip",
+        ShortConv { .. } => "shortconv", TauScale => "tau",
+        RelBiasTable => "rel_bias", Attn { .. } => "attn",
+        GateMul { .. } => "gate", PushBlock => "push_blk",
+        Residual => "residual", MoeRoute => "moe_route",
+        MoeExperts => "moe_exps", LoopMessage => "loop_msg",
+        Head => "head",
+    }
 }

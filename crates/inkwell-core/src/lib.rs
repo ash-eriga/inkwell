@@ -47,6 +47,24 @@ pub struct InklingConfig {
     pub rel_clip: f32,
     /// 30.0
     pub softcap: f32,
+    /// layers between block-stack splits (6)
+    pub attn_res_block_size: u32,
+    /// SITU activation beta (4.0)
+    pub situ_beta: f32,
+    /// SITU linear beta (25.0)
+    pub situ_linear_beta: f32,
+    /// expert weight scale (8.0)
+    pub expert_weights_scale: f32,
+    /// log-position alpha for full-attn layers (0.1)
+    pub log_scale_alpha: f32,
+    /// log-position floor (8192)
+    pub log_scale_floor: u32,
+    /// shortconv kernel/state length (4)
+    pub sconv_l_cache: u32,
+    /// real vocab without padding (200058)
+    pub vocab_unpadded: u32,
+    /// rms norm epsilon (1e-6)
+    pub rms_eps: f32,
 }
 
 fn get<'a>(m: &'a std::collections::HashMap<String, MetaValue>, k: &str) -> &'a MetaValue {
@@ -104,6 +122,15 @@ impl InklingConfig {
             qk_clip: f32v(get(m, &k("attention.qk_clip"))),
             rel_clip: f32v(get(m, &k("attention.relative_clip"))),
             softcap: f32v(get(m, &k("final_logit_softcapping"))),
+            attn_res_block_size: u32v(get(m, &k("attn_res.block_size"))),
+            situ_beta: f32v(get(m, &k("activation.situ_beta"))),
+            situ_linear_beta: f32v(get(m, &k("activation.situ_linear_beta"))),
+            expert_weights_scale: f32v(get(m, &k("expert_weights_scale"))),
+            log_scale_alpha: f32v(get(m, &k("attention.log_scale_alpha"))),
+            log_scale_floor: u32v(get(m, &k("attention.log_scale_floor"))),
+            sconv_l_cache: u32v(get(m, &k("shortconv.l_cache"))),
+            vocab_unpadded: u32v(get(m, &k("vocab_size_unpadded"))),
+            rms_eps: f32v(get(m, &k("attention.layer_norm_rms_epsilon"))),
         }
     }
 

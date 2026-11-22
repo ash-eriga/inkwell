@@ -49,6 +49,7 @@ version = "0.1.0"
 dependencies = [
  "inkwell-core",
  "inkwell-gguf",
+ "inkwell-graph",
  "inkwell-kv",
  "inkwell-model",
  "inkwell-pager",
@@ -71,6 +72,13 @@ dependencies = [
  "bytemuck",
  "memmap2",
  "thiserror",
+]
+
+[[package]]
+name = "inkwell-graph"
+version = "0.1.0"
+dependencies = [
+ "inkwell-core",
 ]
 
 [[package]]
