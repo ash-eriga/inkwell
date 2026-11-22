@@ -460,9 +460,12 @@ __global__ void inkwell_mmvq_iq1_s_moe(const void* const* __restrict__ Wp, const
         grid32[0] = iq1s_grid_gpu[w[b].qs[4 * ib + il] | (((w[b].qh[ib] >> 3 * il) & 7) << 8)];
         grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
         grid32[0] &= 0x0f0f0f0f;
-        const float* xv = xs + g * 8;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) acc += d * (q[j] + delta) * xv[j];
+        const float4 xv0 = *(const float4*)(xs + g * 8);
+        const float4 xv1 = *(const float4*)(xs + g * 8 + 4);
+        acc += d * (q[0] + delta) * xv0.x + d * (q[1] + delta) * xv0.y
+             + d * (q[2] + delta) * xv0.z + d * (q[3] + delta) * xv0.w
+             + d * (q[4] + delta) * xv1.x + d * (q[5] + delta) * xv1.y
+             + d * (q[6] + delta) * xv1.z + d * (q[7] + delta) * xv1.w;
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if (lane == 0) atomicAdd(&y[slot * nrows + row], acc);
@@ -488,18 +491,21 @@ __global__ void inkwell_mmvq_nvfp4_moe(const void* const* __restrict__ Wp, const
         const float d = ue4m3_f(w[b].d[sub]);
         const uint32_t qlo = *(const uint32_t*)&w[b].qs[sub * 8];
         const uint32_t qhi = *(const uint32_t*)&w[b].qs[sub * 8 + 4];
-        const float* xv = xs + g * 16;
+        const float4 xv0 = *(const float4*)(xs + g * 16);
+        const float4 xv1 = *(const float4*)(xs + g * 16 + 4);
+        const float4 xv2 = *(const float4*)(xs + g * 16 + 8);
+        const float4 xv3 = *(const float4*)(xs + g * 16 + 12);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const uint8_t q = (qlo >> (8 * j)) & 0xFF;
-            acc += d * kvalues_fp4[q & 0x0F] * xv[j]
-                 + d * kvalues_fp4[q >> 4]   * xv[j + 8];
+            acc += d * kvalues_fp4[q & 0x0F] * (&xv0.x)[j]
+                 + d * kvalues_fp4[q >> 4]   * (&xv2.x)[j];
         }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const uint8_t q = (qhi >> (8 * j)) & 0xFF;
-            acc += d * kvalues_fp4[q & 0x0F] * xv[j + 4]
-                 + d * kvalues_fp4[q >> 4]   * xv[j + 12];
+            acc += d * kvalues_fp4[q & 0x0F] * (&xv1.x)[j]
+                 + d * kvalues_fp4[q >> 4]   * (&xv3.x)[j];
         }
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
@@ -881,14 +887,16 @@ __global__ void inkwell_mmvq_iq4_xs_moe(const void* const* __restrict__ Wp, cons
         const uint2 qb = *(const uint2*)&w[b].qs[ib * 16 + 8];
         const int ls = ((w[b].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xF) | (((w[b].scales_h >> (2 * ib)) & 3) << 4);
         const float dl = fp16_to_f32(w[b].d) * (ls - 32);
-        const float* xv = xs + u * 16;
+        const float4 xv[4] = {
+            *(const float4*)(xs + u * 16),      *(const float4*)(xs + u * 16 + 4),
+            *(const float4*)(xs + u * 16 + 8),  *(const float4*)(xs + u * 16 + 12)};
         const unsigned long long qs64[2] = {
             (unsigned long long)qa.x | ((unsigned long long)qa.y << 32),
             (unsigned long long)qb.x | ((unsigned long long)qb.y << 32)};
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             const int byte = (int)((qs64[j >> 3] >> (8 * (j & 7))) & 0xFF);
-            acc += dl * (float)kvalues_iq4nl[half ? (byte >> 4) : (byte & 0xF)] * xv[j];
+            acc += dl * (float)kvalues_iq4nl[half ? (byte >> 4) : (byte & 0xF)] * (&xv[j >> 2].x)[j & 3];
         }
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
@@ -939,10 +947,12 @@ __global__ void inkwell_mmvq_iq2_s_moe(const void* const* __restrict__ Wp, const
         const int gidx = w[b].qs[4 * ib32 + l] | ((w[b].qh[ib32] << (8 - 2 * l)) & 0x300);
         const uint8_t* grid = (const uint8_t*)(iq2s_grid + gidx);
         const uint8_t signs = w[b].qs[32 + 4 * ib32 + l];
-        const float* xv = xs + g * 8;
+        const float4 xv0 = *(const float4*)(xs + g * 8);
+        const float4 xv1 = *(const float4*)(xs + g * 8 + 4);
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-            acc += d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f) * xv[j];
+        for (int j = 0; j < 4; ++j)
+            acc += d * grid[j]     * ((signs & kmask_iq2xs[j])     ? -1.f : 1.f) * (&xv0.x)[j]
+               + d * grid[j + 4] * ((signs & kmask_iq2xs[j + 4]) ? -1.f : 1.f) * (&xv1.x)[j];
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if (lane == 0) atomicAdd(&y[slot * nrows + row], acc);
