@@ -27,3 +27,12 @@
 - REXL3 traz `mtp.safetensors` (drafter MTP: markov_rank 256, block_size 8, target layers 5/23/41/48) → spec decode nativo.
 - Ceiling: GGUF ~22 t/s @60GB/s efetivo; REXL3 ~33 t/s. Meta 15 t/s cabe nos dois; REXL3 domina em bytes × EAR (94.66% top-1 vs 90.6%).
 - Custo do porte: loader safetensors + kernels EXL3 trellis sm_61 (exllamav3 não suporta Pascal).
+
+## 2026-11-22 — graph reuse + VRAM experts (176 ms/tok)
+
+- CUDA-graph key era `nodes[0]` (fresh ptr/step → warmup nunca completava → eval eager, ~140ms CPU dispatch/tok). Key agora = FNV-1a sobre (op, type, src->data ptr, node->data ptr) + n_nodes; prop memcmp exclui src[]/view_src/name/userdata (CUSTOM). Warmup completa, replay ativo: eval=2ms, drain=140ms/tok.
+- Experts: reserve VRAM 1150→1050MiB; ~1GB de experts agora residentes. `on_dev` pula moe_stage; pinned layers ainda fazem stage PCIe (~50ms/tok restante).
+- gemv_dp4a split-K: 585→229ms/run.
+- gpu_kern_sum decode: gemv_moe ~640ms/run (56%), dp4a 229ms (20%), had_in/out ~60ms.
+- Regressões revertidas: __ldg sem shared (22s), warp-per-tile, TB=8 batching, moe split-K com memset.
+- Próximo: (a) INT8 xh + dp4a bytesum (mode-1 error-feedback) no inner loop; (b) predictor de experts pra prefetch do restante pinned; (c) fusão had_out+wsum.
