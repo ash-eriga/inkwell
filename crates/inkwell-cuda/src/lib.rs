@@ -24,6 +24,9 @@ extern "C" {
     fn ink_launch_mmvq_nvfp4(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq1_s(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xxs(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
+    fn ink_launch_mmvq_iq2_xxs_moe(w: *const c_void, ids: *const i32, row_bytes: i64, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_mmvq_q2_0_moe(w: *const c_void, ids: *const i32, row_bytes: i64, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_swiglu_pair(y: *mut f32, gu: *const f32, nslots: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn inkwell_rmsnorm_launch(x: *const f32, w: *const f32, y: *mut f32, n: i32, eps: f32);
     fn inkwell_clip_launch(x: *mut f32, scale: *const f32, dim: i32, rows: i32, thr: f32);
@@ -135,6 +138,37 @@ pub fn host_register_mapped_ro(host: &[u8]) -> *mut c_void {
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xxs_host(w: *mut c_void, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
     unsafe { ink_launch_mmvq_iq2_xxs(w, x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Batched expert GEMV: `y[slot][r] = dequant(W[ids[slot]][r,:]) . x`.
+/// `w` may be a device ptr or a `host_register_mapped*` host pointer.
+///
+/// # Safety
+/// `w` and `ids` must be device-accessible pointers.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_xxs_moe(w: *mut c_void, ids: &DevBuf, row_bytes: usize, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_iq2_xxs_moe(w, ids.ptr.cast(), row_bytes as i64, x.ptr, y.ptr, nrows as i64, ncols as i64, nslots as i32, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Batched expert GEMV for Q2_0 weights.
+///
+/// # Safety
+/// See [`mmvq_iq2_xxs_moe`].
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_q2_0_moe(w: *mut c_void, ids: &DevBuf, row_bytes: usize, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize, nslots: usize) {
+    unsafe { ink_launch_mmvq_q2_0_moe(w, ids.ptr.cast(), row_bytes as i64, x.ptr, y.ptr, nrows as i64, ncols as i64, nslots as i32, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Fused `silu(gate)*up` for gate_up pairs; `gu` = `[nslots][2*ncols]`.
+///
+/// # Panics
+/// On launch failure.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub fn swiglu_pair(y: &mut DevBuf, gu: &DevBuf, nslots: usize, ncols: usize) {
+    unsafe { ink_launch_swiglu_pair(y.ptr, gu.ptr, nslots as i64, ncols as i64, std::ptr::null_mut()) };
     DevBuf::sync();
 }
 
