@@ -719,7 +719,7 @@ impl Runner {
                 }
                 let (f_free, _) = inkwell_cuda::mem_info();
                 eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
-                let base = if (f_free as usize) > total + (1050usize << 20) {
+                let base = if (f_free as usize) > total + (1150usize << 20) {
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
                     blob.write_bytes(&host);
                     drop(host);

@@ -1674,11 +1674,9 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
             const uint32_t* rg = rings + g * 32;
 #pragma unroll
             for (int r = 0; r < 16; ++r) {
-                // invert the tile_perm map: i = f(r, c)
                 const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
                             | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                const uint32_t win = exl3_window(rg, i, ka, halfk);
-                s += xhs[r] * exl3_mul1(win); // fp16 hfma per element — spec-exact
+                s += xhs[r] * exl3_mul1(exl3_window(rg, i, ka, halfk));
             }
         }
         __syncthreads();
