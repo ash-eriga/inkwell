@@ -3,6 +3,7 @@ name = "inkwell-cuda"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
+links = "inkwell_cuda"
 
 [lints]
 workspace = true

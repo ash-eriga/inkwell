@@ -321,6 +321,21 @@ extern "C" void ink_launch_dequant_nvfp4(const void* vx, float* y, long long nbl
 // gate_up: w layout rows [ff=2*ne] per expert, y[2*ne] per expert.
 // gridDim.x = rows, gridDim.y = expert slot; w += slot*row_bytes via ids.
 
+__device__ __forceinline__ float unit_iq2xxs(const block_iq2_xxs* w, const float* __restrict__ xs, int g, int NU) {
+    const int b = g / 32, gb = g % 32, ib = gb / 4, il = gb % 4;
+    const uint16_t* q2 = w[b].qs + 4 * ib;
+    const uint8_t* aux8 = (const uint8_t*)q2;
+    const uint8_t* grid = (const uint8_t*)(iq2xxs_grid + aux8[il]);
+    const uint32_t aux32 = q2[2] | ((uint32_t)q2[3] << 16);
+    const float d = fp16_to_f32(w[b].d) * (0.5f + (aux32 >> 28)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+    float a = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        a += d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f) * xs[j * NU + g];
+    return a;
+}
+
 __global__ void inkwell_mmvq_iq2_xxs_moe(const void* const* __restrict__ Wp,
                                          const float* __restrict__ x,
                                          float* __restrict__ y,       // [nslots][nrows]
@@ -328,7 +343,8 @@ __global__ void inkwell_mmvq_iq2_xxs_moe(const void* const* __restrict__ Wp,
     const int slot = blockIdx.y;
     extern __shared__ float xs[];
     x += slot * x_stride;
-    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) xs[i] = x[i];
+    const int NU = (int)(ncols / 8) + 1;             // padded stride, kills bank conflicts
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) xs[(i & 7) * NU + (i >> 3)] = x[i];
     __syncthreads();
     const int lane = threadIdx.x & 31;
     const int64_t row = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -337,19 +353,7 @@ __global__ void inkwell_mmvq_iq2_xxs_moe(const void* const* __restrict__ Wp,
                              + row * (ncols / 256);
     const int ngroups = (int)(ncols / 8);
     float acc = 0.f;
-    for (int g = lane; g < ngroups; g += 32) {
-        const int b = g / 32, gb = g % 32, ib = gb / 4, il = gb % 4;
-        const uint16_t* q2 = w[b].qs + 4 * ib;
-        const uint8_t* aux8 = (const uint8_t*)q2;
-        const uint8_t* grid = (const uint8_t*)(iq2xxs_grid + aux8[il]);
-        const uint32_t aux32 = q2[2] | ((uint32_t)q2[3] << 16);
-        const float d = fp16_to_f32(w[b].d) * (0.5f + (aux32 >> 28)) * 0.25f;
-        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
-        const float* xv = xs + g * 8;
-#pragma unroll
-        for (int j = 0; j < 8; ++j)
-            acc += d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f) * xv[j];
-    }
+    for (int g = lane; g < ngroups; g += 32) acc += unit_iq2xxs(w, xs, g, NU);
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if (lane == 0) y[slot * nrows + row] = acc;
 }
@@ -398,14 +402,14 @@ __global__ void inkwell_swiglu_pair(float* __restrict__ y, const float* __restri
 extern "C" void ink_launch_mmvq_iq2_xxs_moe(const void* const* Wp,
                                             const float* x, float* y,
                                             long long nrows, long long ncols, long long x_stride, int nslots, void* stream) {
-    dim3 g((unsigned)((nrows + 3) / 4), (unsigned)nslots);
-    inkwell_mmvq_iq2_xxs_moe<<<g, 128, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_iq2_xxs_moe<<<g, 512, ((size_t)ncols + 8) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 extern "C" void ink_launch_mmvq_q2_0_moe(const void* const* Wp,
                                          const float* x, float* y,
                                          long long nrows, long long ncols, long long x_stride, int nslots, void* stream) {
-    dim3 g((unsigned)((nrows + 3) / 4), (unsigned)nslots);
-    inkwell_mmvq_q2_0_moe<<<g, 128, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_q2_0_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 extern "C" void ink_launch_swiglu_pair(float* y, const float* gu, long long nslots, long long ncols, void* stream) {
     int64_t n = nslots * ncols;
@@ -458,16 +462,26 @@ __global__ void inkwell_mmvq_nvfp4_moe(const void* const* __restrict__ Wp, const
     if (row >= nrows) return;
     const block_nvfp4* w = (const block_nvfp4*)((const uint8_t*)Wp[slot])
                            + row * (ncols / 64);
-    const int npairs = (int)(ncols / 2);
+    const int ngroups = (int)(ncols / 16);
     float acc = 0.f;
-    for (int p = lane; p < npairs; p += 32) {
-        const int b = p / 32, sub = (p % 32) / 8, j = p % 8;
-        // byte covers vals [sub*16 + j, sub*16 + j + 8]
+    for (int g = lane; g < ngroups; g += 32) {
+        const int b = g >> 2, sub = g & 3;
         const float d = ue4m3_to_f32(w[b].d[sub]);
-        const uint8_t q = w[b].qs[sub * 8 + j];
-        const float* xv = xs + b * 64 + sub * 16 + j;
-        acc += d * kvalues_fp4[q & 0x0F] * xv[0]
-             + d * kvalues_fp4[q >> 4]  * xv[8];
+        const uint32_t qlo = *(const uint32_t*)&w[b].qs[sub * 8];
+        const uint32_t qhi = *(const uint32_t*)&w[b].qs[sub * 8 + 4];
+        const float* xv = xs + g * 16;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t q = (qlo >> (8 * j)) & 0xFF;
+            acc += d * kvalues_fp4[q & 0x0F] * xv[j]
+                 + d * kvalues_fp4[q >> 4]   * xv[j + 8];
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t q = (qhi >> (8 * j)) & 0xFF;
+            acc += d * kvalues_fp4[q & 0x0F] * xv[j + 4]
+                 + d * kvalues_fp4[q >> 4]   * xv[j + 12];
+        }
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
     if (lane == 0) y[slot * nrows + row] = acc;
@@ -505,14 +519,14 @@ __global__ void inkwell_expert_wsum(const float* __restrict__ dn, const float* _
 extern "C" void ink_launch_mmvq_iq1_s_moe(const void* const* Wp,
                                           const float* x, float* y, long long nrows, long long ncols,
                                           long long x_stride, int nslots, void* stream) {
-    dim3 g((unsigned)((nrows + 3) / 4), (unsigned)nslots);
-    inkwell_mmvq_iq1_s_moe<<<g, 128, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_iq1_s_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 extern "C" void ink_launch_mmvq_nvfp4_moe(const void* const* Wp,
                                           const float* x, float* y, long long nrows, long long ncols,
                                           long long x_stride, int nslots, void* stream) {
-    dim3 g((unsigned)((nrows + 3) / 4), (unsigned)nslots);
-    inkwell_mmvq_nvfp4_moe<<<g, 128, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_nvfp4_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 extern "C" void ink_launch_situ_pair(const float* gu, const float* sgu, float* hid,
                                      float beta, float lin_beta, long long ncols, long long nslots, void* stream) {
@@ -613,14 +627,14 @@ extern "C" void ink_launch_mmvq_iq2_xs(const void* W, const float* x, float* y,
 extern "C" void ink_launch_mmvq_iq2_xs_moe(const void* const* Wp,
                                            const float* x, float* y, long long nrows, long long ncols,
                                            long long x_stride, int nslots, void* stream) {
-    dim3 g((unsigned)((nrows + 3) / 4), (unsigned)nslots);
-    inkwell_mmvq_iq2_xs_moe<<<g, 128, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_iq2_xs_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 extern "C" void ink_launch_mmvq_iq4_xs_moe(const void* const* Wp,
                                            const float* x, float* y, long long nrows, long long ncols,
                                            long long x_stride, int nslots, void* stream) {
-    dim3 g((unsigned)((nrows + 3) / 4), (unsigned)nslots);
-    inkwell_mmvq_iq4_xs_moe<<<g, 128, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_iq4_xs_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
 
 // ---------------- IQ2_S (82B/256): {u16 d; u8 qs[64]; u8 qh[8]; u8 scales[8]} --
@@ -660,6 +674,6 @@ __global__ void inkwell_mmvq_iq2_s_moe(const void* const* __restrict__ Wp, const
 extern "C" void ink_launch_mmvq_iq2_s_moe(const void* const* Wp,
                                           const float* x, float* y, long long nrows, long long ncols,
                                           long long x_stride, int nslots, void* stream) {
-    dim3 g((unsigned)((nrows + 3) / 4), (unsigned)nslots);
-    inkwell_mmvq_iq2_s_moe<<<g, 128, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+    dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
+    inkwell_mmvq_iq2_s_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
