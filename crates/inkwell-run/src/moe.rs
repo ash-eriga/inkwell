@@ -100,8 +100,10 @@ impl Cache {
     }
 
     /// Promote misses into VRAM (evict LRU); copies are stream-ordered.
-    fn promote(&mut self, misses: &[(usize, i32)], host: *mut u8) {
-        for &(_, e) in misses {
+    /// Re-points `ptrs` at the cache slot so this call's GEMV reads VRAM
+    /// instead of re-streaming the same expert over PCIe (halves miss traffic).
+    fn promote(&mut self, misses: &[(usize, i32)], host: *mut u8, ptrs: &mut [usize; N_SLOTS]) {
+        for &(s, e) in misses {
             if self.k() == 0 { break; }
             let e = e as usize;
             let (mut victim, mut oldest) = (0usize, u64::MAX);
@@ -118,6 +120,7 @@ impl Cache {
                     self.esz,
                 );
             }
+            ptrs[s] = unsafe { self.dev.dev_ptr().cast::<u8>().add(victim * self.esz) } as usize;
             self.map[e] = victim as i32;
             self.stamp += 1;
             self.lru[victim] = self.stamp;
@@ -210,11 +213,11 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
         let mut caches = a.caches.lock().expect("caches");
         if let Some((gc, dc)) = caches.as_mut() {
             gc.resolve(&ids_v, a.gu_host, &mut ptrs, &mut gu_misses);
+            gc.promote(&gu_misses, a.gu_host, &mut ptrs);
             gu_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
             dc.resolve(&ids_v, a.dn_host, &mut ptrs, &mut dn_misses);
+            dc.promote(&dn_misses, a.dn_host, &mut ptrs);
             dn_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
-            gc.promote(&gu_misses, a.gu_host);
-            dc.promote(&dn_misses, a.dn_host);
         } else {
             for (s, &e) in ids_v.iter().enumerate() {
                 ptrs[s] = unsafe { a.gu_host.add(e as usize * a.gu_stride) } as usize;

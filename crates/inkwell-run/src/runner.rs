@@ -176,7 +176,7 @@ impl Runner {
         let mut moe_pos: HashMap<usize, usize> = HashMap::new();
         // VRAM LRU expert cache: size from free VRAM after dense weights.
         let (vfree, _vtotal) = inkwell_cuda::mem_info();
-        let budget = vfree.saturating_sub(1 << 30).min(4 << 30); // ≤3 GiB, keep 1 GiB headroom
+        let budget = vfree.saturating_sub(1300 << 20); // fill free VRAM; headroom covers dev_buf (~840 MiB) + margin
         let budget_per_layer = budget / 24;
         for i in 0..24usize {
             let Some(&(gi, di, gs, ds)) = moe_w.get(&i) else { continue };
