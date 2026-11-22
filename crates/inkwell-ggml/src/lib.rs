@@ -76,6 +76,9 @@ extern "C" {
     pub fn ink_custom_4d(c: *mut c_void, ty: i32, ne0: i64, ne1: i64, ne2: i64, ne3: i64, args: *mut *mut c_void, n_args: i32, fun: usize, userdata: *mut c_void) -> *mut c_void;
     pub fn ink_tensor_data(t: *mut c_void) -> *mut c_void;
     pub fn ink_tensor_src(t: *mut c_void, i: i32) -> *mut c_void;
+    pub fn ink_tensor_ne(t: *mut c_void, i: i32) -> i64;
+    pub fn ink_tensor_nb(t: *mut c_void, i: i32) -> i64;
+    pub fn ink_tensor_type(t: *mut c_void) -> i32;
     pub fn ink_sched_set_tensor_backend(s: *mut c_void, t: *mut c_void, b: *mut c_void);
     pub fn ink_sched_compute(s: *mut c_void, g: *mut c_void) -> c_int;
     pub fn ink_sched_reset(s: *mut c_void);

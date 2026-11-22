@@ -194,7 +194,7 @@ impl Runner {
         let mut moe_pos: HashMap<usize, usize> = HashMap::new();
         // VRAM LRU expert cache: size from free VRAM after dense weights.
         let (vfree, _vtotal) = inkwell_cuda::mem_info();
-        let budget = vfree.saturating_sub(1400 << 20); // fill free VRAM; headroom covers dev_buf (~840 MiB) + margin
+        let budget = vfree.saturating_sub(1500 << 20); // fill free VRAM; headroom covers dev_buf (~840 MiB) + margin
         let budget_per_layer = budget / 24;
         for i in 0..24usize {
             let Some(&(gi, di, gs, ds)) = moe_w.get(&i) else { continue };
@@ -460,8 +460,8 @@ impl Runner {
         states = t::rms_norm(c, states, 1e-6);
         let n_rows = t::ne(query, 1);
         let queries = t::repeat(c, query, t::new(c, F32, &[n_embd, n_rows, 1]));
-        let scores = t::soft_max(c, t::mul_mat(c, states, queries), Ptr(std::ptr::null_mut()), 1.0 / (n_embd as f32).sqrt(), 0.0);
-        t::mul_mat(c, t::cont(c, t::transpose(c, states)), scores)
+        let scores = t::soft_max(c, t::mmq(c, states, queries), Ptr(std::ptr::null_mut()), 1.0 / (n_embd as f32).sqrt(), 0.0);
+        t::mmq(c, t::cont(c, t::transpose(c, states)), scores)
     }
 
     /// conv state: x rows [4, ch] = [past(3), cur]; shift-store last 3 into region.
@@ -509,9 +509,9 @@ impl Runner {
     fn control(&self, cur: Ptr, msg: Ptr, l: &L, ctrl: usize) -> Ptr {
         let c = self.cur_ctx;
         let gate = t::concat(c, t::rms_norm(c, cur, 1e-6), t::rms_norm(c, msg, 1e-6), 0);
-        let gate = t::mul_mat(c, l.ctrl_down[ctrl].expect("ctrl_down"), gate);
-        let gain = t::tanh(c, t::mul_mat(c, l.ctrl_gain[ctrl].expect("ctrl_gain"), gate));
-        let forget = t::tanh(c, t::mul_mat(c, l.ctrl_forget[ctrl].expect("ctrl_forget"), gate));
+        let gate = t::mmq(c, l.ctrl_down[ctrl].expect("ctrl_down"), gate);
+        let gain = t::tanh(c, t::mmq(c, l.ctrl_gain[ctrl].expect("ctrl_gain"), gate));
+        let forget = t::tanh(c, t::mmq(c, l.ctrl_forget[ctrl].expect("ctrl_forget"), gate));
         t::add(c, t::sub(c, cur, t::mul(c, forget, cur)), t::mul(c, gain, msg))
     }
 
@@ -554,10 +554,10 @@ impl Runner {
 
         // projections: concat {q,gate,rel} when types allowed it at load
         let (q, gate_lin, r_pre) = if let Some(cat) = l.proj0_cat {
-            let out = t::mul_mat(c, cat, inputs[0]);
+            let out = t::mmq(c, cat, inputs[0]);
             // ggml_view_1d offset is in BYTES in this fork — out is F32 (row idx * 4)
             let slice = |off: i64, n: i64, w: Option<Ptr>| {
-                if off >= 0 { t::view1(c, out, n, off * 4) } else { t::mul_mat(c, w.expect("proj"), inputs[0]) }
+                if off >= 0 { t::view1(c, out, n, off * 4) } else { t::mmq(c, w.expect("proj"), inputs[0]) }
             };
             (
                 slice(l.proj0_off[0], 3072, l.wq),
@@ -566,16 +566,16 @@ impl Runner {
             )
         } else {
             (
-                t::mul_mat(c, l.wq.expect("wq"), inputs[0]),
-                t::mul_mat(c, l.wqkv_gate.expect("gate"), inputs[0]),
-                t::mul_mat(c, l.attn_rel.expect("rel"), inputs[0]),
+                t::mmq(c, l.wq.expect("wq"), inputs[0]),
+                t::mmq(c, l.wqkv_gate.expect("gate"), inputs[0]),
+                t::mmq(c, l.attn_rel.expect("rel"), inputs[0]),
             )
         };
-        let k_dyn = if is_swa { None } else { Some(t::mul_mat(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
-        let v_dyn = if is_swa { None } else { Some(t::mul_mat(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
-        let k = self.convolve(t::mul_mat(c, l.wk.expect("wk"), inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores);
+        let k_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
+        let v_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
+        let k = self.convolve(t::mmq(c, l.wk.expect("wk"), inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores);
         let gqa = (hd * hkv) as i64;
-        let v = self.convolve(t::mul_mat(c, l.wv.expect("wv"), inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores);
+        let v = self.convolve(t::mmq(c, l.wv.expect("wv"), inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores);
         let r = r_pre;
         if il == 0 {
             self.dump("rel_raw", r); self.dump("inputs0", inputs[0]);
@@ -617,8 +617,8 @@ impl Runner {
         }
 
         // rel bias (upstream): table = mm(pad(rel_bias), r) - sinks; gather by distance
-        let sinks = t::mul_mat(c, l.attn_sink_proj.expect("sink"), inputs[0]); // [nh, 1]
-        let table = t::mul_mat(c, l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias"), r); // [ext+1, nh, 1]
+        let sinks = t::mmq(c, l.attn_sink_proj.expect("sink"), inputs[0]); // [nh, 1]
+        let table = t::mmq(c, l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias"), r); // [ext+1, nh, 1]
         let table = t::sub(c, table, t::reshape3(c, sinks, 1, nh, 1));
         let table = t::cont(c, t::permute(c, table, 1, 0, 2, 3)); // [nh, ext+1, 1]
         let rel_pos = if is_swa { step.rel_pos_swa } else { step.rel_pos_full };
@@ -630,7 +630,7 @@ impl Runner {
         // MHA (upstream non-FA path): kq = K^T Q -> [n_kv, 1, nh]
         let k_view = t::view3(c, k_upd, hd, n_kv, hkv, t::nb(k_upd, 1), t::nb(k_upd, 2), 0);
         let q3 = t::permute(c, q, 0, 2, 1, 3); // [hd, 1, nh]
-        let kq = t::scale(c, t::mul_mat(c, k_view, q3), 1.0 / (hd as f32).sqrt()); // [n_kv, 1, nh]
+        let kq = t::scale(c, t::mmq(c, k_view, q3), 1.0 / (hd as f32).sqrt()); // [n_kv, 1, nh]
         let kq = t::add(c, kq, kq_b);
         // zero-sink trick: append a zero logit column then slice it off post-softmax
         let sink0 = t::reshape4(c, step.sink_zero, 1, 1, nh, 1);
@@ -643,13 +643,13 @@ impl Runner {
         // weighted V: kqv = V^T @ attn -> [hd, 1, nh]
         let v_view = t::view3(c, v_upd, hd, n_kv, hkv, t::nb(v_upd, 1), t::nb(v_upd, 2), 0);
         let v_t = t::cont(c, t::transpose(c, v_view)); // [n_kv, hd, hkv]
-        let kqv = t::mul_mat(c, v_t, attn); // [hd, 1, nh]
+        let kqv = t::mmq(c, v_t, attn); // [hd, 1, nh]
         let out = t::reshape2(c, t::cont(c, kqv), hd * nh, 1);
 
         let mut cur = out;
         cur = t::mul(c, cur, t::sigmoid(c, gate_lin));
         if il == 0 { self.dump("kqv_out-0", out); }
-        cur = self.convolve(t::mul_mat(c, l.wo.expect("wo"), cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores);
+        cur = self.convolve(t::mmq(c, l.wo.expect("wo"), cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores);
 
         // residual / push block
         if ip % (self.cfg.attn_res_block_size as usize) == 0 {
@@ -668,7 +668,7 @@ impl Runner {
         fcur = self.norm(fcur, l.ffn_norm.expect("ffn_norm"));
 
         // MoE — sigmoid gating + bias select, fused gate_up, SITU
-        let logits = t::mul_mat(c, l.ffn_gate_inp.expect("g"), fcur); // [128, 1]
+        let logits = t::mmq(c, l.ffn_gate_inp.expect("g"), fcur); // [128, 1]
         let probs = t::sigmoid(c, logits);
         let sel = t::add(c, probs, l.ffn_exp_probs_b.expect("pb"));
         let ids = t::argsort_top_k(c, sel, 8); // [8, ntok]
@@ -878,7 +878,7 @@ impl Runner {
         self.dump("result_norm", cur);
         let own_head = self.out_head.is_some();
         if !own_head {
-            cur = t::mul_mat(c, self.output, cur);
+            cur = t::mmq(c, self.output, cur);
             if self.cfg.softcap != 0.0 {
                 let cap = self.cfg.softcap;
                 cur = t::scale(c, t::tanh(c, t::scale(c, cur, 1.0 / cap)), cap);
@@ -926,5 +926,24 @@ impl Runner {
         // release the cached split plan so the next step's graph gets re-allocated
         unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
         logits
+    }
+}
+
+/// `ggml_custom_op_t` for dense quantized GEMVs (Q8_0 → dp4a i8 path).
+/// src[0] = weight (quantized, device), src[1] = x (f32, device), dst = y.
+#[expect(clippy::cast_ptr_alignment)]
+pub fn dense_cb_addr() -> usize { dense_cb as usize }
+
+unsafe extern "C" fn dense_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe {
+        inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+        let w_t = inkwell_ggml::ink_tensor_src(dst, 0);
+        let x_t = inkwell_ggml::ink_tensor_src(dst, 1);
+        let w = inkwell_ggml::ink_tensor_data(w_t);
+        let x = inkwell_ggml::ink_tensor_data(x_t);
+        let y = inkwell_ggml::ink_tensor_data(dst).cast::<f32>();
+        let ncols = inkwell_ggml::ink_tensor_ne(w_t, 0) as usize;
+        let nrows = inkwell_ggml::ink_tensor_ne(w_t, 1) as usize;
+        inkwell_cuda::mmvq_q8_0_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols);
     }
 }

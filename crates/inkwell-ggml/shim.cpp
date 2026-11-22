@@ -184,3 +184,6 @@ extern "C" void ink_graph_op_counts(ggml_cgraph* g) {
         if (cnt[i]) fprintf(stderr, "OPCNT %s = %d\n", ggml_op_name((enum ggml_op)i), cnt[i]);
 }
 extern "C" int ink_is_contiguous(const ggml_tensor* t) { return ggml_is_contiguous(t) ? 1 : 0; }
+extern "C" int64_t ink_tensor_ne(ggml_tensor* t, int i) { return t->ne[i]; }
+extern "C" int64_t ink_tensor_nb(ggml_tensor* t, int i) { return t->nb[i]; }
+extern "C" int ink_tensor_type(ggml_tensor* t) { return (int)t->type; }

@@ -136,6 +136,21 @@ pub mod t {
         };
     }
     op2!(mul_mat, ink_mul_mat);
+    /// `mul_mat` fast-path: Q8_0 weights route to the dp4a i8 GEMV custom op;
+    /// everything else falls back to the ggml kernel.
+    #[must_use]
+    pub fn mmq(c: Ptr, w: Ptr, x: Ptr) -> Ptr {
+        unsafe {
+            if inkwell_ggml::ink_tensor_type(w.0) == 8 {
+                let nrows = inkwell_ggml::ink_tensor_ne(w.0, 1);
+                let mut args = [w.0, x.0];
+                Ptr(inkwell_ggml::ink_custom_4d(c.0, 0, nrows, 1, 1, 1,
+                    args.as_mut_ptr(), 2, crate::runner::dense_cb_addr(), std::ptr::null_mut()))
+            } else {
+                mul_mat(c, w, x)
+            }
+        }
+    }
     op2!(mul, ink_mul);
     op2!(add, ink_add);
     op2!(sub, ink_sub);

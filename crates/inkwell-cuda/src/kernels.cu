@@ -1054,3 +1054,121 @@ extern "C" void ink_launch_moe_gather(const int* missq,
     const unsigned long long* work, long long esz, unsigned long long* stats, void* stream) {
     inkwell_moe_gather<<<8, 512, 0, (cudaStream_t)stream>>>(missq, work, esz, stats);
 }
+
+struct block_q8_0 { uint16_t d; int8_t qs[32]; };
+
+// Dense GEMV for q8_0: x quantized to int8 per 32-val block (same class as
+// ggml's q8_1 x-quant), then 8 dp4a per weight block. 2 warps per row.
+__global__ void inkwell_mmvq_q8_0_moe_i8(const void* const* __restrict__ Wp,
+                                         const float* __restrict__ x,
+                                         float* __restrict__ y,
+                                         int64_t nrows, int64_t ncols, int64_t x_stride) {
+    const int slot = blockIdx.y;
+    extern __shared__ int8_t qx[];
+    float* sx = (float*)(qx + ncols);
+    x += slot * x_stride;
+    const int nblk = (int)(ncols / 32);
+    for (int b = (int)threadIdx.x >> 4; b < nblk; b += (int)(blockDim.x >> 4)) {
+        const int t = threadIdx.x & 15;
+        float m = 0.f;
+        for (int i = t; i < 32; i += 16) m = fmaxf(m, fabsf(x[b * 32 + i]));
+        for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (t == 0) sx[b] = m / 127.f;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) {
+        const float sc = sx[i >> 5];
+        qx[i] = (int8_t)(sc > 0.f ? (int)rintf(x[i] / sc) : 0);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int half = (threadIdx.x >> 5) & 1;
+    const int64_t row = (int64_t)blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
+    if (row >= nrows) return;
+    const block_q8_0* w = (const block_q8_0*)((const uint8_t*)Wp[slot]) + row * nblk;
+    float acc = 0.f;
+    for (int b = lane + half * 32; b < nblk; b += 64) {
+        // qs sits at offset 2 in the 34B block — not 4B-aligned: compose u32s
+        const uint32_t q[8] = {
+            (uint32_t)*(const uint16_t*)&w[b].qs[0]  | ((uint32_t)*(const uint16_t*)&w[b].qs[2]  << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[4]  | ((uint32_t)*(const uint16_t*)&w[b].qs[6]  << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[8]  | ((uint32_t)*(const uint16_t*)&w[b].qs[10] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[12] | ((uint32_t)*(const uint16_t*)&w[b].qs[14] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[16] | ((uint32_t)*(const uint16_t*)&w[b].qs[18] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[20] | ((uint32_t)*(const uint16_t*)&w[b].qs[22] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[24] | ((uint32_t)*(const uint16_t*)&w[b].qs[26] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[28] | ((uint32_t)*(const uint16_t*)&w[b].qs[30] << 16),
+        };
+        const uint32_t* xp = (const uint32_t*)(qx + b * 32);
+        int isum = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) isum = __dp4a((int)xp[j], (int)q[j], isum);
+        acc += fp16_to_f32(w[b].d) * sx[b] * (float)isum;
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) atomicAdd(&y[slot * nrows + row], acc);
+}
+
+
+// Dense variant: single weight tensor, no slot indirection.
+__global__ void inkwell_mmvq_q8_0_i8(const void* __restrict__ W,
+                                     const float* __restrict__ x,
+                                     float* __restrict__ y,
+                                     int64_t nrows, int64_t ncols) {
+    extern __shared__ int8_t qx[];
+    float* sx = (float*)(qx + ncols);
+    const int nblk = (int)(ncols / 32);
+    for (int b = (int)threadIdx.x >> 4; b < nblk; b += (int)(blockDim.x >> 4)) {
+        const int t = threadIdx.x & 15;
+        float m = 0.f;
+        for (int i = t; i < 32; i += 16) m = fmaxf(m, fabsf(x[b * 32 + i]));
+        for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (t == 0) sx[b] = m / 127.f;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) {
+        const float sc = sx[i >> 5];
+        qx[i] = (int8_t)(sc > 0.f ? (int)rintf(x[i] / sc) : 0);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int half = (threadIdx.x >> 5) & 1;
+    const int64_t row = (int64_t)blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
+    if (row >= nrows) return;
+    const block_q8_0* w = (const block_q8_0*)W + row * nblk;
+    float acc = 0.f;
+    for (int b = lane + half * 32; b < nblk; b += 64) {
+        const uint32_t q[8] = {
+            (uint32_t)*(const uint16_t*)&w[b].qs[0]  | ((uint32_t)*(const uint16_t*)&w[b].qs[2]  << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[4]  | ((uint32_t)*(const uint16_t*)&w[b].qs[6]  << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[8]  | ((uint32_t)*(const uint16_t*)&w[b].qs[10] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[12] | ((uint32_t)*(const uint16_t*)&w[b].qs[14] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[16] | ((uint32_t)*(const uint16_t*)&w[b].qs[18] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[20] | ((uint32_t)*(const uint16_t*)&w[b].qs[22] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[24] | ((uint32_t)*(const uint16_t*)&w[b].qs[26] << 16),
+            (uint32_t)*(const uint16_t*)&w[b].qs[28] | ((uint32_t)*(const uint16_t*)&w[b].qs[30] << 16),
+        };
+        const uint32_t* xp = (const uint32_t*)(qx + b * 32);
+        int isum = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) isum = __dp4a((int)xp[j], (int)q[j], isum);
+        acc += fp16_to_f32(w[b].d) * sx[b] * (float)isum;
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) atomicAdd(&y[row], acc);
+}
+extern "C" void ink_launch_mmvq_q8_0_i8(const void* W,
+                                        const float* x, float* y,
+                                        long long nrows, long long ncols, void* stream) {
+    dim3 g((unsigned)((nrows + 7) / 8));
+    cudaMemsetAsync(y, 0, (size_t)nrows * 4, (cudaStream_t)stream);
+    inkwell_mmvq_q8_0_i8<<<g, 512, ((size_t)ncols + 8) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+}
+
+extern "C" void ink_launch_mmvq_q8_0_moe_i8(const void* const* Wp,
+                                            const float* x, float* y,
+                                            long long nrows, long long ncols, long long x_stride, int nslots, void* stream) {
+    dim3 g((unsigned)((nrows + 7) / 8), (unsigned)nslots);
+    cudaMemsetAsync(y, 0, (size_t)nslots * nrows * 4, (cudaStream_t)stream);
+    inkwell_mmvq_q8_0_moe_i8<<<g, 512, ((size_t)ncols + 8) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
+}
