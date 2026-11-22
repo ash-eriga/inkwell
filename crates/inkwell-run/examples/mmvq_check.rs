@@ -50,5 +50,21 @@ fn main() {
         println!("{name}: {n}x{ncols} max_rel_diff={maxd:.3e}");
         assert!(maxd < 1e-3);
     }
+    // bench: expert GEMV from device-resident weights
+    let t = g.tensors.get("blk.5.ffn_gate_up_exps.weight").expect("t");
+    let (nrows, ncols) = (t.dims[1] as usize, t.dims[0] as usize);
+    let bpr = ncols / 256;
+    let raw = &g.mmap[(g.data_start + t.offset) as usize..(g.data_start + t.offset + (nrows * bpr * 66) as u64) as usize];
+    let mut wsrc = inkwell_cuda::DevBuf::new_bytes(raw.len());
+    wsrc.write_bytes(raw);
+    let mut xb = inkwell_cuda::DevBuf::new(ncols);
+    xb.write(&xs(ncols));
+    let mut yb = inkwell_cuda::DevBuf::new(nrows);
+    for _ in 0..3 { inkwell_cuda::mmvq_iq2_xxs(&wsrc, &xb, &mut yb, nrows, ncols) }
+    let t0 = std::time::Instant::now();
+    let iters = 50;
+    for _ in 0..iters { inkwell_cuda::mmvq_iq2_xxs(&wsrc, &xb, &mut yb, nrows, ncols) }
+    let dt = t0.elapsed() / iters;
+    println!("expert GEMV 2304x2304 IQ2_XXS: {:?} ({:.1} GB/s weight traffic)", dt, raw.len() as f64 / dt.as_secs_f64() / 1e9);
     println!("GEMV kernels: PASS");
 }

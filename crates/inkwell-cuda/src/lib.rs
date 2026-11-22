@@ -13,6 +13,8 @@ extern "C" {
     fn cudaGetDeviceCount(c: *mut i32) -> i32;
     fn cudaFree(p: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
+    fn cudaHostRegister(p: *mut c_void, bytes: usize, flags: u32) -> i32;
+    fn cudaHostGetDevicePointer(dst: *mut *mut c_void, src: *mut c_void, flags: u32) -> i32;
     fn cudaDeviceSynchronize() -> i32;
 }
 
@@ -93,6 +95,43 @@ pub fn mmvq_iq2_xxs(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols:
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn mmvq_q2_0(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
     unsafe { ink_launch_mmvq_q2_0(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Register host memory for zero-copy device access; returns a
+/// device-visible pointer. `flags` = `cudaHostRegisterMapped` (2).
+///
+/// # Panics
+/// On registration failure.
+#[must_use]
+pub fn host_register_mapped(host: &mut [u8]) -> *mut c_void {
+    assert_eq!(unsafe { cudaHostRegister(host.as_mut_ptr().cast(), host.len(), 2) }, 0, "cudaHostRegister");
+    let mut dptr = std::ptr::null_mut();
+    assert_eq!(unsafe { cudaHostGetDevicePointer(&raw mut dptr, host.as_mut_ptr().cast(), 0) }, 0);
+    dptr
+}
+
+/// Zero-copy mapping of read-only host memory (e.g. an mmap'd GGUF).
+///
+/// # Panics
+/// On registration failure.
+#[must_use]
+pub fn host_register_mapped_ro(host: &[u8]) -> *mut c_void {
+    let p = host.as_ptr() as *mut c_void; // const-cast: CUDA only reads
+    assert_eq!(unsafe { cudaHostRegister(p, host.len(), 2) }, 0, "cudaHostRegister");
+    let mut dptr = std::ptr::null_mut();
+    assert_eq!(unsafe { cudaHostGetDevicePointer(&raw mut dptr, p, 0) }, 0);
+    dptr
+}
+
+/// GEMV with weights read zero-copy from registered host memory.
+///
+/// # Safety
+/// `w` must be a device pointer from [`host_register_mapped`] covering
+/// `nrows` full rows of quant data.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn mmvq_iq2_xxs_host(w: *mut c_void, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
+    unsafe { ink_launch_mmvq_iq2_xxs(w, x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
     DevBuf::sync();
 }
 
