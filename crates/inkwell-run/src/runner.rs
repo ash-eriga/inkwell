@@ -750,7 +750,7 @@ impl Runner {
                 }
                 let (f_free, _) = inkwell_cuda::mem_info();
                 eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
-                let base = if (f_free as usize) > total + (1150usize << 20) {
+                let base = if (f_free as usize) > total + (1050usize << 20) {
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
                     blob.write_bytes(&host);
                     drop(host);
@@ -773,9 +773,11 @@ impl Runner {
                     unsafe { std::ptr::copy_nonoverlapping(descs[pi * 512..].as_ptr().cast::<u8>(), pb.host, 128 * 32) };
                     pb
                 };
+                let on_dev = f_free as usize > total + (1050usize << 20);
                 l.moe_exl3 = Some(moe_args_exl3.len());
                 moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
+                    on_dev,
                 }));
             }
             l.proj0_off = [-1; 3];

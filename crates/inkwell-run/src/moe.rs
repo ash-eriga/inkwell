@@ -282,6 +282,8 @@ pub struct MoeArgsExl3 {
     pub descs_u: cu::PinnedBuf,
     /// down_proj descriptors
     pub descs_d: cu::PinnedBuf,
+    /// descriptors already point into device memory — staging is a no-op
+    pub on_dev: bool,
 }
 
 /// `ggml_custom_op_t` for the EXL3 MoE path.
@@ -316,7 +318,8 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
             st.exl3_stage.lock().expect("stg").dev_ptr(),
             st.sdescs_g.lock().expect("sg").dev_ptr(),
             st.sdescs_u.lock().expect("su").dev_ptr(),
-            st.sdescs_d.lock().expect("sd").dev_ptr());
+            st.sdescs_d.lock().expect("sd").dev_ptr(),
+            a.on_dev);
     }
 }
 

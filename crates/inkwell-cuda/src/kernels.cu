@@ -1661,8 +1661,12 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     __shared__ float xhs[16];
     __shared__ uint32_t rings[4 * 80];
     const bool live = tn_i < tn;
+    // split-K: gridDim.y chunks over the tk dimension
+    const int tkc = (tk + gridDim.y - 1) / gridDim.y;
+    const int tk0 = blockIdx.y * tkc;
+    const int tk1 = min(tk0 + tkc, tk);
     float s = 0.f;
-    for (int tk_i = 0; tk_i < tk; ++tk_i) {
+    for (int tk_i = tk0; tk_i < tk1; ++tk_i) {
         if (threadIdx.x < 16) xhs[c] = xh[tk_i * 16 + c];
         if (live) {
             const uint32_t* ring = trel + (size_t)(tk_i * tn + tn_i) * (size_t)w;
@@ -1681,7 +1685,10 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
         }
         __syncthreads();
     }
-    if (live) t[tn_i * 16 + c] = s;
+    if (live) {
+        if (gridDim.y == 1) t[tn_i * 16 + c] = s;
+        else atomicAdd(&t[tn_i * 16 + c], s);
+    }
 }
 
 __global__ void inkwell_exl3_gemv_dp4a_dbg(const uint32_t* __restrict__ trel,
@@ -1724,7 +1731,13 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
     const int tk = (int)(k / 16), tn = (int)(n / 16);
     inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
         x, (const uint16_t*)suh, scratch /* xh */, (int)k);
-    inkwell_exl3_gemv_dp4a<<<(tn + 3) / 4, 64, 0, (cudaStream_t)stream>>>(
+    const int nb = (tn + 3) / 4;
+    // aim for ~256 blocks: split K when tn is small
+    int nky = 1;
+    while (nb * nky < 512 && nky * 16 <= tk) nky *= 2;
+    if (nky > 1) cudaMemsetAsync(scratch + k, 0, n * 4, (cudaStream_t)stream);
+    dim3 gsz((unsigned)nb, (unsigned)nky, 1);
+    inkwell_exl3_gemv_dp4a<<<gsz, 64, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
     inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
         scratch + k, (const uint16_t*)svh, y, (int)n);
@@ -1789,7 +1802,6 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     float s = 0.f;
     const bool live = tn_i < tn;
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
-        if (c < 16 && g == 0) {} // all threads share xhs; load once
         if (threadIdx.x < 16) xhs[c] = xh[slot * k + tk_i * 16 + c];
         if (live) {
             const uint32_t* ring = tile_base + (size_t)(tk_i * tn + tn_i) * (size_t)w;
@@ -1808,7 +1820,10 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
         }
         __syncthreads();
     }
-    if (live) t[slot * n + tn_i * 16 + c] = s;
+    if (live) {
+        if (gridDim.z == 1) t[slot * n + tn_i * 16 + c] = s;
+        else atomicAdd(&t[slot * n + tn_i * 16 + c], s);
+    }
 }
 
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
@@ -1883,21 +1898,24 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
                                     const int* ids, const float* x,
                                     float* xh, float* gu, float* hid, float* dn,
                                     const float* w, float* out, int nslots, void* stream,
-                                    void* staging, void* sdescs_g, void* sdescs_u, void* sdescs_d) {
+                                    void* staging, void* sdescs_g, void* sdescs_u, void* sdescs_d,
+                                    int on_dev) {
     const cudaStream_t st = (cudaStream_t)stream;
-    inkwell_exl3_moe_stage<<<nslots * 3, 256, 0, st>>>(
-        (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
-        ids, (uint8_t*)staging, (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
-    const uint64_t* G = (const uint64_t*)sdescs_g;
-    const uint64_t* U = (const uint64_t*)sdescs_u;
-    const uint64_t* D = (const uint64_t*)sdescs_d;
+    if (!on_dev) {
+        inkwell_exl3_moe_stage<<<nslots * 3, 256, 0, st>>>(
+            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+            ids, (uint8_t*)staging, (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
+    }
+    const uint64_t* G = on_dev ? (const uint64_t*)descs_g : (const uint64_t*)sdescs_g;
+    const uint64_t* U = on_dev ? (const uint64_t*)descs_u : (const uint64_t*)sdescs_u;
+    const uint64_t* D = on_dev ? (const uint64_t*)descs_d : (const uint64_t*)sdescs_d;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     // gate + up into gu[slot][0..1152] and gu[slot][1152..2304]
     for (int p = 0; p < 2; ++p) {
         const uint64_t* dd = p ? U : G;
         dim3 gin(KG / 128, nslots);
         inkwell_exl3_had_in_moe<<<gin, 128, 512, st>>>(dd, ids, x, xh, KG);
-        dim3 gg(NG / 64, nslots);
+        dim3 gg(NG / 64, nslots, 1);
         inkwell_exl3_gemv_moe<<<gg, 64, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
         dim3 gout(NG / 128, nslots);
         inkwell_exl3_had_out_moe<<<gout, 128, 512, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
@@ -1906,7 +1924,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     dim3 din(KD / 128, nslots);
     // KD=1152 not multiple of 128*? 1152/128=9 blocks
     inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
-    dim3 gd(ND / 64, nslots);
+    dim3 gd(ND / 64, nslots, 1);
     inkwell_exl3_gemv_moe<<<gd, 64, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
     dim3 dout(ND / 128, nslots);
     inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);

@@ -297,11 +297,18 @@ impl DevBuf {
     }
 
     pub fn read_bytes(&self, dst: &mut [u8]) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if std::env::var("INKWELL_MEMCPY_DEBUG").is_ok() {
+            eprintln!("MC read_bytes len={} n={}", dst.len(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
         let rc = unsafe { cudaMemcpy(dst.as_mut_ptr().cast(), self.ptr.cast::<std::ffi::c_void>(), dst.len(), 2) }; // DtoH
         assert_eq!(rc, 0, "cudaMemcpy DtoH");
     }
 
     pub fn write_bytes(&mut self, src: &[u8]) {
+        if std::env::var("INKWELL_MEMCPY_DEBUG").is_ok() {
+            eprintln!("MC write_bytes len={}", src.len());
+        }
         assert_eq!(unsafe { cudaMemcpy(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1) }, 0);
     }
 
@@ -310,6 +317,9 @@ impl DevBuf {
     /// # Panics
     /// On length mismatch or copy error.
     pub fn write(&mut self, src: &[f32]) {
+        if std::env::var("INKWELL_MEMCPY_DEBUG").is_ok() {
+            eprintln!("MC write len={}", src.len() * 4);
+        }
         assert_eq!(src.len(), self.len);
         assert_eq!(unsafe { cudaMemcpy(self.ptr.cast(), src.as_ptr().cast(), src.len() * 4, 1) }, 0);
     }
@@ -331,6 +341,9 @@ impl DevBuf {
     /// On copy error.
     #[must_use]
     pub fn read(&self) -> Vec<f32> {
+        if std::env::var("INKWELL_MEMCPY_DEBUG").is_ok() {
+            eprintln!("MC read len={}", self.len * 4);
+        }
         let mut v = vec![0.0f32; self.len];
         assert_eq!(unsafe { cudaMemcpy(v.as_mut_ptr().cast(), self.ptr.cast(), self.len * 4, 2) }, 0);
         v
@@ -676,7 +689,8 @@ pub unsafe fn conv_step_async(x_in: *const f32, state: *mut f32, region_off: i32
 pub unsafe fn exl3_moe_async(dg: *const c_void, du: *const c_void, dd: *const c_void,
     ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32,
     w: *const f32, out: *mut f32, nslots: i32,
-    staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void) {
+    staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void,
+    on_dev: bool) {
     unsafe { ink_launch_exl3_moe(dg, du, dd, ids, x, xh, gu, hid, dn, w, out, nslots, stream(), staging, sdescs_g, sdescs_u, sdescs_d) };
 }
 fn stream() -> *mut c_void { INK_STREAM.load(std::sync::atomic::Ordering::Relaxed) }
