@@ -38,6 +38,7 @@ extern "C" {
     fn ink_launch_mmvq_q8_0_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q8_0_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_q6_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
+    fn ink_launch_attn_decode(K: *const f32, V: *const f32, Q: *const f32, bias: *const f32, mask: *const f32, out: *mut f32, nh: i64, hkv: i64, n_kv: i64, hd: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_s_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q5_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
@@ -504,6 +505,14 @@ pub unsafe fn mmvq_iq2_xs_moe_i8_async(wp: *const c_void, x: *const c_void, y: &
 /// `wp`/`x`/`y` are device pointers.
 pub unsafe fn mmvq_iq2_s_moe_i8_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
     unsafe { ink_launch_mmvq_iq2_s_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
+}
+
+/// Fused decode attention (Pascal): scores+softmax+V-mul in one launch per head.
+/// # Safety
+/// All pointers are device pointers; strides are in elements.
+#[expect(clippy::too_many_arguments)]
+pub unsafe fn attn_decode_async(k: *const c_void, v: *const c_void, q: *const c_void, bias: *const c_void, mask: *const c_void, out: *mut f32, nh: i64, hkv: i64, n_kv: i64, hd: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32) {
+    unsafe { ink_launch_attn_decode(k.cast(), v.cast(), q.cast(), bias.cast(), mask.cast(), out, nh, hkv, n_kv, hd, k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, stream()) };
 }
 /// Single-tensor dense Q5_K GEMV (dp4a). Zeroes `y` internally.
 /// # Safety

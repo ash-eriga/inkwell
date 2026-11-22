@@ -1457,3 +1457,87 @@ extern "C" void ink_launch_mmvq_iq2_s_moe_i8(const void* const* Wp,
     dim3 g((unsigned)((nrows + 31) / 32), (unsigned)nslots);
     inkwell_mmvq_iq2_s_moe_i8<<<g, 1024, (size_t)ncols + (size_t)(ncols / 32) * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
+
+// ===== fused decode attention (Pascal-safe replacement for flash_attn_ext) =====
+// One block per query head. score[j] = scale * <q_h, K[hkv(h), j]> + bias[j + h*n_kv] + mask[j]
+// softmax over n_kv real positions plus an implicit zero-logit sink whose mask
+// entry is mask[n_kv]. out[h*hd + d] = sum_j attn[j] * V[hkv(h), j, d].
+__global__ void inkwell_attn_decode(const float* __restrict__ K, const float* __restrict__ V,
+                                    const float* __restrict__ Q, const float* __restrict__ bias,
+                                    const float* __restrict__ mask, float* __restrict__ out,
+                                    int nh, int hkv, int n_kv, int hd,
+                                    int k_s1, int k_s2, int v_s1, int v_s2,
+                                    int q_s2, int b_s2, float scale) {
+    extern __shared__ float sm[];
+    float* scores = sm;
+    float* qs = sm + n_kv;
+    __shared__ float red[32];
+    const int h = blockIdx.x;
+    const int hk = h / (nh / hkv);
+    const int lane = threadIdx.x & 31;
+    const int nw = blockDim.x >> 5;
+    const int w = threadIdx.x >> 5;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) qs[d] = Q[d + h * q_s2];
+    __syncthreads();
+    const float* Kh = K + hk * k_s2;
+    for (int j = w; j < n_kv; j += nw) {
+        const float* kj = Kh + j * k_s1;
+        float a = 0.f;
+        for (int d = lane; d < hd; d += 32) a += qs[d] * kj[d];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
+        if (lane == 0) scores[j] = a;
+    }
+    __syncthreads();
+    float m = -1e30f;
+    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        const float s = scores[j] * scale + bias[j + h * b_s2] + mask[j];
+        scores[j] = s;
+        m = fmaxf(m, s);
+    }
+    m = fmaxf(m, mask[n_kv]); // zero-logit sink with its mask entry
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) red[w] = m;
+    __syncthreads();
+    if (w == 0) {
+        float mm = -1e30f;
+        for (int i = lane; i < nw; i += 32) mm = fmaxf(mm, red[i]);
+        for (int o = 16; o > 0; o >>= 1) mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, o));
+        if (lane == 0) red[0] = mm;
+    }
+    __syncthreads();
+    const float mx = red[0];
+    float den = 0.f;
+    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        const float e = __expf(scores[j] - mx);
+        scores[j] = e;
+        den += e;
+    }
+    if (threadIdx.x == 0) den += __expf(mask[n_kv] - mx);
+    for (int o = 16; o > 0; o >>= 1) den += __shfl_xor_sync(0xffffffffu, den, o);
+    if (lane == 0) red[w] = den;
+    __syncthreads();
+    if (w == 0) {
+        float dd = 0.f;
+        for (int i = lane; i < nw; i += 32) dd += red[i];
+        for (int o = 16; o > 0; o >>= 1) dd += __shfl_xor_sync(0xffffffffu, dd, o);
+        if (lane == 0) red[0] = dd;
+    }
+    __syncthreads();
+    const float inv = 1.f / red[0];
+    const float* Vh = V + hk * v_s2;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float o = 0.f;
+        for (int j = 0; j < n_kv; ++j) o += scores[j] * Vh[j * v_s1 + d];
+        out[h * hd + d] = o * inv;
+    }
+}
+extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void* Q,
+                                       const void* bias, const void* mask, void* out,
+                                       long long nh, long long hkv, long long n_kv, long long hd,
+                                       long long k_s1, long long k_s2, long long v_s1, long long v_s2,
+                                       long long q_s2, long long b_s2, float scale, void* stream) {
+    inkwell_attn_decode<<<(unsigned)nh, 256, (size_t)(n_kv + hd) * 4, (cudaStream_t)stream>>>(
+        (const float*)K, (const float*)V, (const float*)Q, (const float*)bias,
+        (const float*)mask, (float*)out, (int)nh, (int)hkv, (int)n_kv, (int)hd,
+        (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+}

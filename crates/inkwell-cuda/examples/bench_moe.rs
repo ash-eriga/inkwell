@@ -17,6 +17,7 @@ extern "C" {
     fn ink_launch_mmvq_iq1_s_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
+    fn ink_launch_attn_decode(K: *const f32, V: *const f32, Q: *const f32, bias: *const f32, mask: *const f32, out: *mut f32, nh: i64, hkv: i64, n_kv: i64, hd: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_s_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -33,6 +34,7 @@ fn alloc(bytes: usize) -> *mut c_void {
 }
 
 fn main() {
+    if std::env::var("GOLD_ATTN").is_ok() { gold_attn(); return; }
     const NR: i64 = 2304; // gu rows (2*ff) and down rows = embd
     const NC: i64 = 2304; // max cols (down=1152 also tested)
     const NS: i32 = 8;
@@ -158,3 +160,59 @@ fn main() {
         }
     }
 }
+
+fn gold_attn() {
+    let (nh, hkv, n_kv, hd) = (24i64, 8i64, 192i64, 128i64);
+    let k: Vec<f32> = (0..hd * n_kv * hkv).map(|i| ((i * 7) % 13) as f32 * 0.01 - 0.06).collect();
+    let v: Vec<f32> = (0..hd * n_kv * hkv).map(|i| ((i * 11) % 17) as f32 * 0.01 - 0.05).collect();
+    let q: Vec<f32> = (0..hd * nh).map(|i| ((i * 5) % 19) as f32 * 0.01 - 0.05).collect();
+    let bias: Vec<f32> = (0..n_kv * nh).map(|i| ((i * 3) % 23) as f32 * 0.001 - 0.01).collect();
+    let mask: Vec<f32> = (0..=n_kv).map(|j| if j < n_kv / 2 || j == n_kv { 0.0 } else { f32::NEG_INFINITY }).collect();
+    let mut out = vec![0f32; (hd * nh) as usize];
+    unsafe {
+        let up = |d: &Vec<f32>| -> *mut c_void {
+            let mut p: *mut c_void = std::ptr::null_mut();
+            assert_eq!(cudaMalloc(&raw mut p, d.len() * 4), 0);
+            cudaMemcpy(p, d.as_ptr().cast(), d.len() * 4, 1);
+            p
+        };
+        let dk = up(&k); let dv = up(&v); let dq = up(&q); let db = up(&bias); let dm = up(&mask);
+        let mut do_: *mut c_void = std::ptr::null_mut();
+        assert_eq!(cudaMalloc(&raw mut do_, (hd * nh * 4) as usize), 0);
+        ink_launch_attn_decode(dk.cast(), dv.cast(), dq.cast(), db.cast(), dm.cast(), do_.cast(),
+            nh, hkv, n_kv, hd, hd, hd * n_kv, hd, hd * n_kv, hd, n_kv, 1.0 / (hd as f32).sqrt(), std::ptr::null_mut());
+        cudaDeviceSynchronize();
+        cudaMemcpy(out.as_mut_ptr().cast(), do_, (hd * nh * 4) as usize, 2);
+    }
+    let gqa = nh / hkv;
+    let scale = 1.0 / (hd as f32).sqrt();
+    for h in 0..nh {
+        let hk = h / gqa;
+        let mut mx = mask[n_kv as usize];
+        for j in 0..n_kv {
+            let mut a = 0f32;
+            for d in 0..hd { a += q[(d + h * hd) as usize] * k[(d + j * hd + hk * hd * n_kv) as usize]; }
+            let s = a * scale + bias[(j + h * n_kv) as usize] + mask[j as usize];
+            mx = mx.max(s);
+        }
+        let mut den = (mask[n_kv as usize] - mx).exp();
+        for j in 0..n_kv {
+            let mut a = 0f32;
+            for d in 0..hd { a += q[(d + h * hd) as usize] * k[(d + j * hd + hk * hd * n_kv) as usize]; }
+            den += (a * scale + bias[(j + h * n_kv) as usize] + mask[j as usize] - mx).exp();
+        }
+        for d in 0..hd {
+            let mut o = 0f32;
+            for j in 0..n_kv {
+                let mut a = 0f32;
+                for dd in 0..hd { a += q[(dd + h * hd) as usize] * k[(dd + j * hd + hk * hd * n_kv) as usize]; }
+                let s = a * scale + bias[(j + h * n_kv) as usize] + mask[j as usize];
+                o += (s - mx).exp() / den * v[(d + j * hd + hk * hd * n_kv) as usize];
+            }
+            let e = (out[(d + h * hd) as usize] - o).abs();
+            assert!(e < 1e-3, "h{h} d{d}: got {} want {o} (e={e})", out[(d + h * hd) as usize]);
+        }
+    }
+    println!("attn gold ok");
+}
+

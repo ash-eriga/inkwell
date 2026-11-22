@@ -627,24 +627,12 @@ impl Runner {
         let kq_b = t::cont(c, t::permute(c, t::reshape4(c, kq_b, nh, n_kv, 1, 1), 2, 0, 1, 3));
         if il == 0 { self.dump("table-0", table); self.dump("kqb-0", kq_b); }
 
-        // MHA (upstream non-FA path): kq = K^T Q -> [n_kv, 1, nh]
+        // Fused decode attention (replaces kq GEMV + softmax + V GEMV chain)
         let k_view = t::view3(c, k_upd, hd, n_kv, hkv, t::nb(k_upd, 1), t::nb(k_upd, 2), 0);
         let q3 = t::permute(c, q, 0, 2, 1, 3); // [hd, 1, nh]
-        let kq = t::scale(c, t::mmq(c, k_view, q3), 1.0 / (hd as f32).sqrt()); // [n_kv, 1, nh]
-        let kq = t::add(c, kq, kq_b);
-        // zero-sink trick: append a zero logit column then slice it off post-softmax
-        let sink0 = t::reshape4(c, step.sink_zero, 1, 1, nh, 1);
-        let kq_ext = t::concat(c, kq, sink0, 0); // [n_kv+1, 1, nh]
         let kq_mask = if is_swa { step.mask_swa } else { step.mask_full };
-        let attn = t::soft_max(c, kq_ext, kq_mask, 1.0, 0.0);
-        let attn = t::cont(c, t::view4(c, attn, n_kv, 1, nh, 1, t::nb(attn, 1), t::nb(attn, 2), t::nb(attn, 3), 0));
-        if il == 0 { self.dump("kq_ext-0", kq_ext); self.dump("attn-0", attn); }
-
-        // weighted V: kqv = V^T @ attn -> [hd, 1, nh]
         let v_view = t::view3(c, v_upd, hd, n_kv, hkv, t::nb(v_upd, 1), t::nb(v_upd, 2), 0);
-        let v_t = t::cont(c, t::transpose(c, v_view)); // [n_kv, hd, hkv]
-        let kqv = t::mmq(c, v_t, attn); // [hd, 1, nh]
-        let out = t::reshape2(c, t::cont(c, kqv), hd * nh, 1);
+        let out = t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh); // [hd*nh, 1]
 
         let mut cur = out;
         cur = t::mul(c, cur, t::sigmoid(c, gate_lin));
@@ -921,6 +909,38 @@ impl Runner {
         // release the cached split plan so the next step's graph gets re-allocated
         unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
         logits
+    }
+}
+
+/// `ggml_custom_op_t` for fused decode attention: src[0]=K view, src[1]=V view,
+/// src[2]=q3 [hd,1,nh], src[3]=bias [n_kv,1,nh], src[4]=mask [n_kv+1]; dst=[hd*nh].
+pub fn attn_cb_addr() -> usize { attn_cb as usize }
+
+unsafe extern "C" fn attn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe {
+        inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+        let k_t = inkwell_ggml::ink_tensor_src(dst, 0);
+        let v_t = inkwell_ggml::ink_tensor_src(dst, 1);
+        let q_t = inkwell_ggml::ink_tensor_src(dst, 2);
+        let b_t = inkwell_ggml::ink_tensor_src(dst, 3);
+        let m_t = inkwell_ggml::ink_tensor_src(dst, 4);
+        let hd = inkwell_ggml::ink_tensor_ne(k_t, 0);
+        let n_kv = inkwell_ggml::ink_tensor_ne(k_t, 1);
+        let hkv = inkwell_ggml::ink_tensor_ne(k_t, 2);
+        let nh = inkwell_ggml::ink_tensor_ne(q_t, 2);
+        inkwell_cuda::attn_decode_async(
+            inkwell_ggml::ink_tensor_data(k_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(v_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(q_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(b_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(m_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(dst).cast::<f32>(),
+            nh, hkv, n_kv, hd,
+            inkwell_ggml::ink_tensor_nb(k_t, 1) / 4, inkwell_ggml::ink_tensor_nb(k_t, 2) / 4,
+            inkwell_ggml::ink_tensor_nb(v_t, 1) / 4, inkwell_ggml::ink_tensor_nb(v_t, 2) / 4,
+            inkwell_ggml::ink_tensor_nb(q_t, 2) / 4, inkwell_ggml::ink_tensor_nb(b_t, 2) / 4,
+            1.0 / (hd as f32).sqrt(),
+        );
     }
 }
 
