@@ -1,6 +1,14 @@
 # E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
 Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
 
+## Kernel rewrite round 2 (2026-11-22 eve)
+
+- iq2_xxs paired-smem float2: REVERTED — layout collided (NU=290 < 2*ngroups=576 → values overwrote each other). The "+17%" bench win was a broken kernel touching less memory. Caught by new sanity check: fp-moe vs fp-dense (unchanged reference kernel) → was 2.19e4, now 0. e2e golden restored exactly.
+- LESSON: always diff a modified kernel against an untouched reference kernel on the same inputs; junk-weight bench only checks speed, not correctness.
+- iq2xxs_i8 now DEFAULT-ON (per-32 x quant: maxdiff 1.186e3 junk vs fp; e2e golden). Opt out: INKWELL_IQ2XXS_FP=1. ~96 GB/s vs fp 75.4.
+- Flat float4 x-reads kept (no collision possible): iq1_s 76.6, nvfp4 62.3, iq2_xs 111.5, iq2_s 110.8, iq4_xs 217 GB/s.
+- Latest decode wall ~6.09-6.33s/8tok (contended).
+
 ## Current: ~100ms/tok (~10 t/s contended) vs upstream 6.15 t/s. Target 15 t/s (66ms).
 - CUDA graphs REPLAY: persistent ctx + n_kv padded to 64 + -inf mask; embd_row on GPU → 1 split.
 - Device MoE: resolve/alloc/gather in-stream; misses repoint to arena (1 PCIe read). budget=vfree-1.5G, k=65-78.
