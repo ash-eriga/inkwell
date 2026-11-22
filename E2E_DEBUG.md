@@ -66,3 +66,13 @@ Check: ggml-cpu type_traits_cpu[t].vec_dot_type for types 16,17,19,22,23,40,42;
 - Estado: embd/Q/K/V/R **bit-exatos** token0. kqv_out-0: meu -32.46 vs upstream 3.63 (atenção ainda diverge). l_out-0: -26.02 vs -25.78 (quase). result_norm tok0: 317.4 vs 110.66.
 - tau formula confirmada: log(clamp((pos+1)/8192,1,inf))*0.1+1 ✓
 - Próximo: diff kq_b/kq_ext vs upstream node_93/kq_mask_rel_pos (upstream KV width=256 padded)
+
+## Round 4 — E2E funciona + kernels próprios
+- **SCALE BUG RESOLVIDO**: scale 1/sqrt(128) aplica só em k·q; bias rel pos soma DEPOIS (upstream FA semantics: softmax(k·q·scale + bias)). kqv_out-0 = 3.6307 vs upstream 3.6319 ✓
+- **Decode end-to-end**: " Paris.\n\nA. Proper" — gen0 id=152717 golden ✓. Release: encode 4tok/0.93s, decode ~5.4 tok/s (vs upstream ~6). compute=180ms/tok, build=1ms.
+- Kernel próprio 1: dequant IQ2_XXS — bit-exact (5.3M vals, 0 diff)
+- Kernel próprio 2: GEMV IQ2_XXS fused — rel diff 1.3e-5 (fp32 order)
+- Kernel próprio 3: GEMV Q2_0 fused — rel diff 1.0e-4
+- **Zero-copy GEMV: 8.6 GB/s via PCIe** (cudaHostRegister mapped) — experts streamam de RAM sem upload. Estimativa: ~20 t/s só com experts zero-copy.
+- LUTs em crates/inkwell-cuda/src/iq_luts.h (extraídas de ggml-common.h, marcadas __device__)
+- Próximo: IQ1_S/NVFP4 GEMV (outros tipos de expert), pager real (LRU + prefetch), spec decode.

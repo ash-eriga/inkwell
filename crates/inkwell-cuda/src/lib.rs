@@ -20,6 +20,9 @@ extern "C" {
 
 extern "C" {
     fn ink_launch_dequant_iq2_xxs(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
+    fn ink_launch_dequant_iq1_s(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
+    fn ink_launch_mmvq_nvfp4(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
+    fn ink_launch_mmvq_iq1_s(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xxs(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_q2_0(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn inkwell_rmsnorm_launch(x: *const f32, w: *const f32, y: *mut f32, n: i32, eps: f32);
@@ -132,6 +135,28 @@ pub fn host_register_mapped_ro(host: &[u8]) -> *mut c_void {
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xxs_host(w: *mut c_void, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
     unsafe { ink_launch_mmvq_iq2_xxs(w, x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// GEMV for NVFP4 weights (36 bytes per 64 values).
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub fn mmvq_nvfp4(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
+    unsafe { ink_launch_mmvq_nvfp4(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// Dequantize IQ1_S blocks (50 bytes per 256 values) on GPU.
+#[expect(clippy::cast_possible_wrap, reason = "nblocks < i64::MAX")]
+pub fn dequant_iq1_s(src: &DevBuf, dst: &mut DevBuf) {
+    let nblocks = (dst.len / 256) as i64;
+    unsafe { ink_launch_dequant_iq1_s(src.ptr.cast_const().cast(), dst.ptr, nblocks, std::ptr::null_mut()) };
+    DevBuf::sync();
+}
+
+/// GEMV for IQ1_S weights.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub fn mmvq_iq1_s(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
+    unsafe { ink_launch_mmvq_iq1_s(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
     DevBuf::sync();
 }
 

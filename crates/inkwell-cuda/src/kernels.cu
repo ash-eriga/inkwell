@@ -206,3 +206,113 @@ extern "C" void ink_launch_mmvq_q2_0(const void* W, const float* x, float* y,
                                      long long nrows, long long ncols, void* stream) {
     inkwell_mmvq_q2_0<<<(unsigned)nrows, 32, 0, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
 }
+
+// ---------------- IQ1_S (gate_up experts' other format) ------------------------
+struct block_iq1_s { uint16_t d; uint8_t qs[32]; uint16_t qh[8]; }; // 50B/256
+
+#define IQ1S_DELTA 0.125f
+
+__global__ void inkwell_dequant_iq1_s(const void* __restrict__ vx, float* __restrict__ y, int64_t nblocks) {
+    const block_iq1_s* x = (const block_iq1_s*)vx;
+    const int64_t ibs = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int il = tid / 8, ib = tid % 8;
+    float* yl = y + ibs * 256 + 32 * ib + 8 * il;
+    const float delta = (x[ibs].qh[ib] & 0x8000) ? -1.f - IQ1S_DELTA : -1.f + IQ1S_DELTA;
+    const float d = fp16_to_f32(x[ibs].d) * (2 * ((x[ibs].qh[ib] >> 12) & 7) + 1);
+    uint32_t grid32[2];
+    const int8_t* q = (const int8_t*)grid32;
+    grid32[0] = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((x[ibs].qh[ib] >> 3 * il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) yl[j] = d * (q[j] + delta);
+}
+
+__global__ void inkwell_mmvq_iq1_s(const void* __restrict__ W,
+                                   const float* __restrict__ x,
+                                   float* __restrict__ y,
+                                   int64_t nrows, int64_t ncols) {
+    const int64_t row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nb_row = (int)(ncols / 256);
+    const block_iq1_s* w = (const block_iq1_s*)W + row * nb_row;
+    const int ngroups = (int)(ncols / 8);
+    float acc = 0.f;
+    for (int g = lane; g < ngroups; g += 32) {
+        const int b = g / 32, gb = g % 32;
+        const int ib = gb / 4, il = gb % 4;
+        const float delta = (w[b].qh[ib] & 0x8000) ? -1.f - IQ1S_DELTA : -1.f + IQ1S_DELTA;
+        const float d = fp16_to_f32(w[b].d) * (2 * ((w[b].qh[ib] >> 12) & 7) + 1);
+        uint32_t grid32[2];
+        const int8_t* q = (const int8_t*)grid32;
+        grid32[0] = iq1s_grid_gpu[w[b].qs[4 * ib + il] | (((w[b].qh[ib] >> 3 * il) & 7) << 8)];
+        grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+        grid32[0] &= 0x0f0f0f0f;
+        const float* xv = x + g * 8;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc += d * (q[j] + delta) * xv[j];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[row] = acc;
+}
+
+extern "C" void ink_launch_dequant_iq1_s(const void* vx, float* y, long long nblocks, void* stream) {
+    inkwell_dequant_iq1_s<<<(unsigned)nblocks, 32, 0, (cudaStream_t)stream>>>(vx, y, nblocks);
+}
+extern "C" void ink_launch_mmvq_iq1_s(const void* W, const float* x, float* y,
+                                      long long nrows, long long ncols, void* stream) {
+    inkwell_mmvq_iq1_s<<<(unsigned)nrows, 32, 0, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+}
+
+// ---------------- NVFP4 (down experts) ----------------------------------------
+struct block_nvfp4 { uint8_t d[4]; uint8_t qs[32]; }; // 36B/64 vals
+
+__device__ __forceinline__ float ue4m3_to_f32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.f;
+    const int e = (x >> 3) & 0xF, m = x & 0x7;
+    return (e == 0 ? ldexpf((float)m, -9) : ldexpf(1.0f + m / 8.f, e - 7)) / 2.f;
+}
+
+__global__ void inkwell_mmvq_nvfp4(const void* __restrict__ W,
+                                   const float* __restrict__ x,
+                                   float* __restrict__ y,
+                                   int64_t nrows, int64_t ncols) {
+    const int64_t row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int nb_row = (int)(ncols / 64);
+    const block_nvfp4* w = (const block_nvfp4*)W + row * nb_row;
+    const int npairs = (int)(ncols / 2);             // 2 vals per byte
+    float acc = 0.f;
+    for (int p = lane; p < npairs; p += 32) {
+        const int b = p / 32, sub = (p % 32) / 8, j = p % 8;
+        // byte covers vals [sub*16 + j, sub*16 + j + 8]
+        const float d = ue4m3_to_f32(w[b].d[sub]);
+        const uint8_t q = w[b].qs[sub * 8 + j];
+        const float* xv = x + b * 64 + sub * 16 + j;
+        acc += d * kvalues_fp4[q & 0x0F] * xv[0]
+             + d * kvalues_fp4[q >> 4]  * xv[8];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[row] = acc;
+}
+
+__global__ void inkwell_dequant_nvfp4(const void* __restrict__ vx, float* __restrict__ y, int64_t nblocks) {
+    const block_nvfp4* x = (const block_nvfp4*)vx;
+    const int64_t ibs = blockIdx.x;
+    const int tid = threadIdx.x;                    // 32 threads
+    const int sub = tid / 8, j = tid % 8;
+    const float d = ue4m3_to_f32(x[ibs].d[sub]);
+    const uint8_t q = x[ibs].qs[sub * 8 + j];
+    float* yl = y + ibs * 64 + sub * 16 + j;
+    yl[0] = d * kvalues_fp4[q & 0x0F];
+    yl[8] = d * kvalues_fp4[q >> 4];
+}
+
+extern "C" void ink_launch_mmvq_nvfp4(const void* W, const float* x, float* y,
+                                      long long nrows, long long ncols, void* stream) {
+    inkwell_mmvq_nvfp4<<<(unsigned)nrows, 32, 0, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+}
+extern "C" void ink_launch_dequant_nvfp4(const void* vx, float* y, long long nblocks, void* stream) {
+    inkwell_dequant_nvfp4<<<(unsigned)nblocks, 32, 0, (cudaStream_t)stream>>>(vx, y, nblocks);
+}

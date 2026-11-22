@@ -20,13 +20,15 @@ fn main() {
 
     for (name, ty, vals_per_block, _bpb) in [
         ("blk.5.ffn_gate_up_exps.weight", 16, 256usize, 66usize),
+        ("blk.0.ffn_gate_up_exps.weight", 19, 256usize, 50usize),
         ("blk.0.ffn_down_exps.weight", 42, 64usize, 18usize),
+        ("blk.5.ffn_down_exps.weight", 40, 64usize, 36usize),
     ] {
         let t = g.tensors.get(name).unwrap_or_else(|| panic!("{name}"));
         assert_eq!(t.ggml_type, ty, "{name} type");
         let (nrows, ncols) = (t.dims[1] as usize, t.dims[0] as usize);
         let bpr = ncols / vals_per_block; // blocks per row
-        let bpb = if ty == 16 { 66 } else { 18 };
+        let bpb = match ty { 16 => 66, 19 => 50, 40 => 36, _ => 18 };
         let n = 64usize.min(nrows);       // test 64 rows of expert 0
         let raw = &g.mmap[(g.data_start + t.offset) as usize..];
         let raw = &raw[..n * bpr * bpb];
@@ -38,8 +40,12 @@ fn main() {
         let mut xb = inkwell_cuda::DevBuf::new(ncols);
         xb.write(&x);
         let mut yb = inkwell_cuda::DevBuf::new(n);
-        if ty == 16 { inkwell_cuda::mmvq_iq2_xxs(&wsrc, &xb, &mut yb, n, ncols) }
-        else { inkwell_cuda::mmvq_q2_0(&wsrc, &xb, &mut yb, n, ncols) }
+        match ty {
+            16 => inkwell_cuda::mmvq_iq2_xxs(&wsrc, &xb, &mut yb, n, ncols),
+            19 => inkwell_cuda::mmvq_iq1_s(&wsrc, &xb, &mut yb, n, ncols),
+            40 => inkwell_cuda::mmvq_nvfp4(&wsrc, &xb, &mut yb, n, ncols),
+            _ => inkwell_cuda::mmvq_q2_0(&wsrc, &xb, &mut yb, n, ncols),
+        }
         let y = yb.read();
         let mut maxd = 0f32;
         for (i, (a, b)) in ref_y.iter().zip(y.iter()).enumerate() {
