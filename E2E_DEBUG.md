@@ -76,3 +76,17 @@ Check: ggml-cpu type_traits_cpu[t].vec_dot_type for types 16,17,19,22,23,40,42;
 - **Zero-copy GEMV: 8.6 GB/s via PCIe** (cudaHostRegister mapped) — experts streamam de RAM sem upload. Estimativa: ~20 t/s só com experts zero-copy.
 - LUTs em crates/inkwell-cuda/src/iq_luts.h (extraídas de ggml-common.h, marcadas __device__)
 - Próximo: IQ1_S/NVFP4 GEMV (outros tipos de expert), pager real (LRU + prefetch), spec decode.
+
+## Round 5 — overnight final
+- 64-token greedy decode: fully coherent text, sustained ~5.8 t/s
+- Batched expert GEMV (ids[slot] indirection over registered host or device ptr)
+  + fused swiglu_pair — primitives for the real pager MoE path
+- Coverage: ALL expert formats have own GEMVs now (IQ2_XXS/IQ1_S/Q2_0/NVFP4)
+- TODO next: wire zero-copy expert GEMVs into runner MoE path (replace mul_mat_id),
+  pinned host pool for expert streaming, spec decode, remaining type coverage
+  (IQ2_XS/IQ3_S/IQ3_XXS/IQ4_XS/Q6_K for non-expert tensors)
+
+## Análise p/ próxima sessão
+- Experts no CPU (mul_mat_id) = ~120ms dos ~180ms/tok. Split do grafo por visita p/ interpor kernels próprios custaria ~24 syncs — não vale sozinho.
+- Plano real p/ TPS: (1) pager com cache LRU de experts NA VRAM (pool ~3-4GB livre), H2D assíncrono no draft/prefill — sim do pager projeta ~40-60% hit. (2) spec decode ×~2.5. (3) batched MoE GEMV já pronto em kernels.cu.
+- Alternativa: host-mapped ggml buffer pros experts + mul_mat_id CUDA — ggml pode ler tensor de host-pinned em ALGUNS ops; verificar ggml_backend_cuda_host_buffer.
