@@ -24,6 +24,19 @@ fn main() {
         total / 1_048_576
     );
 
+    if let Some("--types") = args.next().as_deref() {
+        let mut census = std::collections::BTreeMap::new();
+        for (name, t) in &g.tensors {
+            let e = census.entry(t.ggml_type).or_insert((0usize, 0u64));
+            e.0 += 1;
+            e.1 += t.nbytes;
+            let _ = name;
+        }
+        for (ty, (cnt, bytes)) in census {
+            println!("type {ty}: {cnt} tensors, {} MiB", bytes / (1 << 20));
+        }
+        return;
+    }
     if let Some("--spec") = args.next().as_deref() {
         bench_spec();
         return;

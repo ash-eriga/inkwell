@@ -38,3 +38,21 @@ Style: follows BeautifulRust skills (rust-best-practices / rust-port / rust-revi
 - Kernels CUDA C++ compiled by nvcc (sm_61), called via FFI. No cudarc/cust.
 - Golden tests: bit-lock hashes of kernel outputs vs llama.cpp reference.
 - Benchmarks: `inkwell bench` vs `llama-bench` same flags; encode/decode @4k and @32k.
+
+## Quant census (UD-IQ2_XXS, measured 2026-11-21)
+
+| ggml type | n | MiB | likely layer use |
+|---|---|---|---|
+| IQ2_XXS (16) | 7 | 1169 | biggest experts |
+| IQ2_XS (17) | 6 | 1123 | experts |
+| IQ3_XXS (19) | 6 | 759 | experts |
+| Q2_0 (42) | 17 | 1549 | experts (new llama.cpp type) |
+| NVFP4 (40) | 7 | 1275 | experts (moe.fused) |
+| MXFP4 (39?) | — | — | (none in this file) |
+| IQ4_XS (23) | 2 | 469 | embed/head? |
+| IQ3_S (22) | 5 | 1037 | dense rows |
+| Q4_K/Q5_K/Q6_K | 56 | 178 | attn/norm misc |
+| BF16 (30) | 32 | 3 | gates/biases |
+| IQ3_XXS(18)/other | 3 | 7 | misc |
+
+Kernel port list = dequant+dot for the ~10 formats above.
