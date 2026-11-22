@@ -7,7 +7,12 @@ Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-g
 - RAM fix: madvise(DONTNEED) after expert pin (~4GB freed).
 - Custom dense GEMV: mmq() routes Q8_0 (type8) mul_mats to inkwell_mmvq_q8_0_i8 inside the graph (CUSTOM=210/tok).
 - CAVEAT: kern_sum under graphs only counts capture-phase launches — use wall time.
-- Remaining ~: MoE GEMVs ~34ms, gather ~10.6ms, mmv_f ~4.3ms, mmvq type13/14 ~6.7ms, swarm ~7ms.
+- MEASURED (post-graph): compute ~85ms/tok, build ~1ms. MoE GEMVs ~54ms/tok real
+  (48 visits x ~3 matrices; iq2_xxs ~500us, others 250-460us). misses_total=0 after
+  warmup — cache hit ~100% (loop x3 revisits reuse experts; gather is front-loaded
+  in early tokens). THE WALL IS NOW PURE GEMV BANDWIDTH (~22-60 GB/s vs 200 target).
+  Next: raise GEMV throughput within same launch structure (wider loads/ILP), or
+  revisit iq2_xxs i8 with better accuracy scheme. mmv_f ~9.5us avg x1500, type13/14 ~6.7ms, swarm ~10ms.
 
 ## Current blocker
 sched allocs 6915 MiB CUDA0 graph buffer (all expert leafs copied to GPU) → OOM.
