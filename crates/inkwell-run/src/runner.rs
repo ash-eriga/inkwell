@@ -939,10 +939,10 @@ unsafe extern "C" fn dense_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, 
         let y = inkwell_ggml::ink_tensor_data(dst).cast::<f32>();
         let ncols = inkwell_ggml::ink_tensor_ne(w_t, 0) as usize;
         let nrows = inkwell_ggml::ink_tensor_ne(w_t, 1) as usize;
-        if inkwell_ggml::ink_tensor_type(w_t) == 14 {
-            inkwell_cuda::mmvq_q6_k_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols);
-        } else {
-            inkwell_cuda::mmvq_q8_0_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols);
+        match inkwell_ggml::ink_tensor_type(w_t) {
+            13 => inkwell_cuda::mmvq_q5_k_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols),
+            14 => inkwell_cuda::mmvq_q6_k_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols),
+            _ => inkwell_cuda::mmvq_q8_0_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols),
         }
     }
 }

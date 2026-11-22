@@ -1253,3 +1253,80 @@ extern "C" void ink_launch_mmvq_q6_k_i8(const void* W,
     cudaMemsetAsync(y, 0, (size_t)nrows * 4, (cudaStream_t)stream);
     inkwell_mmvq_q6_k_i8<<<g, 512, ((size_t)ncols + 16) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
 }
+
+// Q5_K via DP4A: y = d*sc*(nib|hb<<4)*x - dmin*m*x. q fits int8; the min term
+// folds in as -dmin*m*sx*sum(x_i8) via dp4a with 0x01010101.
+// block_q5_K { u16 dm[2] (d, dmin), u8 scales[12] (8 sc + 8 min, 6-bit), u8 qh[32], u8 qs[128] } = 176B/256.
+struct block_q5_k { uint16_t dm[2]; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; };
+__device__ __forceinline__ void q5k_scale_min(int k, const uint8_t* sc, int& s, int& m) {
+    if (k < 4) { s = sc[k] & 63; m = sc[k + 4] & 63; }
+    else { s = (sc[k + 4] & 0xF) | ((sc[k - 4] >> 6) << 4);
+           m = (sc[k + 4] >> 4) | ((sc[k] >> 6) << 4); }
+}
+__global__ void inkwell_mmvq_q5_k_i8(const void* __restrict__ W,
+                                     const float* __restrict__ x,
+                                     float* __restrict__ y,
+                                     int64_t nrows, int64_t ncols) {
+    extern __shared__ int8_t qx[];
+    float* sx = (float*)(qx + ncols);
+    const int nxb = (int)(ncols / 16);
+    for (int b = (int)threadIdx.x >> 4; b < nxb; b += (int)(blockDim.x >> 4)) {
+        const int t = threadIdx.x & 15;
+        float m = fabsf(x[b * 16 + t]);
+        for (int o = 8; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (t == 0) sx[b] = m / 127.f;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < (int)ncols; i += blockDim.x) {
+        const float sc = sx[i >> 4];
+        qx[i] = (int8_t)(sc > 0.f ? (int)rintf(x[i] / sc) : 0);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int half = (threadIdx.x >> 5) & 1;
+    const int64_t row = (int64_t)blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
+    if (row >= nrows) return;
+    const block_q5_k* w = (const block_q5_k*)W + row * (ncols / 256);
+    const int ngroups = (int)(ncols / 16);
+    float acc = 0.f;
+#pragma unroll 1
+    for (int G = lane + half * 32; G < ngroups; G += 64) {
+        const int b = G >> 4;
+        const int g = G & 15;                     // group inside 256-block
+        const int ql_off = 32 * (g >> 2) + 16 * (g & 1);
+        const int hish = ((g >> 1) & 1) * 4;      // nibble: lo for first half of 32-sector
+        const int qhb  = 2 * (g >> 2) + ((g >> 1) & 1); // uniform qh bit per group
+        const uint16_t* qlp = (const uint16_t*)(w[b].qs + ql_off);
+        const uint16_t* qhp = (const uint16_t*)(w[b].qh + 16 * (g & 1));
+        int sc6, m6;
+        q5k_scale_min(2 * (g >> 2) + ((g >> 1) & 1), w[b].scales, sc6, m6);
+        const uint32_t* xp = (const uint32_t*)(qx + G * 16);
+        int isum = 0, xsum = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q = (uint32_t)qlp[2 * j] | ((uint32_t)qlp[2 * j + 1] << 16);
+            const uint32_t h = (uint32_t)qhp[2 * j] | ((uint32_t)qhp[2 * j + 1] << 16);
+            uint32_t wpack = 0;
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const int nib = (int)((q >> (8 * v + hish)) & 0xF);
+                const int hb  = (h >> (8 * v + qhb)) & 1;
+                wpack |= (uint32_t)(uint8_t)(nib | (hb << 4)) << (8 * v);
+            }
+            isum = __dp4a((int)xp[j], (int)wpack, isum);
+            xsum = __dp4a((int)xp[j], 0x01010101, xsum);
+        }
+        const float d = fp16_to_f32(((const uint16_t*)&w[b])[0]);
+        const float dmin = fp16_to_f32(((const uint16_t*)&w[b])[1]);
+        acc += (d * (float)sc6 * (float)isum - dmin * (float)m6 * (float)xsum) * sx[G];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) atomicAdd(&y[row], acc);
+}
+extern "C" void ink_launch_mmvq_q5_k_i8(const void* W,
+                                        const float* x, float* y,
+                                        long long nrows, long long ncols, void* stream) {
+    dim3 g((unsigned)((nrows + 7) / 8));
+    cudaMemsetAsync(y, 0, (size_t)nrows * 4, (cudaStream_t)stream);
+    inkwell_mmvq_q5_k_i8<<<g, 512, ((size_t)ncols + 16) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+}

@@ -142,7 +142,7 @@ pub mod t {
     pub fn mmq(c: Ptr, w: Ptr, x: Ptr) -> Ptr {
         unsafe {
             let wt = inkwell_ggml::ink_tensor_type(w.0);
-            if wt == 8 || wt == 14 {
+            if wt == 8 || wt == 14 || wt == 13 {
                 let nrows = inkwell_ggml::ink_tensor_ne(w.0, 1);
                 let mut args = [w.0, x.0];
                 Ptr(inkwell_ggml::ink_custom_4d(c.0, 0, nrows, 1, 1, 1,
