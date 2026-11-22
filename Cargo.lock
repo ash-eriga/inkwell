@@ -97,6 +97,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkwell-sampler"
+version = "0.1.0"
+
+[[package]]
 name = "inkwell-tokenizer"
 version = "0.1.0"
 dependencies = [
