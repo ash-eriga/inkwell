@@ -1,6 +1,27 @@
 # E2E debug state (runner.rs) — 2026-11-22 (checkpoint)
 Run: cd ~/inkwell && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 ./target/release/inkwell ~/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf --run
 
+## Round 3 (2026-11-22 night): real per-kernel split (nsys, graphs off, ~64 tok)
+
+| kernel | ms/tok | note |
+|---|---|---|
+| gather | ~11 | warmup only — misses_total=0 after (verified MOESTATS) |
+| q8_0_i8 dense | 9.4 | 172 launches |
+| q2_0_i8 dn | 8.3 | 236us avg |
+| iq2_xs moe | 7.5 | worst gu (439us) |
+| iq2xxs_i8 | 7.2 | |
+| iq4_xs | 5.1 | |
+| nvfp4_i8 | 4.5 | |
+| q6_k_i8 | 4.0 | NEW — real Q6_K interleave is per-128-half |
+| iq1_s+iq2_s | 7.2 | |
+| mmv_f | 5.4 | F32 — no dp4a |
+| q5_k_i8 | 1.5 | NEW |
+| swarm (cpy/bcast/concat) | ~6 | |
+
+- bench GB/s numbers were ~4x inflated for 256-val formats (row_b formula bug in bench_moe) — trust nsys per-launch times.
+- dense i8 GEMVs at 1024 threads; q2_0_moe_i8 stays 512 (regressed at 1024).
+- Commits: 0e1c939 q6k, 191278e q5k, af0997b block bump, f35ef8b iq2xxs i8 default.
+
 ## Kernel rewrite round 2 (2026-11-22 eve)
 
 - iq2_xxs paired-smem float2: REVERTED — layout collided (NU=290 < 2*ngroups=576 → values overwrote each other). The "+17%" bench win was a broken kernel touching less memory. Caught by new sanity check: fp-moe vs fp-dense (unchanged reference kernel) → was 2.19e4, now 0. e2e golden restored exactly.
