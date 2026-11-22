@@ -80,6 +80,15 @@ ggml_tensor* ink_flash_attn_ext(ggml_context* c, ggml_tensor* q, ggml_tensor* k,
 void ink_flash_attn_ext_add_sinks(ggml_tensor* t, ggml_tensor* sinks) { ggml_flash_attn_ext_add_sinks(t, sinks); }
 void ink_flash_attn_ext_set_n_kv_max(ggml_tensor* t, int32_t n) { ggml_flash_attn_ext_set_n_kv_max(t, n); }
 
+ggml_tensor* ink_mul_mat_id(ggml_context* c, ggml_tensor* as, ggml_tensor* b, ggml_tensor* ids) { return ggml_mul_mat_id(c, as, b, ids); }
+ggml_tensor* ink_argsort_top_k(ggml_context* c, ggml_tensor* a, int k) { return ggml_argsort_top_k(c, a, k); }
+ggml_tensor* ink_set_rows(ggml_context* c, ggml_tensor* a, ggml_tensor* b, ggml_tensor* idx) { return ggml_set_rows(c, a, b, idx); }
+ggml_tensor* ink_cpy(ggml_context* c, ggml_tensor* a, ggml_tensor* b) { return ggml_cpy(c, a, b); }
+ggml_tensor* ink_dup(ggml_context* c, ggml_tensor* a) { return ggml_dup(c, a); }
+ggml_tensor* ink_softplus(ggml_context* c, ggml_tensor* a) { return ggml_softplus(c, a); }
+ggml_tensor* ink_gelu_quick(ggml_context* c, ggml_tensor* a) { return ggml_gelu_quick(c, a); }
+ggml_tensor* ink_add_id(ggml_context* c, ggml_tensor* a, ggml_tensor* b, ggml_tensor* ids) { return ggml_add_id(c, a, b, ids); }
+
 // ---- backend / buffers / graph compute ----
 ggml_backend_t ink_backend_cuda(int dev) { return ggml_backend_cuda_init(dev); }
 ggml_backend_buffer_type_t ink_cuda_buft(int dev) { return ggml_backend_cuda_buffer_type(dev); }

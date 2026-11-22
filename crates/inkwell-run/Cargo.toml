@@ -1,0 +1,16 @@
+[package]
+name = "inkwell-run"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+inkwell-ggml = { path = "../inkwell-ggml" }
+inkwell-gguf = { path = "../inkwell-gguf" }
+inkwell-model = { path = "../inkwell-model" }
+inkwell-core = { path = "../inkwell-core" }
+inkwell-kv = { path = "../inkwell-kv" }
+inkwell-sampler = { path = "../inkwell-sampler" }
+inkwell-tokenizer = { path = "../inkwell-tokenizer" }

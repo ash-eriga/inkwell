@@ -115,6 +115,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkwell-run"
+version = "0.1.0"
+dependencies = [
+ "inkwell-core",
+ "inkwell-ggml",
+ "inkwell-gguf",
+ "inkwell-kv",
+ "inkwell-model",
+ "inkwell-sampler",
+ "inkwell-tokenizer",
+]
+
+[[package]]
 name = "inkwell-sampler"
 version = "0.1.0"
 
