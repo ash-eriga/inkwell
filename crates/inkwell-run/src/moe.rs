@@ -95,6 +95,7 @@ impl Cache {
 
 /// Device staging buffers shared by all MoE visits of a step.
 struct Staging {
+    stats: cu::DevBuf,
     gu_ptrs: Mutex<cu::DevBuf>, // [N_SLOTS] u64
     dn_ptrs: Mutex<cu::DevBuf>, // [N_SLOTS] u64
     gu: Mutex<cu::DevBuf>,      // [N_SLOTS][2*N_FF] f32
@@ -106,6 +107,7 @@ static STAGING: OnceLock<Staging> = OnceLock::new();
 
 fn staging() -> &'static Staging {
     STAGING.get_or_init(|| Staging {
+        stats: unsafe { let d = cu::DevBuf::new_bytes(16); d.zero(); d },
         gu_ptrs: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 8)),
         dn_ptrs: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 8)),
         gu: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 2 * N_FF * 4)),
@@ -167,11 +169,16 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
                     ptrs.dev_ptr().cast(), c.work_dev.dev_ptr().cast(), c.k);
                 if dbg { cu::sync_check("dispatch"); }
             }
-            // repoint+gather before the GEMVs: each miss pays exactly one PCIe
-            // pass (the gather); the GEMV then reads the fresh arena slot.
+            // gu gather inline on the main stream (its GEMV is next); dn
+            // gather runs on the side stream, hidden under gu GEMV + situ,
+            // and joined by wait_gather_done right before the dn GEMV.
+            let stats = if std::env::var("INKWELL_MOE_STATS").is_ok() {
+                st.stats.dev_ptr().cast()
+            } else { std::ptr::null_mut() };
+            // stats[0] = bytes copied, stats[1] = raw miss count (incl. >8)
             for c in [&*gc, &*dc] {
                 cu::moe_gather_async(c.missq_dev.dev_ptr().cast_const().cast(),
-                    c.work_dev.dev_ptr().cast_const().cast(), c.esz as i64);
+                    c.work_dev.dev_ptr().cast_const().cast(), c.esz as i64, stats);
             }
         } else {
             cu::moe_resolve_async(ids_dev, std::ptr::null(), std::ptr::null_mut(), std::ptr::null(),
@@ -187,7 +194,19 @@ unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_v
         unsafe { cu::memset_dev_async(inkwell_ggml::ink_tensor_data(dst), 0, N_EMBD * 4) };
         return;
     }
+    let caches = a.caches.lock().expect("caches").is_some();
     unsafe {
+        if std::env::var("INKWELL_MOE_STATS").is_ok() {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % 24 == 0 {
+                let mut b = [0u8; 16];
+                st.stats.read_bytes(&mut b);
+                let v = u64::from_le_bytes(b[..8].try_into().unwrap());
+                let m = u64::from_le_bytes(b[8..].try_into().unwrap());
+                eprintln!("MOESTATS visit={n} gathered={:.1}MiB misses_total={m}", v as f64/1048576.0);
+            }
+        }
         let mut gu = st.gu.lock().expect("gu");
         let mut hid = st.hid.lock().expect("hid");
         let mut dn = st.dn.lock().expect("dn");

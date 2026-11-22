@@ -4,6 +4,19 @@
 //! pinned+mapped host memory and stream over PCIe into own GEMV kernels via a
 //! `GGML_OP_CUSTOM` per MoE visit (Strata-style zero-copy offload).
 //! KV + conv state live in per-visit device arenas.
+mod madv {
+    use std::ffi::c_void;
+    unsafe extern "C" {
+        fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    }
+    /// Drop a file-mapped range from the page cache (keeps the pinned copy only).
+    pub unsafe fn dontneed(addr: *const u8, len: usize) {
+        let a = addr as usize & !4095;
+        let end = (addr as usize + len + 4095) & !4095;
+        unsafe { madvise(a as *mut c_void, end - a, 4 /* MADV_DONTNEED */); }
+    }
+}
+
 use crate::ops::{t, Buf, Ptr, Rt};
 use inkwell_gguf::GgufFile;
 use inkwell_core::InklingConfig;
@@ -135,6 +148,8 @@ impl Runner {
                 let pb = inkwell_cuda::host_alloc_mapped(ti.nbytes as usize);
                 let src = unsafe { gg.mmap.as_ptr().add(gg.data_start as usize + ti.offset as usize) };
                 unsafe { std::ptr::copy_nonoverlapping(src, pb.host, ti.nbytes as usize) };
+                // free the duplicated range: the pinned copy is the only one needed
+                unsafe { madv::dontneed(src, ti.nbytes as usize) };
                 let layer: usize = name.split('.').nth(1).expect("blk.N").parse().expect("layer idx");
                 let idx = pinned.len();
                 pinned.push(pb);
@@ -164,10 +179,11 @@ impl Runner {
 
         let (f1,_) = inkwell_cuda::mem_info();
         eprintln!("MEM after weights: {f1}");
-        // small CPU tensor carrying the dequantized embedding row each step
+        // the dequantized embedding row lives on the device: a CPU tensor here
+        // forced a backend split per step, which blocks CUDA-graph capture.
         let embd_row = t::new(rt.ctx(), F32, &[2304, 1, 1, 1]);
-        { let o = (off_cpu + 127) & !127; cpu_buf.assign(embd_row, o); }
-        unsafe { inkwell_ggml::ink_sched_set_tensor_backend(sched.0, embd_row.0, cpu.0) };
+        { let o = (off_dev + 127) & !127; dev_buf.assign(embd_row, o); }
+        unsafe { inkwell_ggml::ink_sched_set_tensor_backend(sched.0, embd_row.0, cuda) };
 
         let get = |n: &str| -> Ptr {
             *w.get(n).unwrap_or_else(|| panic!("missing {n}"))
@@ -178,7 +194,7 @@ impl Runner {
         let mut moe_pos: HashMap<usize, usize> = HashMap::new();
         // VRAM LRU expert cache: size from free VRAM after dense weights.
         let (vfree, _vtotal) = inkwell_cuda::mem_info();
-        let budget = vfree.saturating_sub(1800 << 20); // fill free VRAM; headroom covers dev_buf (~840 MiB) + margin
+        let budget = vfree.saturating_sub(1400 << 20); // fill free VRAM; headroom covers dev_buf (~840 MiB) + margin
         let budget_per_layer = budget / 24;
         for i in 0..24usize {
             let Some(&(gi, di, gs, ds)) = moe_w.get(&i) else { continue };
@@ -582,7 +598,9 @@ impl Runner {
         // KV write via set_rows: in-place write into arena + dep edge so the
         // attention reads below see this token's k/v (upstream pattern).
         let pos_k = step_pos_key(step, is_swa, self.swa);
-        let n_kv = if is_swa { (pos_k + 1).min(self.swa) } else { pos_k + 1 };
+        // n_kv padded to a multiple of 64: constant shapes across steps keep
+        // the CUDA graph reusable (recapture only on 64-token boundaries).
+        let n_kv = if is_swa { step.n_kv_swa_pad } else { step.n_kv_full_pad };
         let kv_idx = if is_swa { step.kv_idx_swa } else { step.kv_idx_full };
         // set_rows wants b [hd, n_idx, hkv]: permute [hd,hkv,1] -> [hd,1,hkv]
         let k_rows = t::cont(c, t::permute(c, k, 0, 2, 1, 3));
@@ -617,7 +635,8 @@ impl Runner {
         // zero-sink trick: append a zero logit column then slice it off post-softmax
         let sink0 = t::reshape4(c, step.sink_zero, 1, 1, nh, 1);
         let kq_ext = t::concat(c, kq, sink0, 0); // [n_kv+1, 1, nh]
-        let attn = t::soft_max(c, kq_ext, Ptr(std::ptr::null_mut()), 1.0, 0.0);
+        let kq_mask = if is_swa { step.mask_swa } else { step.mask_full };
+        let attn = t::soft_max(c, kq_ext, kq_mask, 1.0, 0.0);
         let attn = t::cont(c, t::view4(c, attn, n_kv, 1, nh, 1, t::nb(attn, 1), t::nb(attn, 2), t::nb(attn, 3), 0));
         if il == 0 { self.dump("kq_ext-0", kq_ext); self.dump("attn-0", attn); }
 
@@ -703,6 +722,10 @@ struct Step {
     sink_zero: Ptr,
     tau: Ptr,
     pos_val: i64,
+    mask_full: Ptr,
+    mask_swa: Ptr,
+    n_kv_full_pad: i64,
+    n_kv_swa_pad: i64,
 }
 
 impl Runner {
@@ -725,11 +748,13 @@ impl Runner {
         let n_rep = nh / hkv;
         let extent = (self.cfg.rel_extent + 1) as i64;
 
-        // per-visit max n_kv this step (uniform: pos+1 clamped)
-        let n_kv_full = pos + 1;
-        let n_kv_swa = (pos + 1).min(self.swa);
-        let n_kv = n_kv_full; // use largest for the onehot width; views cut per layer
-        let _ = n_kv_swa;
+        // per-visit max n_kv this step, padded to a multiple of 64 so tensor
+        // shapes stay constant across steps (CUDA-graph replayable). The
+        // -inf softmax masks cover the padding columns.
+        let n_kv_full_raw = pos + 1;
+        let n_kv_swa_raw = (pos + 1).min(self.swa);
+        let n_kv_full = ((n_kv_full_raw + 63) & !63).min(self.max_ctx);
+        let n_kv_swa = ((n_kv_swa_raw + 63) & !63).min(self.swa);
 
         // --- inputs ---
         let ids = t::new(c, I32, &[1]);
@@ -738,6 +763,8 @@ impl Runner {
         let kv_idx_swa = t::new(c, I32, &[1]);
         let rel_pos_full = t::new(c, I32, &[n_kv_full, 1]);
         let rel_pos_swa = t::new(c, I32, &[n_kv_swa, 1]);
+        let mask_full = t::new(c, F32, &[n_kv_full + 1, 1, 1, 1]);
+        let mask_swa = t::new(c, F32, &[n_kv_swa + 1, 1, 1, 1]);
         let sink_zero = t::new(c, F32, &[1, 1, hkv, n_rep]);
         // upload input data into cpu-side buffers? These tensors are graph
         // inputs — allocate them in the device buffer and set.
@@ -747,7 +774,7 @@ impl Runner {
         }
         let buf = self.in_buf.as_ref().unwrap().clone();
         let mut o = 0usize;
-        for x in [ids, pos_t, kv_idx_full, kv_idx_swa, rel_pos_full, rel_pos_swa, sink_zero] {
+        for x in [ids, pos_t, kv_idx_full, kv_idx_swa, rel_pos_full, rel_pos_swa, mask_full, mask_swa, sink_zero] {
             unsafe { inkwell_ggml::ink_set_input(x.0) };
             let off = (o + 255) & !255;
             buf.assign(x, off);
@@ -759,14 +786,23 @@ impl Runner {
             t::set(kv_idx_full, [pos as i32].as_ptr().cast(), 0, 4);
             t::set(kv_idx_swa, [(pos.min(self.swa - 1)) as i32].as_ptr().cast(), 0, 4);
             // rel_pos[j] = distance (pos - key_pos) clamped to extent; slot j of
-            // the SWA window holds position pos-(n_kv-1-j)
-            let rp = |nk: i64| -> Vec<i32> {
-                (0..nk).map(|j| (nk - 1 - j).min(self.cfg.rel_extent as i64) as i32).collect()
+            // the SWA window holds position pos-(n_kv-1-j). Padded slots get a
+            // harmless index — their logits are masked to -inf before softmax.
+            let rp = |nk: i64, raw: i64| -> Vec<i32> {
+                (0..nk).map(|j| if j < raw { (raw - 1 - j).min(self.cfg.rel_extent as i64) as i32 } else { 0 }).collect()
             };
-            let rp_f = rp(n_kv_full);
-            let rp_s = rp(n_kv_swa);
+            let rp_f = rp(n_kv_full, n_kv_full_raw);
+            let rp_s = rp(n_kv_swa, n_kv_swa_raw);
             t::set(rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
             t::set(rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
+            // -inf on padded columns (plus a 0 for the appended sink column)
+            let mk = |nk: i64, raw: i64| -> Vec<f32> {
+                (0..=nk).map(|j| if j < raw || j == nk { 0.0 } else { f32::NEG_INFINITY }).collect()
+            };
+            let mk_f = mk(n_kv_full, n_kv_full_raw);
+            let mk_s = mk(n_kv_swa, n_kv_swa_raw);
+            t::set(mask_full, mk_f.as_ptr().cast(), 0, mk_f.len() * 4);
+            t::set(mask_swa, mk_s.as_ptr().cast(), 0, mk_s.len() * 4);
             let z = vec![0f32; (hkv * n_rep) as usize];
             t::set(sink_zero, z.as_ptr().cast(), 0, z.len() * 4);
         }
@@ -779,7 +815,8 @@ impl Runner {
         let tau = t::log(c, t::clamp(c, t::scale(c, posf, 1.0 / self.cfg.log_scale_floor as f32), 1.0, f32::INFINITY));
         let tau = t::reshape3(c, t::scale_bias(c, tau, self.cfg.log_scale_alpha, 1.0), 1, 1, 1);
 
-        let step = Step { ids, kv_idx_full, kv_idx_swa, pos: pos_t, rel_pos_full, rel_pos_swa, sink_zero, tau, pos_val: pos };
+        let step = Step { ids, kv_idx_full, kv_idx_swa, pos: pos_t, rel_pos_full, rel_pos_swa, sink_zero, tau, pos_val: pos,
+                          mask_full, mask_swa, n_kv_full_pad: n_kv_full, n_kv_swa_pad: n_kv_swa };
 
         // embed: dequantize the row host-side (embd stays quantized, ~230 MiB not 1.85 GiB)
         {

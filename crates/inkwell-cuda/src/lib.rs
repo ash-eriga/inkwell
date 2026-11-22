@@ -255,6 +255,14 @@ impl DevBuf {
         Self { ptr: ptr.cast(), len: bytes / 4 }
     }
 
+    /// Zero-fill the buffer.
+    ///
+    /// # Panics
+    /// On memset error.
+    pub fn zero(&self) {
+        assert_eq!(unsafe { cudaMemset(self.ptr.cast(), 0, self.len * 4) }, 0);
+    }
+
     /// Copy raw bytes → device.
     ///
     /// # Panics
@@ -267,6 +275,13 @@ impl DevBuf {
     #[must_use]
     pub fn dev_ptr(&self) -> *mut c_void {
         self.ptr.cast()
+    }
+
+    /// Blocking D2H read of one u64 (debug only).
+    pub fn read_u64(&self) -> u64 {
+        let mut b = [0u8; 8];
+        self.read_bytes(&mut b);
+        u64::from_le_bytes(b)
     }
 
     pub fn read_bytes(&self, dst: &mut [u8]) {
@@ -562,8 +577,9 @@ extern "C" {
         arena: u64, host: u64, esz: i64,
         ptrs: *mut u64, work: *mut u64, k: i32, stream: *mut c_void);
     fn ink_launch_moe_gather(missq: *const i32, work: *const u64, esz: i64,
-        stream: *mut c_void);
+        stats: *mut u64, stream: *mut c_void);
     fn cudaMemsetAsync(dst: *mut c_void, v: i32, bytes: usize, stream: *mut c_void) -> i32;
+    fn cudaMemset(dst: *mut c_void, v: i32, bytes: usize) -> i32;
 }
 
 /// Set the stream all `*_async` helpers below launch on.
@@ -613,8 +629,16 @@ pub unsafe fn moe_alloc_async(missq: *const i32, map: *mut i32,
 ///
 /// # Safety
 /// `missq`/`work` device-valid; call [`mark_dispatch_ready`] first.
-pub unsafe fn moe_gather_async(missq: *const i32, work: *const u64, esz: i64) {
-    unsafe { ink_launch_moe_gather(missq, work, esz, stream()) }
+pub unsafe fn moe_gather_async(missq: *const i32, work: *const u64, esz: i64, stats: *mut u64) {
+    unsafe { ink_launch_moe_gather(missq, work, esz, stats, stream()) }
+}
+
+/// Gather on the side stream (caller joins with [`wait_gather_done`]).
+///
+/// # Safety
+/// Same contract as [`moe_gather_async`].
+pub unsafe fn moe_gather_side_async(missq: *const i32, work: *const u64, esz: i64, stats: *mut u64) {
+    unsafe { ink_launch_moe_gather(missq, work, esz, stats, side_stream()) }
 }
 
 /// Async device memset on the default stream.
