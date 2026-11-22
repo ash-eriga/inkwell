@@ -1,9 +1,9 @@
-//! Custom-op MoE path: expert GEMVs run on the GPU over **zero-copy pinned
-//! host memory** (the Strata trick) from inside a `GGML_OP_CUSTOM` callback.
-//!
-//! The op lands on the CPU backend (the only one that supports custom ops);
-//! its small srcs (x, ids, weights, scales) arrive on host via scheduler
-//! copies, get uploaded, and the result is written into `dst`.
+//! Custom-op MoE path — **device-side dispatch**: the op now runs on the CUDA
+//! backend (fork supports GGML_OP_CUSTOM), so `dst->src[]` data pointers are
+//! device pointers and everything below is a stream-ordered enqueue:
+//! resolve(ids→ptrs) → alloc(LRU evict, on device) → gather(host→VRAM) →
+//! GEMVs → wsum into `dst`. Zero host syncs, zero backend splits, and the
+//! whole thing is CUDA-graph capturable.
 
 use inkwell_cuda as cu;
 use std::ffi::c_void;
@@ -43,99 +43,60 @@ pub struct MoeArgs {
     pub gu_host: *mut u8,
     /// Host base pointer for down table.
     pub dn_host: *mut u8,
-    /// Optional VRAM LRU caches (gate_up, down).
+    /// Optional VRAM LRU caches (gate_up, down) — device-resident state.
     pub caches: std::sync::Mutex<Option<(Cache, Cache)>>,
 }
 
-/// Hit/miss stats (debug).
-pub static mut HITS: u64 = 0;
-/// miss count.
-pub static mut MISSES: u64 = 0;
-
-/// LRU cache of resident experts in VRAM: `map[expert] -> slot | -1`.
+/// LRU expert cache kept entirely in device memory: the resolve/alloc/gather
+/// kernels read and mutate this state inside the compute stream.
 #[derive(Debug)]
 pub struct Cache {
     /// VRAM arena of `k * esz` bytes.
     pub dev: cu::DevBuf,
-    /// expert -> slot index (-1 absent).
-    pub map: Vec<i32>,
-    /// per-slot last-used stamp.
-    pub lru: Vec<u64>,
-    /// monotonically increasing stamp.
-    pub stamp: u64,
+    /// `map_dev[expert] -> slot | -1` (i32[128]).
+    pub map_dev: cu::DevBuf,
+    /// `lru_dev[slot]` last-used stamp (u64[k]).
+    pub lru_dev: cu::DevBuf,
+    /// `stamp_dev` monotonic counter (u64[1]).
+    pub stamp_dev: cu::DevBuf,
+    /// `rev_dev[slot] -> expert | -1` (i32[k]).
+    pub rev_dev: cu::DevBuf,
+    /// `missq`: i32[18] — [0]=count, then (slot, expert) pairs.
+    pub missq_dev: cu::DevBuf,
+    /// `work`: u64[16] — (src, dst) pairs for the gather kernel.
+    pub work_dev: cu::DevBuf,
+    /// `k` resident slots.
+    pub k: usize,
     /// bytes per expert.
     pub esz: usize,
-    /// per-expert use count (promote at >=2).
-    pub uses: Vec<u8>,
 }
 
 impl Cache {
     /// New cache holding `k` experts of `esz` bytes.
     #[must_use]
     pub fn new(k: usize, esz: usize) -> Self {
-        Self { dev: cu::DevBuf::new_bytes(k * esz), map: vec![-1; 128], lru: vec![0; k], stamp: 0, esz, uses: vec![0; 128] }
-    }
-
-    /// `n_slots`.
-    fn k(&self) -> usize { self.lru.len() }
-
-    /// Resolve `ptrs` for the selected experts; returns miss list (slot_idx, expert).
-    fn resolve(&mut self, ids_v: &[i32], host: *mut u8, ptrs: &mut [usize; N_SLOTS], misses: &mut Vec<(usize, i32)>) {
-        for (s, &e) in ids_v.iter().enumerate() {
-            let e = e as usize;
-            let slot = self.map[e];
-            if slot >= 0 {
-                unsafe { HITS += 1 };
-                self.uses[e] = self.uses[e].saturating_add(1);
-                ptrs[s] = unsafe { self.dev.dev_ptr().cast::<u8>().add(slot as usize * self.esz) } as usize;
-                self.stamp += 1;
-                self.lru[slot as usize] = self.stamp;
-            } else {
-                unsafe { MISSES += 1 };
-                ptrs[s] = unsafe { host.add(e * self.esz) } as usize;
-                self.uses[e] = self.uses[e].saturating_add(1);
-                if self.uses[e] >= 1 { misses.push((s, e as i32)); }
-            }
-        }
-    }
-
-    /// Promote misses into VRAM (evict LRU); copies are stream-ordered.
-    /// Re-points `ptrs` at the cache slot so this call's GEMV reads VRAM
-    /// instead of re-streaming the same expert over PCIe (halves miss traffic).
-    fn promote(&mut self, misses: &[(usize, i32)], host: *mut u8, ptrs: &mut [usize; N_SLOTS], side: bool) {
-        for &(s, e) in misses {
-            if self.k() == 0 { break; }
-            let e = e as usize;
-            let (mut victim, mut oldest) = (0usize, u64::MAX);
-            for (i, &t) in self.lru.iter().enumerate() {
-                if t < oldest { oldest = t; victim = i; }
-            }
-            if let Some(old) = self.map.iter().position(|&m| m == victim as i32) {
-                self.map[old] = -1;
-            }
-            unsafe {
-                let d = self.dev.dev_ptr().cast::<u8>().add(victim * self.esz).cast();
-                let h = host.add(e * self.esz).cast_const().cast();
-                if side { cu::memcpy_h2d_async_side(d, h, self.esz) } else { cu::memcpy_h2d_async(d, h, self.esz) }
-            }
-            ptrs[s] = unsafe { self.dev.dev_ptr().cast::<u8>().add(victim * self.esz) } as usize;
-            self.map[e] = victim as i32;
-            self.stamp += 1;
-            self.lru[victim] = self.stamp;
+        let map_dev = cu::DevBuf::new_bytes(128 * 4);
+        map_dev.write_bytes_async(&[0xFFu8; 128 * 4]);
+        let rev_dev = cu::DevBuf::new_bytes(k * 4);
+        rev_dev.write_bytes_async(&vec![0xFFu8; k * 4]);
+        Self {
+            dev: cu::DevBuf::new_bytes(k * esz),
+            map_dev,
+            lru_dev: cu::DevBuf::new_bytes(k * 8),
+            stamp_dev: cu::DevBuf::new_bytes(8),
+            rev_dev,
+            missq_dev: cu::DevBuf::new_bytes(72),
+            work_dev: cu::DevBuf::new_bytes(128),
+            k,
+            esz,
         }
     }
 }
 
 /// Device staging buffers shared by all MoE visits of a step.
 struct Staging {
-    x: Mutex<cu::DevBuf>,       // [N_EMBD] f32
-    ids: Mutex<cu::DevBuf>,     // [N_SLOTS] i32
-    w: Mutex<cu::DevBuf>,       // [N_SLOTS] f32
-    sgu: Mutex<cu::DevBuf>,     // [N_SLOTS] f32
-    sdn: Mutex<cu::DevBuf>,     // [N_SLOTS] f32
     gu_ptrs: Mutex<cu::DevBuf>, // [N_SLOTS] u64
     dn_ptrs: Mutex<cu::DevBuf>, // [N_SLOTS] u64
-    outp: Mutex<cu::DevBuf>,    // [N_EMBD] f32
     gu: Mutex<cu::DevBuf>,      // [N_SLOTS][2*N_FF] f32
     hid: Mutex<cu::DevBuf>,     // [N_SLOTS][N_FF] f32
     dn: Mutex<cu::DevBuf>,      // [N_SLOTS][N_EMBD] f32
@@ -145,21 +106,16 @@ static STAGING: OnceLock<Staging> = OnceLock::new();
 
 fn staging() -> &'static Staging {
     STAGING.get_or_init(|| Staging {
-        x: Mutex::new(cu::DevBuf::new_bytes(N_EMBD * 4)),
-        ids: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 4)),
-        w: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 4)),
-        sgu: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 4)),
-        sdn: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 4)),
         gu_ptrs: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 8)),
         dn_ptrs: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 8)),
         gu: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 2 * N_FF * 4)),
         hid: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_FF * 4)),
         dn: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_EMBD * 4)),
-        outp: Mutex::new(cu::DevBuf::new_bytes(N_EMBD * 4)),
     })
 }
 
-/// `ggml_custom_op_t` — runs on a CPU-backend thread inside `sched_compute`.
+/// `ggml_custom_op_t` — runs on the CUDA backend inside `sched_compute`.
+/// Everything enqueued on the default stream; returns immediately.
 ///
 /// # Safety
 /// Called by ggml with `dst->src[]` = the op's args and `userdata = &MoeArgs`.
@@ -167,146 +123,100 @@ fn staging() -> &'static Staging {
 unsafe extern "C" fn moe_cb(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_void) {
     let a = unsafe { &*ud.cast::<MoeArgs>() };
     let st = staging();
-    // src data ptrs (host; scheduler copied them to the CPU backend)
+    unsafe { cu::set_stream(inkwell_ggml::cuda_stream()) };
+    if std::env::var("INKWELL_MOE_PTRS").is_ok() {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        eprintln!("STREAM visit={} s={:?}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed), inkwell_ggml::cuda_stream());
+    }
+    // src data ptrs — DEVICE pointers on the CUDA backend
     let src = |i: i32| unsafe {
         let t = inkwell_ggml::ink_tensor_src(dst, i);
         inkwell_ggml::ink_tensor_data(t)
     };
-    let x_h = src(0) as *const f32;
-    let ids_h = src(1) as *const i32;
-    let w_h = src(2) as *const f32;
-    let mut sgu_h: *const f32 = std::ptr::null();
-    let mut sdn_h: *const f32 = std::ptr::null();
+    let x_dev = src(0) as *const c_void;
+    let ids_dev = src(1) as *const i32;
+    let w_dev = src(2) as *const c_void;
+    let mut sgu_dev: *const c_void = std::ptr::null();
+    let mut sdn_dev: *const c_void = std::ptr::null();
     if a.has_sgu && a.has_sdn {
-        sgu_h = src(3).cast::<f32>();
-        sdn_h = src(4).cast::<f32>();
+        sgu_dev = src(3);
+        sdn_dev = src(4);
     } else if a.has_sgu {
-        sgu_h = src(3).cast::<f32>();
+        sgu_dev = src(3);
     } else if a.has_sdn {
-        sdn_h = src(3).cast::<f32>();
+        sdn_dev = src(3);
     }
 
-    let t_up = std::time::Instant::now();
-    // uploads
-    let mut x = st.x.lock().expect("x");
-    x.write_bytes_async(unsafe { std::slice::from_raw_parts(x_h.cast::<u8>(), N_EMBD * 4) });
-    let ids_v: Vec<i32> = unsafe { std::slice::from_raw_parts(ids_h, N_SLOTS).to_vec() };
-    let mut w = st.w.lock().expect("w");
-    w.write_bytes_async(unsafe { std::slice::from_raw_parts(w_h.cast::<u8>(), N_SLOTS * 4) });
-    let mut sgu = st.sgu.lock().expect("sgu");
-    if !sgu_h.is_null() {
-        sgu.write_bytes_async(unsafe { std::slice::from_raw_parts(sgu_h.cast::<u8>(), N_SLOTS * 4) });
-    }
-    let mut sdn = st.sdn.lock().expect("sdn");
-    if !sdn_h.is_null() {
-        sdn.write_bytes_async(unsafe { std::slice::from_raw_parts(sdn_h.cast::<u8>(), N_SLOTS * 4) });
-    }
-    // resolve per-slot weight pointers via the VRAM LRU caches
-    let mut gu_misses: Vec<(usize, i32)> = Vec::new();
-    let mut dn_misses: Vec<(usize, i32)> = Vec::new();
-    let mut gu_ptrs = st.gu_ptrs.lock().expect("gu_ptrs");
-    let mut dn_ptrs = st.dn_ptrs.lock().expect("dn_ptrs");
-    {
-        let mut ptrs = [0usize; N_SLOTS];
+    let gu_ptrs = st.gu_ptrs.lock().expect("gu_ptrs");
+    let dn_ptrs = st.dn_ptrs.lock().expect("dn_ptrs");
+    unsafe {
         let mut caches = a.caches.lock().expect("caches");
         if let Some((gc, dc)) = caches.as_mut() {
-            gc.resolve(&ids_v, a.gu_host, &mut ptrs, &mut gu_misses);
-            gc.promote(&gu_misses, a.gu_host, &mut ptrs, false);
-            gu_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
-            dc.resolve(&ids_v, a.dn_host, &mut ptrs, &mut dn_misses);
-            // dn promotion + ptr upload run on the side stream, overlapped with
-            // the gu GEMV; stream 0 waits before the dn GEMV launch
-            dc.promote(&dn_misses, a.dn_host, &mut ptrs, true);
-            dn_ptrs.write_bytes_async_side(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
+            let dbg = std::env::var("INKWELL_MOE_CHECK").is_ok();
+            for (c, ptrs, host) in [(&*gc, &*gu_ptrs, a.gu_host), (&*dc, &*dn_ptrs, a.dn_host)] {
+                cu::memset_dev_async(c.missq_dev.dev_ptr(), 0, 4);
+                cu::moe_resolve_async(ids_dev, c.map_dev.dev_ptr().cast(),
+                    c.dev.dev_ptr() as u64, host as u64, c.esz as i64,
+                    ptrs.dev_ptr().cast(), c.missq_dev.dev_ptr().cast(), N_SLOTS);
+                cu::moe_alloc_async(c.missq_dev.dev_ptr().cast_const().cast(),
+                    c.map_dev.dev_ptr().cast(), c.lru_dev.dev_ptr().cast(),
+                    c.stamp_dev.dev_ptr().cast(), c.rev_dev.dev_ptr().cast(),
+                    c.dev.dev_ptr() as u64, host as u64, c.esz as i64,
+                    ptrs.dev_ptr().cast(), c.work_dev.dev_ptr().cast(), c.k);
+                cu::moe_gather_async(c.missq_dev.dev_ptr().cast_const().cast(),
+                    c.work_dev.dev_ptr().cast_const().cast(), c.esz as i64);
+                if dbg { cu::sync_check("dispatch"); }
+            }
         } else {
-            for (s, &e) in ids_v.iter().enumerate() {
-                ptrs[s] = unsafe { a.gu_host.add(e as usize * a.gu_stride) } as usize;
-            }
-            gu_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
-            for (s, &e) in ids_v.iter().enumerate() {
-                ptrs[s] = unsafe { a.dn_host.add(e as usize * a.dn_stride) } as usize;
-            }
-            dn_ptrs.write_bytes_async(unsafe { std::slice::from_raw_parts(ptrs.as_ptr().cast::<u8>(), N_SLOTS * 8) });
+            cu::moe_resolve_async(ids_dev, std::ptr::null(),
+                0, a.gu_host as u64, a.gu_stride as i64,
+                gu_ptrs.dev_ptr().cast(), std::ptr::null_mut(), N_SLOTS);
+            cu::moe_resolve_async(ids_dev, std::ptr::null(),
+                0, a.dn_host as u64, a.dn_stride as i64,
+                dn_ptrs.dev_ptr().cast(), std::ptr::null_mut(), N_SLOTS);
         }
     }
 
-    let t_mid = std::time::Instant::now();
-    let mut gu = st.gu.lock().expect("gu");
-    let mut hid = st.hid.lock().expect("hid");
-    let mut dn = st.dn.lock().expect("dn");
-    let mut outp = st.outp.lock().expect("outp");
-
-    if std::env::var("INKWELL_MOE_DUMP").is_ok() {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let v = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if v == 0 {
-            let f = std::fs::File::create("/tmp/moe_dump.bin").expect("dump");
-            use std::io::Write as _;
-            let mut f = std::io::BufWriter::new(f);
-            f.write_all(unsafe { std::slice::from_raw_parts(x_h.cast::<u8>(), N_EMBD * 4) }).expect("w");
-            f.write_all(unsafe { std::slice::from_raw_parts(ids_h.cast::<u8>(), 32) }).expect("w");
-            f.write_all(unsafe { std::slice::from_raw_parts(w_h.cast::<u8>(), 32) }).expect("w");
-            if !sgu_h.is_null() { f.write_all(unsafe { std::slice::from_raw_parts(sgu_h.cast::<u8>(), 32) }).expect("w"); }
-            if !sdn_h.is_null() { f.write_all(unsafe { std::slice::from_raw_parts(sdn_h.cast::<u8>(), 32) }).expect("w"); }
-            eprintln!("DUMPED gu_t={} dn_t={} sgu={} sdn={}", a.gu_type, a.dn_type, a.has_sgu, a.has_sdn);
-        }
-    }
-    if std::env::var("INKWELL_MOE_DBG").is_ok() {
-        let ids_v = unsafe { std::slice::from_raw_parts(ids_h, 8) };
-        let w_v = unsafe { std::slice::from_raw_parts(w_h, 8) };
-        let x_v = unsafe { std::slice::from_raw_parts(x_h, 4) };
-        eprintln!("MOECB ids={ids_v:?} w={w_v:?} x={x_v:?} gu_t={} dn_t={}", a.gu_type, a.dn_type);
-    }
-
-    let t0 = std::time::Instant::now();
-    static SKIP: OnceLock<bool> = OnceLock::new();
-    if *SKIP.get_or_init(|| std::env::var("INKWELL_MOE_SKIP").is_ok()) {
-        unsafe { std::ptr::write_bytes(inkwell_ggml::ink_tensor_data(dst).cast::<u8>(), 0, N_EMBD * 4) };
+    if std::env::var("INKWELL_MOE_SKIP").is_ok() {
+        unsafe { cu::memset_dev_async(inkwell_ggml::ink_tensor_data(dst), 0, N_EMBD * 4) };
         return;
     }
     unsafe {
+        let mut gu = st.gu.lock().expect("gu");
+        let mut hid = st.hid.lock().expect("hid");
+        let mut dn = st.dn.lock().expect("dn");
         match a.gu_type {
-            T_IQ2_XXS => cu::mmvq_iq2_xxs_moe_async(gu_ptrs.dev_ptr().cast_const(), x.dev_ptr().cast_const(), &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
-            T_IQ1_S => cu::mmvq_iq1_s_moe_async(gu_ptrs.dev_ptr().cast_const(), x.dev_ptr().cast_const(), &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
-            T_IQ2_XS => cu::mmvq_iq2_xs_moe_async(gu_ptrs.dev_ptr().cast_const(), x.dev_ptr().cast_const(), &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
-            T_IQ2_S => cu::mmvq_iq2_s_moe_async(gu_ptrs.dev_ptr().cast_const(), x.dev_ptr().cast_const(), &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
+            T_IQ2_XXS => cu::mmvq_iq2_xxs_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
+            T_IQ1_S => cu::mmvq_iq1_s_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
+            T_IQ2_XS => cu::mmvq_iq2_xs_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
+            T_IQ2_S => cu::mmvq_iq2_s_moe_async(gu_ptrs.dev_ptr().cast_const(), x_dev, &mut gu, 2 * N_FF, N_EMBD, 0, N_SLOTS),
             t => panic!("gate_up type {t}"),
         }
-        cu::situ_pair_async(&mut hid, &gu, if sgu_h.is_null() { std::ptr::null() } else { sgu.dev_ptr().cast_const() }, 4.0, 25.0, N_FF, N_SLOTS);
-        cu::side_sync_to_main();
+        cu::situ_pair_async(&mut hid, &gu, sgu_dev, 4.0, 25.0, N_FF, N_SLOTS);
         match a.dn_type {
             T_Q2_0 => cu::mmvq_q2_0_moe_i8_async(dn_ptrs.dev_ptr().cast_const(), hid.dev_ptr().cast_const(), &mut dn, N_EMBD, N_FF, N_FF, N_SLOTS),
             T_NVFP4 => cu::mmvq_nvfp4_moe_i8_async(dn_ptrs.dev_ptr().cast_const(), hid.dev_ptr().cast_const(), &mut dn, N_EMBD, N_FF, N_FF, N_SLOTS),
             t => panic!("down type {t}"),
         }
-        cu::expert_wsum_async(outp.dev_ptr(), &dn, w.dev_ptr().cast_const(), if sdn_h.is_null() { std::ptr::null() } else { sdn.dev_ptr().cast_const() }, N_EMBD, N_SLOTS);
-    }
-    if std::env::var("INKWELL_MOE_T").is_ok() {
-        unsafe { eprintln!("MOET kern={:?} hits={HITS} misses={MISSES}", t0.elapsed()) };
-    }
-    let mut v = [0u8; N_EMBD * 4];
-    outp.read_bytes(&mut v);
-    if std::env::var("INKWELL_MOE_DUMP").is_ok() {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let v = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if v == 0 {
-            let f = std::fs::File::create("/tmp/moe_dump.bin").expect("dump");
-            use std::io::Write as _;
-            let mut f = std::io::BufWriter::new(f);
-            f.write_all(unsafe { std::slice::from_raw_parts(x_h.cast::<u8>(), N_EMBD * 4) }).expect("w");
-            f.write_all(unsafe { std::slice::from_raw_parts(ids_h.cast::<u8>(), 32) }).expect("w");
-            f.write_all(unsafe { std::slice::from_raw_parts(w_h.cast::<u8>(), 32) }).expect("w");
-            if !sgu_h.is_null() { f.write_all(unsafe { std::slice::from_raw_parts(sgu_h.cast::<u8>(), 32) }).expect("w"); }
-            if !sdn_h.is_null() { f.write_all(unsafe { std::slice::from_raw_parts(sdn_h.cast::<u8>(), 32) }).expect("w"); }
-            eprintln!("DUMPED gu_t={} dn_t={} sgu={} sdn={}", a.gu_type, a.dn_type, a.has_sgu, a.has_sdn);
+        cu::expert_wsum_async(inkwell_ggml::ink_tensor_data(dst), &dn, w_dev, sdn_dev, N_EMBD, N_SLOTS);
+        if std::env::var("INKWELL_MOE_CHECK").is_ok() { cu::sync_check("gemv"); }
+        if std::env::var("INKWELL_MOE_PTRS").is_ok() {
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut g = [0u64; N_SLOTS];
+                let mut d = [0u64; N_SLOTS];
+                gu_ptrs.read_bytes(unsafe { std::slice::from_raw_parts_mut(g.as_mut_ptr().cast::<u8>(), N_SLOTS * 8) });
+                dn_ptrs.read_bytes(unsafe { std::slice::from_raw_parts_mut(d.as_mut_ptr().cast::<u8>(), N_SLOTS * 8) });
+                let caches = a.caches.lock().expect("c");
+                let (gk, dk) = caches.as_ref().map_or((0, 0), |(x, y)| (x.k, y.k));
+                eprintln!("PTRS gu_h={:p} gu_arena={:?} dn_h={:p} dn_arena={:?} k=({gk},{dk})",
+                    a.gu_host, caches.as_ref().map(|c| c.0.dev.dev_ptr()),
+                    a.dn_host, caches.as_ref().map(|c| c.1.dev.dev_ptr()));
+                for i in 0..N_SLOTS {
+                    eprintln!("  s{i}: gu={:#x} dn={:#x}", g[i], d[i]);
+                }
+            }
         }
-    }
-    if std::env::var("INKWELL_MOE_DBG").is_ok() {
-        let f: &[f32] = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<f32>(), 8) };
-        eprintln!("MOECB out={f:?}");
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(v.as_ptr(), inkwell_ggml::ink_tensor_data(dst).cast::<u8>(), v.len());
     }
 }
 

@@ -69,6 +69,7 @@ extern "C" {
     pub fn ink_softplus(c: *mut c_void, a: *mut c_void) -> *mut c_void;
     pub fn ink_gelu_quick(c: *mut c_void, a: *mut c_void) -> *mut c_void;
     pub fn ink_add_id(c: *mut c_void, a: *mut c_void, b: *mut c_void, ids: *mut c_void) -> *mut c_void;
+    pub fn ink_cuda_stream() -> *mut c_void;
     pub fn ink_backend_cuda(dev: c_int) -> *mut c_void;
     pub fn ink_backend_cpu(threads: c_int) -> *mut c_void;
     pub fn ink_sched_new(backends: *mut *mut c_void, bufts: *mut *mut c_void, n: c_int, graph_size: usize) -> *mut c_void;
@@ -161,4 +162,10 @@ pub fn smoke() -> Vec<f32> {
         ink_ctx_free(ctx);
         v
     }
+}
+
+/// Current compute stream of the ggml CUDA backend.
+#[must_use]
+pub fn cuda_stream() -> *mut std::ffi::c_void {
+    unsafe { ink_cuda_stream() }
 }

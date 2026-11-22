@@ -109,14 +109,14 @@ pub fn add(y: &mut DevBuf, a: &DevBuf, b: &DevBuf) {
 /// `w` = raw quant rows, `x` = f32 activations, `y` = `nrows` out.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn mmvq_iq2_xxs(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
-    unsafe { ink_launch_mmvq_iq2_xxs(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_xxs(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, stream()) };
     DevBuf::sync();
 }
 
 /// GEMV `y[r] = dequant(W[r,:]) . x` for Q2_0 weights.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn mmvq_q2_0(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
-    unsafe { ink_launch_mmvq_q2_0(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_q2_0(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, stream()) };
     DevBuf::sync();
 }
 
@@ -153,7 +153,7 @@ pub fn host_register_mapped_ro(host: &[u8]) -> *mut c_void {
 /// `nrows` full rows of quant data.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xxs_host(w: *mut c_void, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
-    unsafe { ink_launch_mmvq_iq2_xxs(w, x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_xxs(w, x.ptr, y.ptr, nrows as i64, ncols as i64, stream()) };
     DevBuf::sync();
 }
 
@@ -164,7 +164,7 @@ pub unsafe fn mmvq_iq2_xxs_host(w: *mut c_void, x: &DevBuf, y: &mut DevBuf, nrow
 /// `w` and `ids` must be device-accessible pointers.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xxs_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq2_xxs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_xxs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
     DevBuf::sync();
 }
 
@@ -174,7 +174,7 @@ pub unsafe fn mmvq_iq2_xxs_moe(wp: *const c_void, x: *const c_void, y: &mut DevB
 /// See [`mmvq_iq2_xxs_moe`].
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_q2_0_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_q2_0_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_q2_0_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
     DevBuf::sync();
 }
 
@@ -184,14 +184,14 @@ pub unsafe fn mmvq_q2_0_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf,
 /// On launch failure.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn swiglu_pair(y: &mut DevBuf, gu: &DevBuf, nslots: usize, ncols: usize) {
-    unsafe { ink_launch_swiglu_pair(y.ptr, gu.ptr, nslots as i64, ncols as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_swiglu_pair(y.ptr, gu.ptr, nslots as i64, ncols as i64, stream()) };
     DevBuf::sync();
 }
 
 /// GEMV for NVFP4 weights (36 bytes per 64 values).
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn mmvq_nvfp4(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
-    unsafe { ink_launch_mmvq_nvfp4(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_nvfp4(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, stream()) };
     DevBuf::sync();
 }
 
@@ -199,14 +199,14 @@ pub fn mmvq_nvfp4(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: u
 #[expect(clippy::cast_possible_wrap, reason = "nblocks < i64::MAX")]
 pub fn dequant_iq1_s(src: &DevBuf, dst: &mut DevBuf) {
     let nblocks = (dst.len / 256) as i64;
-    unsafe { ink_launch_dequant_iq1_s(src.ptr.cast_const().cast(), dst.ptr, nblocks, std::ptr::null_mut()) };
+    unsafe { ink_launch_dequant_iq1_s(src.ptr.cast_const().cast(), dst.ptr, nblocks, stream()) };
     DevBuf::sync();
 }
 
 /// GEMV for IQ1_S weights.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn mmvq_iq1_s(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: usize) {
-    unsafe { ink_launch_mmvq_iq1_s(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq1_s(w.ptr.cast_const().cast(), x.ptr, y.ptr, nrows as i64, ncols as i64, stream()) };
     DevBuf::sync();
 }
 
@@ -215,7 +215,7 @@ pub fn mmvq_iq1_s(w: &DevBuf, x: &DevBuf, y: &mut DevBuf, nrows: usize, ncols: u
 #[expect(clippy::cast_possible_wrap, reason = "nblocks < i64::MAX")]
 pub fn dequant_iq2_xxs(src: &DevBuf, dst: &mut DevBuf) {
     let nblocks = (dst.len / 256) as i64;
-    unsafe { ink_launch_dequant_iq2_xxs(src.ptr.cast_const().cast(), dst.ptr, nblocks, std::ptr::null_mut()) };
+    unsafe { ink_launch_dequant_iq2_xxs(src.ptr.cast_const().cast(), dst.ptr, nblocks, stream()) };
     DevBuf::sync();
 }
 
@@ -294,7 +294,7 @@ impl DevBuf {
         assert_eq!(rc, 0, "cudaMemcpyAsync HtoD side");
     }
     pub fn write_bytes_async(&self, src: &[u8]) {
-        let rc = unsafe { cudaMemcpyAsync(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1, std::ptr::null_mut()) };
+        let rc = unsafe { cudaMemcpyAsync(self.ptr.cast(), src.as_ptr().cast(), src.len(), 1, stream()) };
         assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");
     }
 
@@ -331,7 +331,7 @@ impl Drop for DevBuf {
 /// See [`mmvq_iq2_xxs_moe`].
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq1_s_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq1_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq1_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
     DevBuf::sync();
 }
 
@@ -341,7 +341,7 @@ pub unsafe fn mmvq_iq1_s_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf
 /// See [`mmvq_iq2_xxs_moe`].
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_nvfp4_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_nvfp4_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_nvfp4_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
     DevBuf::sync();
 }
 
@@ -352,7 +352,7 @@ pub unsafe fn mmvq_nvfp4_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn situ_pair(hid: &mut DevBuf, gu: &DevBuf, sgu: Option<&DevBuf>, beta: f32, lin_beta: f32, ncols: usize, nslots: usize) {
     let s = sgu.map_or(std::ptr::null(), |b| b.ptr);
-    unsafe { ink_launch_situ_pair(gu.ptr, s, hid.ptr, beta, lin_beta, ncols as i64, nslots as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_situ_pair(gu.ptr, s, hid.ptr, beta, lin_beta, ncols as i64, nslots as i64, stream()) };
     DevBuf::sync();
 }
 
@@ -363,7 +363,7 @@ pub fn situ_pair(hid: &mut DevBuf, gu: &DevBuf, sgu: Option<&DevBuf>, beta: f32,
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub fn expert_wsum(out: &mut DevBuf, dn: &DevBuf, w: &DevBuf, sd: Option<&DevBuf>, ncols: usize, nslots: usize) {
     let s = sd.map_or(std::ptr::null(), |b| b.ptr);
-    unsafe { ink_launch_expert_wsum(dn.ptr, w.ptr, s, out.ptr, ncols as i64, nslots as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_expert_wsum(dn.ptr, w.ptr, s, out.ptr, ncols as i64, nslots as i64, stream()) };
     DevBuf::sync();
 }
 
@@ -373,7 +373,7 @@ pub fn expert_wsum(out: &mut DevBuf, dn: &DevBuf, w: &DevBuf, sd: Option<&DevBuf
 /// See [`mmvq_iq2_xxs_moe`].
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xs_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq2_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
     DevBuf::sync();
 }
 
@@ -383,7 +383,7 @@ pub unsafe fn mmvq_iq2_xs_moe(wp: *const c_void, x: *const c_void, y: &mut DevBu
 /// See [`mmvq_iq2_xxs_moe`].
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_s_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq2_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
     DevBuf::sync();
 }
 
@@ -393,7 +393,7 @@ pub unsafe fn mmvq_iq2_s_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf
 /// See [`mmvq_iq2_xxs_moe`].
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq4_xs_moe(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq4_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq4_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
     DevBuf::sync();
 }
 
@@ -430,55 +430,55 @@ unsafe impl Sync for PinnedBuf {}
 /// Same as [`mmvq_iq2_xxs_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xxs_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq2_xxs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_xxs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// Same as [`mmvq_q2_0_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_q2_0_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_q2_0_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_q2_0_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// Same as [`mmvq_iq1_s_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq1_s_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq1_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq1_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// DP4A variant of q2_0 (~0.05% error).
 /// # Safety
 /// See [`mmvq_nvfp4_moe`].
 pub unsafe fn mmvq_q2_0_moe_i8_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_q2_0_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_q2_0_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 /// DP4A variant: x quantized to int8 per 64-val block (~0.1% error).
 /// # Safety
 /// See [`mmvq_nvfp4_moe`].
 pub unsafe fn mmvq_nvfp4_moe_i8_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_nvfp4_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_nvfp4_moe_i8(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 /// Same as [`mmvq_nvfp4_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_nvfp4_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_nvfp4_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_nvfp4_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// Same as [`mmvq_iq2_xs_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_xs_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq2_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// Same as [`mmvq_iq2_s_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq2_s_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq2_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq2_s_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// Same as [`mmvq_iq4_xs_moe`] but does not synchronize; caller must sync.
 #[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
 pub unsafe fn mmvq_iq4_xs_moe_async(wp: *const c_void, x: *const c_void, y: &mut DevBuf, nrows: usize, ncols: usize, x_stride: usize, nslots: usize) {
-    unsafe { ink_launch_mmvq_iq4_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, std::ptr::null_mut()) };
+    unsafe { ink_launch_mmvq_iq4_xs_moe(wp.cast(), x.cast(), y.ptr, nrows as i64, ncols as i64, x_stride as i64, nslots as i32, stream()) };
 }
 
 /// Async `situ_pair` — no sync.
@@ -486,7 +486,7 @@ pub unsafe fn mmvq_iq4_xs_moe_async(wp: *const c_void, x: *const c_void, y: &mut
 /// # Safety
 /// `sgu` may be null; pointers valid for `ncols*nslots` elements.
 pub unsafe fn situ_pair_async(hid: &mut DevBuf, gu: &DevBuf, sgu: *const c_void, beta: f32, lin_beta: f32, ncols: usize, nslots: usize) {
-    unsafe { ink_launch_situ_pair(gu.ptr, sgu.cast(), hid.ptr, beta, lin_beta, ncols as i64, nslots as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_situ_pair(gu.ptr, sgu.cast(), hid.ptr, beta, lin_beta, ncols as i64, nslots as i64, stream()) };
 }
 
 /// Async `expert_wsum` — no sync.
@@ -494,7 +494,7 @@ pub unsafe fn situ_pair_async(hid: &mut DevBuf, gu: &DevBuf, sgu: *const c_void,
 /// # Safety
 /// `sd` may be null; `w` valid for `nslots`, `out` for `ncols`.
 pub unsafe fn expert_wsum_async(out: *mut c_void, dn: &DevBuf, w: *const c_void, sd: *const c_void, ncols: usize, nslots: usize) {
-    unsafe { ink_launch_expert_wsum(dn.ptr, w.cast(), sd.cast(), out.cast(), ncols as i64, nslots as i64, std::ptr::null_mut()) };
+    unsafe { ink_launch_expert_wsum(dn.ptr, w.cast(), sd.cast(), out.cast(), ncols as i64, nslots as i64, stream()) };
 }
 
 /// Free/total VRAM in bytes.
@@ -511,7 +511,7 @@ pub fn mem_info() -> (usize, usize) {
 /// # Safety
 /// `dst`/`src` valid for `bytes`.
 pub unsafe fn memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
-    let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, std::ptr::null_mut()) };
+    let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, stream()) };
     assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");
 }
 /// Secondary stream + event for overlapping MoE expert promotion with compute.
@@ -550,4 +550,85 @@ pub unsafe fn side_sync_to_main() {
     let e = side_event();
     assert_eq!(unsafe { cudaEventRecord(e, s) }, 0);
     assert_eq!(unsafe { cudaStreamWaitEvent(std::ptr::null_mut(), e, 0) }, 0);
+}
+
+extern "C" {
+    fn ink_launch_moe_resolve(ids: *const i32, map: *const i32,
+        arena: u64, host: u64, esz: i64,
+        ptrs: *mut u64, missq: *mut i32, nslots: i32, stream: *mut c_void);
+    fn ink_launch_moe_alloc(missq: *const i32, map: *mut i32,
+        lru: *mut u64, stamp: *mut u64, rev: *mut i32,
+        arena: u64, host: u64, esz: i64,
+        ptrs: *mut u64, work: *mut u64, k: i32, stream: *mut c_void);
+    fn ink_launch_moe_gather(missq: *const i32, work: *const u64, esz: i64,
+        stream: *mut c_void);
+    fn cudaMemsetAsync(dst: *mut c_void, v: i32, bytes: usize, stream: *mut c_void) -> i32;
+
+}
+
+/// Set the stream all `*_async` helpers below launch on.
+///
+/// # Safety
+/// `s` must outlive all launches (use the ggml CUDA stream).
+static INK_STREAM: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+pub unsafe fn set_stream(s: *mut c_void) {
+    INK_STREAM.store(s, std::sync::atomic::Ordering::Relaxed);
+}
+fn stream() -> *mut c_void { INK_STREAM.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// ids[s] -> ptrs[s] via device map (misses pushed to missq).
+///
+/// # Safety
+/// `ids`/`map`/`ptrs`/`missq` are device pointers; `host` may be a host-mapped pointer.
+pub unsafe fn moe_resolve_async(ids: *const i32, map: *const i32,
+    arena: u64, host: u64, esz: i64,
+    ptrs: *mut u64, missq: *mut i32, nslots: usize) {
+    unsafe {
+        ink_launch_moe_resolve(ids, map, arena, host, esz, ptrs, missq,
+            nslots as i32, stream());
+    }
+}
+
+/// Pick LRU victims for queued misses on device; writes ptrs + copy work items.
+///
+/// # Safety
+/// All pointer args are device pointers.
+pub unsafe fn moe_alloc_async(missq: *const i32, map: *mut i32,
+    lru: *mut u64, stamp: *mut u64, rev: *mut i32,
+    arena: u64, host: u64, esz: i64,
+    ptrs: *mut u64, work: *mut u64, k: usize) {
+    unsafe {
+        ink_launch_moe_alloc(missq, map, lru, stamp, rev, arena, host, esz,
+            ptrs, work, k as i32, stream());
+    }
+}
+
+/// Copy queued misses host->VRAM slot (zero-copy read), one block each.
+///
+/// # Safety
+/// `missq`/`work` are device pointers; work srcs may be host-mapped.
+pub unsafe fn moe_gather_async(missq: *const i32, work: *const u64, esz: i64) {
+    unsafe { ink_launch_moe_gather(missq, work, esz, stream()) }
+}
+
+/// Async device memset on the default stream.
+///
+/// # Safety
+/// `dst` is a device pointer.
+pub unsafe fn memset_dev_async(dst: *mut c_void, v: i32, bytes: usize) {
+    unsafe { cudaMemsetAsync(dst, v, bytes, stream()) };
+}
+
+/// cudaDeviceSynchronize + report last error (debug only).
+///
+/// # Safety
+/// Synchronizes the device.
+pub unsafe fn sync_check(tag: &str) {
+    extern "C" { fn cudaDeviceSynchronize() -> i32; fn cudaGetLastError() -> i32; }
+    unsafe {
+        cudaDeviceSynchronize();
+        let e = cudaGetLastError();
+        if e != 0 { eprintln!("CUDAERR@{tag}: {e}"); }
+    }
 }

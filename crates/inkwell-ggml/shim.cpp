@@ -98,7 +98,9 @@ ggml_tensor* ink_gelu_quick(ggml_context* c, ggml_tensor* a) { return ggml_gelu_
 ggml_tensor* ink_add_id(ggml_context* c, ggml_tensor* a, ggml_tensor* b, ggml_tensor* ids) { return ggml_add_id(c, a, b, ids); }
 
 // ---- backend / buffers / graph compute ----
-ggml_backend_t ink_backend_cuda(int dev) { return ggml_backend_cuda_init(dev); }
+static ggml_backend_t g_cuda_backend = nullptr;
+ggml_backend_t ink_backend_cuda(int dev) { g_cuda_backend = ggml_backend_cuda_init(dev); return g_cuda_backend; }
+void* ink_cuda_stream() { return g_cuda_backend ? ggml_backend_cuda_stream(g_cuda_backend) : nullptr; }
 ggml_backend_buffer_type_t ink_cuda_buft(int dev) { return ggml_backend_cuda_buffer_type(dev); }
 ggml_backend_buffer_type_t ink_cpu_buft() { return ggml_backend_cpu_buffer_type(); }
 ggml_backend_buffer_type_t ink_cuda_host_buft() { return ggml_backend_cuda_host_buffer_type(); }

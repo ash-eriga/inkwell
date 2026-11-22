@@ -948,3 +948,94 @@ extern "C" void ink_launch_mmvq_iq2_s_moe(const void* const* Wp,
     dim3 g((unsigned)((nrows + 15) / 16), (unsigned)nslots);
     inkwell_mmvq_iq2_s_moe<<<g, 512, (size_t)ncols * 4, (cudaStream_t)stream>>>(Wp, x, y, nrows, ncols, x_stride);
 }
+
+// ===== device-side MoE dispatch: resolve + alloc + gather =====
+// resolve: ids[s] -> ptrs[s] via device map; misses queued.
+// alloc: 1 warp, serial victim pick (LRU), updates map/rev/lru + ptrs + work.
+// gather: one block per miss, zero-copy u32 read from host -> vram slot.
+// All stream-ordered: resolve -> alloc -> gather -> GEMVs read VRAM.
+
+extern "C" __global__ void inkwell_moe_resolve(const int* ids, const int* map,
+    unsigned long long arena, unsigned long long host, long long esz,
+    unsigned long long* ptrs, int* missq, int nslots) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nslots) return;
+    const int e = ids[s];
+    const int m = map ? map[e] : -1;
+    ptrs[s] = m >= 0 ? arena + (unsigned long long)m * esz
+                     : host + (unsigned long long)e * esz;
+    if (m < 0 && map) {
+        const int q = atomicAdd(missq, 1);
+        if (q < 8) { missq[2 + 2*q] = s; missq[2 + 2*q + 1] = e; }
+    }
+}
+
+extern "C" __global__ void inkwell_moe_alloc(const int* missq, int* map,
+    unsigned long long* lru, unsigned long long* stamp, int* rev,
+    unsigned long long arena, unsigned long long host, long long esz,
+    unsigned long long* ptrs, unsigned long long* work, int k) {
+    int n = missq[0];
+    if (n > 8) n = 8;
+    const int lane = threadIdx.x & 31;
+    for (int i = 0; i < n; ++i) {
+        const int s = missq[2 + 2*i];
+        const int e = missq[2 + 2*i + 1];
+        unsigned long long best = ~0ull;
+        int victim = 0;
+        for (int j = lane; j < k; j += 32) {
+            if (lru[j] < best) { best = lru[j]; victim = j; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const unsigned long long ob = __shfl_down_sync(0xffffffffu, best, o);
+            const int ov = __shfl_down_sync(0xffffffffu, victim, o);
+            if (ob < best) { best = ob; victim = ov; }
+        }
+        victim = __shfl_sync(0xffffffffu, victim, 0);
+        if (lane == 0) {
+            const int old = rev[victim];
+            if (old >= 0) map[old] = -1;
+            map[e] = victim;
+            rev[victim] = e;
+            *stamp += 1;
+            lru[victim] = *stamp;
+            ptrs[s] = arena + (unsigned long long)victim * esz;
+            work[2*i]   = host + (unsigned long long)e * esz;
+            work[2*i+1] = arena + (unsigned long long)victim * esz;
+        }
+        __syncwarp();
+    }
+}
+
+extern "C" __global__ void inkwell_moe_gather(const int* missq,
+    const unsigned long long* work, long long esz) {
+    const int i = blockIdx.x;
+    if (i >= missq[0] || i >= 8) return;
+    const unsigned int* src = (const unsigned int*)(uintptr_t)work[2*i];
+    unsigned int* dst = (unsigned int*)(uintptr_t)work[2*i+1];
+    const long long nu = esz >> 2;
+    for (long long j = threadIdx.x; j < nu; j += blockDim.x) dst[j] = src[j];
+    const int tail = (int)(esz & 3);
+    if (threadIdx.x == 0 && tail) {
+        const unsigned char* s8 = (const unsigned char*)src + (nu << 2);
+        unsigned char* d8 = (unsigned char*)dst + (nu << 2);
+        for (int b = 0; b < tail; ++b) d8[b] = s8[b];
+    }
+}
+
+extern "C" void ink_launch_moe_resolve(const int* ids, const int* map,
+    unsigned long long arena, unsigned long long host, long long esz,
+    unsigned long long* ptrs, int* missq, int nslots, void* stream) {
+    inkwell_moe_resolve<<<(nslots + 127)/128, 128, 0, (cudaStream_t)stream>>>(
+        ids, map, arena, host, esz, ptrs, missq, nslots);
+}
+extern "C" void ink_launch_moe_alloc(const int* missq, int* map,
+    unsigned long long* lru, unsigned long long* stamp, int* rev,
+    unsigned long long arena, unsigned long long host, long long esz,
+    unsigned long long* ptrs, unsigned long long* work, int k, void* stream) {
+    inkwell_moe_alloc<<<1, 32, 0, (cudaStream_t)stream>>>(
+        missq, map, lru, stamp, rev, arena, host, esz, ptrs, work, k);
+}
+extern "C" void ink_launch_moe_gather(const int* missq,
+    const unsigned long long* work, long long esz, void* stream) {
+    inkwell_moe_gather<<<8, 512, 0, (cudaStream_t)stream>>>(missq, work, esz);
+}
