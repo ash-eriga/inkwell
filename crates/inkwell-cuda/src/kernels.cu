@@ -1171,9 +1171,9 @@ __global__ void inkwell_mmvq_q8_0_i8(const void* __restrict__ W,
 extern "C" void ink_launch_mmvq_q8_0_i8(const void* W,
                                         const float* x, float* y,
                                         long long nrows, long long ncols, void* stream) {
-    dim3 g((unsigned)((nrows + 7) / 8));
+    dim3 g((unsigned)((nrows + 15) / 16));
     cudaMemsetAsync(y, 0, (size_t)nrows * 4, (cudaStream_t)stream);
-    inkwell_mmvq_q8_0_i8<<<g, 512, ((size_t)ncols + 8) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+    inkwell_mmvq_q8_0_i8<<<g, 1024, ((size_t)ncols + 8) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
 }
 
 extern "C" void ink_launch_mmvq_q8_0_moe_i8(const void* const* Wp,
@@ -1249,9 +1249,9 @@ __global__ void inkwell_mmvq_q6_k_i8(const void* __restrict__ W,
 extern "C" void ink_launch_mmvq_q6_k_i8(const void* W,
                                         const float* x, float* y,
                                         long long nrows, long long ncols, void* stream) {
-    dim3 g((unsigned)((nrows + 7) / 8));
+    dim3 g((unsigned)((nrows + 15) / 16));
     cudaMemsetAsync(y, 0, (size_t)nrows * 4, (cudaStream_t)stream);
-    inkwell_mmvq_q6_k_i8<<<g, 512, ((size_t)ncols + 16) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+    inkwell_mmvq_q6_k_i8<<<g, 1024, ((size_t)ncols + 16) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
 }
 
 // Q5_K via DP4A: y = d*sc*(nib|hb<<4)*x - dmin*m*x. q fits int8; the min term
@@ -1326,7 +1326,7 @@ __global__ void inkwell_mmvq_q5_k_i8(const void* __restrict__ W,
 extern "C" void ink_launch_mmvq_q5_k_i8(const void* W,
                                         const float* x, float* y,
                                         long long nrows, long long ncols, void* stream) {
-    dim3 g((unsigned)((nrows + 7) / 8));
+    dim3 g((unsigned)((nrows + 15) / 16));
     cudaMemsetAsync(y, 0, (size_t)nrows * 4, (cudaStream_t)stream);
-    inkwell_mmvq_q5_k_i8<<<g, 512, ((size_t)ncols + 16) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
+    inkwell_mmvq_q5_k_i8<<<g, 1024, ((size_t)ncols + 16) * 4, (cudaStream_t)stream>>>(W, x, y, nrows, ncols);
 }
