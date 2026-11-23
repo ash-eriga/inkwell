@@ -347,3 +347,4 @@
 {"ts":"2026-11-23","config":"cache k=25 margin=50 defaults","decode_s":0.769,"ms_tok":96.1,"golden":true,"note":"WIN vs ~100.3; k=32 worse (fewer layers), k=8 worse (misses)"}
 {"ts":"2026-11-23","config":"moe-gemv double-buffer rings","ms_tok":101,"golden":true,"note":"REJECTED ~101 vs 96 control"}
 {"ts":"2026-11-23","config":"prefetch off by default","ms_tok":96,"golden":true,"note":"bank ~0 hits; frees ~190MB -> +2 cached layers"}
+{"ts":"2026-11-23","config":"k8 fallback cache for late layers","ms_tok":100,"golden":true,"note":"REJECTED — k8 thrash worse than stage path"}
