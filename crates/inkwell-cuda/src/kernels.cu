@@ -1824,40 +1824,54 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     const uint32_t* tile_base = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff);
     const int halfk = (int)((d[3] >> 8) & 1);
-    const int g = threadIdx.x >> 4;      // 4 tiles per block
-    const int c = threadIdx.x & 15;      // column within tile
+    const int g = threadIdx.x >> 6;      // 4 tiles per block, 64 threads/tile
+    const int u = threadIdx.x & 63;      // 4 threads per column (r split 4-way)
+    const int c = u >> 2, rp = u & 3;
     const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
-    __shared__ float xhs[16];            // same xh slice for all 4 tiles
-    __shared__ uint32_t rings[4 * 80];
-    // dec(i) is affine in bytesum (see gemv_dp4a): t = KINV*Σ xh*bs + KOFF*Σ xh
+    __shared__ uint32_t rings[4 * 4 * 32]; // 4 tiles × 4 tk-batch × ≤32 words
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
     float s = 0.f, sx = 0.f;
     const bool live = tn_i < tn;
-    for (int tk_i = 0; tk_i < tk; ++tk_i) {
-        if (threadIdx.x < 16) xhs[c] = xh[slot * k + tk_i * 16 + c];
+    // batch 4 tk per sync round: 0.5 syncs/tile instead of 2
+    __shared__ float xhb[4][16];
+    for (int tk0 = 0; tk0 < tk; tk0 += 4) {
+        const int tkn = min(4, tk - tk0);
+        if (threadIdx.x < 64) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn) xhb[j >> 4][j & 15] = xh[slot * k + (tk0 + (j >> 4)) * 16 + (j & 15)];
+        }
         if (live) {
-            const uint32_t* ring = tile_base + (size_t)(tk_i * tn + tn_i) * (size_t)w;
-            uint32_t* rg = rings + g * 80;
-            for (int j = c; j < w; j += 16) rg[j] = ring[j];
+            for (int b = 0; b < tkn; ++b) {
+                const uint32_t* ring = tile_base + (size_t)((tk0 + b) * tn + tn_i) * (size_t)w;
+                uint32_t* rg = rings + g * 128;
+                for (int j = u; j < w; j += 64) rg[b * 32 + j] = ring[j];
+            }
         }
         __syncthreads();
         if (live) {
-            const uint32_t* rg = rings + g * 80;
+            const uint32_t* rg = rings + g * 128;
+            for (int b = 0; b < tkn; ++b) {
 #pragma unroll
-            for (int r = 0; r < 16; ++r) {
-                const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
-                            | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                const int bs = (int)__dp4a(exl3_window(rg, i, ka, halfk) * 0x83DCD12Du,
-                                           0x01010101u, 0u);
-                s += xhs[r] * (float)bs;
-                sx += xhs[r];
+                for (int r = rp; r < 16; r += 4) {
+                    const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                                | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+                    const int bs = (int)__dp4a(exl3_window(rg + b * 32, i, ka, halfk) * 0x83DCD12Du,
+                                               0x01010101u, 0u);
+                    s += xhb[b][r] * (float)bs;
+                    sx += xhb[b][r];
+                }
             }
         }
         __syncthreads();
     }
-    if (live) t[slot * n + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
+    // 4-way lane reduce within each 4-thread column group
+    s += __shfl_xor_sync(0xffffffffu, s, 1);
+    sx += __shfl_xor_sync(0xffffffffu, sx, 1);
+    s += __shfl_xor_sync(0xffffffffu, s, 2);
+    sx += __shfl_xor_sync(0xffffffffu, sx, 2);
+    if (live && rp == 0) t[slot * n + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
 }
 
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
@@ -2020,7 +2034,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         dim3 gin(KG / 128, nslots);
         inkwell_exl3_had_in_moe<<<gin, 128, 512, st>>>(dd, ids, x, xh, KG);
         dim3 gg(NG / 64, nslots, 1);
-        inkwell_exl3_gemv_moe<<<gg, 64, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
         dim3 gout(NG / 128, nslots);
         inkwell_exl3_had_out_moe<<<gout, 128, 512, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
     }
@@ -2029,7 +2043,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     // KD=1152 not multiple of 128*? 1152/128=9 blocks
     inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
     dim3 gd(ND / 64, nslots, 1);
-    inkwell_exl3_gemv_moe<<<gd, 64, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
+    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
     dim3 dout(ND / 128, nslots);
     inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
@@ -2059,7 +2073,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         dim3 gin(KG / 128, nslots);
         inkwell_exl3_had_in_moe<<<gin, 128, 512, st>>>(dd, ids, x, xh, KG);
         dim3 gg(NG / 64, nslots, 1);
-        inkwell_exl3_gemv_moe<<<gg, 64, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
         dim3 gout(NG / 128, nslots);
         inkwell_exl3_had_out_moe<<<gout, 128, 512, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
     }
@@ -2067,7 +2081,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     dim3 din(KD / 128, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
     dim3 gd(ND / 64, nslots, 1);
-    inkwell_exl3_gemv_moe<<<gd, 64, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
+    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
     dim3 dout(ND / 128, nslots);
     inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);

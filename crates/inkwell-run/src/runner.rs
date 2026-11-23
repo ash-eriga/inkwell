@@ -838,7 +838,7 @@ impl Runner {
         // the real remainder: dev_buf, kv_buf and staging already exist — only
         // CUDA-graph capture + desktop fluctuation still need room.
         let ck: usize = std::env::var("INKWELL_EXL3_CACHE_K")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(16);
         if ck >= 8 {
             for (i, a) in moe_args_exl3.iter_mut().enumerate() {
                 if a.on_dev || a.max_slot == 0 { continue; }

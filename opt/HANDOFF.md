@@ -108,3 +108,23 @@ LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-in
 - Estado: bench_cache4.log rodando — verificar coerência + ms/tok.
 - OBS: só ~12 camadas pinned (il≥12); cache 32MB/camada; free pós-load ~983-1214MiB;
   compute buf 835MiB; graph instantiate precisa ~150-200MiB livres → OOM se exagerar.
+
+## 2026-11-23 progresso (sessão 2, cont.)
+- KV arenas F32→F16 (só load_st): kv 835→419MiB. Kernel attn_decode virou template<KV16>,
+  strides k/v em BYTES; set_rows F32→F16 nativo do ggml. Golden mantido.
+- Cache lazy pós-load (depois de kv_buf+warm_staging): margem 260→190MiB; ~10-11/12 pinned cached.
+- dev_buf headroom 300→160MiB; INKWELL_MAX_CTX env (default 8192, 4096 libera ~134MiB).
+- DevBuf::try_new_bytes (Option) — OOM degrada p/ staged.
+- gemv_dp4a + gemv_moe: acúmulo AFIM em bytesum (t=KINV*Σxh*bs+KOFF*Σxh, KOFF=1024*KINV+KBIAS)
+  — remove decode fp16 por elemento. ~160-170ms/tok.
+- NSYS PROFILE (nsys em ~/lfm-gtx1060-bench/cuda-12.6/bin): gemv_moe 39% (369µs×144),
+  gemv_dp4a 21% (99µs×289), ccopy 21% (1.34ms×21 misses). Resto <2%/kernel.
+- Piso não-MoE (INKWELL_MOE_SKIP): 84ms/tok. MoE atual ~85ms.
+- Ledger: exl3-cache-kv16 med ~171; exl3-affine med ~168 (variância desktop ±15).
+
+## estado pós-afffine (auto-save)
+- gemv_moe reescrito: 4 tiles/blk × 64thr (256/blk), r split 4-way + shfl_xor reduce,
+  tk batch ×4/sync, rings[4*4*32]. Launches <<<gg/gd,256>>>.
+- nsys: ~/lfm-gtx1060-bench/cuda-12.6/bin/nsys profile --trace=cuda + stats --report cuda_gpu_kern_sum
+- Ledger tags: exl3-cache-kv16(~171), exl3-affine(~168), exl3-moe-tkb(~169), exl3-cache-k12(running)
+- K=12 test: INKWELL_EXL3_CACHE_K=12 env (coverage vs hit-rate tradeoff)
