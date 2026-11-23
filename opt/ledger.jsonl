@@ -273,3 +273,10 @@
 {"ts":"2026-11-23T06:51:17-03:00","config":"ctl-lfu","i":1,"decode_s":830.284156ms,"ms_tok":103.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T06:51:30-03:00","config":"ctl-lfu","i":2,"decode_s":790.172293ms,"ms_tok":98.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T06:51:39-03:00","config":"ctl-lfu","i":3,"decode_s":793.706095ms,"ms_tok":99.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:04:11-03:00","config":"gemv-z2","i":1,"decode_s":751.29551ms,"ms_tok":93.9,"golden":"no","text":"        "}
+{"ts":"2026-11-23T07:04:25-03:00","config":"gemv-z2","i":2,"decode_s":759.427005ms,"ms_tok":94.9,"golden":"no","text":"        "}
+{"ts":"2026-11-23T07:04:36-03:00","config":"gemv-z2","i":3,"decode_s":747.378096ms,"ms_tok":93.4,"golden":"no","text":"        "}
+{"ts":"2026-11-23T07:04:47-03:00","config":"gemv-z2","i":4,"decode_s":783.38931ms,"ms_tok":97.9,"golden":"no","text":"        "}
+{"ts":"2026-11-23T07:07:31-03:00","config":"revert-fuse","i":1,"decode_s":771.49073ms,"ms_tok":96.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:07:47-03:00","config":"revert-fuse","i":2,"decode_s":767.149061ms,"ms_tok":95.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:07:58-03:00","config":"revert-fuse","i":3,"decode_s":756.763614ms,"ms_tok":94.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}

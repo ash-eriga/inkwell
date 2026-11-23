@@ -845,7 +845,8 @@ impl Runner {
                 if a.on_dev || a.max_slot == 0 { continue; }
                 let cbytes = ck * 3 * a.max_slot;
                 let (f, _) = inkwell_cuda::mem_info();
-                if f <= cbytes + (100usize << 20) { continue; }
+                let margin: usize = std::env::var("INKWELL_CACHE_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+                if f <= cbytes + (margin << 20) { continue; }
                 let Some(buf) = inkwell_cuda::DevBuf::try_new_bytes(cbytes) else { continue };
                 let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
                 tag.write_bytes_async(&vec![0xFFu8; ck * 4]);
@@ -856,8 +857,8 @@ impl Runner {
                     prefetch: std::env::var_os("INKWELL_MOE_NOPREFETCH").is_none()
                         .then(|| crate::moe::Exl3Prefetch::new(a.max_slot)).flatten(),
                 });
-                eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED",
-                    a.max_slot, cbytes as f64 / 1e6);
+                eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED free={}MiB",
+                    a.max_slot, cbytes as f64 / 1e6, f >> 20);
             }
         }
         Self {

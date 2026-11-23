@@ -213,3 +213,16 @@ Real agora: ~105.6ms/tok (~9.5 TPS). Baseline real era ~165 não ~200.
 Timers: PROF build~3ms compute~97ms logits~0.3ms; stepwall~105ms; loop main ~1ms.
 Fixes commitados: top() linear + timer antes do tokenizer + bench aceita unidade ms.
 Ledger histórico: subtrair ~35ms de tudo.
+
+## SESSÃO 4b — pós correção de medição (~96ms = 10.4 TPS)
+- **LFU eviction (cnt[128] por expert em device): commitado** — ~96 vs ~99 controle.
+- Cobertura real: 24 camadas MoE; on_dev 0-12, cached 13-19 (7×k16), staged 20-23.
+  Free na hora dos caches ≈708MiB; downstream precisa ~250MiB → orçamento ~458MiB:
+  k16→7, k12→9 (sem ganho ~97.5), k10→10 (~123 com margens erradas — instável).
+- Rejeitados: __launch_bounds__(256,6) (113, spill), i_r hoist (neutro), xhb→regs xr[16] (neutro),
+  ccopy 32×256 (155), chunk 0/2048.
+- **PARADOXO RESOLVIDO parcialmente**: fused gemv z=2 quebrou de novo (texto em branco).
+  O write `t[slot*n]` com n=NG gera layout p-major; had_out lê s-major — análise dizia
+  impossível ser golden, mas é. Provável subtileza nos offsets — NÃO mexer sem debug real.
+- pkill gotcha: usar `pkill -9 -x inkwell` (o -f casa com a própria shell).
+- nohup: rodar bg com `nohup env ... < /dev/null &` — subshell (cmd &) morre com a call.
