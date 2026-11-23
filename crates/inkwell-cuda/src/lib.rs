@@ -15,6 +15,7 @@ extern "C" {
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
     fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> i32;
     fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
+    fn cudaStreamSynchronize(s: *mut c_void) -> i32;
     fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
     fn cudaEventRecord(e: *mut c_void, s: *mut c_void) -> i32;
     fn cudaStreamWaitEvent(s: *mut c_void, e: *mut c_void, flags: u32) -> i32;
@@ -56,6 +57,16 @@ extern "C" {
         pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void);
     fn ink_launch_exl3_copy8(src: *const c_void, dst: *mut c_void, stream: *mut c_void);
     fn ink_launch_exl3_stage(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, staging: *mut c_void, sg: *mut c_void, su: *mut c_void, sd: *mut c_void, stream: *mut c_void);
+    fn ink_launch_draft_mix(f: *const f32, a: *const f32, w: *const f32, o: *mut f32, rows: i32, tstride: i32, ch: i32, eps: f32, s: *mut c_void);
+    fn ink_launch_draft_rms(x: *const f32, res: *const f32, w: *const f32, o: *mut f32, ro: *mut f32, n: i32, ch: i32, eps: f32, s: *mut c_void);
+    fn ink_launch_draft_rope(x: *mut f32, pos: *const i32, n: i32, nh: i32, hd: i32, theta: f32, s: *mut c_void);
+    fn ink_launch_draft_kvwrite(kc: *mut f32, vc: *mut f32, k: *const f32, v: *const f32, pos: *const i32, n: i32, kvch: i32, s: *mut c_void);
+    fn ink_launch_draft_attn(q: *const f32, kc: *const f32, vc: *const f32, kb: *const f32, vb: *const f32, o: *mut f32, c: i32, win_lo: i32, nb: i32, nkv: i32, g: i32, hd: i32, s: *mut c_void);
+    fn ink_launch_draft_silu(g: *const f32, u: *const f32, x: *mut f32, n: i32, ff: i32, s: *mut c_void);
+    fn ink_launch_draft_gru(raw: *const f32, bias: *const f32, st: *mut f32, lat: *mut f32, r: i32, s: *mut c_void);
+    fn ink_launch_draft_add3(a: *const f32, b: *const f32, c: *const f32, o: *mut f32, n: i32, s: *mut c_void);
+    fn ink_launch_draft_bf16row(w: *const c_void, idx: i32, ldw: i32, o: *mut f32, s: *mut c_void);
+    fn ink_launch_draft_argmax(z: *const f32, n: i32, cap: f32, o: *mut i32, s: *mut c_void);
     fn ink_launch_conv_step(x_in: *const f32, state: *mut f32, region_off: i32, w: *const f32, dyn_p: *const f32, ch: i32, n_heads: i32, scale: f32, out: *mut f32, snap: *mut f32, stream: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -922,3 +933,56 @@ pub unsafe fn launch_stage_only(descs_dev: *const c_void, ids: *const i32,
     staging: *mut c_void, sdescs: *mut c_void) {
     unsafe { ink_launch_exl3_stage(descs_dev, descs_dev, descs_dev, ids, staging, sdescs, sdescs, sdescs, stream()) };
 }
+
+/// DSpark draft helper launches (all stream-ordered, f32).
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_mix_async(f: *const f32, a: *const f32, w: *const f32, o: *mut f32, rows: usize, tstride: usize, ch: usize, eps: f32) {
+    unsafe { ink_launch_draft_mix(f, a, w, o, rows as i32, tstride as i32, ch as i32, eps, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_rms_async(x: *const f32, res: *const f32, w: *const f32, o: *mut f32, ro: *mut f32, n: usize, ch: usize, eps: f32) {
+    unsafe { ink_launch_draft_rms(x, res, w, o, ro, n as i32, ch as i32, eps, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_rope_async(x: *mut f32, pos: *const i32, n: usize, nh: usize, hd: usize, theta: f32) {
+    unsafe { ink_launch_draft_rope(x, pos, n as i32, nh as i32, hd as i32, theta, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_kvwrite_async(kc: *mut f32, vc: *mut f32, k: *const f32, v: *const f32, pos: *const i32, n: usize, kvch: usize) {
+    unsafe { ink_launch_draft_kvwrite(kc, vc, k, v, pos, n as i32, kvch as i32, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_attn_async(q: *const f32, kc: *const f32, vc: *const f32, kb: *const f32, vb: *const f32, o: *mut f32, c: usize, win_lo: usize, nb: usize, nkv: usize, g: usize, hd: usize) {
+    unsafe { ink_launch_draft_attn(q, kc, vc, kb, vb, o, c as i32, win_lo as i32, nb as i32, nkv as i32, g as i32, hd as i32, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_silu_async(g: *const f32, u: *const f32, x: *mut f32, n: usize, ff: usize) {
+    unsafe { ink_launch_draft_silu(g, u, x, n as i32, ff as i32, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_gru_async(raw: *const f32, bias: *const f32, st: *mut f32, lat: *mut f32, r: usize) {
+    unsafe { ink_launch_draft_gru(raw, bias, st, lat, r as i32, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_add3_async(a: *const f32, b: *const f32, c: *const f32, o: *mut f32, n: usize) {
+    unsafe { ink_launch_draft_add3(a, b, c, o, n as i32, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_bf16row_async(w: *const c_void, idx: i32, ldw: usize, o: *mut f32) {
+    unsafe { ink_launch_draft_bf16row(w, idx, ldw as i32, o, stream()) };
+}
+/// # Safety
+/// device pointers valid for the documented shapes.
+pub unsafe fn draft_argmax_async(z: *const f32, n: usize, cap: f32, o: *mut i32) {
+    unsafe { ink_launch_draft_argmax(z, n as i32, cap, o, stream()) };
+}
+

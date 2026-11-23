@@ -96,6 +96,13 @@ pub struct Runner {
     k_arena: Vec<Ptr>, v_arena: Vec<Ptr>, conv_state: Vec<Ptr>,
     /// per-position conv snapshots for spec rollback: [slot][NT][3*n_sconv].
     conv_snap: Vec<inkwell_cuda::DevBuf>,
+    /// DSpark ctx taps captured by step_block: [NT][4][n_embd] f32
+    /// (visits {5,23,41} inputs + final-norm output).
+    block_feats: Option<inkwell_cuda::DevBuf>,
+    /// boxed `*mut c_void` dsts for feat_tap ops; cleared per `step_block`.
+    feat_ud: std::cell::RefCell<Vec<Box<*mut std::ffi::c_void>>>,
+    /// tap-op tensors to expand into the `step_block` graph.
+    feat_ops: std::cell::RefCell<Vec<Ptr>>,
     max_ctx: i64,
     swa: i64,
     visits: Vec<(usize /*layer*/, usize /*slot*/)>,
@@ -181,6 +188,17 @@ unsafe extern "C" fn exl3_ntok_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i
 #[must_use]
 pub fn exl3_ntok_cb_addr() -> usize {
     exl3_ntok_cb as usize
+}
+
+/// `ggml_custom_op_t`: device→device copy of src[0] into `*(ud as *mut *mut c_void)`.
+/// Captures a graph tensor's data into `block_feats` at compute time.
+unsafe extern "C" fn feat_copy_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let s = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let sp = unsafe { inkwell_ggml::ink_tensor_data(s) };
+    let n = (unsafe { inkwell_ggml::ink_tensor_ne(s, 0) } * unsafe { inkwell_ggml::ink_tensor_ne(s, 1) }) as usize * 4;
+    let d = unsafe { *ud.cast::<*mut std::ffi::c_void>() };
+    unsafe { inkwell_cuda::memcpy_d2d_async(d, sp, n) };
 }
 
 /// userdata for the fused conv-step custom op.
@@ -549,7 +567,7 @@ impl Runner {
             exl3_w: Vec::new(), exl3_blk: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
-            k_arena, v_arena, conv_state, conv_snap: Vec::new(), max_ctx, swa, visits,
+            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits,
             n_full,
         }
     }
@@ -917,7 +935,7 @@ impl Runner {
             moe_args: Vec::new(), exl3_w, exl3_blk, moe_args_exl3, output_exl3,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
-            k_arena, v_arena, conv_state, conv_snap: Vec::new(), max_ctx, swa, visits, n_full,
+            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits, n_full,
         }
     }
 }
@@ -1065,6 +1083,42 @@ impl Runner {
                     inkwell_ggml::ink_tensor_data(s.0),
                     snap.dev_ptr().cast::<u8>().add(m * n).cast(), n);
             }
+        }
+    }
+
+    /// DSpark ctx tap: copy `cur` [2304, NT] into `block_feats` tap slab
+    /// (layout [4][NT][2304]) when `vi` is a tap visit.
+    fn feat_tap(&self, c: &Ptr, vi: usize, cur: Ptr) {
+        let slab = match vi { 5 | 23 | 41 => (vi - 5) / 18, 48 => 3, _ => return };
+        let fb = self.block_feats.as_ref().expect("block_feats");
+        let d = unsafe { fb.dev_ptr().cast::<u8>().add(slab * NT * 2304 * 4) };
+        let mut args = [t::cont(*c, cur).0];
+        let ud = Box::into_raw(Box::new(d.cast::<std::ffi::c_void>()));
+        self.feat_ud.borrow_mut().push(unsafe { Box::from_raw(ud) });
+        let op = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [1, 1, 1, 1], &mut args,
+            feat_copy_cb as usize, ud.cast()) });
+        self.feat_ops.borrow_mut().push(op);
+    }
+
+    /// The target unembed EXL3 desc `(trel, suh, svh, k, n, ka, halfk,
+    /// scratch)` — borrowed device pointers for the DSpark drafter.
+    #[must_use]
+    pub fn unembed_desc(&self) -> Option<(*const std::ffi::c_void, *const std::ffi::c_void,
+            *const std::ffi::c_void, usize, usize, usize, bool, *mut f32)> {
+        self.output_exl3.map(|i| {
+            let w = &*self.exl3_w[i];
+            (w.trel.dev_ptr().cast_const(), w.suh.dev_ptr().cast_const(), w.svh.dev_ptr().cast_const(),
+                w.k, w.n, w.ka, w.halfk, w.scratch.dev_ptr().cast())
+        })
+    }
+
+    /// device ptr to the `[4][NT][n_embd]` tap slabs written by the last
+    /// `step_block` (visits {5,23,41} + final norm).
+    #[must_use]
+    pub fn block_feats_ptr(&self) -> *const f32 {
+        match self.block_feats.as_ref() {
+            Some(b) => b.dev_ptr().cast(),
+            None => std::ptr::null(),
         }
     }
 
@@ -1820,6 +1874,11 @@ impl Runner {
     /// # Panics
     /// On graph/alloc/compute failure.
     pub fn step_block(&mut self, ids: &[u32; NT], pos: i64) -> Vec<f32> {
+        if self.block_feats.is_none() {
+            self.block_feats = Some(inkwell_cuda::DevBuf::new_bytes(4 * NT * 2304 * 4));
+        }
+        self.feat_ud.borrow_mut().clear();
+        self.feat_ops.borrow_mut().clear();
         if self.conv_snap.len() < self.conv_state.len() {
             for s in &self.conv_state {
                 let n = (t::ne(*s, 0) * t::ne(*s, 1)) as usize;
@@ -1944,6 +2003,7 @@ impl Runner {
         let mut blocks: Vec<Ptr> = Vec::new();
         let mut vi = 0usize;
         for il in 0..start {
+            self.feat_tap(&c, vi, cur);
             cur = self.layer_blk(il, il, self.visits[vi].1, 0, cur, &mut blocks, None, &self.layers[il], &step);
             vi += 1;
         }
@@ -1960,6 +2020,7 @@ impl Runner {
             }
             for ip in start..end {
                 let (_il_v, slot) = self.visits[vi];
+                self.feat_tap(&c, vi, cur);
                 if pass == 0 {
                     cur = self.layer_blk(ip, ip, slot, pass, cur, &mut blocks, None, &self.layers[ip], &step);
                 } else {
@@ -1972,6 +2033,7 @@ impl Runner {
         }
         for il in end..24 {
             let (_il_v, slot) = self.visits[vi];
+            self.feat_tap(&c, vi, cur);
             cur = self.layer_blk(il, il, slot, 0, cur, &mut blocks, None, &self.layers[il], &step);
             vi += 1;
         }
@@ -1979,6 +2041,7 @@ impl Runner {
 
         cur = t::reshape2(c, self.mix8(&blocks, cur, self.output_res_query), n_embd, NT as i64);
         cur = self.norm(cur, self.output_norm);
+        self.feat_tap(&c, 48, cur);
         let oi = self.output_exl3.expect("output exl3");
         let e = &*self.exl3_blk[oi];
         let mut args = [cur.0];
@@ -1995,6 +2058,7 @@ impl Runner {
 
         let g = Ptr(unsafe { inkwell_ggml::ink_graph_new(c.0, 32768) });
         t::build_forward(g, cur);
+        for op in self.feat_ops.borrow().iter() { t::build_forward(g, *op); }
         let prof = std::env::var_os("INKWELL_PROF").is_some();
         let t0 = std::time::Instant::now();
         unsafe {

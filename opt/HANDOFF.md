@@ -351,3 +351,17 @@ Ledger histórico: subtrair ~35ms de tudo.
   4. main.rs spec loop (env INKWELL_SPEC): committed `id`@pos; draft = ids[1..7] via NgramDraft/MTP; step_block([id,d1..d7]) → rows j predict pos+j+1; verify[j]=argmax(row j); accept d_{j+1} iff verify[j]==d_{j+1}; emitted=n+1 (n accepted + bonus v_n); rollback_conv(emitted); pos+=emitted; id=emitted last token.
   5. Verify uses K=10 cache during tests (VRAM tight: K=15 OOM'd on the batched graph ~110MB extra vs serial). Desktop apps on.
 - Zombie cleanup: `pkill -9 -x inkwell` before every run.
+
+## DSPARK DRAFTER — algoritmo completo (ref: ~/megakernel-zoo/engines/inkling-2-mini_b200/offline-c/engine/draft.py — implementação funcional do MESMO mtp.safetensors)
+Config (config.json mtp_config): markov_head_type=rnn_hidden, block_size=8, 3 layers, H=2304, nh=? kv=?, hd=128, markov_rank r=256, window=swa, target_layer_ids=[5,23,41,48] = visits {5,23,41} (input do layer_blk) + 48 = final-norm output. mtp shapes: q_proj 2304→3072, k/v_proj 2304→1024 (nh*hd=3072→24 heads, nkv*hd=1024→8 kv), o 3072→2304, gate/up 2304→9216, down 9216→2304, k/v_proj_ctx 2304→1024 cada.
+PESOS: tudo EXL3 (trellis/suh/svh/mul1) menos: norms bf16, fuse_weight[4,4], mask_embed[2304], markov_w1[201024,256] bf16, rnn_proj.bias[768], hidden_out.bias[2304]. Normas/embed/rope/softmax em f32; GEMMs bf16 (nós fazemos f32 — ok, drafter só propõe).
+FOLD: hidden_out é EXL3 [256→2304]+bias; fold_w[V,r]=unembed@hidden_out.weight (f64→bf16), fold_b[V]=unembed@hidden_out.bias — foldar 1x no load (~200058×256).
+CICLO (após verify de 8 rows com tgt[8]=argmax por row):
+- accept: a = #drafts líderes iguais (vtok[1..]==tgt[..]); c_new=c+a+1; anchor=tgt[a]; frow=a; emit=tgt[0..a+1).
+- ctx_append: p/ CADA row j do verify, feats[j,4,H] (visits 5,23,41 inputs + finalnorm out) → p/ cada layer l: u=_mix(feats[j],alpha[l])→dflare_norm→kv_ctx proj→k_norm_ctx+RoPE(pos=c+j)→kc[l][pos], vc[l][pos]. Rows>a reescritas no próximo ciclo (draft só atende pos<c_new).
+- propose: x=[rms(embd(anchor))*embed_norm; mask_embed×7]; pos=c..c+7; 3 layers: in_ln→qkv→q_norm+rope,k_norm+rope (rope halves: x[:64]cos - x[64:]sin, GPTJ?) → attn: q[8,24,128] vs keys=kc[l] (ctx rows pos<c + block rows 8) mask (global: pos<c; local layers: pos>=c-window) + softmax → o_proj→+res→post_ln→MLP(silu(gate)*up→down); residual separado por _add_rms(x,residual,w): normed value → próxima op, raw soma → residual.
+- hid = add_rms(x,residual,norm)[1:] [7,2304]; f=_mix(feats[frow],alpha[3],m_norm) [2304].
+- markov: inp=cat(hid[i],f)[4608]→context[i]=inp@w_ctx[2H,3r]+rnn_b [7×768]; base[i]=hid[i]@unembed [7,V]; state[256]=0; prev=anchor; loop i=0..6: raw=context[i]+cat(state,w1[prev])@w_rec[512→768]; gt=sig(raw[:256]); cand=tanh(raw[256:512]); state=gt*state+(1-gt)*cand; latent=tanh(raw[512:768]); logits=cap*tanh((base[i]+fold_b+latent@fold_w^T)/30); prev=argmax→draft[i+1].
+- kd adaptativo: pconf=top1 prob/step; kd=maior k com cumprod>=theta(0.4) → próximo verify usa kd+1 rows.
+CUSTO estimado Pascal: base GEMM lê unembed 922MB bf16 (~90-120ms); fold_w 7×102MB (~70ms); 3-layer tr ExL3 (~uns ms); total draft ~150-200ms. Ciclo ~550-600ms → precisa ~5-6 tok/round p/ ganhar de 97ms serial. Verify ~400ms hoje (~3.5GB/s efetivo vs 1.4GB de pesos → chão ~140ms): OTIMIZAR verify é o lever crítico.
+- feats capture: feats[j] = x_in (residual) no INÍCIO de layer_blk p/ vi ∈ {5,23,41} + normed output final — por row j. step_block deve expor feats[8][4][2304].

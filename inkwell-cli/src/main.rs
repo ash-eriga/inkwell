@@ -357,6 +357,59 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         // also dump row7-vs-row0 sanity: rows should diverge (different KV)
     }
 
+    if std::env::var("INKWELL_SPEC").as_deref() == Ok("mtp") {
+        // DSpark draft: bootstrap feats via a throwaway block on `id` at pos,
+        // then cycles of step_block(vtok) -> accept -> ctx_append -> propose.
+        let blk0 = [id; 8];
+        let _ = r.step_block(&blk0, pos);
+        r.rollback_conv(1);
+        let mut mtp = inkwell_run::draft::Mtp::new(path,
+            r.unembed_desc().expect("unembed"), r.block_feats_ptr(), max_ctx as usize);
+        mtp.ctx_append(pos);
+        let mut vtok = mtp.propose(pos + 1, id, 0);
+        let mut c = pos + 1;
+        let target: usize = std::env::var("INKWELL_SPEC_GENS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(32);
+        let mut spec_ids: Vec<u32> = Vec::new();
+        let (mut rounds, mut accepted) = (0u64, 0u64);
+        let t2 = Instant::now();
+        while spec_ids.len() < target {
+            let tv = Instant::now();
+            let vl = r.step_block(&vtok, c);
+            let ms = tv.elapsed().as_secs_f64() * 1e3;
+            let nv = vl.len() / 8;
+            let mut verify = [0u32; 8];
+            for j in 0..8 {
+                verify[j] = vl[j * nv..(j + 1) * nv].iter()
+                    .enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            }
+            let mut n = 0;
+            while n < 7 && vtok[n + 1] == verify[n] { n += 1; }
+            let ne = n + 1;
+            spec_ids.extend_from_slice(&verify[..ne]);
+            id = verify[n];
+            rounds += 1; accepted += n as u64;
+            let c_old = c;
+            c += ne as i64;
+            eprintln!("spec r{rounds}: verify={ms:.1}ms accept={n} emit={ne} pos={c}");
+            eprintln!("   vtok={:?}
+   veri={:?}", &vtok, &verify);
+            r.rollback_conv(ne);
+            let td = Instant::now();
+            mtp.ctx_append(c_old);
+            vtok = mtp.propose(c, id, n);
+            eprintln!("          draft={:.1}ms", td.elapsed().as_secs_f64() * 1e3);
+        }
+        let dt = t2.elapsed().as_secs_f64();
+        let text = inkwell_tokenizer::Tokenizer::from_gguf(gg).expect("tokenizer")
+            .decode(&spec_ids).unwrap_or_else(|_| "<decode error>".into());
+        eprintln!("spec text: {text:?}");
+        eprintln!("spec: {} tok in {dt:.1}s = {:.1} tok/s ({} rounds, accept {:.0}%, {:.2} tok/round)",
+            spec_ids.len(), spec_ids.len() as f64 / dt, rounds,
+            100.0 * accepted as f64 / (rounds.max(1) * 7) as f64,
+            spec_ids.len() as f64 / rounds.max(1) as f64);
+        return;
+    }
     if let Ok(spec) = std::env::var("INKWELL_SPEC") {
         // spec decode: rounds of [committed id + <=7 drafts] through step_block;
         // accept the matching prefix, emit it + the bonus row, rewind conv.

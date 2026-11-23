@@ -4,4 +4,5 @@
 
 mod moe;
 pub mod ops;
+pub mod draft;
 pub mod runner;

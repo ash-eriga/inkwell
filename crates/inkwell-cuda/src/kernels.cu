@@ -2959,3 +2959,247 @@ extern "C" void ink_launch_exl3_moe_ntok(
     inkwell_exl3_expert_wsum8<<<dim3((ND + 255) / 256, 8), 256, 0, st>>>(xh_e, w8, epos, out8, ND);
     if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok all done err=%d\n", (int)e); }
 }
+
+// ======================== DSpark draft helper kernels ========================
+// All f32, single-block-per-row launches on stream 0. Sizes are tiny
+// (2304..201024) — latency-bound by design, no graph.
+
+// mix + rmsnorm: out[t] = rmsnorm( sum_j alpha[j]*feats_tap_j[row t] ) * w
+// feats layout [4][nt][ch]; one block per row, 256 threads.
+extern "C" __global__ void inkwell_draft_mix(
+    const float* __restrict__ feats, const float* __restrict__ alpha,
+    const float* __restrict__ w, float* __restrict__ out,
+    int nt, int ch, float eps)
+{
+    const int t = blockIdx.x;
+    const int c0 = threadIdx.x;
+    __shared__ float ss[256];
+    float acc = 0.f;
+    for (int c = c0; c < ch; c += 256) {
+        float v = 0.f;
+        for (int j = 0; j < 4; ++j)
+            v += alpha[j] * feats[(size_t)j * nt * ch + (size_t)t * ch + c];
+        acc += v * v;
+    }
+    ss[c0] = acc;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) { if (c0 < s) ss[c0] += ss[c0 + s]; __syncthreads(); }
+    const float inv = rsqrtf(ss[0] / ch + eps);
+    for (int c = c0; c < ch; c += 256) {
+        float v = 0.f;
+        for (int j = 0; j < 4; ++j)
+            v += alpha[j] * feats[(size_t)j * nt * ch + (size_t)t * ch + c];
+        out[(size_t)t * ch + c] = v * inv * w[c];
+    }
+}
+
+// out[r] = rmsnorm(x[r]) * w ; res variant adds res to x first and saves the sum.
+extern "C" __global__ void inkwell_draft_rms(
+    const float* __restrict__ x, const float* __restrict__ res,
+    const float* __restrict__ w, float* __restrict__ out, float* __restrict__ res_out,
+    int ch, float eps)
+{
+    const int t = blockIdx.x;
+    const int c0 = threadIdx.x;
+    __shared__ float ss[256];
+    float acc = 0.f;
+    for (int c = c0; c < ch; c += 256) {
+        float v = x[(size_t)t * ch + c] + (res ? res[(size_t)t * ch + c] : 0.f);
+        acc += v * v;
+    }
+    ss[c0] = acc;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) { if (c0 < s) ss[c0] += ss[c0 + s]; __syncthreads(); }
+    const float inv = rsqrtf(ss[0] / ch + eps);
+    for (int c = c0; c < ch; c += 256) {
+        float v = x[(size_t)t * ch + c] + (res ? res[(size_t)t * ch + c] : 0.f);
+        out[(size_t)t * ch + c] = v * inv * w[c];
+        if (res_out) res_out[(size_t)t * ch + c] = v;
+    }
+}
+
+// rope (rotate-halves) in place on x[n][nh][hd]; pos per row.
+extern "C" __global__ void inkwell_draft_rope(
+    float* __restrict__ x, const int* __restrict__ pos, int nh, int hd, float theta)
+{
+    const int r = blockIdx.y, h = blockIdx.x, i = threadIdx.x; // i < hd/2
+    const int hh = hd / 2;
+    if (i >= hh) return;
+    const float f = pos[r] * powf(theta, -2.f * i / hd);
+    const float co = cosf(f), si = sinf(f);
+    float* p = x + ((size_t)r * nh + h) * hd;
+    const float x1 = p[i], x2 = p[i + hh];
+    p[i] = x1 * co - x2 * si;
+    p[i + hh] = x2 * co + x1 * si;
+}
+
+// write k/v block rows into ctx caches at absolute positions pos[r].
+extern "C" __global__ void inkwell_draft_kvwrite(
+    float* __restrict__ kc, float* __restrict__ vc,
+    const float* __restrict__ k, const float* __restrict__ v,
+    const int* __restrict__ pos, int kvch)
+{
+    const int r = blockIdx.x, c = threadIdx.x;
+    const size_t dst = (size_t)pos[r] * kvch + c;
+    const size_t src = (size_t)r * kvch + c;
+    kc[dst] = k[src];
+    vc[dst] = v[src];
+}
+
+// attention: q[8][nh][hd] attends keys = kc rows [win_lo,c) + kb rows [0,8)
+// (the block's own keys, non-causal). One block per (row, head): scores in
+// dynamic smem, then softmax, then weighted V sum. kv heads nkv, g = nh/nkv.
+extern "C" __global__ void inkwell_draft_attn(
+    const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
+    const float* __restrict__ kb, const float* __restrict__ vb, float* __restrict__ out,
+    int c, int win_lo, int nb, int nkv, int g, int hd)
+{
+    extern __shared__ float s[];
+    const int r = blockIdx.y, h = blockIdx.x;
+    const int kvh = h / g;
+    const int nctx = c - win_lo;
+    const int T = nctx + nb;
+    const int tid = threadIdx.x;
+    const float* qr = q + ((size_t)r * (nkv * g) + h) * hd;
+    const float scale = rsqrtf((float)hd);
+    for (int t = tid; t < T; t += blockDim.x) {
+        const float* kp = (t < nctx)
+            ? kc + ((size_t)(win_lo + t) * nkv + kvh) * hd
+            : kb + ((size_t)(t - nctx) * nkv + kvh) * hd;
+        float d = 0.f;
+        for (int e = 0; e < hd; ++e) d += qr[e] * kp[e];
+        s[t] = d * scale;
+    }
+    __syncthreads();
+    // softmax
+    __shared__ float red[256];
+    float mx = -1e30f;
+    for (int t = tid; t < T; t += blockDim.x) mx = fmaxf(mx, s[t]);
+    red[tid] = mx; __syncthreads();
+    for (int st = 128; st; st >>= 1) { if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]); __syncthreads(); }
+    mx = red[0];
+    float sm = 0.f;
+    for (int t = tid; t < T; t += blockDim.x) { s[t] = expf(s[t] - mx); sm += s[t]; }
+    __syncthreads();
+    red[tid] = sm; __syncthreads();
+    for (int st = 128; st; st >>= 1) { if (tid < st) red[tid] += red[tid + st]; __syncthreads(); }
+    const float inv = 1.f / red[0];
+    // out[r][h][e] = sum_t s[t]*v[t]
+    for (int e = tid; e < hd; e += blockDim.x) {
+        float acc = 0.f;
+        for (int t = 0; t < T; ++t) {
+            const float* vp = (t < nctx)
+                ? vc + ((size_t)(win_lo + t) * nkv + kvh) * hd
+                : vb + ((size_t)(t - nctx) * nkv + kvh) * hd;
+            acc += s[t] * vp[e];
+        }
+        out[((size_t)r * (nkv * g) + h) * hd + e] = acc * inv;
+    }
+}
+
+// x = silu(g) * u ; g,u,x [n][ff]
+extern "C" __global__ void inkwell_draft_silu(const float* __restrict__ g,
+        const float* __restrict__ u, float* __restrict__ x, int ff)
+{
+    const int t = blockIdx.x;
+    for (int c = threadIdx.x; c < ff; c += blockDim.x) {
+        const float g_ = g[(size_t)t * ff + c];
+        x[(size_t)t * ff + c] = (g_ / (1.f + expf(-g_))) * u[(size_t)t * ff + c];
+    }
+}
+
+// GRU-ish markov update: raw = rnn_proj([state | w1prev | hid | f])
+// gt = sig(raw[:r]); cand = tanh(raw[r:2r]); state' = gt*state + (1-gt)*cand;
+// latent = tanh(raw[2r:3r])
+extern "C" __global__ void inkwell_draft_gru(const float* __restrict__ raw,
+        const float* __restrict__ bias,
+        float* __restrict__ state, float* __restrict__ latent, int r)
+{
+    const int c = threadIdx.x;
+    if (c >= r) return;
+    const float gt = 1.f / (1.f + expf(-(raw[c] + bias[c])));
+    const float cand = tanhf(raw[r + c] + bias[r + c]);
+    state[c] = gt * state[c] + (1.f - gt) * cand;
+    latent[c] = tanhf(raw[2 * r + c] + bias[2 * r + c]);
+}
+
+// out = a + b + c elementwise
+extern "C" __global__ void inkwell_draft_add3(const float* __restrict__ a,
+        const float* __restrict__ b, const float* __restrict__ c_,
+        float* __restrict__ out, int n)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        out[i] = a[i] + b[i] + c_[i];
+}
+
+// gather bf16 row idx of w[n][ldw] -> f32 out
+extern "C" __global__ void inkwell_draft_bf16row(const unsigned short* __restrict__ w,
+        int idx, int ldw, float* __restrict__ out)
+{
+    const int c = threadIdx.x + blockIdx.x * blockDim.x;
+    if (c >= ldw) return;
+    const unsigned int u = (unsigned int)w[(size_t)idx * ldw + c] << 16;
+    out[c] = __uint_as_float(u);
+}
+
+// argmax over cap*tanh(z/cap) -> u32
+extern "C" __global__ void inkwell_draft_argmax(const float* __restrict__ z,
+        int n, float cap, int* __restrict__ out)
+{
+    __shared__ float mv[256];
+    __shared__ int mi[256];
+    const int tid = threadIdx.x;
+    float bv = -1e30f; int bi = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = cap * tanhf(z[i] / cap);
+        if (v > bv) { bv = v; bi = i; }
+    }
+    mv[tid] = bv; mi[tid] = bi;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) {
+        if (tid < s && mv[tid + s] > mv[tid]) { mv[tid] = mv[tid + s]; mi[tid] = mi[tid + s]; }
+        __syncthreads();
+    }
+    if (tid == 0) out[blockIdx.x] = mi[0];
+}
+
+extern "C" void ink_launch_draft_mix(const float* f, const float* a, const float* w,
+        float* o, int rows, int tstride, int ch, float eps, void* s) {
+    inkwell_draft_mix<<<rows, 256, 0, (cudaStream_t)s>>>(f, a, w, o, tstride, ch, eps);
+}
+extern "C" void ink_launch_draft_rms(const float* x, const float* res, const float* w,
+        float* o, float* ro, int n, int ch, float eps, void* s) {
+    inkwell_draft_rms<<<n, 256, 0, (cudaStream_t)s>>>(x, res, w, o, ro, ch, eps);
+}
+extern "C" void ink_launch_draft_rope(float* x, const int* pos, int n, int nh, int hd,
+        float theta, void* s) {
+    dim3 g(nh, n);
+    inkwell_draft_rope<<<g, hd / 2, 0, (cudaStream_t)s>>>(x, pos, nh, hd, theta);
+}
+extern "C" void ink_launch_draft_kvwrite(float* kc, float* vc, const float* k,
+        const float* v, const int* pos, int n, int kvch, void* s) {
+    inkwell_draft_kvwrite<<<n, kvch, 0, (cudaStream_t)s>>>(kc, vc, k, v, pos, kvch);
+}
+extern "C" void ink_launch_draft_attn(const float* q, const float* kc, const float* vc,
+        const float* kb, const float* vb, float* o, int c, int win_lo, int nb,
+        int nkv, int g, int hd, void* s) {
+    dim3 gr(nkv * g, nb);
+    const int T = c - win_lo + nb;
+    inkwell_draft_attn<<<gr, 256, T * 4, (cudaStream_t)s>>>(q, kc, vc, kb, vb, o, c, win_lo, nb, nkv, g, hd);
+}
+extern "C" void ink_launch_draft_silu(const float* g, const float* u, float* x, int n, int ff, void* s) {
+    inkwell_draft_silu<<<n, 256, 0, (cudaStream_t)s>>>(g, u, x, ff);
+}
+extern "C" void ink_launch_draft_gru(const float* raw, const float* bias, float* st, float* lat, int r, void* s) {
+    inkwell_draft_gru<<<1, r, 0, (cudaStream_t)s>>>(raw, bias, st, lat, r);
+}
+extern "C" void ink_launch_draft_add3(const float* a, const float* b, const float* c,
+        float* o, int n, void* s) {
+    inkwell_draft_add3<<<(n + 255) / 256, 256, 0, (cudaStream_t)s>>>(a, b, c, o, n);
+}
+extern "C" void ink_launch_draft_bf16row(const void* w, int idx, int ldw, float* o, void* s) {
+    inkwell_draft_bf16row<<<(ldw + 255) / 256, 256, 0, (cudaStream_t)s>>>((const unsigned short*)w, idx, ldw, o);
+}
+extern "C" void ink_launch_draft_argmax(const float* z, int n, float cap, int* o, void* s) {
+    inkwell_draft_argmax<<<1, 256, 0, (cudaStream_t)s>>>(z, n, cap, o);
+}
