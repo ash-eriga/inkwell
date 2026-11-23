@@ -356,6 +356,54 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         eprintln!("verify row0: max|d|={d:.6} argmax={b0} vs step argmax={br}");
         // also dump row7-vs-row0 sanity: rows should diverge (different KV)
     }
+
+    if let Ok(spec) = std::env::var("INKWELL_SPEC") {
+        // spec decode: rounds of [committed id + <=7 drafts] through step_block;
+        // accept the matching prefix, emit it + the bonus row, rewind conv.
+        let k: usize = spec.parse().unwrap_or(7).min(7);
+        let mut drafter = inkwell_spec::NgramDraft::new(4);
+        use inkwell_spec::Draft;
+        let mut hist: Vec<u32> = ids.clone();
+        hist.extend_from_slice(&gen_ids);
+        hist.push(id);
+        let target: usize = std::env::var("INKWELL_SPEC_GENS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(32);
+        let mut spec_ids: Vec<u32> = Vec::new();
+        let (mut rounds, mut drafted, mut accepted) = (0u64, 0u64, 0u64);
+        let t2 = Instant::now();
+        while spec_ids.len() < target {
+            let draft = drafter.propose(&hist, k);
+            let nd = draft.len();
+            let mut blk = [id; 8];
+            for (i, &d) in draft.iter().enumerate() { blk[i + 1] = d; }
+            let tv = Instant::now();
+            let vl = r.step_block(&blk, pos);
+            let ms = tv.elapsed().as_secs_f64() * 1e3;
+            let nv = vl.len() / 8;
+            let verify: Vec<u32> = (0..8).map(|j| vl[j * nv..(j + 1) * nv].iter()
+                .enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32).collect();
+            let mut n = 0;
+            while n < nd && draft[n] == verify[n] { n += 1; }
+            let mut emitted: Vec<u32> = draft[..n].to_vec();
+            emitted.push(verify[n]);
+            let ne = emitted.len();
+            hist.extend_from_slice(&emitted);
+            spec_ids.extend_from_slice(&emitted);
+            id = *emitted.last().unwrap();
+            pos += ne as i64;
+            rounds += 1; drafted += nd as u64; accepted += n as u64;
+            eprintln!("spec r{rounds}: verify={ms:.1}ms draft={nd} accept={n} emit={ne} pos={pos}");
+            r.rollback_conv(ne);
+        }
+        let dt = t2.elapsed().as_secs_f64();
+        let text = inkwell_tokenizer::Tokenizer::from_gguf(gg).expect("tokenizer")
+            .decode(&spec_ids).unwrap_or_else(|_| "<decode error>".into());
+        eprintln!("spec text: {text:?}");
+        eprintln!("spec: {} tok in {dt:.1}s = {:.1} tok/s ({} rounds, accept {:.0}%, {:.2} tok/round)",
+            spec_ids.len(), spec_ids.len() as f64 / dt, rounds,
+            100.0 * accepted as f64 / drafted.max(1) as f64,
+            spec_ids.len() as f64 / rounds.max(1) as f64);
+    }
 }
 
 fn top(l: &[f32], n: usize) -> Vec<(usize, f32)> {

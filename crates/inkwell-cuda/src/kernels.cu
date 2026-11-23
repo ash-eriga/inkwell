@@ -2608,7 +2608,8 @@ extern "C" __global__ void inkwell_conv_step(
     const float* __restrict__ w,        // [4, ch] conv taps
     const float* __restrict__ dyn,      // [4, n_heads] or nullptr
     int ch, int n_heads, float scale,
-    float* __restrict__ out)            // [ch]
+    float* __restrict__ out,            // [ch]
+    float* __restrict__ snap)           // [3, n_sconv] per-position state save (nullable)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ch) return;
@@ -2619,6 +2620,7 @@ extern "C" __global__ void inkwell_conv_step(
     const float x3 = x_in[c];
     // shift: state = x[1..4]
     st[3 * c] = x1; st[3 * c + 1] = x2; st[3 * c + 2] = x3;
+    if (snap) { float* sp = snap + 3 * (size_t)region_off; sp[3 * c] = x1; sp[3 * c + 1] = x2; sp[3 * c + 2] = x3; }
     // w is [4, ch] contiguous: element (tap j, channel c) at w[4*c + j]
     float acc = w[4 * c] * x0 + w[4 * c + 1] * x1 + w[4 * c + 2] * x2 + w[4 * c + 3] * x3;
     if (dyn) {
@@ -2633,10 +2635,10 @@ extern "C" __global__ void inkwell_conv_step(
 
 extern "C" void ink_launch_conv_step(const float* x_in, float* state, int region_off,
         const float* w, const float* dyn, int ch, int n_heads, float scale,
-        float* out, void* stream) {
+        float* out, float* snap, void* stream) {
     const int thr = ch < 256 ? ch : 256;
     inkwell_conv_step<<<(ch + thr - 1) / thr, thr, 0, (cudaStream_t)stream>>>(
-        x_in, state, region_off, w, dyn, ch, n_heads, scale, out);
+        x_in, state, region_off, w, dyn, ch, n_heads, scale, out, snap);
 }
 
 // ================= union-batched (verify ntok) MoE =================

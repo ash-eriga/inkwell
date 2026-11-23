@@ -332,3 +332,22 @@ Ledger histórico: subtrair ~35ms de tudo.
 ## CORRECTNESS BUG FIXED (2026-11-23)
 - `inkwell_exl3_had_in_moe` read `x[e]` shared across slots; for the DOWN chain x=hid ([8][1152]) → slots 1-7 used expert 0's gate*up output. Bug since original commit 72a02e1.
 - Fix: `x[(descs2 ? 0 : slot*k) + e]` (down chain only). Old golden " the capital of France." was the BUGGED output; new golden = " Paris. The capital of the United States is Washington, D.C. ...".
+
+## 2026-11-23 — UNION MoE COMMITTED (79a567e), spec driver WIP
+- Non-spec plateau CONFIRMED ~97ms/tok (~10.3 TPS). User: "60ms primeiro, depois speculative" — non-spec esgotado; seguindo spec path (user avisado).
+- verify-8 (step_block): CORRECT (max|d|=0.00014, argmax match) and now ~463-492ms (was ~840ms) via union-batched MoE:
+  - kernels.cu: `inkwell_exl3_union_expand` (dedups 8x8→~20 unique experts, emits eids/euni/etok/estart/epos), `inkwell_exl3_gemv_moe_ntok` (gemv per expert applied to all consumer x-vecs, grouped output), `inkwell_exl3_expert_wsum8`, launcher `ink_launch_exl3_moe_ntok`.
+  - had_in_moe gained optional `euni`/`etok` params (miss by union idx; x offset by token).
+  - resolve fix: nexp>k → map=EXL3_DIRECT (was map=-1 → wild sdescs → illegal access). NEEDED upstream too since serial nslots can exceed k if k<8.
+  - moe.rs: VScratch (64-slot scratch) + `moe_cb_exl3_ntok`; runner.rs layer_blk: batched router (logits8 [128,8] → sigmoid → +pb → argsort_top_k → cont → ids3[8,8,1] get_rows → w8 [8,8] norm+scale) + ONE custom_4d [n_embd,8] + convolve per token.
+  - ids8 MUST be `t::cont` (argsort_top_k returns a view).
+- Layout: x8/out8 [n_embd,8] col-major → row t at offset t*2304. desc tables indexed by expert id [128][4] u64.
+- INKWELL_MNTOK_DBG=n env left in launcher: 1..5 + 99 = stage markers with cudaGetLastError prints. Keep for now (dbg=0 inert).
+- Kernel cost after union: gemv_moe_ntok ~1.5-1.9ms avg/launch (~120 launches/verify), ccopy still big (PCIe misses), dp4a_ntok ~50ms/verify.
+- Spec driver exists: crates/inkwell-spec (SpecLoop/NgramDraft/accept_len/commit). NEXT:
+  1. conv rollback WIP (IN PROGRESS, uncommitted): conv_step gained `float* snap` param (writes post-shift state to snap[3*region_off+3c+r]); ink_launch_conv_step + conv_step_async gain trailing `snap` arg — lib.rs edit applied to ffi decl only (see diff); conv_step_async body still needs `, snap, stream()` + caller `a.snap`.
+  2. ConvStepArgs needs `snap: *mut f32`; convolve() takes snap ptr (null in serial, conv_snap[slot]+j*3*n_sconv*4 in block). Allocate conv_snap[slot][8][3*n_sconv] lazily on first step_block (DevBuf per conv_state entry).
+  3. rollback_conv(emitted): if emitted<8 memcpy snap[slot][emitted-1]→conv_state[slot] (D2D) for every slot. KV arenas need NO rollback (stale slots overwritten next round).
+  4. main.rs spec loop (env INKWELL_SPEC): committed `id`@pos; draft = ids[1..7] via NgramDraft/MTP; step_block([id,d1..d7]) → rows j predict pos+j+1; verify[j]=argmax(row j); accept d_{j+1} iff verify[j]==d_{j+1}; emitted=n+1 (n accepted + bonus v_n); rollback_conv(emitted); pos+=emitted; id=emitted last token.
+  5. Verify uses K=10 cache during tests (VRAM tight: K=15 OOM'd on the batched graph ~110MB extra vs serial). Desktop apps on.
+- Zombie cleanup: `pkill -9 -x inkwell` before every run.

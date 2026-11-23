@@ -94,6 +94,8 @@ pub struct Runner {
     out_head: Option<(inkwell_cuda::DevBuf, inkwell_cuda::DevBuf, inkwell_cuda::DevBuf)>,
     // per-visit KV arenas + conv states (visit → tensors)
     k_arena: Vec<Ptr>, v_arena: Vec<Ptr>, conv_state: Vec<Ptr>,
+    /// per-position conv snapshots for spec rollback: [slot][NT][3*n_sconv].
+    conv_snap: Vec<inkwell_cuda::DevBuf>,
     max_ctx: i64,
     swa: i64,
     visits: Vec<(usize /*layer*/, usize /*slot*/)>,
@@ -189,6 +191,7 @@ struct ConvStepArgs {
     ch: i32,
     n_heads: i32,         // 0 = no dynamic taps
     scale: f32,
+    snap: *mut f32,       // nullable per-position state save [3, n_sconv]
 }
 
 /// `ggml_custom_op_t`: fused conv shift + ssm_conv + taps + residual + scale.
@@ -203,7 +206,7 @@ unsafe extern "C" fn conv_step_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i
     unsafe {
         inkwell_cuda::conv_step_async(src(0), a.state, a.region_off, src(1), dyn_p,
             a.ch, a.n_heads, a.scale,
-            inkwell_ggml::ink_tensor_data(dst).cast());
+            inkwell_ggml::ink_tensor_data(dst).cast(), a.snap);
     }
 }
 
@@ -546,7 +549,7 @@ impl Runner {
             exl3_w: Vec::new(), exl3_blk: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
-            k_arena, v_arena, conv_state, max_ctx, swa, visits,
+            k_arena, v_arena, conv_state, conv_snap: Vec::new(), max_ctx, swa, visits,
             n_full,
         }
     }
@@ -914,7 +917,7 @@ impl Runner {
             moe_args: Vec::new(), exl3_w, exl3_blk, moe_args_exl3, output_exl3,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
-            k_arena, v_arena, conv_state, max_ctx, swa, visits, n_full,
+            k_arena, v_arena, conv_state, conv_snap: Vec::new(), max_ctx, swa, visits, n_full,
         }
     }
 }
@@ -1006,7 +1009,7 @@ impl Runner {
     }
 
     /// `dynamic` = per-head taps tensor (conv-gated layers).
-    fn convolve(&self, x_in: Ptr, w: Ptr, dynamic: Option<Ptr>, slot: usize, region_off: i64, _stores: &mut Vec<Ptr>) -> Ptr {
+    fn convolve(&self, x_in: Ptr, w: Ptr, dynamic: Option<Ptr>, slot: usize, region_off: i64, _stores: &mut Vec<Ptr>, snap: *mut f32) -> Ptr {
         let c = self.cur_ctx;
         let n_conv = 4i64;
         let ch = t::ne(x_in, 0); // x_in: [ch, 1]
@@ -1020,6 +1023,7 @@ impl Runner {
             ch: ch as i32,
             n_heads,
             scale,
+            snap,
         };
         if idx >= pool.len() {
             pool.push(Box::new(fresh));
@@ -1039,6 +1043,29 @@ impl Runner {
             inkwell_ggml::custom_4d(c.0, F32, [ch, 1, 1, 1], &mut args,
                 conv_step_cb as usize, (arg as *const ConvStepArgs).cast_mut().cast())
         })
+    }
+
+    /// device ptr into `conv_snap[slot]` for verify position `j`.
+    fn snap_ptr(&self, slot: usize, j: usize) -> *mut f32 {
+        if self.conv_snap.len() <= slot { return std::ptr::null_mut(); }
+        let n = (t::ne(self.conv_state[slot], 0) * t::ne(self.conv_state[slot], 1)) as usize;
+        unsafe { self.conv_snap[slot].dev_ptr().cast::<f32>().add(j * n) }
+    }
+
+    /// Spec partial-accept: rewind conv state to after verify input index
+    /// `emitted - 1` (`snap` copies written during `step_block`). No-op on
+    /// full acceptance.
+    pub fn rollback_conv(&self, emitted: usize) {
+        if emitted == 0 || emitted >= NT { return; }
+        let m = emitted - 1;
+        for (s, snap) in self.conv_state.iter().zip(self.conv_snap.iter()) {
+            let n = (t::ne(*s, 0) * t::ne(*s, 1)) as usize * 4;
+            unsafe {
+                inkwell_cuda::memcpy_d2d_async(
+                    inkwell_ggml::ink_tensor_data(s.0),
+                    snap.dev_ptr().cast::<u8>().add(m * n).cast(), n);
+            }
+        }
     }
 
     /// loop control gate: (1-forget)*cur + gain*msg
@@ -1115,9 +1142,9 @@ impl Runner {
         };
         let k_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
         let v_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
-        let k = self.convolve(self.proj(c, l, "wk", l.wk, inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores);
+        let k = self.convolve(self.proj(c, l, "wk", l.wk, inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores, std::ptr::null_mut());
         let gqa = (hd * hkv) as i64;
-        let v = self.convolve(self.proj(c, l, "wv", l.wv, inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores);
+        let v = self.convolve(self.proj(c, l, "wv", l.wv, inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores, std::ptr::null_mut());
         let r = r_pre;
         if il == 0 {
             self.dump("rel_raw", r); self.dump("inputs0", inputs[0]);
@@ -1180,7 +1207,7 @@ impl Runner {
         let mut cur = out;
         cur = t::mul(c, cur, t::sigmoid(c, gate_lin));
         if il == 0 { self.dump("kqv_out-0", out); }
-        cur = self.convolve(self.proj(c, l, "wo", l.wo, cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores);
+        cur = self.convolve(self.proj(c, l, "wo", l.wo, cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores, std::ptr::null_mut());
 
         // residual / push block
         if ip % (self.cfg.attn_res_block_size as usize) == 0 {
@@ -1223,7 +1250,7 @@ impl Runner {
             });
             // EXL3 experts are device-side (VRAM staging + pinned DMA): do NOT pin
             // ffn_out to CPU — that forced a backend split + host copies per layer.
-            let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores);
+            let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores, std::ptr::null_mut());
             if il == 0 { self.dump("ffn_out-0", fcur); }
             let out = t::add(c, ffn_inp, fcur);
             self.dump(&format!("s_lout{il}"), out);
@@ -1243,7 +1270,7 @@ impl Runner {
         });
         self.set_cpu(ffn_out);
 
-        let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores);
+        let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores, std::ptr::null_mut());
         if il == 0 { self.dump("ffn_out-0", fcur); }
         let out2 = t::add(c, ffn_inp, fcur);
         self.dump(&format!("l_out-{slot}"), out2);
@@ -1658,8 +1685,8 @@ impl Runner {
         for j in 0..NT {
             let kd = k_dyn8.map(|d| t::cont(c, self.tokslice(c, d, t::ne(d, 0), j as i64)));
             let vd = v_dyn8.map(|d| t::cont(c, self.tokslice(c, d, t::ne(d, 0), j as i64)));
-            ks.push(self.convolve(t::cont(c, self.tokslice(c, wk8, t::ne(wk8, 0), j as i64)), l.attn_k_conv.expect("kconv"), kd, slot, 0, &mut Vec::new()));
-            vs.push(self.convolve(t::cont(c, self.tokslice(c, wv8, t::ne(wv8, 0), j as i64)), l.attn_v_conv.expect("vconv"), vd, slot, gqa, &mut Vec::new()));
+            ks.push(self.convolve(t::cont(c, self.tokslice(c, wk8, t::ne(wk8, 0), j as i64)), l.attn_k_conv.expect("kconv"), kd, slot, 0, &mut Vec::new(), self.snap_ptr(slot, j)));
+            vs.push(self.convolve(t::cont(c, self.tokslice(c, wv8, t::ne(wv8, 0), j as i64)), l.attn_v_conv.expect("vconv"), vd, slot, gqa, &mut Vec::new(), self.snap_ptr(slot, j)));
         }
         let k8 = self.cat8(c, &ks);
         let v8 = self.cat8(c, &vs);
@@ -1718,7 +1745,7 @@ impl Runner {
         // post conv per token
         let mut pcs: Vec<Ptr> = Vec::with_capacity(NT);
         for j in 0..NT {
-            pcs.push(self.convolve(t::cont(c, self.tokslice(c, cur, n_embd, j as i64)), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, &mut Vec::new()));
+            pcs.push(self.convolve(t::cont(c, self.tokslice(c, cur, n_embd, j as i64)), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, &mut Vec::new(), self.snap_ptr(slot, j)));
         }
         cur = self.cat8(c, &pcs);
 
@@ -1759,7 +1786,7 @@ impl Runner {
         let mut fouts: Vec<Ptr> = Vec::with_capacity(NT);
         for j in 0..NT {
             let fj = self.tokslice(c, ffn8, n_embd, j as i64);
-            fouts.push(self.convolve(fj, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, &mut Vec::new()));
+            fouts.push(self.convolve(fj, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, &mut Vec::new(), self.snap_ptr(slot, j)));
         }
         let fcur = self.cat8(c, &fouts);
         let out = t::add(c, ffn_inp, fcur);
@@ -1793,6 +1820,12 @@ impl Runner {
     /// # Panics
     /// On graph/alloc/compute failure.
     pub fn step_block(&mut self, ids: &[u32; NT], pos: i64) -> Vec<f32> {
+        if self.conv_snap.len() < self.conv_state.len() {
+            for s in &self.conv_state {
+                let n = (t::ne(*s, 0) * t::ne(*s, 1)) as usize;
+                self.conv_snap.push(inkwell_cuda::DevBuf::new_bytes(n * NT * 4));
+            }
+        }
         if self.cur_ctx.0.is_null() {
             self.cur_ctx = Ptr(unsafe { inkwell_ggml::ink_ctx_new() });
         } else {

@@ -496,7 +496,7 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
     let x8 = src(0) as *const f32;
     let ids8 = src(1) as *const i32;
     let w8 = src(2) as *const f32;
-    let out8 = inkwell_ggml::ink_tensor_data(dst) as *mut f32;
+    let out8 = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
     unsafe {
         let (cache, tag, cnt, k, slot_proj) = if let Some(c) = &a.cache {
             (c.buf.dev_ptr(), c.tag.dev_ptr().cast::<i32>(), c.cnt.dev_ptr().cast::<i32>(),
