@@ -1688,7 +1688,7 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     const int c = u >> 2, rp = u & 3;
     const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk); // ≤80 u32 per tile
-    __shared__ float xhb[4][16];
+    __shared__ float xhb[8][16];
     __shared__ uint32_t rings[4 * 4 * 80]; // 4 tiles × 4 tk-batch × ≤80 words
     const bool live = tn_i < tn;
     // split-K: gridDim.y chunks over the tk dimension
@@ -1913,10 +1913,16 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
                                       const float* __restrict__ xh,
                                       const float* __restrict__ xh2, int xh2s,
                                       float* __restrict__ t, int tslot, int tzoff,
-                                      int tk, int tn, int k, int n) {
+                                      int tk, int tn, int k, int n, int nky) {
     const int slot = blockIdx.y;
-    const uint64_t* d = (blockIdx.z ? descs2 : descs) + ids[slot] * 4;
-    const float* xhb_g = blockIdx.z ? xh2 + slot * xh2s : xh + slot * k;
+    const int nsel = descs2 ? 2 : 1;             // fused gate+up pairs vs single
+    const int ky = blockIdx.z / nsel;            // k-range index
+    const int zsel = blockIdx.z % nsel;
+    const uint64_t* d = (zsel ? descs2 : descs) + ids[slot] * 4;
+    const float* xhb_g = zsel ? xh2 + slot * xh2s : xh + slot * k;
+    // this block's batch-row range within [0, tk)
+    const int tk_lo = (ky * tk) / nky;
+    const int tk_hi = ((ky + 1) * tk) / nky;
     const uint32_t* tile_base = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff);
     const int halfk = (int)((d[3] >> 8) & 1);
@@ -1925,12 +1931,12 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     const int c = u >> 2, rp = u & 3;
     const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
-    __shared__ uint32_t rings[4 * 4 * 32]; // 4 tiles × 4 tk-batch × ≤32 words
+    __shared__ uint32_t rings[4 * 8 * 32]; // 4 tiles × 8 tk-batch × ≤32 words
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
     float s = 0.f, sx = 0.f;
     const bool live = tn_i < tn;
-    __shared__ float xhb[4][16];
+    __shared__ float xhb[8][16];
     // hoisted window indices: (i0, i1, s0) per q — (c,r) fixed across all batches
     uint32_t widx[4];
     {
@@ -1951,39 +1957,45 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     }
     // prologue: fill batch 0 (global loads stall, unavoidable once)
     {
-        const int tkn0 = min(4, tk);
+        const int tkn0 = min(8, tk_hi - tk_lo);
         if (threadIdx.x < 64) {
             const int j = threadIdx.x;
-            if (j < 16 * tkn0) xhb[j >> 4][j & 15] = xhb_g[(j >> 4) * 16 + (j & 15)];
+            if (j < 16 * tkn0) xhb[j >> 4][j & 15] = xhb_g[(tk_lo + (j >> 4)) * 16 + (j & 15)];
+            const int j2 = j + 64;
+            if (j2 < 16 * tkn0) xhb[j2 >> 4][j2 & 15] = xhb_g[(tk_lo + (j2 >> 4)) * 16 + (j2 & 15)];
         }
         if (live && u < w) {
-            uint32_t* rg = rings + g * 128;
+            uint32_t* rg = rings + g * 256;
             for (int b = 0; b < tkn0; ++b)
-                rg[b * 32 + u] = tile_base[((size_t)(b * tn + tn_i)) * (size_t)w + u];
+                rg[b * 32 + u] = tile_base[((size_t)((tk_lo + b) * tn + tn_i)) * (size_t)w + u];
         }
     }
     __syncthreads();
-    for (int tk0 = 0; tk0 < tk; tk0 += 4) {
-        const int tkn = min(4, tk - tk0);
-        const int nk0 = tk0 + 4;
-        const int tkn2 = min(4, tk - nk0);
+    for (int tk0 = tk_lo; tk0 < tk_hi; tk0 += 8) {
+        const int tkn = min(8, tk_hi - tk0);
+        const int nk0 = tk0 + 8;
+        const int tkn2 = min(8, tk_hi - nk0);
         // prefetch next batch into registers while current smem is consumed —
         // hides the global-load latency behind this batch's math.
-        uint32_t pfb[4];
-        float pfx = 0.f;
-        if (live && nk0 < tk && u < w) {
+        uint32_t pfb[8];
+        float pfx0 = 0.f, pfx1 = 0.f;
+        if (live && nk0 < tk_hi && u < w) {
             for (int b = 0; b < tkn2; ++b)
                 pfb[b] = tile_base[((size_t)((nk0 + b) * tn + tn_i)) * (size_t)w + u];
         }
-        if (threadIdx.x < 64 && nk0 < tk) {
+        if (nk0 < tk_hi) {
             const int j = threadIdx.x;
-            if (j < 16 * tkn2) pfx = xhb_g[(nk0 + (j >> 4)) * 16 + (j & 15)];
+            if (j < 64) {
+                pfx0 = (j < 16 * tkn2) ? xhb_g[(nk0 + (j >> 4)) * 16 + (j & 15)] : 0.f;
+                const int j2 = j + 64;
+                pfx1 = (j2 < 16 * tkn2) ? xhb_g[(nk0 + (j2 >> 4)) * 16 + (j2 & 15)] : 0.f;
+            }
         }
         if (live) {
-            const uint32_t* rg = rings + g * 128;
-            float xr[4][4];
+            const uint32_t* rg = rings + g * 256;
+            float xr[8][4];
 #pragma unroll
-            for (int b = 0; b < 4; ++b)
+            for (int b = 0; b < 8; ++b)
 #pragma unroll
                 for (int q = 0; q < 4; ++q)
                     xr[b][q] = xhb[b][rp + 4 * q];
@@ -2002,13 +2014,17 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
         }
         __syncthreads();
         // store next batch from regs (load latency already hidden)
-        if (live && nk0 < tk && u < w) {
-            uint32_t* rg = rings + g * 128;
+        if (live && nk0 < tk_hi && u < w) {
+            uint32_t* rg = rings + g * 256;
             for (int b = 0; b < tkn2; ++b) rg[b * 32 + u] = pfb[b];
         }
-        if (threadIdx.x < 64 && nk0 < tk) {
+        if (nk0 < tk_hi) {
             const int j = threadIdx.x;
-            if (j < 16 * tkn2) xhb[j >> 4][j & 15] = pfx;
+            if (j < 64) {
+                if (j < 16 * tkn2) xhb[j >> 4][j & 15] = pfx0;
+                const int j2 = j + 64;
+                if (j2 < 16 * tkn2) xhb[j2 >> 4][j2 & 15] = pfx1;
+            }
         }
         __syncthreads();
     }
@@ -2017,7 +2033,11 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     sx += __shfl_xor_sync(0xffffffffu, sx, 1);
     s += __shfl_xor_sync(0xffffffffu, s, 2);
     sx += __shfl_xor_sync(0xffffffffu, sx, 2);
-    if (live && rp == 0) t[slot * n + blockIdx.z * tzoff + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
+    if (live && rp == 0) {
+        float* dstp = &t[slot * n + zsel * tzoff + tn_i * 16 + c];
+        const float v = fmaf(KINV, s, KOFF * sx);
+        if (nky > 1) atomicAdd(dstp, v); else *dstp = v;
+    }
 }
 
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
@@ -2308,17 +2328,21 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     // gate + up fused: blockIdx.z selects the descriptor set
     dim3 gin((KG + 511) / 512, nslots, 2);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG);
-    dim3 gg(NG / 64, nslots, 2);
+    int nky = 1;
+    { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    dim3 gg(NG / 64, nslots, 2 * nky);
     inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND);
+                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky);
     dim3 gout((NG + 511) / 512, nslots, 2);
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD);
-    dim3 gd(ND / 64, nslots, 1);
+    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    dim3 gd(ND / 64, nslots, nky);
     inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                             dn, ND, 0, KD / 16, ND / 16, KD, ND);
+                                             dn, ND, 0, KD / 16, ND / 16, KD, ND, nky);
     dim3 dout((ND + 511) / 512, nslots, 1);
     inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
@@ -2369,17 +2393,21 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     dim3 gin((KG + 511) / 512, nslots, 2);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG);
     cudaStreamWaitEvent(st, ev_join, 0);
-    dim3 gg(NG / 64, nslots, 2);
+    int nky = 1;
+    { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    dim3 gg(NG / 64, nslots, 2 * nky);
     inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND);
+                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky);
     dim3 gout((NG + 511) / 512, nslots, 2);
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD);
-    dim3 gd(ND / 64, nslots, 1);
+    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    dim3 gd(ND / 64, nslots, nky);
     inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                             dn, ND, 0, KD / 16, ND / 16, KD, ND);
+                                             dn, ND, 0, KD / 16, ND / 16, KD, ND, nky);
     dim3 dout((ND + 511) / 512, nslots, 1);
     inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
