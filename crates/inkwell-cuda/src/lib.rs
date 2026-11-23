@@ -690,6 +690,32 @@ pub unsafe fn exl3_gemv_async(trel: *const c_void, suh: *const c_void, svh: *con
     x: *const f32, y: *mut f32, k: usize, n: usize, ka: usize, halfk: bool, scratch: *mut f32) {
     unsafe { ink_launch_exl3_gemv(trel, suh, svh, x, y, k as i64, n as i64, ka as i64, halfk as i64, scratch, stream()) };
 }
+/// Same gemv launched on the shared side stream (for pair-overlap cbs).
+///
+/// # Safety
+/// Caller must event-gate the side stream on the inputs and re-join it
+/// to the main stream after (see `event_record`/`stream_wait`).
+pub unsafe fn exl3_gemv_async_side(trel: *const c_void, suh: *const c_void, svh: *const c_void,
+    x: *const f32, y: *mut f32, k: usize, n: usize, ka: usize, halfk: bool, scratch: *mut f32) {
+    unsafe { ink_launch_exl3_gemv(trel, suh, svh, x, y, k as i64, n as i64, ka as i64, halfk as i64, scratch, side_stream()) };
+}
+/// Record `e` on stream `s`.
+///
+/// # Safety
+/// CUDA event plumbing.
+pub unsafe fn event_record(e: *mut c_void, s: *mut c_void) {
+    assert_eq!(unsafe { cudaEventRecord(e, s) }, 0, "cudaEventRecord");
+}
+/// Make `s` wait on `e`.
+///
+/// # Safety
+/// CUDA event plumbing.
+pub unsafe fn stream_wait(s: *mut c_void, e: *mut c_void) {
+    assert_eq!(unsafe { cudaStreamWaitEvent(s, e, 0) }, 0, "cudaStreamWaitEvent");
+}
+/// The shared side stream's raw handle.
+#[must_use]
+pub fn side_stream_raw() -> *mut c_void { side_stream() }
 /// 8-token batched variant: x `[8][k]`, y `[8][n]` — one weight read feeds all 8.
 ///
 /// # Safety
