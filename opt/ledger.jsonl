@@ -17,3 +17,4 @@
 {"ts":"2026-11-22","exp":"expert alloc reserve 1150->1050MiB + on_dev descs skip moe_stage for VRAM layers (~1GB experts resident)","ms_tok":176,"verdict":"keep"}
 {"ts":"2026-11-22","exp":"gemv_dp4a split-K gridDim.y ~512 blocks + atomicAdd","gemv_dp4a_ms":229,"verdict":"keep"}
 {"ts":"2026-11-22","exp":"gemv_moe variants: split-K memset+atomics (643ms, worse), 16thr warp-per-tile (worse), TB=8 tk batching (1.458s, worse), __ldg no-shared (22s, catastrophic) — kept 4tile/64thr shared-ring","verdict":"revert"}
+{"ts":"2026-11-22","exp":"dp4a deterministic split-K (slices+had_out reduce) — keeps coherence; moe in-block split-K REVERTED (corrupt)","ms_tok":193,"verdict":"keep dp4a, revert moe"}
