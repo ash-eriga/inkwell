@@ -1927,7 +1927,8 @@ extern "C" void ink_launch_exl3_gemv_ntok(const void* trel, const void* suh, con
             x + (size_t)tt * k, (const uint16_t*)suh, scratch + (size_t)tt * k, (int)k);
     const int nb = (tn + 3) / 4;
     int nky = 1;
-    while (nb * nky < 512 && nky < 8 && nky * 16 <= tk) nky *= 2;
+    { static int tgt = -1; if (tgt < 0) { const char* e = getenv("INKWELL_GEMV_NKY_TGT"); tgt = e ? atoi(e) : 512; }
+      while (nb * nky < tgt && nky < 8 && nky * 16 <= tk) nky *= 2; }
     if (nky > 1) cudaMemsetAsync(scratch + (size_t)NTOK * k, 0, (size_t)nky * NTOK * n * 4, (cudaStream_t)stream);
     dim3 gsz((unsigned)nb, (unsigned)nky, 1);
     inkwell_exl3_gemv_dp4a_ntok<<<gsz, 256, 0, (cudaStream_t)stream>>>(
@@ -1981,7 +1982,8 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
     const int nb = (tn + 3) / 4;
     // aim for ~256 blocks: split K when tn is small
     int nky = 1;
-    while (nb * nky < 512 && nky < 8 && nky * 16 <= tk) nky *= 2;
+    { static int tgt = -1; if (tgt < 0) { const char* e = getenv("INKWELL_GEMV_NKY_TGT"); tgt = e ? atoi(e) : 512; }
+      while (nb * nky < tgt && nky < 8 && nky * 16 <= tk) nky *= 2; }
     if (nky > 1) cudaMemsetAsync(scratch + k, 0, nky * n * 4, (cudaStream_t)stream);
     dim3 gsz((unsigned)nb, (unsigned)nky, 1);
     inkwell_exl3_gemv_dp4a<<<gsz, 256, 0, (cudaStream_t)stream>>>(

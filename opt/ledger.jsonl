@@ -348,3 +348,11 @@
 {"ts":"2026-11-23","config":"moe-gemv double-buffer rings","ms_tok":101,"golden":true,"note":"REJECTED ~101 vs 96 control"}
 {"ts":"2026-11-23","config":"prefetch off by default","ms_tok":96,"golden":true,"note":"bank ~0 hits; frees ~190MB -> +2 cached layers"}
 {"ts":"2026-11-23","config":"k8 fallback cache for late layers","ms_tok":100,"golden":true,"note":"REJECTED — k8 thrash worse than stage path"}
+{"exp": "bs range (int8-xh feasibility)", "result": "u8-sum 0..1005 — NO int8 pack", "verdict": "rejected", "note": "int8×int8 dp4a on (xh,bs) impossible without 3-bit loss on bs"}
+{"exp": "DEV_MARGIN 800/500", "result": "800: ~110ms; 500: no extra layers", "verdict": "rejected", "note": "VRAM genuinely full, margin not the limiter"}
+{"exp": "MAX_CTX=1024", "result": "cached L16-21 (+6 layers), ~98ms", "verdict": "neutral", "note": "fewer stage calls but same wall; ctx cost too high to ship"}
+{"exp": "MAX_CTX=512", "result": "cached thru L22, ~99ms", "verdict": "neutral"}
+{"exp": "MOE_NKY=2/4", "result": "105/112ms", "verdict": "rejected", "note": "more blocks worse — memset+atomic overhead"}
+{"exp": "dense gemv batch 4->8", "result": "broken output", "verdict": "rejected", "note": "xhb fill only loads 64 elems; needs pfx pair like moe kernel"}
+{"exp": "moe split hit/miss pass", "result": "~97ms golden ok", "verdict": "kept", "note": "correct; helps when misses occur; neutral at k=25"}
+{"exp": "wk||wv Exl3Par 2-stream pair op", "result": "~103-106ms vs ~97", "verdict": "rejected", "note": "SM contention in full pipeline; event overhead ~20us/op; reverted"}
