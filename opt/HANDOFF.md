@@ -204,3 +204,5 @@ ccopy 19ms (25×~750µs), stage 8.2ms (6×1.37ms), pcopy ~2ms, mul_mat_vec 6ms, 
 5. **13ms build/token**: ggml graph build em step() — custo fixo; reduzir via ctx reuse mais agressivo
    seria projeto grande; deixar por último.
 Mediana atual ~128ms. Meta 15 TPS = 66.7. Alvo 33.
+- Rejeitado: GGML_CUDA_GRAPH_CHUNK_SIZE 0 (~145ms — instantiate serializa; chunks pipelinem) e 2048 (~131, neutro).
+  Os 14 chunks são por contagem de nós (default 512) e o pipeline instantiate|exec já é eficaz.
