@@ -1,11 +1,38 @@
 # HANDOFF — Inkwell REXL3 port (overnight session)
 
 ## Missão
-Meta overnight: **30 TPS sem speculative decoding** (~33 ms/tok). Se chegar lá e sobrar
-tempo, pode seguir para speculative decoding (o REXL3 tem drafter MTP embutido —
-`mtp.safetensors`, markov_rank 256, block_size 8 — e o usuário aprovou a "magiquinha"
-depois do alvo). Mantenha texto coerente (`generated text` deve parecer português/inglês
+**60 ms/tok (~16.7 TPS) no caminho NÃO-spec primeiro**, depois speculative.
+Spec já implementado/verificado mas não paga (verify ~500ms, accept ~14%).
+REXL3 obrigatório (sem quants menores). Avisar o usuário em PT ao bater 15 TPS estáveis —
+NUNCA parar. Mantenha texto coerente (`generated text` deve parecer português/inglês
 real, ex: " the capital of France.\n\nThe ").
+
+## Estado atual (HEAD = c9613d6+oracle-dumps)
+- **NON-SPEC PLATEAU: ~97-100 ms/tok (~10.4 TPS)**, golden coerente " Paris. The capital of
+  the United States is Washington, D.C. ...". Todos os levers de numérica exata esgotados:
+  ~800MB de pesos/tok a ~10GB/s efetivo (latência de VRAM, não PCIe nem BW).
+- **Spec decode (DSpark/mtp.safetensors) IMPLEMENTADO e VERIFICADO**: driver em
+  `inkwell-cli` (INKWELL_SPEC=mtp), drafter em `crates/inkwell-run/src/draft.rs`,
+  feats taps em runner.rs (FEAT_IDX=(5,23,41)+final-norm), ctx-K/V de 3 camadas,
+  markov head (state 256 + rnn + hidden_out + unembed + argmax cap30).
+- **Aceitação medida ~14% (1.98 tok/round, 101 rounds)** — flat com ctx cheio (~200 pos).
+  Verificado por ORÁCULO NUMPY (/tmp/mtp_oracle.py + /tmp/mtp_bisect.py): dequant de todas
+  as 29 matrizes EXL3 por unit-vectors (mesma matemática do kernel), forward do draft
+  replicado — TODOS os estágios dentro de ruído fp32 (GPU é determinístico a 3e-4; diffs
+  GPU-vs-oracle são propagação de ~2e-4 base). Draft tokens são plausíveis-mas-difíceis;
+  vLLM/B200 reporta accept_len 3.5-5.2 em prompts naturais — nosso texto é repetitivo mas
+  semanticamente difícil (nomes de capitais). ngram k=4..6: 1.19-1.21 tok/round < MTP.
+- **Spec economics**: verify ~470-570ms + draft ~46ms por round → ~3.5 tok/s vs serial
+  10.3 tok/s = 3x PIOR. Verify dominado por `inkwell_exl3_gemv_moe_ntok` (~2.6ms/call,
+  ~60 calls/round): a união de experts deduplica pouco (8 tok × 8 experts de 128 → ~60/64).
+- Bug fix real: bf16_to_f32 em draft.rs (shift precedence) — commit d6d903e; down-proj MoE
+  lendo expert-0 p/ todos os slots — fix anterior ("golden" antigo era saída bugada).
+- **LEVER REAL p/ 60ms**: gemv_moe serial lê ~7MB/expert a ~12GB/s efetivo — VRAM real
+  ~150GB/s → kernel é instr/latency-bound, headroom ~4x. Se gemv_moe subir pra ~40GB/s:
+  MoE 48ms→~15ms → total ~65ms. ANTES de mais spec, otimizar esse kernel.
+- Próximos: (1) otimizar inkwell_exl3_gemv_moe (smem/prefetch/occupancy — o ntok compartilha
+  o mesmo decode interno); (2) kd-adaptive draft len (theta=0.4 cumprod, NÃO implementado);
+  (3) variable-length verify (step_block é fixo-8).
 
 ## Estado atual (HEAD = 2f1b0d6)
 - **decode ~1.5–1.6 s / 8 tok ≈ ~190 ms/tok** (INKWELL_GENS=8). Coerente.
