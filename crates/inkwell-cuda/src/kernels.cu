@@ -1836,26 +1836,50 @@ extern "C" void ink_launch_exl3_dbg_had(const float* x, const void* suh, float* 
 // desc[expert] = 4 u64: {trellis ptr, suh ptr, svh ptr, ka | halfk<<8}
 // All pointers are pinned host-mapped (zero-copy readable on sm_61).
 
+// 128-dim Hadamard via 4 in-register elems/lane + 5 warp-shuffle levels.
+// Element e = lane*4+i inside the warp's 128-block; same butterfly order as
+// the old smem version but with zero __syncthreads and no smem traffic.
+__device__ __forceinline__ void had128_warp(float* __restrict__ v, int ebase) {
+#pragma unroll
+    for (int s = 1; s < 4; s <<= 1) {
+        float u[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            u[i] = (i & s) ? v[i ^ s] - v[i] : v[i] + v[i ^ s];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = u[i];
+    }
+#pragma unroll
+    for (int s = 4; s < 128; s <<= 1) {
+        const int mask = s >> 2;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[i], mask);
+            v[i] = ((ebase + i) & s) ? o - v[i] : v[i] + o;
+        }
+    }
+}
+
 __global__ void inkwell_exl3_had_in_moe(const uint64_t* __restrict__ descs,
                                         const int* __restrict__ ids,
                                         const float* __restrict__ x,
                                         float* __restrict__ xh, int k) {
-    extern __shared__ float sm[];
     const int slot = blockIdx.y;
     const uint16_t* suh = (const uint16_t*)(uintptr_t)descs[ids[slot] * 4 + 1];
-    const int blk = blockIdx.x;
-    const int t = threadIdx.x;
-    const int base = blk * 128;
-    float v = (base + t < k) ? x[base + t] * __half2float(__ushort_as_half(suh[base + t])) : 0.f;
-    sm[t] = v;
-    __syncthreads();
-    for (int s = 1; s < 128; s <<= 1) {
-        const float u = (t & s) ? sm[t - s] - sm[t] : sm[t] + sm[t + s];
-        __syncthreads();
-        sm[t] = u;
-        __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int base = blockIdx.x * 512 + (threadIdx.x >> 5) * 128;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int e = base + lane * 4 + i;
+        v[i] = (e < k) ? x[e] * __half2float(__ushort_as_half(suh[e])) : 0.f;
     }
-    if (base + t < k) xh[slot * k + base + t] = sm[t] * 0.08838834764831845f;
+    had128_warp(v, lane * 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int e = base + lane * 4 + i;
+        if (e < k) xh[slot * k + e] = v[i] * 0.08838834764831845f;
+    }
 }
 
 // grid (tn, nslots): block decodes tile tn_i of expert ids[slot]; acc -> t[slot][n]
@@ -1948,22 +1972,23 @@ __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
                                          const int* __restrict__ ids,
                                          const float* __restrict__ t,
                                          float* __restrict__ y, int n, int stride, int off) {
-    extern __shared__ float sm[];
     const int slot = blockIdx.y;
     const uint16_t* svh = (const uint16_t*)(uintptr_t)descs[ids[slot] * 4 + 2];
-    const int blk = blockIdx.x;
-    const int th = threadIdx.x;
-    const int base = blk * 128;
-    sm[th] = (base + th < n) ? t[slot * n + base + th] : 0.f;
-    __syncthreads();
-    for (int s = 1; s < 128; s <<= 1) {
-        const float u = (th & s) ? sm[th - s] - sm[th] : sm[th] + sm[th + s];
-        __syncthreads();
-        sm[th] = u;
-        __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int base = blockIdx.x * 512 + (threadIdx.x >> 5) * 128;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int e = base + lane * 4 + i;
+        v[i] = (e < n) ? t[slot * n + e] : 0.f;
     }
-    if (base + th < n) y[slot * stride + off + base + th] = sm[th] * 0.08838834764831845f
-        * __half2float(__ushort_as_half(svh[base + th]));
+    had128_warp(v, lane * 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int e = base + lane * 4 + i;
+        if (e < n) y[slot * stride + off + e] = v[i] * 0.08838834764831845f
+            * __half2float(__ushort_as_half(svh[e]));
+    }
 }
 
 // Stage selected experts pinned-host → VRAM staging (coalesced uint4 copies,
@@ -2016,11 +2041,13 @@ __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
 // miss[s] = 1 when a copy is required. rr = per-layer victim counter.
 // PF_BASE+p encodes "slot p of the prefetch bank" in map[].
 #define EXL3_PF_BASE 0x40000000
+#define EXL3_DIRECT 0x20000000
 __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         int* __restrict__ tag, int* __restrict__ map, int* __restrict__ miss,
         int* __restrict__ rr, int nslots, int k,
         const int* __restrict__ ptag, const int* __restrict__ pready,
         int* __restrict__ pf_hit) {
+    // pf_hit[0]=bank hits, pf_hit[1]=real misses (filled via serial ccopy)
     if (threadIdx.x != 0) return;
     // Serial: a victim slot must not be one already claimed this visit,
     // otherwise a miss could overwrite a slot a hit still needs.
@@ -2049,6 +2076,7 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         }
         miss[s] = m;
         map[s] = v;
+        if (m && pf_hit) atomicAdd(pf_hit + 1, 1);
     }
 }
 
@@ -2077,8 +2105,20 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
     const int trel_b = 10368 * r_bits_words(ka, halfk) * 4;
     const int suh_b = (proj == 2 ? 2304 : 4608);
     const int svh_b = (proj == 2 ? 4608 : 2304);
-    uint8_t* cbase = cache;
     int mslot = map[slot];
+    if (mslot >= EXL3_DIRECT && mslot < EXL3_PF_BASE) {
+        // direct: point sdescs at the expert's host descriptors — the gemv
+        // streams the blob over PCIe; no serial copy, cache stays stable.
+        if (threadIdx.x == 0 && part == 0) {
+            uint64_t* o = sd + ids[slot] * 4;
+            o[0] = d[0];
+            o[1] = d[1];
+            o[2] = d[2];
+            o[3] = d[3];
+        }
+        return;
+    }
+    uint8_t* cbase = cache;
     if (mslot >= EXL3_PF_BASE) { cbase = bank; mslot -= EXL3_PF_BASE; }
     uint8_t* dst = cbase + (size_t)(mslot * 3 + proj) * (size_t)slot_proj;
     if (threadIdx.x == 0 && part == 0) {
@@ -2197,21 +2237,20 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     // gate + up into gu[slot][0..1152] and gu[slot][1152..2304]
     for (int p = 0; p < 2; ++p) {
         const uint64_t* dd = p ? U : G;
-        dim3 gin(KG / 128, nslots);
-        inkwell_exl3_had_in_moe<<<gin, 128, 512, st>>>(dd, ids, x, xh, KG);
+        dim3 gin((KG + 511) / 512, nslots);
+        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(dd, ids, x, xh, KG);
         dim3 gg(NG / 64, nslots, 1);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
-        dim3 gout(NG / 128, nslots);
-        inkwell_exl3_had_out_moe<<<gout, 128, 512, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
+        dim3 gout((NG + 511) / 512, nslots);
+        inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
     }
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
-    dim3 din(KD / 128, nslots);
-    // KD=1152 not multiple of 128*? 1152/128=9 blocks
-    inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
+    dim3 din((KD + 511) / 512, nslots);
+    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, ids, hid, xh, KD);
     dim3 gd(ND / 64, nslots, 1);
     inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
-    dim3 dout(ND / 128, nslots);
-    inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
+    dim3 dout((ND + 511) / 512, nslots);
+    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
 }
 
@@ -2228,7 +2267,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
         (int*)tag, (int*)map, (int*)miss, (int*)rr, nslots, k,
         (const int*)ptag, (const int*)pready, pf_hit);
-    inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 4), 256, 0, st>>>(
+    inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, st>>>(
         (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
         ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
         (uint8_t*)bank, slot_proj,
@@ -2239,20 +2278,20 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     for (int p = 0; p < 2; ++p) {
         const uint64_t* dd = p ? U : G;
-        dim3 gin(KG / 128, nslots);
-        inkwell_exl3_had_in_moe<<<gin, 128, 512, st>>>(dd, ids, x, xh, KG);
+        dim3 gin((KG + 511) / 512, nslots);
+        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(dd, ids, x, xh, KG);
         dim3 gg(NG / 64, nslots, 1);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
-        dim3 gout(NG / 128, nslots);
-        inkwell_exl3_had_out_moe<<<gout, 128, 512, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
+        dim3 gout((NG + 511) / 512, nslots);
+        inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
     }
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din(KD / 128, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
     dim3 gd(ND / 64, nslots, 1);
     inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
-    dim3 dout(ND / 128, nslots);
-    inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
+    dim3 dout((ND + 511) / 512, nslots);
+    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
 }
 

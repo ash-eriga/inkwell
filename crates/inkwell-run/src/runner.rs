@@ -1424,10 +1424,11 @@ impl Runner {
                     pf.pf_miss.dev_ptr().cast(), 8, c.k, c.slot as i64);
             }
             if pos % 7 == 6 && std::env::var_os("INKWELL_PF_STAT").is_some() {
-                let mut b = [0u8; 36];
+                let mut b = [0u8; 40];
                 pf.pf_miss.read_bytes(&mut b);
                 let hits = i32::from_le_bytes(b[32..36].try_into().unwrap());
-                eprintln!("PFSTAT L{} hits={}", a.layer, hits);
+                let misses = i32::from_le_bytes(b[36..40].try_into().unwrap());
+                eprintln!("PFSTAT L{} hits={} misses={}", a.layer, hits, misses);
             }
         }
         let prof = std::env::var_os("INKWELL_PROF").is_some();

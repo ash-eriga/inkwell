@@ -370,7 +370,7 @@ impl Exl3Prefetch {
             ptag: { let mut d = cu::DevBuf::try_new_bytes(32)?; d.write_bytes(&[0xFFu8; 32]); d },
             pready: cu::DevBuf::try_new_bytes(4)?,
             pf_map: cu::DevBuf::try_new_bytes(32)?,
-            pf_miss: { let mut d = cu::DevBuf::try_new_bytes(36)?; d.write_bytes(&[0u8; 36]); d },
+            pf_miss: { let mut d = cu::DevBuf::try_new_bytes(40)?; d.write_bytes(&[0u8; 40]); d },
         })
     }
 }
