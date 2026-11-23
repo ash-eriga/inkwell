@@ -418,6 +418,10 @@ impl Mtp {
                     self.d(&self.kb), self.d(&self.vb), self.d(&self.att),
                     c as usize, win_lo as usize, NB, NKV, NH / NKV, HD);
                 w.o.gemv8(self.d(&self.att), self.d(&self.ob));
+                if std::env::var_os("INKWELL_MTP_ORACLE").is_some()
+                    && !std::path::Path::new(&format!("/tmp/mtp_in/lob{l}.bin")).exists() {
+                    dev_dump(&self.ob, NB * H, &format!("/tmp/mtp_in/lob{l}.bin"));
+                }
                 inkwell_cuda::draft_rms_async(self.d(&self.ob), self.d(&self.res),
                     self.d(&w.post_ln).cast_const(), self.d(&self.h), self.d(&self.res), NB, H, EPS);
                 w.gate.gemv8(self.d(&self.h), self.d(&self.gb));

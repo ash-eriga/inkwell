@@ -381,7 +381,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
             }
             bases.dedup();
             for &bc in &bases {
-                if bc <= 0 { continue; }
+                if bc < 0 { continue; }
                 let mut blk = [0u32; 8];
                 for j in 0..8 { blk[j] = toks[(bc as usize) + j]; }
                 eprintln!("ctx replay base={bc}");
@@ -459,6 +459,13 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
             let td = Instant::now();
             mtp.ctx_append(c_old);
             vtok = mtp.propose(c, id, n);
+            // fewer distinct tokens -> smaller expert union in verify: pad
+            // rows past dlen with the anchor (they can never be emitted).
+            // fewer distinct tokens -> smaller expert union in verify: pad
+            // rows past INKWELL_SPEC_DLEN with the anchor (never emitted).
+            let dlen: usize = std::env::var("INKWELL_SPEC_DLEN").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(7);
+            for j in dlen + 1..8 { vtok[j] = vtok[0]; }
             eprintln!("          draft={:.1}ms", td.elapsed().as_secs_f64() * 1e3);
         }
         let dt = t2.elapsed().as_secs_f64();

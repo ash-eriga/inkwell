@@ -2283,10 +2283,11 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         int* __restrict__ tag, int* __restrict__ map, int* __restrict__ miss,
         int* __restrict__ cnt, int nslots, int k,
         const int* __restrict__ ptag, const int* __restrict__ pready,
-        int* __restrict__ pf_hit) {
+        int* __restrict__ pf_hit, const int* __restrict__ pnexp) {
     // LFU eviction: cnt[e] counts uses; the least-used resident is evicted.
     // pf_hit[0]=bank hits, pf_hit[1]=real misses (filled via serial ccopy)
     if (threadIdx.x != 0) return;
+    if (pnexp) nslots = *pnexp;
     const int pf = pready ? *pready : 0;
     int claimed = 0;
     // pass 1: hits (and prefetch-bank hits) — never evict slots needed now
@@ -2346,8 +2347,9 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
                                        uint64_t* __restrict__ sdescs_g,
                                        uint64_t* __restrict__ sdescs_u,
                                        uint64_t* __restrict__ sdescs_d,
-                                       int mode) {
+                                       int mode, const int* __restrict__ pnexp) {
     const int slot = blockIdx.x / 3;
+    if (pnexp && slot >= *pnexp) return;
     const int proj = blockIdx.x % 3;
     const int part = blockIdx.y, nparts = gridDim.y;
     const uint64_t* src = (proj == 0 ? descs_g : (proj == 1 ? descs_u : descs_d));
@@ -2526,7 +2528,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const cudaStream_t st = (cudaStream_t)stream;
     inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
         (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
-        (const int*)ptag, (const int*)pready, pf_hit);
+        (const int*)ptag, (const int*)pready, pf_hit, nullptr);
     static cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     static cudaStream_t ss = nullptr;
     {
@@ -2541,14 +2543,14 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
             (uint8_t*)bank, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1, nullptr);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
         inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
             (uint8_t*)bank, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2, nullptr);
         cudaEventRecord(ev_join, ss);
     }
     const uint64_t* G = (const uint64_t*)sdescs_g;
@@ -2671,7 +2673,8 @@ __global__ void inkwell_exl3_union_expand(
             if (sh_cnt[i]) { uids[nu] = i; sh_uidx[i] = nu; estart[nu] = off; ++nu; }
             off += sh_cnt[i];
         }
-        estart[nu] = 64;
+        for (int i = nu; i <= 64; ++i) estart[i] = 64;
+        for (int i = nu; i < 64; ++i) { eids[i] = 0; euni[i] = 0; etok[i] = 0; }
         *pnexp = nu;
     }
     __syncthreads();
@@ -2707,8 +2710,10 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
                                       const float* __restrict__ xh2, int xh2s,
                                       float* __restrict__ t, int tslot, int tzoff,
                                       int tk, int tn, int k, int n, int nky,
-                                      const int* __restrict__ missf, int skipmode) {
+                                      const int* __restrict__ missf, int skipmode,
+                                      const int* __restrict__ pnexp) {
     const int slot = blockIdx.y;
+    if (pnexp && slot >= *pnexp) return;
     if (skipmode && ((missf[slot] != 0) == (skipmode == 1))) return;
     const int nsel = descs2 ? 2 : 1;
     const int ky = blockIdx.z / nsel;
@@ -2876,9 +2881,7 @@ extern "C" void ink_launch_exl3_moe_ntok(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
     }
-    int nexp = 64;
-    cudaMemcpyAsync(&nexp, unexp, 4, cudaMemcpyDeviceToHost, st);
-    cudaStreamSynchronize(st);
+    int nexp = 64;  // union cap; kernels early-exit on *unexp
     const int dbg = getenv("INKWELL_MNTOK_DBG") ? atoi(getenv("INKWELL_MNTOK_DBG")) : 0;
     if (dbg) { cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok expand ok nexp=%d err=%d\n", nexp, (int)e); }
     if (dbg == 1) return;
@@ -2898,19 +2901,19 @@ extern "C" void ink_launch_exl3_moe_ntok(
     const uint64_t* D = (const uint64_t*)sdescs_d;
     if (cached) {
         inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(uids,
-            tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr);
+            tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr, unexp);
         inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 1), 32, 0, st>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
             nullptr, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1, unexp);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
         inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 16), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
             nullptr, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2, unexp);
         cudaEventRecord(ev_join, ss);
     }
     dim3 gin((KG + 511) / 512, 64, 2);
@@ -2927,19 +2930,19 @@ extern "C" void ink_launch_exl3_moe_ntok(
             2 * NG, KG, miss, 1, euni, etok);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin1 err=%d\n", (int)cudaGetLastError()); }
         inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
-            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 1);
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 1, unexp);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  gemv1 err=%d\n", (int)cudaGetLastError()); }
         cudaStreamWaitEvent(st, ev_join, 0);
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, miss, 2, euni, etok);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin2 err=%d\n", (int)cudaGetLastError()); }
         inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
-            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2);
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2, unexp);
     } else {
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, nullptr, 0, euni, etok);
         inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
-            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, nullptr, 0);
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, nullptr, 0, unexp);
     }
     if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok gu done err=%d\n", (int)e); }
     if (dbg == 3) return;
@@ -2952,7 +2955,7 @@ extern "C" void ink_launch_exl3_moe_ntok(
         nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn_e, 0, 64 * ND * 4, st);
     inkwell_exl3_gemv_moe_ntok<<<gd, 256, 0, st>>>(D, nullptr, uids, estart, xh_e,
-        nullptr, 0, dn_e, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
+        nullptr, 0, dn_e, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0, unexp);
     if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok dgemv done err=%d\n", (int)e); }
     if (dbg == 5) return;
     inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, eids, dn_e, xh_e, ND, ND, 0, ND, 0);
