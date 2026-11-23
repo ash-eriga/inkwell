@@ -362,3 +362,4 @@
 {"exp": "conv pool staleness fix", "result": "verify-8 runs, no segfault", "verdict": "kept", "note": "step_block still diverges (max|d|=12.7) — defer to spec phase"}
 {"exp": "step_block correctness", "result": "max|d|=0.00036 row0 vs step", "verdict": "fixed", "note": "tau8 missing +1.0 bias of serial scale_bias; also in_buf 64MB->8MB, conv snapshot/restore helpers"}
 {"exp": "Exl3Duo wq+gate via moe slots", "result": "~101-115ms", "verdict": "rejected", "note": "moe slot path slower than dense pipeline; reverted"}
+{"exp": "verify-8 timing", "result": "807ms compute / 8 tok", "verdict": "too slow", "note": "per-token serial ops (moe ~45ms/tok, conv, attn) dominate; exl3 ntok batching only covers projs; need batched MoE (union experts) + cuda-graph to make verify pay"}

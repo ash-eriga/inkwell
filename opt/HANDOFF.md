@@ -301,3 +301,7 @@ Ledger histórico: subtrair ~35ms de tudo.
   bloco, batch MoE/router por token.
 - WALL non-spec confirmado ~97ms: ~800MB/token a ~9-10GB/s efetivo uniforme
   (VRAM-latency), todas fusões menores rejeitadas em A/B — caminho real = spec.
+- verify-8 compute=807ms ≈ 101ms/tok: per-token ops dominam (moe ~45ms/tok
+  ×8 = ~360ms). Próximo lever p/ spec pagar: MoE batched por union de
+  experts (rotear 8 tokens juntos, gemv ntok por expert único) + graph do
+  bloco. Serial per-token moe reaproveita pesos só por token.

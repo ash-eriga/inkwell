@@ -1960,10 +1960,13 @@ impl Runner {
 
         let g = Ptr(unsafe { inkwell_ggml::ink_graph_new(c.0, 32768) });
         t::build_forward(g, cur);
+        let prof = std::env::var_os("INKWELL_PROF").is_some();
+        let t0 = std::time::Instant::now();
         unsafe {
             assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
             self.dump_all();
         }
+        if prof { eprintln!("PROF blk_compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
         let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize * NT];
         // logits tensor is [n_vocab_padded, NT]; read per token prefix
         let nv = t::ne(logits_t, 0) as usize;
