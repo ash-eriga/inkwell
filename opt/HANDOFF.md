@@ -321,3 +321,10 @@ Ledger histórico: subtrair ~35ms de tudo.
   Spec ainda paga SE verify < ~500ms E drafter acertar ~4+/8.
   Levers restantes p/ verify: cuda-graph do bloco (overhead ~13ms×?),
   batch conv/attn/router por token (small ops ×8 serializam).
+
+## verify union-MoE economics (measured 2026-11-23)
+- Expert overlap across 8 verify tokens: ~20.3 unique experts/visit (64 selections) → 3.2x dedup possible. b_ids{il}t{j} dumps added behind INKWELL_DUMP.
+- Verify kernel budget (nsys): gemv_moe ~370ms (of ~840ms block), ccopy ~100, stage ~90, dp4a_ntok ~50, had ~40, misc ~190.
+- Union-batched plan: expand (expert,consumer) pairs on GPU; new gemv_moe_ntok reads each unique expert once for ≤8 consumer xh vectors; wsum groups by token. Est verify ~450ms.
+- CUDA graphs confirmed DEAD on Pascal: is_enabled() false (arch gate) even with GGML_PASCAL_GRAPHS; patch attempt → cudaGraphInstantiate OOM. Reverted.
+- Non-spec serial remains ~97ms floor.

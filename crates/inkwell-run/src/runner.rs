@@ -1744,6 +1744,7 @@ impl Runner {
             let probs = t::sigmoid(c, logits);
             let sel = t::add(c, probs, l.ffn_exp_probs_b.expect("pb"));
             let ids = t::argsort_top_k(c, sel, 8);
+            self.dump(&format!("b_ids{il}t{j}"), ids);
             let probs3 = t::reshape3(c, probs, 1, 128, 1);
             let mut weights = t::get_rows(c, probs3, ids);
             let weights2 = t::reshape2(c, weights, 8, 1);
