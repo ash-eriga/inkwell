@@ -80,6 +80,8 @@ pub struct Runner {
     moe_args: Vec<Box<crate::moe::MoeArgs>>,
     /// EXL3 weight descriptors (device-resident trellis+suh+svh)
     exl3_w: Vec<Box<Exl3W>>,
+    /// 8-token variants sharing `exl3_w` weights (spec-decode verify)
+    exl3_blk: Vec<Box<Exl3Blk>>,
     /// EXL3 MoE bindings per visit
     moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>>,
     /// unembed as EXL3 (REXL3)
@@ -145,6 +147,38 @@ unsafe extern "C" fn exl3_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, u
 #[must_use]
 pub fn exl3_cb_addr() -> usize {
     exl3_cb as usize
+}
+
+/// 8-token EXL3 weight: shares `Exl3W` device buffers, owns a wider scratch.
+#[derive(Debug)]
+pub struct Exl3Blk {
+    trel: *const std::ffi::c_void,
+    suh: *const std::ffi::c_void,
+    svh: *const std::ffi::c_void,
+    k: usize,
+    n: usize,
+    ka: usize,
+    halfk: bool,
+    scratch: inkwell_cuda::DevBuf,
+}
+
+/// `ggml_custom_op_t`: batched EXL3 GEMV — `dst->src[0]` = x `[k, 8]` f32 device.
+unsafe extern "C" fn exl3_ntok_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let w = unsafe { &*ud.cast::<Exl3Blk>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let x = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let x_dev = unsafe { inkwell_ggml::ink_tensor_data(x) } as *const f32;
+    let y = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
+    unsafe {
+        inkwell_cuda::exl3_gemv_ntok_async(w.trel, w.suh, w.svh,
+            x_dev, y, w.k, w.n, w.ka, w.halfk, w.scratch.dev_ptr().cast());
+    }
+}
+
+/// Callback address for the batched EXL3 GEMV custom op.
+#[must_use]
+pub fn exl3_ntok_cb_addr() -> usize {
+    exl3_ntok_cb as usize
 }
 
 /// userdata for the fused conv-step custom op.
@@ -509,7 +543,7 @@ impl Runner {
             dump_list: std::cell::UnsafeCell::new(Vec::new()),
             in_buf: None,
             rt, sched, dev_buf, cpu_buf, w, pinned, expert_dev: Vec::new(), moe_args,
-            exl3_w: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
+            exl3_w: Vec::new(), exl3_blk: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, max_ctx, swa, visits,
@@ -792,6 +826,11 @@ impl Runner {
         }
         eprintln!("load_st: dev={}MiB exl3_w={} pinned={}MiB", dev_bytes >> 20, exl3_w.len(),
             pinned_bytes >> 20);
+        let exl3_blk: Vec<Box<Exl3Blk>> = exl3_w.iter().map(|e| Box::new(Exl3Blk {
+            trel: e.trel.dev_ptr(), suh: e.suh.dev_ptr(), svh: e.svh.dev_ptr(),
+            k: e.k, n: e.n, ka: e.ka, halfk: e.halfk,
+            scratch: inkwell_cuda::DevBuf::new(8 * e.k + 64 * e.n),
+        })).collect();
 
         // visits + KV arenas (same as GGUF path)
         let (start, end, np, nphys) = (6usize, 18usize, 3usize, 24usize);
@@ -872,7 +911,7 @@ impl Runner {
             in_buf: None,
             rt, sched, dev_buf, cpu_buf,
             w: HashMap::new(), pinned, expert_dev,
-            moe_args: Vec::new(), exl3_w, moe_args_exl3, output_exl3,
+            moe_args: Vec::new(), exl3_w, exl3_blk, moe_args_exl3, output_exl3,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, max_ctx, swa, visits, n_full,
@@ -986,6 +1025,9 @@ impl Runner {
         }
         let arg = &*pool[idx];
         self.conv_arg_idx.set(idx + 1);
+        if std::env::var_os("INKWELL_VDBG").is_some() {
+            eprintln!("convdbg idx={idx} slot={slot} roff={region_off} ch={ch} nh={n_heads} state={:?}", arg.state);
+        }
         let mut args: Vec<*mut std::ffi::c_void> = vec![x_in.0, w.0];
         if let Some(d) = dynamic { args.push(d.0); }
         Ptr(unsafe {
@@ -1466,6 +1508,433 @@ impl Runner {
     }
 }
 
+// ============ spec-decode verify: ntok=8 block forward ============
+
+const NT: usize = 8;
+
+/// per-token step inputs for the block path
+struct StepBlk {
+    kv_idx_full: [Ptr; NT],
+    kv_idx_swa: [Ptr; NT],
+    rel_pos_full: [Ptr; NT],
+    rel_pos_swa: [Ptr; NT],
+    mask_full: [Ptr; NT],
+    mask_swa: [Ptr; NT],
+    tau8: Ptr, // [8] f32
+    n_kv_full_pad: i64,
+    n_kv_swa_pad: i64,
+}
+
+impl Runner {
+    /// slice token `j` out of a contiguous tensor whose last dim is `NT`
+    /// (`n` = per-token element count: product of the leading dims).
+    fn tokslice(&self, c: Ptr, x: Ptr, n: i64, j: i64) -> Ptr {
+        t::view1(c, x, n, j * n * 4)
+    }
+
+    fn cat8(&self, c: Ptr, xs: &[Ptr]) -> Ptr {
+        let mut acc = t::reshape3(c, xs[0], t::ne(xs[0], 0), 1, 1);
+        for x in &xs[1..] {
+            acc = t::concat(c, acc, t::reshape3(c, *x, t::ne(*x, 0), 1, 1), 1);
+        }
+        t::reshape2(c, acc, t::ne(acc, 0), NT as i64)
+    }
+
+    /// GEMV dispatch for `[k, NT]` inputs → `[n, NT]` (batched EXL3 or mmq).
+    fn proj8(&self, c: Ptr, l: &L, key: &'static str, w: Option<Ptr>, x: Ptr) -> Ptr {
+        match l.exl3.get(key) {
+            Some(&i) => {
+                let e = &*self.exl3_blk[i];
+                let mut args = [x.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [e.n as i64, NT as i64, 1, 1], &mut args,
+                    exl3_ntok_cb_addr(), (e as *const Exl3Blk).cast_mut().cast()) })
+            }
+            None => t::mmq(c, w.expect(key), x),
+        }
+    }
+
+    /// `mix` over `[n, NT]` residual checkpoints → `[n, rows, NT]`
+    fn mix8(&self, blocks: &[Ptr], cur: Ptr, query: Ptr) -> Ptr {
+        let c = self.cur_ctx;
+        let n_embd = self.cfg.n_embd as i64;
+        let mut states = if blocks.is_empty() {
+            t::reshape3(c, cur, n_embd, 1, NT as i64)
+        } else {
+            let mut p = t::reshape3(c, blocks[0], n_embd, 1, NT as i64);
+            for b in &blocks[1..] {
+                p = t::concat(c, p, t::reshape3(c, *b, n_embd, 1, NT as i64), 1);
+            }
+            t::concat(c, p, t::reshape3(c, cur, n_embd, 1, NT as i64), 1)
+        };
+        states = t::rms_norm(c, states, 1e-6);
+        let n_rows = t::ne(query, 1);
+        let queries = t::repeat(c, query, t::new(c, F32, &[n_embd, n_rows, NT as i64]));
+        let scores = t::soft_max(c, t::mmq(c, states, queries), Ptr(std::ptr::null_mut()), 1.0 / (n_embd as f32).sqrt(), 0.0);
+        t::mmq(c, t::cont(c, t::transpose(c, states)), scores)
+    }
+
+    /// block forward of one layer-visit: `cur`/`blocks`/`messages` are `[n, NT]` tensors;
+    /// stateful ops (conv state, KV write, attention, MoE) run per token on slices.
+    #[expect(clippy::too_many_arguments)]
+    fn layer_blk(&self, il: usize, ip: usize, slot: usize, pass: usize, mut cur: Ptr, blocks: &mut Vec<Ptr>,
+             messages: Option<Ptr>, l: &L, step: &StepBlk) -> Ptr {
+        let c = self.cur_ctx;
+        let is_swa = self.is_swa_layer(il);
+        let (n_embd, hd, nh, hkv, n_rel) =
+            (self.cfg.n_embd as i64, 128i64, 24i64, 8i64, self.cfg.n_rel as i64);
+        let n_rep = nh / hkv;
+        let gqa = (hd * hkv) as i64;
+        let inp_sa = cur;
+
+        let mut inputs = [cur, cur, cur];
+        if let Some(rq) = l.attn_res_query {
+            let mixed = self.mix8(blocks, cur, rq); // [n, 3, NT]
+            for (j, inp) in inputs.iter_mut().enumerate() {
+                let (a, n, rs, off) = (mixed, n_embd, t::nb(mixed, 2), (if is_swa { 0 } else { j as i64 }) * t::nb(mixed, 1));
+                if std::env::var_os("INKWELL_VDBG").is_some() { eprintln!("vdbg il={il} p{pass} mixed[{},{},{}] nb[{},{},{}] n0={n} rs={rs} off={off}", t::ne(a,0),t::ne(a,1),t::ne(a,2),t::nb(a,0),t::nb(a,1),t::nb(a,2)); }
+                *inp = t::cont(c, t::view2(c, a, n, NT as i64, rs, off));
+            }
+        }
+        if let Some(msgs) = messages {
+            for (j, inp) in inputs.iter_mut().enumerate() {
+                let (a, n, rs, off) = (msgs, n_embd, t::nb(msgs, 2), j as i64 * t::nb(msgs, 1));
+                if std::env::var_os("INKWELL_VDBG").is_some() { eprintln!("vdbg il={il} p{pass} msgs[{},{},{}] nb[{},{},{}] n0={n} rs={rs} off={off}", t::ne(a,0),t::ne(a,1),t::ne(a,2),t::nb(a,0),t::nb(a,1),t::nb(a,2)); }
+                let m = t::cont(c, t::view2(c, a, n, NT as i64, rs, off));
+                *inp = self.control(*inp, m, l, j);
+            }
+        }
+        if is_swa && messages.is_some() {
+            for inp in inputs.iter_mut() { *inp = self.norm(*inp, l.attn_norm.expect("attn_norm")); }
+        } else if is_swa {
+            inputs[0] = self.norm(inputs[0], l.attn_norm.expect("attn_norm"));
+            inputs[1] = inputs[0];
+            inputs[2] = inputs[0];
+        } else {
+            inputs[0] = self.norm(inputs[0], l.attn_q_inp_norm.expect("q_inp"));
+            inputs[1] = self.norm(inputs[1], l.attn_k_inp_norm.expect("k_inp"));
+            inputs[2] = self.norm(inputs[2], l.attn_v_inp_norm.expect("v_inp"));
+        }
+
+        // projections on [k, NT]
+        let (q8, gate8, r8) = if let Some(cat) = l.proj0_cat {
+            let out = t::mmq(c, cat, inputs[0]); // [n_cat, NT]
+            let slice = |off: i64, n: i64, key: &'static str, w: Option<Ptr>| {
+                if off >= 0 {
+                    if std::env::var_os("INKWELL_VDBG").is_some() { eprintln!("vdbg il={il} p{pass} catout[{},{},{}] nb[{},{},{}] n0={n} rs={} off={}", t::ne(out,0),t::ne(out,1),t::ne(out,2),t::nb(out,0),t::nb(out,1),t::nb(out,2), t::nb(out,1), off*4); }
+                    t::view2(c, out, n, NT as i64, t::nb(out, 1), off * 4)
+                } else { self.proj8(c, l, key, w, inputs[0]) }
+            };
+            (
+                slice(l.proj0_off[0], 3072, "wq", l.wq),
+                slice(l.proj0_off[1], 3072, "gate", l.wqkv_gate),
+                slice(l.proj0_off[2], 384, "rel", l.attn_rel),
+            )
+        } else {
+            (
+                self.proj8(c, l, "wq", l.wq, inputs[0]),
+                self.proj8(c, l, "gate", l.wqkv_gate, inputs[0]),
+                self.proj8(c, l, "rel", l.attn_rel, inputs[0]),
+            )
+        };
+        let k_dyn8 = if is_swa { None } else { Some(t::mmq(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
+        let v_dyn8 = if is_swa { None } else { Some(t::mmq(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
+        // batched exl3 GEMV, then per-token conv state updates
+        let wk8 = self.proj8(c, l, "wk", l.wk, inputs[1]);
+        let wv8 = self.proj8(c, l, "wv", l.wv, inputs[2]);
+        let mut ks: Vec<Ptr> = Vec::with_capacity(NT);
+        let mut vs: Vec<Ptr> = Vec::with_capacity(NT);
+        for j in 0..NT {
+            let kd = k_dyn8.map(|d| t::cont(c, self.tokslice(c, d, t::ne(d, 0), j as i64)));
+            let vd = v_dyn8.map(|d| t::cont(c, self.tokslice(c, d, t::ne(d, 0), j as i64)));
+            ks.push(self.convolve(t::cont(c, self.tokslice(c, wk8, t::ne(wk8, 0), j as i64)), l.attn_k_conv.expect("kconv"), kd, slot, 0, &mut Vec::new()));
+            vs.push(self.convolve(t::cont(c, self.tokslice(c, wv8, t::ne(wv8, 0), j as i64)), l.attn_v_conv.expect("vconv"), vd, slot, gqa, &mut Vec::new()));
+        }
+        let k8 = self.cat8(c, &ks);
+        let v8 = self.cat8(c, &vs);
+
+        let q8 = self.clip(t::reshape3(c, q8, hd, nh, NT as i64), l.attn_q_clip, self.cfg.qk_clip);
+        let k8 = self.clip(t::reshape3(c, k8, hd, hkv, NT as i64), None, self.cfg.qk_clip);
+        let v8 = t::rms_norm(c, t::reshape3(c, v8, hd, hkv, NT as i64), 1e-6);
+        let r8 = self.clip(t::reshape3(c, r8, n_rel, nh, NT as i64), l.attn_rel_clip, self.cfg.rel_clip);
+
+        let n_kv = if is_swa { step.n_kv_swa_pad } else { step.n_kv_full_pad };
+        let mut k_cur = self.k_arena[slot];
+        let mut v_cur = self.v_arena[slot];
+        let mut outs: Vec<Ptr> = Vec::with_capacity(NT);
+        for j in 0..NT {
+            let k_j = t::reshape3(c, self.tokslice(c, k8, hd * hkv, j as i64), hd, hkv, 1);
+            let v_j = t::reshape3(c, self.tokslice(c, v8, hd * hkv, j as i64), hd, hkv, 1);
+            let k_rows = t::cont(c, t::permute(c, k_j, 0, 2, 1, 3));
+            let v_rows = t::cont(c, t::permute(c, v_j, 0, 2, 1, 3));
+            let kv_idx = if is_swa { step.kv_idx_swa[j] } else { step.kv_idx_full[j] };
+            k_cur = t::set_rows(c, k_cur, k_rows, kv_idx);
+            v_cur = t::set_rows(c, v_cur, v_rows, kv_idx);
+
+            let mut q_j = t::reshape3(c, self.tokslice(c, q8, hd * nh, j as i64), hd, nh, 1);
+            let mut r_j = t::reshape3(c, self.tokslice(c, r8, n_rel * nh, j as i64), n_rel, nh, 1);
+            if !is_swa {
+                let tau_j = t::view1(c, step.tau8, 1, (j * 4) as i64);
+                q_j = t::mul(c, q_j, t::reshape3(c, tau_j, 1, 1, 1));
+                r_j = t::mul(c, r_j, t::reshape3(c, tau_j, 1, 1, 1));
+            }
+            let inputs0_j = self.tokslice(c, inputs[0], n_embd, j as i64);
+            let sinks = t::mmq(c, l.attn_sink_proj.expect("sink"), inputs0_j);
+            let table = t::mmq(c, l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias"), r_j);
+            let table = t::sub(c, table, t::reshape3(c, sinks, 1, nh, 1));
+            let table = t::cont(c, t::permute(c, table, 1, 0, 2, 3));
+            let rel_pos = if is_swa { step.rel_pos_swa[j] } else { step.rel_pos_full[j] };
+            let kq_b = t::get_rows(c, table, rel_pos);
+            let kq_b = t::cont(c, t::permute(c, t::reshape4(c, kq_b, nh, n_kv, 1, 1), 2, 0, 1, 3));
+            let k_view = t::view3(c, k_cur, hd, n_kv, hkv, t::nb(k_cur, 1), t::nb(k_cur, 2), 0);
+            let q3 = t::permute(c, q_j, 0, 2, 1, 3);
+            let kq_mask = if is_swa { step.mask_swa[j] } else { step.mask_full[j] };
+            let v_view = t::view3(c, v_cur, hd, n_kv, hkv, t::nb(v_cur, 1), t::nb(v_cur, 2), 0);
+            let out = t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh);
+            outs.push(t::mul(c, out, t::sigmoid(c, self.tokslice(c, gate8, t::ne(gate8, 0), j as i64))));
+        }
+        let mut cur = self.cat8(c, &outs);
+        cur = self.proj8(c, l, "wo", l.wo, cur);
+        // post conv per token
+        let mut pcs: Vec<Ptr> = Vec::with_capacity(NT);
+        for j in 0..NT {
+            pcs.push(self.convolve(t::cont(c, self.tokslice(c, cur, n_embd, j as i64)), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, &mut Vec::new()));
+        }
+        cur = self.cat8(c, &pcs);
+
+        if ip % (self.cfg.attn_res_block_size as usize) == 0 {
+            blocks.push(inp_sa);
+        } else {
+            cur = t::add(c, inp_sa, cur);
+        }
+        let ffn_inp = cur;
+
+        let mut fcur = t::reshape2(c, self.mix8(blocks, cur, l.ffn_res_query.expect("ffn_res")), n_embd, NT as i64);
+        if let Some(msgs) = messages {
+            let m = t::cont(c, t::view2(c, msgs, n_embd, NT as i64, t::nb(msgs, 2), 3 * t::nb(msgs, 1)));
+            fcur = self.control(fcur, m, l, 3);
+        }
+        fcur = self.norm(fcur, l.ffn_norm.expect("ffn_norm"));
+
+        // MoE per token (router on slices)
+        let mut fouts: Vec<Ptr> = Vec::with_capacity(NT);
+        for j in 0..NT {
+            let fcur_j = self.tokslice(c, fcur, n_embd, j as i64);
+            let logits = t::mmq(c, l.ffn_gate_inp.expect("g"), fcur_j);
+            let probs = t::sigmoid(c, logits);
+            let sel = t::add(c, probs, l.ffn_exp_probs_b.expect("pb"));
+            let ids = t::argsort_top_k(c, sel, 8);
+            let probs3 = t::reshape3(c, probs, 1, 128, 1);
+            let mut weights = t::get_rows(c, probs3, ids);
+            let weights2 = t::reshape2(c, weights, 8, 1);
+            let wsum = t::clamp(c, t::sum_rows(c, weights2), 6.103515625e-5, f32::INFINITY);
+            weights = t::reshape3(c, t::div(c, weights2, wsum), 1, 8, 1);
+            let weights3 = t::scale(c, weights, self.cfg.expert_weights_scale);
+            let mi = l.moe_exl3.expect("moe_exl3");
+            let m = &self.moe_args_exl3[mi];
+            let mut args: Vec<*mut std::ffi::c_void> = vec![fcur_j.0, ids.0, weights3.0];
+            let ffn_out = Ptr(unsafe {
+                inkwell_ggml::custom_4d(c.0, F32, [n_embd, 1, 1, 1], &mut args,
+                    crate::moe::moe_cb_exl3_addr(), (&**m as *const crate::moe::MoeArgsExl3).cast_mut().cast())
+            });
+            fouts.push(self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, &mut Vec::new()));
+        }
+        let fcur = self.cat8(c, &fouts);
+        t::add(c, ffn_inp, fcur)
+    }
+
+    /// Verify forward: run `ids[NT]` at positions `pos..pos+NT` through the full
+    /// model in one graph. Returns logits `[NT][vocab_unpadded]` (row j = token j).
+    /// KV writes for all 8 tokens land in the arenas; conv state ends at pos+7
+    /// (caller snapshots/restores on partial acceptance).
+    ///
+    /// # Panics
+    /// On graph/alloc/compute failure.
+    pub fn step_block(&mut self, ids: &[u32; NT], pos: i64) -> Vec<f32> {
+        if self.cur_ctx.0.is_null() {
+            self.cur_ctx = Ptr(unsafe { inkwell_ggml::ink_ctx_new() });
+        } else {
+            unsafe { inkwell_ggml::ink_ctx_reset(self.cur_ctx.0) };
+        }
+        unsafe { *self.mix_prefix.get() = None };
+        self.conv_arg_idx.set(0);
+        let c = self.cur_ctx;
+        let n_embd = self.cfg.n_embd as i64;
+
+        let n_kv_full_raw = pos + NT as i64;
+        let n_kv_swa_raw = n_kv_full_raw.min(self.swa);
+        let n_kv_full = ((n_kv_full_raw + 63) & !63).min(self.max_ctx);
+        let n_kv_swa = ((n_kv_swa_raw + 63) & !63).min(self.swa);
+
+        // per-token input tensors
+        let mk_i32 = |v: &[i32]| -> Ptr {
+            let t0 = t::new(c, I32, &[1]);
+            unsafe { inkwell_ggml::ink_set_input(t0.0) };
+            t0
+        };
+        let _ = mk_i32; // silence
+        let mut step = StepBlk {
+            kv_idx_full: [Ptr(std::ptr::null_mut()); NT],
+            kv_idx_swa: [Ptr(std::ptr::null_mut()); NT],
+            rel_pos_full: [Ptr(std::ptr::null_mut()); NT],
+            rel_pos_swa: [Ptr(std::ptr::null_mut()); NT],
+            mask_full: [Ptr(std::ptr::null_mut()); NT],
+            mask_swa: [Ptr(std::ptr::null_mut()); NT],
+            tau8: t::new(c, F32, &[NT as i64]),
+            n_kv_full_pad: n_kv_full,
+            n_kv_swa_pad: n_kv_swa,
+        };
+        let embd8 = t::new(c, F32, &[n_embd, NT as i64]);
+        unsafe { inkwell_ggml::ink_set_input(embd8.0) };
+        unsafe { inkwell_ggml::ink_set_input(step.tau8.0) };
+        let mut small: Vec<Ptr> = vec![embd8, step.tau8];
+        let mut sets: Vec<(Ptr, Vec<i32>)> = Vec::new();
+        let mut setf: Vec<(Ptr, Vec<f32>)> = Vec::new();
+        for j in 0..NT {
+            for (arr, v) in [(&mut step.kv_idx_full, (pos + j as i64) as i32),
+                             (&mut step.kv_idx_swa, ((pos + j as i64).min(self.swa - 1)) as i32)] {
+                let t0 = t::new(c, I32, &[1]);
+                unsafe { inkwell_ggml::ink_set_input(t0.0) };
+                sets.push((t0, vec![v]));
+                arr[j] = t0;
+                small.push(t0);
+            }
+            for is_swa in [true, false] {
+                let (nk, raw) = if is_swa { (n_kv_swa, n_kv_swa_raw.min(pos + j as i64 + 1)) }
+                                else { (n_kv_full, pos + j as i64 + 1) };
+                // rel_pos[j] = distance to key at slot j (0..raw-1), clamp extent
+                let rp: Vec<i32> = (0..nk).map(|i| if i < raw { (raw - 1 - i).min(self.cfg.rel_extent as i64) as i32 } else { 0 }).collect();
+                let t_rp = t::new(c, I32, &[nk, 1]);
+                let mk: Vec<f32> = (0..=nk).map(|i| if i < raw || i == nk { 0.0 } else { f32::NEG_INFINITY }).collect();
+                let t_mk = t::new(c, F32, &[nk + 1, 1, 1, 1]);
+                unsafe {
+                    inkwell_ggml::ink_set_input(t_rp.0);
+                    inkwell_ggml::ink_set_input(t_mk.0);
+                }
+                sets.push((t_rp, rp));
+                setf.push((t_mk, mk));
+                if is_swa { step.rel_pos_swa[j] = t_rp; step.mask_swa[j] = t_mk; }
+                else { step.rel_pos_full[j] = t_rp; step.mask_full[j] = t_mk; }
+                small.push(t_rp);
+                small.push(t_mk);
+            }
+        }
+        // assign all inputs into the device in_buf
+        if self.in_buf.is_none() {
+            self.in_buf = Some(self.rt.buf(self.rt.device_buft(), 64 << 20));
+        }
+        let buf = self.in_buf.as_ref().unwrap().clone();
+        let mut o = 0usize;
+        for x in &small {
+            let off = (o + 255) & !255;
+            buf.assign(*x, off);
+            o = off + t::nbytes(*x);
+        }
+        std::mem::forget(buf);
+        // now that every input is buffer-assigned, upload values
+        for (t0, v) in &sets {
+            unsafe { t::set(*t0, v.as_ptr().cast(), 0, v.len() * 4) };
+        }
+        for (t0, v) in &setf {
+            unsafe { t::set(*t0, v.as_ptr().cast(), 0, v.len() * 4) };
+        }
+        // tau values + embd rows
+        let tau: Vec<f32> = (0..NT).map(|j| {
+            let p = (pos + j as i64 + 1) as f32;
+            self.cfg.log_scale_alpha * (p / self.cfg.log_scale_floor as f32).max(1.0).ln()
+        }).collect();
+        unsafe { t::set(step.tau8, tau.as_ptr().cast(), 0, tau.len() * 4) };
+        {
+            let (esrc, ty, stride) = self.embd_src;
+            let mut rows = vec![0f32; 2304 * NT];
+            for (j, id) in ids.iter().enumerate() {
+                if ty == -2 {
+                    let s = unsafe { esrc.add(*id as usize * stride) } as *const u16;
+                    for (i, r) in rows[j * 2304..(j + 1) * 2304].iter_mut().enumerate() {
+                        *r = f32::from_bits(u32::from(unsafe { *s.add(i) }) << 16);
+                    }
+                } else {
+                    let rc = unsafe { inkwell_ggml::ink_dequant(ty, esrc.add(*id as usize * stride).cast(),
+                        rows[j * 2304..].as_mut_ptr(), 2304) };
+                    assert_eq!(rc, 0, "dequant embd row");
+                }
+            }
+            unsafe { t::set(embd8, rows.as_ptr().cast(), 0, rows.len() * 4) };
+        }
+        let mut cur = self.norm(embd8, self.tok_norm);
+
+        // driver
+        let (start, end, np) = (6usize, 18usize, 3usize);
+        let mut blocks: Vec<Ptr> = Vec::new();
+        let mut vi = 0usize;
+        for il in 0..start {
+            cur = self.layer_blk(il, il, self.visits[vi].1, 0, cur, &mut blocks, None, &self.layers[il], &step);
+            vi += 1;
+        }
+        let prelude = cur;
+        let prelude_blocks = blocks.clone();
+        for pass in 0..np {
+            let mut bank: Vec<Ptr> = Vec::new();
+            let mut bank_out = Ptr(std::ptr::null_mut());
+            if pass > 0 {
+                bank = blocks[prelude_blocks.len() + 1..].to_vec();
+                bank_out = cur;
+                cur = prelude;
+                blocks = prelude_blocks.clone();
+            }
+            for ip in start..end {
+                let (_il_v, slot) = self.visits[vi];
+                if pass == 0 {
+                    cur = self.layer_blk(ip, ip, slot, pass, cur, &mut blocks, None, &self.layers[ip], &step);
+                } else {
+                    let l = &self.layers[ip];
+                    let msgs = self.mix8(&bank, bank_out, l.msg_query.expect("msg_query"));
+                    cur = self.layer_blk(ip, ip, slot, pass, cur, &mut blocks, Some(msgs), l, &step);
+                }
+                vi += 1;
+            }
+        }
+        for il in end..24 {
+            let (_il_v, slot) = self.visits[vi];
+            cur = self.layer_blk(il, il, slot, 0, cur, &mut blocks, None, &self.layers[il], &step);
+            vi += 1;
+        }
+        debug_assert_eq!(vi, 48);
+
+        cur = t::reshape2(c, self.mix8(&blocks, cur, self.output_res_query), n_embd, NT as i64);
+        cur = self.norm(cur, self.output_norm);
+        let oi = self.output_exl3.expect("output exl3");
+        let e = &*self.exl3_blk[oi];
+        let mut args = [cur.0];
+        let logits_t = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [e.n as i64, NT as i64, 1, 1], &mut args,
+            exl3_ntok_cb_addr(), (e as *const Exl3Blk).cast_mut().cast()) });
+        let logits_t = t::cont(c, logits_t);
+        if self.cfg.softcap != 0.0 {
+            let cap = self.cfg.softcap;
+            cur = t::scale(c, t::tanh(c, t::scale(c, logits_t, 1.0 / cap)), cap);
+        } else {
+            cur = logits_t;
+        }
+        t::output(cur);
+
+        let g = Ptr(unsafe { inkwell_ggml::ink_graph_new(c.0, 32768) });
+        t::build_forward(g, cur);
+        unsafe {
+            assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
+            self.dump_all();
+        }
+        let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize * NT];
+        // logits tensor is [n_vocab_padded, NT]; read per token prefix
+        let nv = t::ne(logits_t, 0) as usize;
+        for j in 0..NT {
+            unsafe {
+                t::get(logits_t, logits[j * self.cfg.vocab_unpadded as usize..].as_mut_ptr().cast(),
+                    j * nv * 4, self.cfg.vocab_unpadded as usize * 4);
+            }
+        }
+        unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
+        logits
+    }
+}
 /// `ggml_custom_op_t` for fused decode attention: src[0]=K view, src[1]=V view,
 /// src[2]=q3 [hd,1,nh], src[3]=bias [n_kv,1,nh], src[4]=mask [n_kv+1]; dst=[hd*nh].
 pub fn attn_cb_addr() -> usize { attn_cb as usize }

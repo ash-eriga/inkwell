@@ -334,6 +334,21 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         .unwrap_or_else(|_| "<decode error>".into());
     eprintln!("generated text: {text:?}");
     eprintln!("decode 8 tok in {:?}", dec_t);
+
+    if std::env::var_os("INKWELL_VTEST").is_some() {
+        // verify path sanity: block of 8×(last id) at `pos` — row 0 logits must
+        // equal what step() produced for that id at pos.
+        let mut blk = [id; 8];
+        blk[0] = id;
+        let t2 = Instant::now();
+        let vl = r.step_block(&blk, pos);
+        eprintln!("verify-8 in {:?}", t2.elapsed());
+        let nv = logits.len();
+        let d: f32 = vl[..nv].iter().zip(logits.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let (b0, _) = vl[..nv].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+        let (br, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+        eprintln!("verify row0: max|d|={d:.6} argmax={b0} vs step argmax={br}");
+    }
 }
 
 fn top(l: &[f32], n: usize) -> Vec<(usize, f32)> {
