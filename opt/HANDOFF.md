@@ -257,3 +257,8 @@ Ledger histórico: subtrair ~35ms de tudo.
 - IDEIA não testada (maior EV): os 433 launches densos/tok incluem várias projeções pequenas por camada (n=384-3072). Agrupar projeções independentes num único custom op/desc-set (padrão do fused gu+up) corta chains serializadas. Ver runner.rs exl3_w usage e os custom_4d calls ~894/1390.
 - gemv_moe latency ideas esgotadas no formato atual (smem pipeline + prefetch já otimizados; k-split/double-buffer/direct-loads rejeitados).
 - Próximo grande passo teórico: int8 xh → dp4a int8×int8 no inner loop (muda numérica, medir EAR).
+
+## Nota de continuidade
+- Dense exl3 sites: proj() @runner.rs:889 (chamado por camada p/ q/gate/rel via proj0_cat concat já feito), head @1390. proj0_cat já concatena q+gate+rel — fusão adicional: o-proj+rel_logits+attn_sink independentes poderiam concat no load (mesmo k) → menos launches.
+- Caminho p/ batching: em exl3_of() aceitar lista de bases e concat trel na dim n (igual proj0_cat faz para 3 já).
+- Zumbis: sempre `pkill -9 -x inkwell; nvidia-smi --query-compute-apps` antes de run.
