@@ -2125,10 +2125,13 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
             const int j2 = j + 64;
             if (j2 < 16 * tkn0) xhb[j2 >> 4][j2 & 15] = xhb_g[(tk_lo + (j2 >> 4)) * 16 + (j2 & 15)];
         }
-        if (live && u < w) {
+        if (live && u < (w + 3) / 4) {
             uint32_t* rg = rings + g * 256;
-            for (int b = 0; b < tkn0; ++b)
-                rg[b * 32 + u] = tile_base[((size_t)((tk_lo + b) * tn + tn_i)) * (size_t)w + u];
+            for (int b = 0; b < tkn0; ++b) {
+                const uint4 v4 = *(const uint4*)&tile_base[((size_t)((tk_lo + b) * tn + tn_i)) * (size_t)w + u * 4];
+                rg[b * 32 + u * 4] = v4.x; rg[b * 32 + u * 4 + 1] = v4.y;
+                rg[b * 32 + u * 4 + 2] = v4.z; rg[b * 32 + u * 4 + 3] = v4.w;
+            }
         }
     }
     __syncthreads();
@@ -2744,7 +2747,7 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
     const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk);
     __shared__ uint32_t rings[4 * 8 * 32];
-    __shared__ float xhb[8][8][16];   // [consumer][batch row][16]
+    __shared__ float xhb[8][16][8];   // [consumer][fragment][batch row]
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
     float s[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
@@ -2771,13 +2774,22 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
         const int tkn0 = min(8, tk_hi - tk_lo);
         for (int idx = threadIdx.x; idx < tkn0 * 16 * nc; idx += 256) {
             const int cc = idx / (tkn0 * 16), r16 = idx % (tkn0 * 16);
-            xhb[cc][r16 >> 4][r16 & 15] =
+            xhb[cc][r16 & 15][r16 >> 4] =
                 xhb_g[(size_t)cc * xstride + (tk_lo + (r16 >> 4)) * 16 + (r16 & 15)];
         }
-        if (live && u < w) {
+        if (live && u < (w + 3) / 4) {
             uint32_t* rg = rings + g * 256;
-            for (int b = 0; b < tkn0; ++b)
-                rg[b * 32 + u] = tile_base[((size_t)((tk_lo + b) * tn + tn_i)) * (size_t)w + u];
+            for (int b = 0; b < tkn0; ++b) {
+                const uint4 v4 = *(const uint4*)&tile_base[((size_t)((tk_lo + b) * tn + tn_i)) * (size_t)w + u * 4];
+                rg[b * 32 + u * 4] = v4.x; rg[b * 32 + u * 4 + 1] = v4.y;
+                rg[b * 32 + u * 4 + 2] = v4.z; rg[b * 32 + u * 4 + 3] = v4.w;
+            }
+        }
+        if (tkn0 < 8) {
+            for (int idx = threadIdx.x; idx < nc * 16 * (8 - tkn0); idx += 256) {
+                const int cc = idx / (16 * (8 - tkn0)), r = idx % (16 * (8 - tkn0));
+                xhb[cc][r & 15][tkn0 + (r >> 4)] = 0.f;
+            }
         }
     }
     __syncthreads();
@@ -2785,11 +2797,11 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
         const int tkn = min(8, tk_hi - tk0);
         const int nk0 = tk0 + 8;
         const int tkn2 = min(8, tk_hi - nk0);
-        uint32_t pfb[8];
+        uint4 pfb4[8];
         int pfidx[4]; float pfx[4]; int npf = 0;
-        if (live && nk0 < tk_hi && u < w) {
+        if (live && nk0 < tk_hi && u < (w + 3) / 4) {
             for (int b = 0; b < tkn2; ++b)
-                pfb[b] = tile_base[((size_t)((nk0 + b) * tn + tn_i)) * (size_t)w + u];
+                pfb4[b] = *(const uint4*)&tile_base[((size_t)((nk0 + b) * tn + tn_i)) * (size_t)w + u * 4];
         }
         if (nk0 < tk_hi) {
             for (int idx = threadIdx.x; idx < nc * tkn2 * 16; idx += 256) {
@@ -2803,6 +2815,10 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
         }
         if (live) {
             const uint32_t* rg = rings + g * 256;
+            // decode all 32 bs values once (b x q), then per-consumer float4 FMAs
+            // over the transposed xhb[c][frag][b]: ~2x fewer instr per MAC.
+            float bs4[4][8];
+#ifndef MNTOK_NOCOMP
             for (int b = 0; b < tkn; ++b) {
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
@@ -2810,30 +2826,43 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
                     const uint64_t v = ((uint64_t)rg[b * 32 + (wi & 63)] << 32)
                                      | (uint64_t)rg[b * 32 + ((wi >> 6) & 63)];
                     const uint32_t w16 = (uint32_t)(v >> (wi >> 12)) & 0xffffu;
-                    const int bs = (int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
-#pragma unroll
-#ifndef MNTOK_NOCOMP
-                    for (int c2 = 0; c2 < 8; ++c2) {
-                        if (c2 < nc) {
-                            const float xr = xhb[c2][b][rp + 4 * q];
-                            s[c2] += xr * (float)bs;
-                            sx[c2] += xr;
-                        }
-                    }
-#endif
+                    bs4[q][b] = (float)(int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
                 }
             }
+            for (int c2 = 0; c2 < nc; ++c2) {
+                float s2 = 0.f, sx2 = 0.f;
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float4 x0 = *(const float4*)&xhb[c2][rp + 4 * q][0];
+                    const float4 x1 = *(const float4*)&xhb[c2][rp + 4 * q][4];
+                    s2 += x0.x * bs4[q][0] + x0.y * bs4[q][1] + x0.z * bs4[q][2] + x0.w * bs4[q][3]
+                        + x1.x * bs4[q][4] + x1.y * bs4[q][5] + x1.z * bs4[q][6] + x1.w * bs4[q][7];
+                    sx2 += (x0.x + x0.z) + (x0.y + x0.w) + (x1.x + x1.z) + (x1.y + x1.w);
+                }
+                s[c2] += s2;
+                sx[c2] += sx2;
+            }
+#endif
         }
         __syncthreads();
-        if (live && nk0 < tk_hi && u < w) {
+        if (live && nk0 < tk_hi && u < (w + 3) / 4) {
             uint32_t* rg = rings + g * 256;
-            for (int b = 0; b < tkn2; ++b) rg[b * 32 + u] = pfb[b];
+            for (int b = 0; b < tkn2; ++b) {
+                rg[b * 32 + u * 4] = pfb4[b].x; rg[b * 32 + u * 4 + 1] = pfb4[b].y;
+                rg[b * 32 + u * 4 + 2] = pfb4[b].z; rg[b * 32 + u * 4 + 3] = pfb4[b].w;
+            }
         }
         if (nk0 < tk_hi) {
             for (int i = 0; i < npf; ++i) {
                 const int idx = pfidx[i];
                 const int cc = idx / (tkn2 * 16), r16 = idx % (tkn2 * 16);
-                xhb[cc][r16 >> 4][r16 & 15] = pfx[i];
+                xhb[cc][r16 & 15][r16 >> 4] = pfx[i];
+            }
+            if (tkn2 < 8) {
+                for (int idx = threadIdx.x; idx < nc * 16 * (8 - tkn2); idx += 256) {
+                    const int cc = idx / (16 * (8 - tkn2)), r = idx % (16 * (8 - tkn2));
+                    xhb[cc][r & 15][tkn2 + (r >> 4)] = 0.f;
+                }
             }
         }
         __syncthreads();

@@ -53,3 +53,11 @@
   drafter tops ~4.3-5.3 → spec is structurally bounded ~5-6 tok/s.
 - Kernel-level: miss-gemv ran before ev_join (phase-order race fixed) —
   kept for correctness, no perf change.
+
+## 2026-11-23 late2 — moe_ntok inner restructure (kept: ~5-7% verify)
+- Transposed xhb to [c][frag][b] + float4 consumer FMAs (decode bs4 once) +
+  uint4 (16B/lane) ring fills + xhb tail-row zeroing for correctness.
+- verify ~534-613ms (was ~580-650). Small but real. gemv still ~3.4-3.7ms/visit
+  → bound shifts further from instr to dependent-chain latency (18 windows ×
+  stage→sync→compute→sync).
+- Rejected same session: y=32 fixed (nu>32 incorrect), sx-hoist (bug).
