@@ -305,3 +305,12 @@ Ledger histórico: subtrair ~35ms de tudo.
   ×8 = ~360ms). Próximo lever p/ spec pagar: MoE batched por union de
   experts (rotear 8 tokens juntos, gemv ntok por expert único) + graph do
   bloco. Serial per-token moe reaproveita pesos só por token.
+- DESIGN moe-ntok (verify): por camada, rotear 8 tokens (router mmq por
+  token já existe), montar união de experts no host, e por expert u fazer
+  had_in(xh dos tokens seletores) + gemv_ntok(w_u) sobre as linhas
+  selecionadas + had_out×weight, acumular no out por linha. Reusa
+  exl3_ntok_cb com x = linhas selecionadas compactadas [k,#sel]. Precisa:
+  readback dos ids por token (argsort já roda em dev — copiar pra host ou
+  kernel de gather), e mapear expert→desc (descs_* pinned já indexa por
+  expert id). ~30-60 experts únicos vs 64 leituras → ~2x no gemv_moe.
+  DEPOIS: cuda-graph do step_block (mesma maquinaria chunked do step()).
