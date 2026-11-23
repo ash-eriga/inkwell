@@ -839,13 +839,13 @@ impl Runner {
         // the real remainder: dev_buf, kv_buf and staging already exist — only
         // CUDA-graph capture + desktop fluctuation still need room.
         let ck: usize = std::env::var("INKWELL_EXL3_CACHE_K")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         if ck >= 8 {
             for (i, a) in moe_args_exl3.iter_mut().enumerate() {
                 if a.on_dev || a.max_slot == 0 { continue; }
                 let cbytes = ck * 3 * a.max_slot;
                 let (f, _) = inkwell_cuda::mem_info();
-                let margin: usize = std::env::var("INKWELL_CACHE_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+                let margin: usize = std::env::var("INKWELL_CACHE_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
                 if f <= cbytes + (margin << 20) { continue; }
                 let Some(buf) = inkwell_cuda::DevBuf::try_new_bytes(cbytes) else { continue };
                 let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
