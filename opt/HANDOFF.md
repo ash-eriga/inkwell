@@ -279,3 +279,11 @@ Ledger histórico: subtrair ~35ms de tudo.
   * KV garbage pós-rejeição é auto-mascarado (mask limita a pos+1) → ok; conv_state snapshot+restore se aceitação parcial (~5.3MB memcpy).
   * CUDA graphs: verify graph = seq de ops diferente → cache key separado ok.
 - Estimativa: verify-8 ~130-160ms/bloco; aceitação a~4 → ~15-25 TPS.
+
+## 23-11 noite — corrida p/ 60ms non-spec
+- HEAD 65480cf+ ; ~97ms/tok estável golden. Breakdown real (nsys run inteiro): gemv_moe ~45ms, gemv denso ~34ms, ccopy ~13ms, moe_stage ~10ms (2-3 camadas sem cache), misc ~10ms, build host ~2-14ms.
+- DESCOBERTA: moe lê ~430MB/tok (8 experts × ~2.2MB × 24 camadas) a ~9.5GB/s — mesmo throughput do denso (~10GB/s). O problema NÃO é o kernel ser ruim: ~800MB/tok a ~10GB/s efetivo. Teto teórico a 15GB/s efetivo ~55ms — quase impossível chegar a 60 sem spec.
+- Feito: split hit/miss nos gemv/had_in moe (hit-pass ANTES do ev_join → overlap com bulk copy) — correto, ~neutro a k=25 (misses raros). Commitado.
+- Rejeitados: wk||wv pair 2-stream (SM contention + event overhead → pior), NKY sweep, batch4→8 denso (quebra xhb fill), DEV_MARGIN 800/500, MAX_CTX 512/1024 (neutro).
+- bs range = 0..1005 → int8×int8 (xh,bs) inviável sem perder 3 bits de bs — int8-xh puro morto.
+- Restam só: (a) fusão de projeções independentes no load (concat trel na dim n — padrão proj0_cat), ~2-4ms; (b) int8-xh com bs 2-termos (numérica muda); (c) spec decode (o caminho real).

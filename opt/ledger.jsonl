@@ -356,3 +356,4 @@
 {"exp": "dense gemv batch 4->8", "result": "broken output", "verdict": "rejected", "note": "xhb fill only loads 64 elems; needs pfx pair like moe kernel"}
 {"exp": "moe split hit/miss pass", "result": "~97ms golden ok", "verdict": "kept", "note": "correct; helps when misses occur; neutral at k=25"}
 {"exp": "wk||wv Exl3Par 2-stream pair op", "result": "~103-106ms vs ~97", "verdict": "rejected", "note": "SM contention in full pipeline; event overhead ~20us/op; reverted"}
+{"exp": "GEMV_NKY_TGT 256/1024", "result": "~99ms both", "verdict": "neutral", "note": "env kept, default unchanged"}
