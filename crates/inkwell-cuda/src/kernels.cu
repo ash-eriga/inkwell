@@ -1698,6 +1698,23 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
     float s = 0.f, sx = 0.f;
+    // hoisted window indices per r-lane (i0|i1<<7|s0<<14) — (c,r) fixed for all batches
+    uint32_t widx[4];
+    {
+        const int r_bits = halfk ? 256 * ka + 128 : 256 * ka;
+        const int nw = r_bits >> 5;
+        int q = 0;
+        for (int r = rp; r < 16; r += 4, ++q) {
+            const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                        | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+            const int s_i = halfk ? (i + 1) * ka + ((i + 1) >> 1) : (i + 1) * ka;
+            const int b0 = s_i - 16 + (s_i < 16 ? r_bits : 0);
+            const int i0 = b0 >> 5;
+            const int s0 = 48 - (b0 & 31);
+            const int i1 = (i0 + 1 == nw) ? 0 : i0 + 1;
+            widx[q] = (uint32_t)(i0 | (i1 << 7) | (s0 << 14));
+        }
+    }
     // prologue fill of batch tk0 (global-load stall happens once)
     {
         const int tkn0 = min(4, tk1 - tk0);
@@ -1736,12 +1753,14 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
         if (live) {
             const uint32_t* rg = rings + g * 320;
             for (int b = 0; b < tkn; ++b) {
+                int q = 0;
 #pragma unroll
-                for (int r = rp; r < 16; r += 4) {
-                    const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
-                                | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                    const int bs = (int)__dp4a(exl3_window(rg + b * 80, i, ka, halfk) * 0x83DCD12Du,
-                                               0x01010101u, 0u);
+                for (int r = rp; r < 16; r += 4, ++q) {
+                    const uint32_t wi = widx[q];
+                    const uint64_t v = ((uint64_t)rg[b * 80 + (wi & 127)] << 32)
+                                     | (uint64_t)rg[b * 80 + ((wi >> 7) & 127)];
+                    const uint32_t w16 = (uint32_t)(v >> (wi >> 14)) & 0xffffu;
+                    const int bs = (int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
                     s += xhb[b][r] * (float)bs;
                     sx += xhb[b][r];
                 }
@@ -1912,6 +1931,24 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     float s = 0.f, sx = 0.f;
     const bool live = tn_i < tn;
     __shared__ float xhb[4][16];
+    // hoisted window indices: (i0, i1, s0) per q — (c,r) fixed across all batches
+    uint32_t widx[4];
+    {
+        const int r_bits = halfk ? 256 * ka + 128 : 256 * ka;
+        const int nw = r_bits >> 5;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int r = rp + 4 * q;
+            const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                        | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+            const int s_i = halfk ? (i + 1) * ka + ((i + 1) >> 1) : (i + 1) * ka;
+            const int b0 = s_i - 16 + (s_i < 16 ? r_bits : 0);
+            const int i0 = b0 >> 5;
+            const int s0 = 48 - (b0 & 31);
+            const int i1 = (i0 + 1 == nw) ? 0 : i0 + 1;
+            widx[q] = (uint32_t)(i0 | (i1 << 6) | (s0 << 12));
+        }
+    }
     // prologue: fill batch 0 (global loads stall, unavoidable once)
     {
         const int tkn0 = min(4, tk);
@@ -1953,11 +1990,11 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
             for (int b = 0; b < tkn; ++b) {
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {
-                    const int r = rp + 4 * q;
-                    const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
-                                | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                    const int bs = (int)__dp4a(exl3_window(rg + b * 32, i, ka, halfk) * 0x83DCD12Du,
-                                               0x01010101u, 0u);
+                    const uint32_t wi = widx[q];
+                    const uint64_t v = ((uint64_t)rg[b * 32 + (wi & 63)] << 32)
+                                     | (uint64_t)rg[b * 32 + ((wi >> 6) & 63)];
+                    const uint32_t w16 = (uint32_t)(v >> (wi >> 12)) & 0xffffu;
+                    const int bs = (int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
                     s += xr[b][q] * (float)bs;
                     sx += xr[b][q];
                 }
