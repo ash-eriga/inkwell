@@ -1980,7 +1980,7 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     sx += __shfl_xor_sync(0xffffffffu, sx, 1);
     s += __shfl_xor_sync(0xffffffffu, s, 2);
     sx += __shfl_xor_sync(0xffffffffu, sx, 2);
-    if (live && rp == 0) t[slot * n + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
+    if (live && rp == 0) t[slot * n + blockIdx.z * tzoff + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
 }
 
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
@@ -2266,14 +2266,9 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     // gate + up fused: blockIdx.z selects the descriptor set
     dim3 gin((KG + 511) / 512, nslots, 2);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG);
-    for (int p = 0; p < 2; ++p) {
-        const uint64_t* dd = p ? U : G;
-        const float* xhp = p ? (const float*)gu : xh;
-        const int xhs = p ? 2 * NG : KG;
-        dim3 gg(NG / 64, nslots, 1);
-        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, nullptr, ids, xhp, nullptr, xhs,
-                                                 (float*)dn + p * NG, ND, 0, KG / 16, NG / 16, KG, NG);
-    }
+    dim3 gg(NG / 64, nslots, 2);
+    inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND);
     dim3 gout((NG + 511) / 512, nslots, 2);
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
@@ -2312,14 +2307,9 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     // gate+up fused in one launch: blockIdx.z selects the descriptor set
     dim3 gin((KG + 511) / 512, nslots, 2);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG);
-    for (int p = 0; p < 2; ++p) {
-        const uint64_t* dd = p ? U : G;
-        const float* xhp = p ? (const float*)gu : xh;
-        const int xhs = p ? 2 * NG : KG;
-        dim3 gg(NG / 64, nslots, 1);
-        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, nullptr, ids, xhp, nullptr, xhs,
-                                                 (float*)dn + p * NG, ND, 0, KG / 16, NG / 16, KG, NG);
-    }
+    dim3 gg(NG / 64, nslots, 2);
+    inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND);
     dim3 gout((NG + 511) / 512, nslots, 2);
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);

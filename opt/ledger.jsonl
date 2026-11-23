@@ -280,3 +280,9 @@
 {"ts":"2026-11-23T07:07:31-03:00","config":"revert-fuse","i":1,"decode_s":771.49073ms,"ms_tok":96.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T07:07:47-03:00","config":"revert-fuse","i":2,"decode_s":767.149061ms,"ms_tok":95.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T07:07:58-03:00","config":"revert-fuse","i":3,"decode_s":756.763614ms,"ms_tok":94.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:13:43-03:00","config":"ploop-nND","i":1,"error":"no decode line","tail":"#9  0x000055d7645b0cc5 in main ()|[Inferior 1 (process 3689570) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T07:13:59-03:00","config":"ploop-nND","i":2,"decode_s":800.854611ms,"ms_tok":100.1,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:15:03-03:00","config":"gemv-z2-real","i":1,"decode_s":751.253916ms,"ms_tok":93.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:15:18-03:00","config":"gemv-z2-real","i":2,"decode_s":763.648143ms,"ms_tok":95.5,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:16:26-03:00","config":"gemv-z2-real","i":3,"error":"no decode line","tail":"#9  0x00005566d87b6eb5 in main ()|[Inferior 1 (process 3719744) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T07:16:47-03:00","config":"gemv-z2-real","i":4,"decode_s":788.471608ms,"ms_tok":98.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
