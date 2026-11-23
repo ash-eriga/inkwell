@@ -428,3 +428,22 @@ perfect accept (emit 8) only reaches ~76ms/tok; realistic emit ~3-4.3 loses
 to serial 97. Options forward: (a) serial-side expert-byte cuts (~48ms of
 the 97 is the same PCIe wall — hot-static residency ~200MB ≈ ~5%), (b) lazy
 verify (~140ms/tok floor — still loses), (c) call spec done mechanically.
+
+
+## 2026-11-23 late — spec-decode deep dive (definitive bottleneck)
+- Union size nu ≈ 8-18 (median ~12), NOT ~60 → expert bytes/verify ≈ 1.2-1.3GB
+- PCIe measured ~11GB/s plain loads, ~12.4GB/s ccopy-gather → bytes are NOT the wall
+- `inkwell_exl3_gemv_moe_ntok` is INSTRUCTION/LATENCY-bound (~5GB/s effective):
+  pool=40 (all experts VRAM-resident) changed nothing; ~4-5 instr per useful MAC
+  in the consumer-FMA inner loop (smem ld + 2 FMA + predicate); ~2.2G instr/launch
+  ≈ 1.6ms compute floor; ~1.5ms of it is dead blocks (grid.y=64, nu~12)
+- FIXED real bug: union_expand could emit nc>8 → xhb[8][8][16] smem OOB →
+  split experts into ≤8-consumer chunks (commit). Fix correctness + crashes.
+- Rejected: host readback of nu (illegal in graph capture), slot-loop over
+  gridDim.y (serializes, ~2x worse), #pragma unroll (worse), NKY>1 (worse),
+  window-16 (err=900 crashes — cause unknown, NOT the nc OOB), sx-hoist
+  (fragmentation bug, marginal anyway)
+- verify ~550-700ms (gemv ~260ms, dp4a_ntok ~63, had ~140, rest + host gaps)
+- spec ~3.4-5.1 tok/s, accept 21-50%; serial ~97ms (~10.3 TPS)
+- TO WIN: need verify ~300ms AND emit ~4.3 → gemv inner-loop rewrite is THE
+  lever (cut instr/MAC ~2x or pre-decode trellis→fp16 then plain FMA gemv)
