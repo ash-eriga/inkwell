@@ -328,3 +328,7 @@ Ledger histórico: subtrair ~35ms de tudo.
 - Union-batched plan: expand (expert,consumer) pairs on GPU; new gemv_moe_ntok reads each unique expert once for ≤8 consumer xh vectors; wsum groups by token. Est verify ~450ms.
 - CUDA graphs confirmed DEAD on Pascal: is_enabled() false (arch gate) even with GGML_PASCAL_GRAPHS; patch attempt → cudaGraphInstantiate OOM. Reverted.
 - Non-spec serial remains ~97ms floor.
+
+## CORRECTNESS BUG FIXED (2026-11-23)
+- `inkwell_exl3_had_in_moe` read `x[e]` shared across slots; for the DOWN chain x=hid ([8][1152]) → slots 1-7 used expert 0's gate*up output. Bug since original commit 72a02e1.
+- Fix: `x[(descs2 ? 0 : slot*k) + e]` (down chain only). Old golden " the capital of France." was the BUGGED output; new golden = " Paris. The capital of the United States is Washington, D.C. ...".

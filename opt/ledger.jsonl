@@ -364,3 +364,4 @@
 {"exp": "Exl3Duo wq+gate via moe slots", "result": "~101-115ms", "verdict": "rejected", "note": "moe slot path slower than dense pipeline; reverted"}
 {"exp": "verify-8 timing", "result": "807ms compute / 8 tok", "verdict": "too slow", "note": "per-token serial ops (moe ~45ms/tok, conv, attn) dominate; exl3 ntok batching only covers projs; need batched MoE (union experts) + cuda-graph to make verify pay"}
 {"exp":"verify expert overlap","result":"unique/visit mean=20.3 range 11-30 of 64 selections","verdict":"KEY: 3.2x dedup available for union-batched moe verify","ts":"2026-11-23"}
+{"exp":"down had_in per-slot x offset","result":"BUG FIX: down-proj read hid[0] for all 8 experts since commit 72a02e1","verdict":"FIXED - new golden: Paris/Washington/London/Berlin","ts":"2026-11-23"}

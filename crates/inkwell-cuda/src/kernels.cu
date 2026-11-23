@@ -2051,7 +2051,7 @@ __global__ void inkwell_exl3_had_in_moe(const uint64_t* __restrict__ descs,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int e = base + lane * 4 + i;
-        v[i] = (e < k) ? x[e] * __half2float(__ushort_as_half(suh[e])) : 0.f;
+        v[i] = (e < k) ? x[(descs2 ? 0 : (size_t)slot * k) + e] * __half2float(__ushort_as_half(suh[e])) : 0.f;
     }
     had128_warp(v, lane * 4);
 #pragma unroll
