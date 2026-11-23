@@ -587,7 +587,7 @@ impl Runner {
             let mut svh = inkwell_cuda::DevBuf::new_bytes(sv.nbytes() as usize);
             svh.write_bytes(repo.data(&format!("{base}.svh")).unwrap());
             Box::new(Exl3W { trel, suh, svh, ka, halfk, k, n,
-                scratch: inkwell_cuda::DevBuf::new(k + n) })
+                scratch: inkwell_cuda::DevBuf::new(k + 8 * n) })
         }
 
         // ---- globals ----
