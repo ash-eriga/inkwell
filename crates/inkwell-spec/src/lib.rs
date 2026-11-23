@@ -36,16 +36,26 @@ impl NgramDraft {
 }
 
 impl Draft for NgramDraft {
+    /// Prompt-lookup: find the last earlier occurrence of the tail's
+    /// (`n`-1)-gram and continue from there. Iterates its own predictions so
+    /// the window slides over proposed tokens too.
     fn propose(&mut self, tail: &[u32], k: usize) -> Vec<u32> {
         let mut out = Vec::with_capacity(k);
         let mut window = tail.to_vec();
         for _ in 0..k {
-            if window.len() < self.n {
+            let plen = self.n - 1;
+            if window.len() < plen + 1 {
                 break;
             }
-            let pat: Vec<u32> = window[window.len() - self.n + 1..].to_vec();
-            match self.history.get(&pat) {
-                Some(&t) => {
+            let pat = &window[window.len() - plen..];
+            let mut next = None;
+            for i in 0..window.len() - plen {
+                if window[i..i + plen] == *pat {
+                    next = window.get(i + plen).copied();
+                }
+            }
+            match next {
+                Some(t) => {
                     out.push(t);
                     window.push(t);
                 }
@@ -58,7 +68,6 @@ impl Draft for NgramDraft {
                 self.history.insert(pat, last);
             }
         }
-        let _ = &mut window;
         out
     }
 }
