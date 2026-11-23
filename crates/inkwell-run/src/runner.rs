@@ -1225,7 +1225,9 @@ impl Runner {
             // ffn_out to CPU — that forced a backend split + host copies per layer.
             let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores);
             if il == 0 { self.dump("ffn_out-0", fcur); }
-            return t::add(c, ffn_inp, fcur);
+            let out = t::add(c, ffn_inp, fcur);
+            self.dump(&format!("s_lout{il}"), out);
+            return out;
         }
         let m = &self.moe_args[l.moe.expect("moe")];
         let mut args: Vec<*mut std::ffi::c_void> = vec![fcur.0, ids.0, weights3.0];
@@ -1620,6 +1622,11 @@ impl Runner {
             inputs[2] = self.norm(inputs[2], l.attn_v_inp_norm.expect("v_inp"));
         }
 
+        if il == 0 {
+            self.dump("b_cur_in", cur);
+            self.dump("b_inputs0", inputs[0]);
+            self.dump("b_inputs1", inputs[1]);
+        }
         // projections on [k, NT]
         let (q8, gate8, r8) = if let Some(cat) = l.proj0_cat {
             let out = t::mmq(c, cat, inputs[0]); // [n_cat, NT]
@@ -1656,6 +1663,10 @@ impl Runner {
         }
         let k8 = self.cat8(c, &ks);
         let v8 = self.cat8(c, &vs);
+        if il == 0 {
+            self.dump("b_q8", q8); self.dump("b_k8", k8);
+            self.dump("b_v8", v8); self.dump("b_r8", r8);
+        }
 
         let q8 = self.clip(t::reshape3(c, q8, hd, nh, NT as i64), l.attn_q_clip, self.cfg.qk_clip);
         let k8 = self.clip(t::reshape3(c, k8, hd, hkv, NT as i64), None, self.cfg.qk_clip);
@@ -1694,7 +1705,12 @@ impl Runner {
             let q3 = t::permute(c, q_j, 0, 2, 1, 3);
             let kq_mask = if is_swa { step.mask_swa[j] } else { step.mask_full[j] };
             let v_view = t::view3(c, v_cur, hd, n_kv, hkv, t::nb(v_cur, 1), t::nb(v_cur, 2), 0);
+            if il == 0 && j == 0 {
+                self.dump("b_qj0", q_j); self.dump("b_rj0", r_j);
+                self.dump("b_table0", table); self.dump("b_kqb0", kq_b);
+            }
             let out = t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh);
+            if il == 0 && j == 0 { self.dump("b_attnout0", out); }
             outs.push(t::mul(c, out, t::sigmoid(c, self.tokslice(c, gate8, t::ne(gate8, 0), j as i64))));
         }
         let mut cur = self.cat8(c, &outs);
@@ -1744,7 +1760,27 @@ impl Runner {
             fouts.push(self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, &mut Vec::new()));
         }
         let fcur = self.cat8(c, &fouts);
-        t::add(c, ffn_inp, fcur)
+        let out = t::add(c, ffn_inp, fcur);
+        self.dump(&format!("b_lout{il}"), out);
+        out
+    }
+
+    /// Host snapshot of every conv state tensor (`[3][n_sconv]` f32 each) —
+    /// restore with [`Runner::restore_conv`] to rewind stateful conv layers.
+    pub fn snapshot_conv(&self) -> Vec<Vec<f32>> {
+        self.conv_state.iter().map(|s| unsafe {
+            let n = t::ne(*s, 0) as usize * t::ne(*s, 1) as usize;
+            let mut v = vec![0f32; n];
+            t::get(*s, v.as_mut_ptr().cast(), 0, n * 4);
+            v
+        }).collect()
+    }
+
+    /// Rewind conv states to a `snapshot_conv` copy.
+    pub fn restore_conv(&self, snap: &[Vec<f32>]) {
+        for (s, v) in self.conv_state.iter().zip(snap.iter()) {
+            unsafe { t::set(*s, v.as_ptr().cast(), 0, v.len() * 4) };
+        }
     }
 
     /// Verify forward: run `ids[NT]` at positions `pos..pos+NT` through the full
@@ -1825,7 +1861,7 @@ impl Runner {
         }
         // assign all inputs into the device in_buf
         if self.in_buf.is_none() {
-            self.in_buf = Some(self.rt.buf(self.rt.device_buft(), 64 << 20));
+            self.in_buf = Some(self.rt.buf(self.rt.device_buft(), 8 << 20));
         }
         let buf = self.in_buf.as_ref().unwrap().clone();
         let mut o = 0usize;
@@ -1845,7 +1881,8 @@ impl Runner {
         // tau values + embd rows
         let tau: Vec<f32> = (0..NT).map(|j| {
             let p = (pos + j as i64 + 1) as f32;
-            self.cfg.log_scale_alpha * (p / self.cfg.log_scale_floor as f32).max(1.0).ln()
+            // serial: scale_bias(ln, alpha, 1) = alpha*ln + 1
+            self.cfg.log_scale_alpha * (p / self.cfg.log_scale_floor as f32).max(1.0).ln() + 1.0
         }).collect();
         unsafe { t::set(step.tau8, tau.as_ptr().cast(), 0, tau.len() * 4) };
         {

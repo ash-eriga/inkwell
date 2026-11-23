@@ -338,16 +338,23 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     if std::env::var_os("INKWELL_VTEST").is_some() {
         // verify path sanity: block of 8×(last id) at `pos` — row 0 logits must
         // equal what step() produced for that id at pos.
-        let mut blk = [id; 8];
-        blk[0] = id;
+        // correct baseline: step() for `id` AT `pos` (not the stale decode
+        // logits). Conv state is snapshotted + restored around it so the block
+        // sees the same conv position; KV at pos is rewritten with identical
+        // values by the block's token 0.
+        let snap = r.snapshot_conv();
+        let logits0 = r.step(id, pos);
+        r.restore_conv(&snap);
+        let blk = [id; 8];
         let t2 = Instant::now();
         let vl = r.step_block(&blk, pos);
         eprintln!("verify-8 in {:?}", t2.elapsed());
-        let nv = logits.len();
-        let d: f32 = vl[..nv].iter().zip(logits.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let nv = logits0.len();
+        let d: f32 = vl[..nv].iter().zip(logits0.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
         let (b0, _) = vl[..nv].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
-        let (br, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+        let (br, _) = logits0.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
         eprintln!("verify row0: max|d|={d:.6} argmax={b0} vs step argmax={br}");
+        // also dump row7-vs-row0 sanity: rows should diverge (different KV)
     }
 }
 

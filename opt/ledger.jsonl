@@ -358,3 +358,5 @@
 {"exp": "wk||wv Exl3Par 2-stream pair op", "result": "~103-106ms vs ~97", "verdict": "rejected", "note": "SM contention in full pipeline; event overhead ~20us/op; reverted"}
 {"exp": "GEMV_NKY_TGT 256/1024", "result": "~99ms both", "verdict": "neutral", "note": "env kept, default unchanged"}
 {"exp": "moe gemv batch 8->16", "result": "~106-127ms", "verdict": "rejected", "note": "register spill pfb[16]+xr; reverted"}
+{"exp": "wq+gate fused via moe slot machinery (Exl3Duo)", "result": "~101-115ms", "verdict": "rejected", "note": "moe gemv per-slot path slower than dense pipeline; reverted"}
+{"exp": "conv pool staleness fix", "result": "verify-8 runs, no segfault", "verdict": "kept", "note": "step_block still diverges (max|d|=12.7) — defer to spec phase"}
