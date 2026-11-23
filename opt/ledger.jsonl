@@ -360,3 +360,5 @@
 {"exp": "moe gemv batch 8->16", "result": "~106-127ms", "verdict": "rejected", "note": "register spill pfb[16]+xr; reverted"}
 {"exp": "wq+gate fused via moe slot machinery (Exl3Duo)", "result": "~101-115ms", "verdict": "rejected", "note": "moe gemv per-slot path slower than dense pipeline; reverted"}
 {"exp": "conv pool staleness fix", "result": "verify-8 runs, no segfault", "verdict": "kept", "note": "step_block still diverges (max|d|=12.7) — defer to spec phase"}
+{"exp": "step_block correctness", "result": "max|d|=0.00036 row0 vs step", "verdict": "fixed", "note": "tau8 missing +1.0 bias of serial scale_bias; also in_buf 64MB->8MB, conv snapshot/restore helpers"}
+{"exp": "Exl3Duo wq+gate via moe slots", "result": "~101-115ms", "verdict": "rejected", "note": "moe slot path slower than dense pipeline; reverted"}

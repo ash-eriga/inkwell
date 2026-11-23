@@ -287,3 +287,17 @@ Ledger histórico: subtrair ~35ms de tudo.
 - Rejeitados: wk||wv pair 2-stream (SM contention + event overhead → pior), NKY sweep, batch4→8 denso (quebra xhb fill), DEV_MARGIN 800/500, MAX_CTX 512/1024 (neutro).
 - bs range = 0..1005 → int8×int8 (xh,bs) inviável sem perder 3 bits de bs — int8-xh puro morto.
 - Restam só: (a) fusão de projeções independentes no load (concat trel na dim n — padrão proj0_cat), ~2-4ms; (b) int8-xh com bs 2-termos (numérica muda); (c) spec decode (o caminho real).
+
+## 23-11 noite pt2 — step_block verify CORRETO (21620b9)
+- VTEST baseline was stale (compared pos-1 logits): now snapshots conv, runs
+  step() at same pos, restores, then step_block — real comparison.
+- Bug: tau8 faltava o bias +1.0 de scale_bias nas layers full (il%6==5) —
+  q/r escalados por alpha*ln em vez de alpha*ln+1 → divergência nas layers
+  full. Fixado: row0 max|d|=0.00036, argmax match.
+- snapshot_conv/restore_conv (host) adicionados p/ spec rollback.
+- in_buf 64MB→8MB. b_*/s_lout* dumps per layer p/ bisect futuro.
+- verify-8 ~0.9s wall (sem cuda-graph + ops por-token serializadas) —
+  precisa acelerar p/ spec pagar; próximos: medir breakdown, cuda-graph o
+  bloco, batch MoE/router por token.
+- WALL non-spec confirmado ~97ms: ~800MB/token a ~9-10GB/s efetivo uniforme
+  (VRAM-latency), todas fusões menores rejeitadas em A/B — caminho real = spec.
