@@ -232,3 +232,13 @@ Ledger histórico: subtrair ~35ms de tudo.
 - Lost delta reconstructed + COMMITTED (src-v2 `5a99456`): (1) `GGML_OP_CUSTOM` in `ggml_backend_cuda_device_supports_op` → tensors land on device; (2) `case GGML_OP_CUSTOM` in `ggml_cuda_compute_forward` → calls `p.fun(dst,0,1,userdata)`; (3) op-seq `get_key` (hash of op+type+src-count, NOT ne/nb); (4) `ggml_backend_cuda_stream` shim; (5) PASCAL_GRAPHS gate on graph-eval path; (6) CUSTOM exclusions in `graph_update_required`.
 - Rule: ALWAYS commit src-v2 changes immediately.
 - State after recovery: ~100 ms/tok golden at HEAD c292e3f.
+
+## nsys breakdown @~100ms/tok (per token, GPU busy ~115ms)
+- exl3_gemv_moe: 43.6ms (med 323µs, ~144 launches)
+- exl3_gemv_dp4a (dense): 33.7ms (med 86µs, ~433 launches!)
+- exl3_moe_ccopy: 14.8ms; exl3_moe_stage: 8ms (uncached L21-23)
+- had_in/out_moe+had_in/out: ~8ms; attn_decode 1.3ms; misc ~5ms
+- Cache hits REAL ~80% (PFSTAT hits= só prefetch-bank; misses reais ~1.5-2/visita). margin=50 → cached moe13-20, neutro.
+- REJEITADOS A/B: nky-split moe gemv (108/113ms), direct-loads sem smem (131ms), prefetch-depth-8 (neutro, mantido).
+- gemv_moe não é starved de blocos (~288) nem math-bound (~5Gops); suspeita: latência das chains smem/syncs.
+- Não testado: fundir had_in/out no gemv (economiza 2 launches+roundtrip), batchar os 433 dp4a (proj pequenas agrupáveis?), exl3_moe_stage p/ L21-23 via ccopy k=8.

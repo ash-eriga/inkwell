@@ -343,3 +343,4 @@
 {"ts":"2026-11-23T08:16:06-03:00","config":"restored","i":3,"error":"no decode line","tail":"#9  0x0000562d42817795 in main ()|[Inferior 1 (process 258148) detached]|timeout: the monitored command dumped core|"}
 {"ts":"2026-11-23T08:17:16-03:00","config":"restored","i":4,"error":"no decode line","tail":"#9  0x00005626a0257795 in main ()|[Inferior 1 (process 270637) detached]|timeout: the monitored command dumped core|"}
 {"ts":"2026-11-23","config":"moe-gemv nky env + prefetch-depth-8","decode_s":0.8145,"ms_tok":101.7,"golden":true,"note":"nky=2/4 worse (108/113); depth8 neutral vs 100.3 baseline"}
+{"ts":"2026-11-23","config":"moe-gemv direct-loads no-sync","ms_tok":130.8,"golden":true,"note":"REJECTED — worse than cooperative smem pipeline"}
