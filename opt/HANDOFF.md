@@ -262,3 +262,20 @@ Ledger histórico: subtrair ~35ms de tudo.
 - Dense exl3 sites: proj() @runner.rs:889 (chamado por camada p/ q/gate/rel via proj0_cat concat já feito), head @1390. proj0_cat já concatena q+gate+rel — fusão adicional: o-proj+rel_logits+attn_sink independentes poderiam concat no load (mesmo k) → menos launches.
 - Caminho p/ batching: em exl3_of() aceitar lista de bases e concat trel na dim n (igual proj0_cat faz para 3 já).
 - Zumbis: sempre `pkill -9 -x inkwell; nvidia-smi --query-compute-apps` antes de run.
+
+## 2025-11-23 manhã — estado + MTP
+- Estável ~96-102ms/tok (~10 TPS), golden. HEAD inkwell 8bf80ba+, src-v2 5a99456.
+- Teto sem spec estimado ~60-70ms (450MB pesos/tok × latência VRAM+PCIe). 15 TPS sem spec improvável.
+- mtp.safetensors baixado (236MB) p/ ~/models/inkling/. Drafter = 3 camadas REXL3 (mesmo formato trellis/suh/svh/mul1 → reusar exl3_of + gemv_dp4a) + markov_head (rnn_proj 5120→768, hidden_out 256→2304, markov_w1 [201024,256] logits) + mask_embed, fuse_weight [4,4], norm.
+- mtp_config: block_size 8, markov_rank 256, markov_head_type rnn_hidden, target_layer_ids [5,23,41,48] (visit-space: última visita de cada attn_res block), local_layer_ids [0,2] (SWA), sliding_window 1024.
+- Plano: (1) parsear mtp no runner (exl3_of path), (2) drafter fwd 3L + markov head, (3) loop draft-8 → verify-prefill no target, (4) medir acceptance.
+
+## MTP/DSpark — design (ref: vllm vllm/models/inkling2/nvidia/dspark.py)
+- Draft: 1 passada paralela no bloco[8]: x[0]=norm(embd(anchor)), x[1:8]=mask_embed; 3 camadas (RMSNorm→attn RoPE com ctx-KV de features do target via kv_proj_ctx→MLP); contexto = fuse_weight softmax das hidden states do target nos visits {5,23,41,48} via dflare_norm; Markov head: logits = fold_weight[201024,256] @ latent + fold_bias + base, latent via rnn_proj[5120→768] + markov_gate seq/step, prev-token via markov_w1[vocab,256].
+- fold_weight = lm_head @ hidden_out (foldar no load — head é exl3! desquant ou aplicar em 2 estágios).
+- Verify = step_block(ids[8], pos): mesmas ops do step() mas ntok=8:
+  * dense exl3 gemv BATCHADO (ntok=8 numa leitura de peso) — ÚNICA amortização que importa (~34ms/token → ~34ms/bloco).
+  * attn por token (8 máscaras/rel_pos separadas), conv sequencial, MoE ids[8] por token (~×2 tráfego de expert), KV set_rows idx[8].
+  * KV garbage pós-rejeição é auto-mascarado (mask limita a pos+1) → ok; conv_state snapshot+restore se aceitação parcial (~5.3MB memcpy).
+  * CUDA graphs: verify graph = seq de ops diferente → cache key separado ok.
+- Estimativa: verify-8 ~130-160ms/bloco; aceitação a~4 → ~15-25 TPS.
