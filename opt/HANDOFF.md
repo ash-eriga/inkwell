@@ -392,3 +392,14 @@ CICLO (após verify de 8 rows com tgt[8]=argmax por row):
 - kd adaptativo: pconf=top1 prob/step; kd=maior k com cumprod>=theta(0.4) → próximo verify usa kd+1 rows.
 CUSTO estimado Pascal: base GEMM lê unembed 922MB bf16 (~90-120ms); fold_w 7×102MB (~70ms); 3-layer tr ExL3 (~uns ms); total draft ~150-200ms. Ciclo ~550-600ms → precisa ~5-6 tok/round p/ ganhar de 97ms serial. Verify ~400ms hoje (~3.5GB/s efetivo vs 1.4GB de pesos → chão ~140ms): OTIMIZAR verify é o lever crítico.
 - feats capture: feats[j] = x_in (residual) no INÍCIO de layer_blk p/ vi ∈ {5,23,41} + normed output final — por row j. step_block deve expor feats[8][4][2304].
+
+## 2026-11-23 late — spec verify is GPU-bound; moe_ntok is the target
+State: serial ~97ms/tok golden `" Paris. The capital of the United States..."`.
+Spec works mechanically (accept 25-47% noisy, 2.2-4.3 tok/round) but ~4.4 tok/s
+< serial — verify ~570ms, ~93% GPU-busy, ~70% = inkwell_exl3_gemv_moe_ntok
+(latency-bound ~10GB/s effective; union ~60/64 experts ≈ serial bytes).
+CUDA graphs confirmed working on block path (GGML_PASCAL_GRAPHS + pnexp patch).
+NEXT: (a) moe_ntok inner loop efficiency (vectorize tile_base reads — pfb[]
+loads are 4B/thread; try uint4); (b) per-row swarm ~50ms minor; (c) draft att
+residual 0.28 vs oracle — likely bf16-reference rounding; verify by comparing
+draft logits vs reference api.py if needed; (d) kd-adaptive draft len.
