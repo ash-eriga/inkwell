@@ -165,6 +165,8 @@ pub struct Mtp {
     rnn_in: inkwell_cuda::DevBuf, raw: inkwell_cuda::DevBuf, latent: inkwell_cuda::DevBuf,
     ho: inkwell_cuda::DevBuf, u2: inkwell_cuda::DevBuf, z: inkwell_cuda::DevBuf,
     amax: inkwell_cuda::DevBuf,
+    /// host copy of draft logits per block row (probabilistic acceptance)
+    pub dz: Vec<Vec<f32>>,
     posd: inkwell_cuda::DevBuf,
     x0: inkwell_cuda::DevBuf,
     // host-side target embedding table + norm (mmap'd repo, 'static)
@@ -176,6 +178,8 @@ pub struct Mtp {
     /// first ctx position ever written (rows below are zeros — mask them out).
     lo: i64,
 }
+
+pub fn dev_sync() { unsafe { inkwell_cuda::DevBuf::sync() } }
 
 impl Mtp {
     /// `un_desc`: `(trel, suh, svh, k, n, ka, halfk, scratch)` of the target's
@@ -271,6 +275,7 @@ impl Mtp {
             u2: inkwell_cuda::DevBuf::new(H),
             z: inkwell_cuda::DevBuf::new(VOCAB),
             amax: inkwell_cuda::DevBuf::new(1),
+            dz: Vec::new(),
             posd: inkwell_cuda::DevBuf::new(NB),
             x0: inkwell_cuda::DevBuf::new(H),
             embd,
@@ -480,6 +485,10 @@ impl Mtp {
                 self.amax.read_bytes(&mut tok);
                 prev = u32::from_ne_bytes(tok);
                 out[i] = prev;
+                if self.dz.len() < NB { self.dz.resize(NB, Vec::new()); }
+                self.dz[i].resize(VOCAB, 0.0);
+                inkwell_cuda::memcpy_d2h_sync(self.dz[i].as_mut_ptr().cast(),
+                    self.d(&self.z).cast(), VOCAB * 4);
                 if i == 1 && std::env::var_os("INKWELL_MTP_BASE").is_some() {
                     // diagnostic: argmax of unembed(hid_1) alone (no markov/ho)
                     let (t_, s_, v_, k_, n_, ka_, hk_, scr_) = self.un;

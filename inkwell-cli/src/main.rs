@@ -297,7 +297,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     // real prompt via our tokenizer (bit-identical to llama.cpp)
     let mut ids = inkwell_tokenizer::Tokenizer::from_gguf(gg)
         .expect("tokenizer")
-        .encode("The capital of France is");
+        .encode(&std::env::var("INKWELL_PROMPT").unwrap_or_else(|_| "The capital of France is".into()));
     // upstream adds no BOS for this model (add_bos=false)
     let t0 = Instant::now();
     let mut pos = 0i64;
@@ -361,10 +361,42 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         // DSpark draft: bootstrap feats via a throwaway block on `id` at pos,
         // then cycles of step_block(vtok) -> accept -> ctx_append -> propose.
         let blk0 = [id; 8];
-        let _ = r.step_block(&blk0, pos);
+        let _ = r.step_block(&blk0, pos);  // creates block_feats
         r.rollback_conv(1);
         let mut mtp = inkwell_run::draft::Mtp::new(path,
             r.unembed_desc().expect("unembed"), r.block_feats_ptr(), max_ctx as usize);
+        // Prompt ctx: replay the prompt through step_block in NB-sized chunks so
+        // draft ctx-K/V covers positions 0..pos (reference does this in prefill).
+        {
+            let t0p = Instant::now();
+            // tokens for every committed position so far: prompt + serial gen
+            let toks: Vec<u32> = ids.iter().map(|&t| t as u32)
+                .chain(gen_ids.iter().copied()).collect();
+            let mut bases: Vec<i64> = Vec::new();
+            let mut b: i64 = 0;
+            let last_full = (toks.len() as i64) - 8; // need 8 real tokens per block
+            while b <= last_full { bases.push(b); b += 8; }
+            if !bases.is_empty() && *bases.last().unwrap() != last_full {
+                bases.push(last_full); // final overlapping chunk ends at pos-1
+            }
+            bases.dedup();
+            for &bc in &bases {
+                if bc <= 0 { continue; }
+                let mut blk = [0u32; 8];
+                for j in 0..8 { blk[j] = toks[(bc as usize) + j]; }
+                eprintln!("ctx replay base={bc}");
+                let _ = r.step_block(&blk, bc);
+                inkwell_run::draft::dev_sync();
+                eprintln!("  block done");
+                mtp.ctx_append(bc);
+                inkwell_run::draft::dev_sync();
+                eprintln!("  ctx appended (sync ok)");
+            }
+            eprintln!("prompt ctx replay: {} blocks in {:?}", bases.len(), t0p.elapsed());
+        }
+        // blk0 again: feats slab must hold rows for pos..pos+7 (replay overwrote it)
+        let _ = r.step_block(&blk0, pos);
+        r.rollback_conv(1);
         mtp.ctx_append(pos);
         let mut vtok = mtp.propose(pos + 1, id, 0);
         let mut c = pos + 1;
@@ -372,6 +404,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
             .and_then(|v| v.parse().ok()).unwrap_or(32);
         let mut spec_ids: Vec<u32> = Vec::new();
         let (mut rounds, mut accepted) = (0u64, 0u64);
+        let mut spec_rng: u64 = 0x243F6A8885A308D3;
         let t2 = Instant::now();
         while spec_ids.len() < target {
             let tv = Instant::now();
@@ -383,11 +416,39 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
                 verify[j] = vl[j * nv..(j + 1) * nv].iter()
                     .enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
             }
+            // probabilistic acceptance (vLLM draft_sample_method=probabilistic):
+            // accept draft d at row j w.p. min(1, p_target(d)/p_draft(d)); on
+            // rejection emit a sample from the residual (p_t - p_d)+.
             let mut n = 0;
-            while n < 7 && vtok[n + 1] == verify[n] { n += 1; }
-            let ne = n + 1;
-            spec_ids.extend_from_slice(&verify[..ne]);
-            id = verify[n];
+            let mut emitted: Vec<u32> = Vec::with_capacity(8);
+            if std::env::var_os("INKWELL_SPEC_PROB").is_some() {
+                for j in 0..7 {
+                    let d = vtok[j + 1] as usize;
+                    let vrow = &vl[j * nv..(j + 1) * nv];
+                    let pt = softmax_prob(vrow, d);
+                    let pd = softmax_prob(&mtp.dz[j + 1], d);
+                    spec_rng ^= spec_rng << 13; spec_rng ^= spec_rng >> 7; spec_rng ^= spec_rng << 17;
+                    let u = (spec_rng >> 11) as f64 / ((1u64 << 53) as f64);
+                    if rounds <= 3 && j < 3 {
+                        let t5v = top(vrow, 5);
+                        let t5d = top(&mtp.dz[j + 1], 5);
+                        eprintln!("      j{j} d={d} pt={pt:.4} pd={pd:.4} targ_top5={:?} draft_top5={:?}", t5v, t5d);
+                    }
+                    if u < (pt / pd.max(1e-300)).min(1.0) {
+                        n += 1; emitted.push(d as u32);
+                    } else {
+                        emitted.push(residual_sample(vrow, &mtp.dz[j + 1], &mut spec_rng));
+                        break;
+                    }
+                }
+                if n == 7 { emitted.push(verify[7]); }
+            } else {
+                while n < 7 && vtok[n + 1] == verify[n] { n += 1; }
+                emitted.extend_from_slice(&verify[..n + 1]);
+            }
+            let ne = emitted.len();
+            spec_ids.extend_from_slice(&emitted);
+            id = emitted[emitted.len() - 1];
             rounds += 1; accepted += n as u64;
             let c_old = c;
             c += ne as i64;
@@ -471,4 +532,40 @@ fn top(l: &[f32], n: usize) -> Vec<(usize, f32)> {
         }
     }
     v
+}
+
+fn softmax_prob(l: &[f32], d: usize) -> f64 {
+    let m = l.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let (mut s_, mut pd) = (0.0f64, 0.0f64);
+    for (i, &v) in l.iter().enumerate() {
+        let e = ((v - m) as f64).exp(); s_ += e;
+        if i == d { pd = e; }
+    }
+    pd / s_.max(1e-300)
+}
+
+fn residual_sample(vrow: &[f32], drow: &[f32], rng: &mut u64) -> u32 {
+    let mv = vrow.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let md = drow.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut res = vec![0f64; vrow.len()];
+    let (mut sv, mut sd) = (0.0f64, 0.0f64);
+    for i in 0..vrow.len() {
+        sv += ((vrow[i] - mv) as f64).exp();
+        sd += ((drow[i] - md) as f64).exp();
+    }
+    let mut z = 0.0f64;
+    for i in 0..vrow.len() {
+        let r = (((vrow[i] - mv) as f64).exp() / sv - ((drow[i] - md) as f64).exp() / sd).max(0.0);
+        res[i] = r; z += r;
+    }
+    if z <= 0.0 {
+        return vrow.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+    }
+    *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
+    let mut u = (*rng >> 11) as f64 / ((1u64 << 53) as f64) * z;
+    for (i, &r) in res.iter().enumerate() {
+        u -= r;
+        if u <= 0.0 { return i as u32; }
+    }
+    vrow.len() as u32 - 1
 }
