@@ -1656,13 +1656,13 @@ __global__ void inkwell_exl3_gemv(const uint32_t* __restrict__ trel,
 // y = svh .* (H128 * t): block per 128-block.
 __global__ void inkwell_exl3_had_out(const float* __restrict__ t,
                                      const uint16_t* __restrict__ svh,
-                                     float* __restrict__ y, int n, int nky) {
+                                     float* __restrict__ y, int n, int nky, int tstride) {
     extern __shared__ float sm[];
     const int blk = blockIdx.x;
     const int th = threadIdx.x;
     const int base = blk * 128;
     float v = 0.f;
-    if (base + th < n) { for (int z = 0; z < nky; ++z) v += t[z * n + base + th]; }
+    if (base + th < n) { for (int z = 0; z < nky; ++z) v += t[z * tstride + base + th]; }
     sm[th] = v;
     __syncthreads();
     for (int s = 1; s < 128; s <<= 1) {
@@ -1787,6 +1787,157 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     if (live && rp == 0) t[blockIdx.y * (tn * 16) + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
 }
 
+// Batched-token GEMV (spec-decode verify): one weight stream feeds NTOK=8
+// activation sets. t layout: [nky][ntok][n]; xh: [ntok][tk*16].
+__global__ void inkwell_exl3_gemv_dp4a_ntok(const uint32_t* __restrict__ trel,
+                                          const float* __restrict__ xh,
+                                          float* __restrict__ t,
+                                          int tk, int tn, int ka, int halfk) {
+    const int NTOK = 8;
+    const int g = threadIdx.x >> 6;
+    const int u = threadIdx.x & 63;
+    const int c = u >> 2, rp = u & 3;
+    const int tn_i = blockIdx.x * 4 + g;
+    const int w = r_bits_words(ka, halfk);
+    __shared__ float xhb[8][8][16];   // [tk-batch][token][elem]
+    __shared__ uint32_t rings[4 * 4 * 80];
+    const bool live = tn_i < tn;
+    const int tkc = (tk + gridDim.y - 1) / gridDim.y;
+    const int tk0 = blockIdx.y * tkc;
+    const int tk1 = min(tk0 + tkc, tk);
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    float s[8], sx[8];
+#pragma unroll
+    for (int z = 0; z < 8; ++z) { s[z] = 0.f; sx[z] = 0.f; }
+    uint32_t widx[4];
+    {
+        const int r_bits = halfk ? 256 * ka + 128 : 256 * ka;
+        const int nw = r_bits >> 5;
+        int q = 0;
+        for (int r = rp; r < 16; r += 4, ++q) {
+            const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                        | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+            const int s_i = halfk ? (i + 1) * ka + ((i + 1) >> 1) : (i + 1) * ka;
+            const int b0 = s_i - 16 + (s_i < 16 ? r_bits : 0);
+            const int i0 = b0 >> 5;
+            const int s0 = 48 - (b0 & 31);
+            const int i1 = (i0 + 1 == nw) ? 0 : i0 + 1;
+            widx[q] = (uint32_t)(i0 | (i1 << 7) | (s0 << 14));
+        }
+    }
+    // xhb fill helper: all 256 threads cover [tkn][8][16]
+    auto fill_xh = [&](int base, int tkn) {
+        for (int j = threadIdx.x; j < 16 * tkn * NTOK; j += 256) {
+            const int tt = j >> 6;
+            const int rem = j & 63;
+            xhb[rem >> 4][tt][rem & 15] =
+                xh[(size_t)tt * tk * 16 + (size_t)(base + (rem >> 4)) * 16 + (rem & 15)];
+        }
+    };
+    {
+        const int tkn0 = min(4, tk1 - tk0);
+        fill_xh(tk0, tkn0);
+        if (live) {
+            uint32_t* rg = rings + g * 320;
+            for (int b = 0; b < tkn0; ++b) {
+                const uint32_t* ring = trel + (size_t)((tk0 + b) * tn + tn_i) * (size_t)w;
+                if (u < w) rg[b * 80 + u] = ring[u];
+                if (u + 64 < w) rg[b * 80 + u + 64] = ring[u + 64];
+            }
+        }
+    }
+    __syncthreads();
+    for (int tkb0 = tk0; tkb0 < tk1; tkb0 += 4) {
+        const int tkn = min(4, tk1 - tkb0);
+        const int nb0 = tkb0 + 4;
+        const int tkn2 = min(4, tk1 - nb0);
+        uint32_t pfb[4][2];
+        if (live && nb0 < tk1) {
+            for (int b = 0; b < tkn2; ++b) {
+                const uint32_t* ring = trel + (size_t)((nb0 + b) * tn + tn_i) * (size_t)w;
+                if (u < w) pfb[b][0] = ring[u];
+                if (u + 64 < w) pfb[b][1] = ring[u + 64];
+            }
+        }
+        float pfx[8];
+        if (nb0 < tk1) {
+            const int b = u >> 4, e = u & 15;
+#pragma unroll
+            for (int tt = 0; tt < 8; ++tt)
+                pfx[tt] = (b < tkn2) ? xh[(size_t)tt * tk * 16 + (size_t)(nb0 + b) * 16 + e] : 0.f;
+        }
+        if (live) {
+            const uint32_t* rg = rings + g * 320;
+            for (int b = 0; b < tkn; ++b) {
+                int q = 0;
+#pragma unroll
+                for (int r = rp; r < 16; r += 4, ++q) {
+                    const uint32_t wi = widx[q];
+                    const uint64_t v = ((uint64_t)rg[b * 80 + (wi & 127)] << 32)
+                                     | (uint64_t)rg[b * 80 + ((wi >> 7) & 127)];
+                    const uint32_t w16 = (uint32_t)(v >> (wi >> 14)) & 0xffffu;
+                    const int bs = (int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
+                    const float fbs = (float)bs;
+#pragma unroll
+                    for (int tt = 0; tt < 8; ++tt) {
+                        const float xr = xhb[b][tt][r];
+                        s[tt] += xr * fbs;
+                        sx[tt] += xr;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (live && nb0 < tk1) {
+            uint32_t* rg = rings + g * 320;
+            for (int b = 0; b < tkn2; ++b) {
+                if (u < w) rg[b * 80 + u] = pfb[b][0];
+                if (u + 64 < w) rg[b * 80 + u + 64] = pfb[b][1];
+            }
+        }
+        if (nb0 < tk1) {
+            const int b = u >> 4, e = u & 15;
+#pragma unroll
+            for (int tt = 0; tt < 8; ++tt)
+                if (b < tkn2) xhb[b][tt][e] = pfx[tt];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int tt = 0; tt < 8; ++tt) {
+        s[tt] += __shfl_xor_sync(0xffffffffu, s[tt], 1);
+        sx[tt] += __shfl_xor_sync(0xffffffffu, sx[tt], 1);
+        s[tt] += __shfl_xor_sync(0xffffffffu, s[tt], 2);
+        sx[tt] += __shfl_xor_sync(0xffffffffu, sx[tt], 2);
+        if (live && rp == 0)
+            t[((size_t)blockIdx.y * 8 + tt) * (size_t)(tn * 16) + tn_i * 16 + c] =
+                fmaf(KINV, s[tt], KOFF * sx[tt]);
+    }
+}
+
+extern "C" void ink_launch_exl3_gemv_ntok(const void* trel, const void* suh, const void* svh,
+                                          const float* x, float* y,
+                                          long long k, long long n, long long ka, long long halfk,
+                                          float* scratch, void* stream) {
+    const int NTOK = 8;
+    const int tk = (int)(k / 16), tn = (int)(n / 16);
+    for (int tt = 0; tt < NTOK; ++tt)
+        inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+            x + (size_t)tt * k, (const uint16_t*)suh, scratch + (size_t)tt * k, (int)k);
+    const int nb = (tn + 3) / 4;
+    int nky = 1;
+    while (nb * nky < 512 && nky < 8 && nky * 16 <= tk) nky *= 2;
+    if (nky > 1) cudaMemsetAsync(scratch + (size_t)NTOK * k, 0, (size_t)nky * NTOK * n * 4, (cudaStream_t)stream);
+    dim3 gsz((unsigned)nb, (unsigned)nky, 1);
+    inkwell_exl3_gemv_dp4a_ntok<<<gsz, 256, 0, (cudaStream_t)stream>>>(
+        (const uint32_t*)trel, scratch, scratch + (size_t)NTOK * k, tk, tn, (int)ka, (int)halfk);
+    for (int tt = 0; tt < NTOK; ++tt)
+        inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
+            scratch + (size_t)NTOK * k + (size_t)tt * n, (const uint16_t*)svh,
+            y + (size_t)tt * n, (int)n, nky, (int)(NTOK * n));
+}
+
 __global__ void inkwell_exl3_gemv_dp4a_dbg(const uint32_t* __restrict__ trel,
                                           const float* __restrict__ xh,
                                           float* __restrict__ out_s, float* __restrict__ out_sx,
@@ -1836,7 +1987,7 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
     inkwell_exl3_gemv_dp4a<<<gsz, 256, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
     inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
-        scratch + k, (const uint16_t*)svh, y, (int)n, nky);
+        scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
 }
 
 __global__ void inkwell_exl3_dbg_dec(const uint32_t* __restrict__ trel,

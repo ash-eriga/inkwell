@@ -47,6 +47,7 @@ extern "C" {
     fn ink_launch_mmvq_nvfp4_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_situ_pair(gu: *const f32, sgu: *const f32, hid: *mut f32, beta: f32, lin_beta: f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_exl3_gemv(trel: *const c_void, suh: *const c_void, svh: *const c_void, x: *const f32, y: *mut f32, k: i64, n: i64, ka: i64, halfk: i64, scratch: *mut f32, stream: *mut c_void);
+    fn ink_launch_exl3_gemv_ntok(trel: *const c_void, suh: *const c_void, svh: *const c_void, x: *const f32, y: *mut f32, k: i64, n: i64, ka: i64, halfk: i64, scratch: *mut f32, stream: *mut c_void);
     fn ink_launch_exl3_moe(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, on_dev: i32);
     fn ink_launch_exl3_moe_cached(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, cnt: *mut i32, k: i32, slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, ptag: *const i32, pready: *const i32, bank: *mut c_void, pf_hit: *mut i32);
     fn ink_launch_exl3_prefetch2(dg: *const c_void, du: *const c_void, dd: *const c_void,
@@ -688,6 +689,14 @@ pub unsafe fn set_stream(s: *mut c_void) {
 pub unsafe fn exl3_gemv_async(trel: *const c_void, suh: *const c_void, svh: *const c_void,
     x: *const f32, y: *mut f32, k: usize, n: usize, ka: usize, halfk: bool, scratch: *mut f32) {
     unsafe { ink_launch_exl3_gemv(trel, suh, svh, x, y, k as i64, n as i64, ka as i64, halfk as i64, scratch, stream()) };
+}
+/// 8-token batched variant: x `[8][k]`, y `[8][n]` — one weight read feeds all 8.
+///
+/// # Safety
+/// `scratch` must hold `8*k + 8*8*n` f32.
+pub unsafe fn exl3_gemv_ntok_async(trel: *const c_void, suh: *const c_void, svh: *const c_void,
+    x: *const f32, y: *mut f32, k: usize, n: usize, ka: usize, halfk: bool, scratch: *mut f32) {
+    unsafe { ink_launch_exl3_gemv_ntok(trel, suh, svh, x, y, k as i64, n as i64, ka as i64, halfk as i64, scratch, stream()) };
 }
 /// EXL3 MoE per-slot expert chain (gate+up -> situ -> down -> wsum).
 ///
