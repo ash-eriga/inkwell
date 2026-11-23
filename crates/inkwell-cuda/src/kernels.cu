@@ -3,6 +3,7 @@
 // fusion comes later per the autotuning ledger.
 
 #include <cstdio>
+#include <cuda_fp16.h>
 
 extern "C" {
 
@@ -1465,7 +1466,8 @@ extern "C" void ink_launch_mmvq_iq2_s_moe_i8(const void* const* Wp,
 // One block per query head. score[j] = scale * <q_h, K[hkv(h), j]> + bias[j + h*n_kv] + mask[j]
 // softmax over n_kv real positions plus an implicit zero-logit sink whose mask
 // entry is mask[n_kv]. out[h*hd + d] = sum_j attn[j] * V[hkv(h), j, d].
-__global__ void inkwell_attn_decode(const float* __restrict__ K, const float* __restrict__ V,
+template<bool KV16>
+__global__ void inkwell_attn_decode(const void* __restrict__ K, const void* __restrict__ V,
                                     const float* __restrict__ Q, const float* __restrict__ bias,
                                     const float* __restrict__ mask, float* __restrict__ out,
                                     int nh, int hkv, int n_kv, int hd,
@@ -1482,11 +1484,17 @@ __global__ void inkwell_attn_decode(const float* __restrict__ K, const float* __
     const int w = threadIdx.x >> 5;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) qs[d] = Q[d + h * q_s2];
     __syncthreads();
-    const float* Kh = K + hk * k_s2;
+    const char* Kh = (const char*)K + (size_t)hk * k_s2;
     for (int j = w; j < n_kv; j += nw) {
-        const float* kj = Kh + j * k_s1;
+        const char* kj = Kh + (size_t)j * k_s1;
         float a = 0.f;
-        for (int d = lane; d < hd; d += 32) a += qs[d] * kj[d];
+        if (KV16) {
+            const __half* kjh = (const __half*)kj;
+            for (int d = lane; d < hd; d += 32) a += qs[d] * __half2float(kjh[d]);
+        } else {
+            const float* kjf = (const float*)kj;
+            for (int d = lane; d < hd; d += 32) a += qs[d] * kjf[d];
+        }
         for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
         if (lane == 0) scores[j] = a;
     }
@@ -1527,10 +1535,16 @@ __global__ void inkwell_attn_decode(const float* __restrict__ K, const float* __
     }
     __syncthreads();
     const float inv = 1.f / red[0];
-    const float* Vh = V + hk * v_s2;
+    const char* Vh = (const char*)V + (size_t)hk * v_s2;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float o = 0.f;
-        for (int j = 0; j < n_kv; ++j) o += scores[j] * Vh[j * v_s1 + d];
+        if (KV16) {
+            const __half* vh = (const __half*)Vh;
+            for (int j = 0; j < n_kv; ++j) o += scores[j] * __half2float(vh[(size_t)j * v_s1 / 2 + d]);
+        } else {
+            const float* vf = (const float*)Vh;
+            for (int j = 0; j < n_kv; ++j) o += scores[j] * vf[(size_t)j * v_s1 / 4 + d];
+        }
         out[h * hd + d] = o * inv;
     }
 }
@@ -1538,14 +1552,24 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
                                        const void* bias, const void* mask, void* out,
                                        long long nh, long long hkv, long long n_kv, long long hd,
                                        long long k_s1, long long k_s2, long long v_s1, long long v_s2,
-                                       long long q_s2, long long b_s2, float scale, void* stream) {
-    inkwell_attn_decode<<<(unsigned)nh, 256, (size_t)(n_kv + hd) * 4, (cudaStream_t)stream>>>(
-        (const float*)K, (const float*)V, (const float*)Q, (const float*)bias,
-        (const float*)mask, (float*)out, (int)nh, (int)hkv, (int)n_kv, (int)hd,
-        (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+                                       long long q_s2, long long b_s2, float scale, int kv16, void* stream) {
+    // k/v strides arrive in BYTES (dtype-agnostic); q_s2/b_s2 stay f32 elements
+    const dim3 g((unsigned)nh), b(256);
+    const size_t sm = (size_t)(n_kv + hd) * 4;
+    const cudaStream_t st = (cudaStream_t)stream;
+    if (kv16) {
+        inkwell_attn_decode<true><<<g, b, sm, st>>>(
+            K, V, (const float*)Q, (const float*)bias, (const float*)mask, (float*)out,
+            (int)nh, (int)hkv, (int)n_kv, (int)hd,
+            (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+    } else {
+        inkwell_attn_decode<false><<<g, b, sm, st>>>(
+            K, V, (const float*)Q, (const float*)bias, (const float*)mask, (float*)out,
+            (int)nh, (int)hkv, (int)n_kv, (int)hd,
+            (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+    }
 }
 
-#include <cuda_fp16.h>
 // ===================== EXL3 trellis GEMV (sm_61, mul1 codebook) =====================
 // W = diag(suh) H What H diag(svh); y = svh . H (What^T-ish GEMV over decoded tiles).
 // Decomposition: xh = H128*(suh*x); t[n] = sum_k xh[k]*What[k,n]; y = svh*H128*t.

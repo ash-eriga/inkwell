@@ -290,6 +290,8 @@ pub struct MoeArgsExl3 {
     pub on_dev: bool,
     /// per-layer VRAM cache of staged expert blobs (pinned layers only)
     pub cache: Option<Exl3Cache>,
+    /// per-expert blob stride in bytes (max trel_b + suh+svh) for `cache` sizing
+    pub max_slot: usize,
 }
 
 /// Per-layer VRAM cache: `k` slots × 3 projs × EXL3_STAGE_PROJ bytes,

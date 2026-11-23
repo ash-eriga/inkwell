@@ -24,6 +24,7 @@ use inkwell_core::InklingConfig;
 use std::collections::HashMap;
 
 const F32: i32 = 0;
+const F16: i32 = 1;
 const I32: i32 = 26;
 
 /// per-layer weight handles resolved by name
@@ -540,7 +541,7 @@ impl Runner {
         let dtp = |name: &str| repo.data(name).unwrap_or_else(|| panic!("missing data {name}"));
 
         // ---- device byte budget: all dense F32 + headroom ----
-        let mut dev_bytes = 300usize << 20;
+        let mut dev_bytes = 160usize << 20;
         for (n, t) in &repo.tensors {
             let (name, ti) = (n.as_str(), &t.1);
             if name.contains(".experts.") || name.contains(".trellis") || name.contains(".suh")
@@ -778,35 +779,10 @@ impl Runner {
                     pb
                 };
                 let on_dev = f_free as usize > total + (1300usize << 20);
-                // Pinned layers stage expert blobs over PCIe every visit (~25-40 ms/tok
-                // total). Cache k experts/layer in VRAM; k must be ≥ N_SLOTS(8) so a
-                // single visit never evicts its own slots.
-                let ck: usize = std::env::var("INKWELL_EXL3_CACHE_K")
-                    .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-                let cbytes = ck * 3 * max_slot;
-                let cache = (!on_dev && ck >= 8
-                    && (f_free as usize) > cbytes + (1100usize << 20)).then(|| {
-                    let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
-                    tag.write_bytes_async(&vec![0xFFu8; ck * 4]);
-                    let rr = inkwell_cuda::DevBuf::new_bytes(4);
-                    rr.write_bytes_async(&[0u8; 4]);
-                    crate::moe::Exl3Cache {
-                        buf: inkwell_cuda::DevBuf::new_bytes(cbytes),
-                        tag,
-                        rr,
-                        k: ck as i32,
-                        slot: max_slot,
-                    }
-                });
-                if !on_dev {
-                    eprintln!("exl3 cache il={il}: k={} slot={}B ({:.0} MiB) {}",
-                        ck, max_slot, cbytes as f64 / 1e6,
-                        if cache.is_some() { "CACHED" } else { "staged" });
-                }
                 l.moe_exl3 = Some(moe_args_exl3.len());
                 moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
-                    on_dev, cache,
+                    on_dev, cache: None, max_slot,
                 }));
             }
             l.proj0_off = [-1; 3];
@@ -838,8 +814,8 @@ impl Runner {
             let il_phys = if slot < nphys { slot } else { start + (slot - nphys) % (end - start) };
             let full = il_phys % 6 == 5;
             let cap = if full { max_ctx } else { swa };
-            k_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
-            v_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
+            k_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
+            v_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
             conv_state.push(t::new(rt.ctx(), F32, &[3, n_sconv as i64]));
         }
         let kv_bytes: usize = k_arena.iter().chain(v_arena.iter()).map(|x| t::nbytes(*x) + 256).sum::<usize>()
@@ -851,9 +827,36 @@ impl Runner {
             kv_buf.assign(*x, o);
             o += t::nbytes(*x);
         }
+        eprintln!("bufs: dev={}MiB kv={}MiB hd={hd} hkv={hkv} swa={swa} n_slots={n_slots}",
+            dev_bytes >> 20, kv_bytes >> 20);
         std::mem::forget(kv_buf);
 
         crate::moe::warm_staging(); // staging buffers must exist before CUDA-graph capture
+        // Pinned layers stage expert blobs over PCIe every visit (~25-40 ms/tok
+        // total). Cache k experts/layer in VRAM; k must be ≥ N_SLOTS(8) so a
+        // single visit never evicts its own slots. Runs post-load so f_free is
+        // the real remainder: dev_buf, kv_buf and staging already exist — only
+        // CUDA-graph capture + desktop fluctuation still need room.
+        let ck: usize = std::env::var("INKWELL_EXL3_CACHE_K")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        if ck >= 8 {
+            for (i, a) in moe_args_exl3.iter_mut().enumerate() {
+                if a.on_dev || a.max_slot == 0 { continue; }
+                let cbytes = ck * 3 * a.max_slot;
+                let (f, _) = inkwell_cuda::mem_info();
+                if f <= cbytes + (190usize << 20) { continue; }
+                let Some(buf) = inkwell_cuda::DevBuf::try_new_bytes(cbytes) else { continue };
+                let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
+                tag.write_bytes_async(&vec![0xFFu8; ck * 4]);
+                let rr = inkwell_cuda::DevBuf::new_bytes(4);
+                rr.write_bytes_async(&[0u8; 4]);
+                a.cache = Some(crate::moe::Exl3Cache {
+                    buf, tag, rr, k: ck as i32, slot: a.max_slot,
+                });
+                eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED",
+                    a.max_slot, cbytes as f64 / 1e6);
+            }
+        }
         Self {
             sched_cpu: Some((sched, cpu)),
             conv_args: std::cell::UnsafeCell::new(Vec::new()),
@@ -1448,6 +1451,8 @@ unsafe extern "C" fn attn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _
         let n_kv = inkwell_ggml::ink_tensor_ne(k_t, 1);
         let hkv = inkwell_ggml::ink_tensor_ne(k_t, 2);
         let nh = inkwell_ggml::ink_tensor_ne(q_t, 2);
+        // k/v strides in BYTES (kernel picks elem size by kv16); q/b stay f32 elems
+        let kv16 = inkwell_ggml::ink_tensor_type(k_t) == 1;
         inkwell_cuda::attn_decode_async(
             inkwell_ggml::ink_tensor_data(k_t).cast_const(),
             inkwell_ggml::ink_tensor_data(v_t).cast_const(),
@@ -1456,10 +1461,11 @@ unsafe extern "C" fn attn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _
             inkwell_ggml::ink_tensor_data(m_t).cast_const(),
             inkwell_ggml::ink_tensor_data(dst).cast::<f32>(),
             nh, hkv, n_kv, hd,
-            inkwell_ggml::ink_tensor_nb(k_t, 1) / 4, inkwell_ggml::ink_tensor_nb(k_t, 2) / 4,
-            inkwell_ggml::ink_tensor_nb(v_t, 1) / 4, inkwell_ggml::ink_tensor_nb(v_t, 2) / 4,
+            inkwell_ggml::ink_tensor_nb(k_t, 1), inkwell_ggml::ink_tensor_nb(k_t, 2),
+            inkwell_ggml::ink_tensor_nb(v_t, 1), inkwell_ggml::ink_tensor_nb(v_t, 2),
             inkwell_ggml::ink_tensor_nb(q_t, 2) / 4, inkwell_ggml::ink_tensor_nb(b_t, 2) / 4,
             1.0 / (hd as f32).sqrt(),
+            kv16,
         );
     }
 }

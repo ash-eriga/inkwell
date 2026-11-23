@@ -285,11 +285,13 @@ fn bench_spec() {
 fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path: &str) {
     use inkwell_run::runner::Runner;
     use std::time::Instant;
+    let max_ctx: i64 = std::env::var("INKWELL_MAX_CTX")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     let mut r = if std::path::Path::new(path).is_dir() {
         let repo = Box::leak(Box::new(inkwell_st::StRepo::open(std::path::Path::new(path)).expect("st repo")));
-        Runner::load_st(repo, cfg, 8192)
+        Runner::load_st(repo, cfg, max_ctx)
     } else {
-        Runner::load(gg, cfg, 8192)
+        Runner::load(gg, cfg, max_ctx)
     };
     eprintln!("runner loaded");
     // real prompt via our tokenizer (bit-identical to llama.cpp)
