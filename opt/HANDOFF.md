@@ -175,3 +175,17 @@ LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-in
 - tk8 batch: regs demais, 142ms — rejeitado.
 - PFSTAT: ~1-3 misses/visita; bank prefetch ~2% hits — neutro.
 - gemv_moe ~instruction-bound (window+dp4a+fma por elem); DRAM floor é ~10x menor.
+
+## SESSÃO 3e — PROFILE REAL (nsys) — muda o mapa
+HEAD: 93f7a3d (~128-133 ms/tok). DESCOBERTA (eager + graph trace):
+Por token ~122ms: **~96ms dentro de 14 graph execs + ~13ms host (build graph ggml em step()) + ~13ms launch/tail**.
+Kernels em eager (por token, ÷8 runs): gemv_moe 47.6ms (216×220µs), dp4a 33.6ms (433×77µs),
+ccopy 19ms (25×~750µs), stage 8.2ms (6×1.37ms), pcopy ~2ms, mul_mat_vec 6ms, had ~4ms, attn 1.3ms.
+→ as cópias PCIe totais ~29ms/token são o 2º maior custo; gemv_moe instr-bound ~10 inst/elem.
+- Kernel-table NÃO cobre kernels de graph-replay (ficam invisíveis no ncu/nsys kernel sum).
+- Rejeitados: tk8 (142ms, regs), window i-map hoist (144ms, regs), sx tail-compute (neutro ~133).
+- Aceito: `(i0+1)%nw` → select (~128ms). Commitado.
+- BUG RESOLVIDO do dia: replace() sem escopo zerou sx do kernel dp4a → "SUL CONTROL". Cuidado com replaces amplos.
+- Próximos alvos por payoff: (1) cópias PCIe 29ms — menos misses (pin quente) OU cópia mais rápida (>2.6GB/s);
+  (2) gemv_moe 47.6ms instr-bound; (3) 13ms host build/token (ggml sched — difícil); (4) ~4ms graphLaunch (293µs×14).
+- Rejeitado: ccopy nparts 16→32 / 256thr (~155ms — sem ganho; PCIe já satura).

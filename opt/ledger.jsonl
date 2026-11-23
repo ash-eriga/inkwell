@@ -231,3 +231,7 @@
 {"ts":"2026-11-23T03:39:00-03:00","config":"exl3-sxtail","i":4,"decode_s":1.032844802,"ms_tok":129.1,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T03:39:13-03:00","config":"exl3-sxtail","i":5,"decode_s":1.052629734,"ms_tok":131.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T03:39:25-03:00","config":"exl3-sxtail","i":6,"decode_s":1.368356702,"ms_tok":171.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:48:34-03:00","config":"exl3-ccopy-wide","i":1,"decode_s":1.027968962,"ms_tok":128.5,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:48:49-03:00","config":"exl3-ccopy-wide","i":2,"decode_s":1.359553491,"ms_tok":169.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:49:02-03:00","config":"exl3-ccopy-wide","i":3,"decode_s":1.13302023,"ms_tok":141.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:49:15-03:00","config":"exl3-ccopy-wide","i":4,"decode_s":1.363568691,"ms_tok":170.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
