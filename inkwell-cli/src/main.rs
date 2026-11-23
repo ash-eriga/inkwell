@@ -313,20 +313,67 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let mut id = ids[ids.len() - 1];
     let mut gen_ids = Vec::new();
     let n_gen: usize = std::env::var("INKWELL_GENS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    // INKWELL_VTEST8: after every serial step, replay the 8 tokens just
+    // processed as one step_block (conv state snapshotted 8 steps back) and
+    // compare all 8 rows against the serial logits — covers deep rows, which
+    // the single-row VTEST cannot reach.
+    let vtest8 = std::env::var_os("INKWELL_VTEST8").is_some();
+    let mut fed: Vec<u32> = Vec::new();
+    let mut hist_logits: std::collections::VecDeque<Vec<f32>> = Default::default();
+    let mut hist_snaps: std::collections::VecDeque<Vec<Vec<f32>>> = Default::default();
+    let (mut vt8_rows, mut vt8_bad) = (0usize, 0usize);
     for g in 0..n_gen {
+        if vtest8 { hist_snaps.push_back(r.snapshot_conv()); }
         let ts = Instant::now();
         logits = r.step(id, pos);
         eprintln!("stepwall={:.1}ms", ts.elapsed().as_secs_f64()*1e3);
         pos += 1;
         let ta = Instant::now();
         let (best, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+        let fed_id = id;
         if g == 0 { eprintln!("gen0-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]); }
         eprintln!("gen {g}: id={id} next={best} top5={:?}",
             top(&logits, 5));
         id = best as u32;
         gen_ids.push(id);
         eprintln!("poststep={:.1}ms", ta.elapsed().as_secs_f64()*1e3);
+        if vtest8 {
+            fed.push(fed_id);
+            hist_logits.push_back(logits.clone());
+            if hist_snaps.len() > 8 { hist_snaps.pop_front(); hist_logits.pop_front(); }
+            if hist_snaps.len() == 8 {
+                // steps g-7..g fed fed[g-7..=g] at pos-8..pos-1
+                let mut blk = [0u32; 8];
+                blk.copy_from_slice(&fed[g - 7..=g]);
+                let base = pos - 8;
+                let snap = hist_snaps.front().expect("8 conv snapshots").clone();
+                r.restore_conv(&snap);
+                let tb = Instant::now();
+                let vl = r.step_block(&blk, base);
+                let msb = tb.elapsed().as_secs_f64() * 1e3;
+                let nv = logits.len();
+                let mut line = String::new();
+                for j in 0..8 {
+                    let row = &vl[j * nv..(j + 1) * nv];
+                    let ser = &hist_logits[j];
+                    let d: f32 = row.iter().zip(ser.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                    let (ba, _) = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+                    let (sa, _) = ser.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+                    // serial top1-top2 margin: a flip inside it is fp noise
+                    let t2 = top(ser, 2);
+                    let margin = t2[0].1 - t2[1].1;
+                    vt8_rows += 1;
+                    if ba != sa {
+                        vt8_bad += 1;
+                        eprintln!("VTEST8 MISMATCH g={g} base={base} j={j} block={ba} serial={sa} serial_margin={margin:.4} maxd={d:.5}");
+                    }
+                    line.push_str(&format!(" j{j}:{} d={d:.1e}", if ba == sa { "ok" } else { "BAD" }));
+                }
+                eprintln!("VTEST8 g={g} base={base} blk={msb:.0}ms{line}");
+            }
+        }
     }
+    if vtest8 { eprintln!("VTEST8 total: rows={vt8_rows} mismatches={vt8_bad}"); }
     let dec_t = t1.elapsed();
     let text = inkwell_tokenizer::Tokenizer::from_gguf(gg)
         .expect("tokenizer")
@@ -398,8 +445,11 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         let _ = r.step_block(&blk0, pos);
         r.rollback_conv(1);
         mtp.ctx_append(pos);
-        let mut vtok = mtp.propose(pos + 1, id, 0);
-        let mut c = pos + 1;
+        // the anchor sits at `pos`: the verify block is [anchor, d1..d7] at
+        // pos..pos+7 (same frame as VTEST / Mtp::cycle), not pos+1 — a +1 base
+        // processes the anchor twice ("capital of of ...").
+        let mut c = pos;
+        let mut vtok = mtp.propose(c, id, 0);
         let target: usize = std::env::var("INKWELL_SPEC_GENS").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(32);
         let mut spec_ids: Vec<u32> = Vec::new();

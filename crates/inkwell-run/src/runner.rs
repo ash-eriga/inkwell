@@ -966,10 +966,11 @@ impl Runner {
 
     /// register a tensor for post-compute dump (INKWELL_DUMP)
     fn dump(&self, name: &str, t0: Ptr) {
-        if std::env::var("INKWELL_DUMP").is_err() { return; }
+        if std::env::var("INKWELL_DUMP").is_err() && std::env::var_os("INKWELL_DUMP_IDS").is_none() { return; }
         t::output(t0); // keep alive: gallocr won't reuse output memory
         unsafe { (*self.dump_list.get()).push((name.to_string(), t0)); }
     }
+    fn dump_list_get(&self) -> &Vec<(String, Ptr)> { unsafe { &*self.dump_list.get() } }
     fn dump_all(&self) {
         for (name, t0) in unsafe { &*self.dump_list.get() } {
             let n = t::ne(*t0,0)*t::ne(*t0,1)*t::ne(*t0,2)*t::ne(*t0,3);
@@ -977,6 +978,26 @@ impl Runner {
             unsafe { t::get(*t0, v.as_mut_ptr().cast(), 0, (n*4) as usize) };
             let sum: f32 = v.iter().sum();
             eprintln!("DBG {name} ne={n} sum={sum:.6} first3={:?}", &v[..8]);
+        }
+        // INKWELL_DUMP_IDS=<path>: append every `b_ids<il>` router tensor of
+        // this block as [il i32][64 i32] — real expert ids for kernel benches.
+        if let Ok(path) = std::env::var("INKWELL_DUMP_IDS") {
+            use std::io::Write as _;
+            let rec: Vec<(i32, Vec<i32>)> = self.dump_list_get().iter()
+                .filter_map(|(name, t0)| {
+                    let il = name.strip_prefix("b_ids")?.parse::<i32>().ok()?;
+                    let n = t::ne(*t0, 0) * t::ne(*t0, 1);
+                    let mut v = vec![0f32; n as usize];
+                    unsafe { t::get(*t0, v.as_mut_ptr().cast(), 0, (n * 4) as usize) };
+                    Some((il, v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>()))
+                })
+                .collect();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                for (il, ids) in &rec {
+                    let _ = f.write_all(&il.to_le_bytes());
+                    for x in ids { let _ = f.write_all(&x.to_le_bytes()); }
+                }
+            }
         }
         unsafe { (*self.dump_list.get()).clear(); }
     }

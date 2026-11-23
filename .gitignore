@@ -1,2 +1,5 @@
 /target
 opt/rexl3/exl3-src
+# kbench built binaries (keep sources + ids)
+opt/kbench/probe_*
+opt/kbench/kb_*

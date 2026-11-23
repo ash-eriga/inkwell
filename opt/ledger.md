@@ -61,3 +61,93 @@
   → bound shifts further from instr to dependent-chain latency (18 windows ×
   stage→sync→compute→sync).
 - Rejected same session: y=32 fixed (nu>32 incorrect), sx-hoist (bug).
+
+## 2026-11-23 (sessão 4 — retomada por agente novo, HEAD ec940d9)
+Baseline própria (apps de desktop ligados, `opt/spec_bench.sh`, medianas):
+- serial K=25, 48 tok: **88.1 / 89.1 ms/tok (≈11,3 TPS)** — mais rápido que o "~97" do
+  handoff; a régua do spec é (verify+draft)/emit < 88 ms.
+- spec K=4 (handoff cmd), ANTES do fix abaixo: 4.5 / 4.5 / 5.7 TPS, emit 2.8-3.7,
+  verify ~580 ms, draft ~48 ms. 1ª run morreu com OOM no graph instantiate (cache
+  come VRAM até sobrar 126 MiB; margin 50 é pouco) — flake conhecido.
+
+### BUG FIX: anchor do spec processado em pos+1 (commit seguinte)
+- `INKWELL_SPEC=mtp` chamava `step_block(&vtok, c)` com `c = pos + 1`, mas o anchor
+  fica em `pos` (frame do VTEST, do path n-gram e do `Mtp::cycle`). Resultado: o token
+  anchor entrava DUAS vezes ("capital of of the Netherlands") e o texto do spec
+  divergia do serial no 1º token (" the Netherlands..." vs " Japan is Tokyo..."),
+  terminando em loop "Ireland is Dublin ×3".
+- Fix: `c = pos`. Depois: 38/39 linhas de verify == serial-96; texto do spec == serial
+  (" Japan is Tokyo. The capital of China is Beijing...").
+- Aceitação REAL do drafter neste prompt (pós-fix): **21% / 2,45 tok/round** (antes
+  "26-38%" medido no contexto corrompido — número inflado).
+
+### VTEST8 (harness novo, `INKWELL_VTEST8=1`): bloco de 8 tokens vs serial
+A cada passo serial roda `step_block` sobre os 8 tokens recém-processados (conv
+snapshotted 8 passos antes) e compara as 8 linhas com os logits seriais:
+- 96 passos → **712 linhas, 0 divergências de argmax**, max|d| típico 1e-4…1e-3.
+- MAO: max|d| salta p/ **1,2-1,4** nas linhas logo após tokens raros ("C" de
+  "Washington, D.C.") e decai em ~6 tokens. Não é bug de bloco (argmax igual): é
+  fp-chaos — um near-tie discreto interno (provável router top-8) vira com ruído de
+  1e-4. Consequência: o spec pode divergir do serial quando o top-1 do serial tem
+  margem < ~0,2 (visto 1×: " Canada"→" Mexico", marginais a 0,15). Aceitável.
+
+### PERFIL REAL DO VERIFY (nsys, `--cuda-graph-trace=node`, 12 blocos)
+Janela ≈ 498 ms, **GPU 98% busy** (não é gap de host). Por bloco:
+| kernel | ms | % | chamadas | média |
+|---|---|---|---|---|
+| gemv_moe_ntok | 358 | 73,5% | 96 | 3,73 ms |
+| gemv_dp4a_ntok (denso) | 47 | 9,6% | 283 | 166 µs |
+| had_in_moe + had_out_moe | 16,3 | 3,3% | 192 | 104 / 65 µs |
+| had_in/out densos | 12,1 | 2,5% | 4528 | 2-3 µs |
+| swarm (sgemm, concat, bcast, cpy, conv, attn…) | ~54 | 11% | ~13000 | 2-13 µs |
+Entre blocos: ~85 ms (45 ms de kernel: 7× unembed do draft a 1,7 ms + ctx; ~40 ms host).
+
+### CORREÇÃO DO HANDOFF: união real é ~28, não ~12
+`INKWELL_DUMP_IDS` (novo) gravou os ids de roteamento reais de 15 blocos: união por
+visita **min 13 / mediana 28 / máx 44** (média 28,4). O "nu ≈ 8-18 (mediana ~12)" do
+handoff estava errado. Consequências:
+- gemv_moe_ntok lê ~2,8 GB por bloco (não 1,15 GB): VRAM 3,2 GB/s efetivos no geral;
+  por camada: VRAM-residentes 4,3 ms/visita (~54 MiB → 12,6 GB/s = 8% da VRAM),
+  pinned 10-15 ms/visita (~4,5 GB/s de PCIe).
+- **O verify faz MAIS trabalho de MoE por token emitido que o serial**: 10,7 G pesos
+  / 2,45 tok = 4,4 G por token vs 3,05 G do serial (744 MB). A dedup da união só
+  poupa 2,3× (28 de 64 seleções), e o emit é 2,45.
+- Pisos: decode ≈ 7 instr/peso → ~10 µs por matriz a 100% de issue; PCIe das 21
+  visitas pinned ≈ 1,14 GB ≈ 104 ms/bloco. Logo gemv_moe_ntok tem piso ~130-150 ms
+  (não ~55): headroom ~2,4×, não 6×.
+- Especulação só vence o serial com kernel no piso E emit ≥ ~2,6 E resto do bloco
+  (denso+swarm+host+draft, hoje ~185 ms) cortado para ≤ ~70 ms.
+
+### Amostra pós-fix + aceitação em outros prompts (apps ligados)
+- spec fixpos K=4, 4 runs: **4.3 / 3.5 / 3.5 / 3.3 TPS (mediana 3,5)**, emit 2,58/2,04/2,00/1,92,
+  verify ~530 ms, draft ~45 ms, golden ok em 4/4. (A aceitação depende de quais capitais aparecem.)
+- aceitação por prompt (1 run cada, GENS=48/SPEC_GENS=64): prosa 12% / 1,86 tok/round; código 20% /
+  2,39; texto técnico 9% / 1,64. **Baixa em qualquer prompt** — não é artefato do prompt de capitais.
+- Referência do próprio autor do drafter (`~/megakernel-zoo/.../engine/ngram.py:7`): "tokens per
+  cycle 2.74 -> 3.09 (com n-gram)". Nosso 2,0-2,6 está na mesma ordem; o "vLLM 4.34" não é comparável.
+  Conclusão: emit satura em ~2,4-3,1; não há 2× escondido no drafter.
+
+### Crescimento da união por nº de linhas do bloco (ids reais, 384 visitas)
+| linhas | união média | % de 8 | emit estimado |
+|---|---|---|---|
+| 2 | 12,9 | 45% | ~1,75 |
+| 3 | 16,6 | 58% | ~2,10 |
+| 4 | 20,0 | 70% | ~2,25 |
+| 8 | 28,4 | 100% | ~2,4 |
+P(1º draft aceito)=75%, continuação ~18%: emit satura em k=3-4. O bloco de 8 linhas paga 2×
+pelo MoE e 4× pelo denso/swarm para +10% de emit. **Bloco de 2-4 linhas é a alavanca
+estrutural** (exige NT variável: hoje NT=8 fixo em kernels + runner).
+
+### Custo real da decodificação EXL3 no Pascal (opt/kbench/probe_decode.cu)
+Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8 (nc=8)**.
+- Variantes "2 XMAD", "shifts 32-bit", "conversão magic-number": 4,5-5,0 → nenhuma domina.
+- ~17 instruções/peso a 4,6 ciclos = **3,7 IPC de 4**: o kernel é limitado por CONTAGEM de
+  instruções emitidas, não por XMAD, pipe XU, latência ou VRAM.
+- SASS do laço interno: por peso LDS,LDS,SHF,LOP3,XMAD,XMAD.MRG,XMAD.PSL,IDP,I2F (9); por
+  consumidor a cada 8 pesos: 2×LDS.128 + 8 FFMA + 7 FADD (Σx redundante) = 17.
+- Device: smem 48 KB/bloco (96 KB/SM), L2 1,5 MB → LUT de 64 KB em smem não existe aqui.
+- Nota: `dp4a(p, 1s, 0x4B000000)` devolve bits do float de bytesum, mas usar o float "mágico"
+  direto no FMA introduz erro ~6e-4 (arredonda x·2^23) → NÃO usar; I2F fica.
+- Piso com dieta de instruções (~7 instr/peso decode + 1,25/consumidor, 3,7 IPC): por bloco
+  MoE-VRAM ≈ 33 ms (hoje 113), denso ntok-8 ≈ 25 ms (47), unembed ≈ 6 (11), MoE-pinned
+  ≈ 104 ms (PCIe; hoje 254). GEMVs 425 → ~168 ms.
