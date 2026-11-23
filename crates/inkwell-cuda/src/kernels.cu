@@ -1693,7 +1693,10 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     const int tkc = (tk + gridDim.y - 1) / gridDim.y;
     const int tk0 = blockIdx.y * tkc;
     const int tk1 = min(tk0 + tkc, tk);
-    float s = 0.f;
+    // dec(i) is affine in bytesum: t = KINV*Σ xh*bs + (1024*KINV+KBIAS)*Σ xh
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    float s = 0.f, sx = 0.f;
     for (int tk_i = tk0; tk_i < tk1; ++tk_i) {
         if (threadIdx.x < 16) xhs[c] = xh[tk_i * 16 + c];
         if (live) {
@@ -1708,12 +1711,15 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
             for (int r = 0; r < 16; ++r) {
                 const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
                             | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                s += xhs[r] * exl3_mul1(exl3_window(rg, i, ka, halfk));
+                const int bs = (int)__dp4a(exl3_window(rg, i, ka, halfk) * 0x83DCD12Du,
+                                           0x01010101u, 0u);
+                s += xhs[r] * (float)bs;
+                sx += xhs[r];
             }
         }
         __syncthreads();
     }
-    if (live) t[blockIdx.y * (tn * 16) + tn_i * 16 + c] = s;
+    if (live) t[blockIdx.y * (tn * 16) + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
 }
 
 __global__ void inkwell_exl3_gemv_dp4a_dbg(const uint32_t* __restrict__ trel,
@@ -1824,7 +1830,10 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
     __shared__ float xhs[16];            // same xh slice for all 4 tiles
     __shared__ uint32_t rings[4 * 80];
-    float s = 0.f;
+    // dec(i) is affine in bytesum (see gemv_dp4a): t = KINV*Σ xh*bs + KOFF*Σ xh
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    float s = 0.f, sx = 0.f;
     const bool live = tn_i < tn;
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
         if (threadIdx.x < 16) xhs[c] = xh[slot * k + tk_i * 16 + c];
@@ -1840,12 +1849,15 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
             for (int r = 0; r < 16; ++r) {
                 const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
                             | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                s += xhs[r] * exl3_mul1(exl3_window(rg, i, ka, halfk));
+                const int bs = (int)__dp4a(exl3_window(rg, i, ka, halfk) * 0x83DCD12Du,
+                                           0x01010101u, 0u);
+                s += xhs[r] * (float)bs;
+                sx += xhs[r];
             }
         }
         __syncthreads();
     }
-    if (live) t[slot * n + tn_i * 16 + c] = s;
+    if (live) t[slot * n + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
 }
 
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
