@@ -2283,16 +2283,17 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         int* __restrict__ tag, int* __restrict__ map, int* __restrict__ miss,
         int* __restrict__ cnt, int nslots, int k,
         const int* __restrict__ ptag, const int* __restrict__ pready,
-        int* __restrict__ pf_hit, const int* __restrict__ pnexp) {
+        int* __restrict__ pf_hit, const int* __restrict__ pnexp,
+        int key_base, int force_direct) {
     // LFU eviction: cnt[e] counts uses; the least-used resident is evicted.
     // pf_hit[0]=bank hits, pf_hit[1]=real misses (filled via serial ccopy)
     if (threadIdx.x != 0) return;
     if (pnexp) nslots = *pnexp;
     const int pf = pready ? *pready : 0;
-    int claimed = 0;
+    unsigned long long claimed = 0;
     // pass 1: hits (and prefetch-bank hits) — never evict slots needed now
     for (int s = 0; s < nslots; ++s) {
-        const int e = ids[s];
+        const int e = ids[s] + key_base;
         ++cnt[e];
         int v = -1;
         for (int j = 0; j < k; ++j) if (tag[j] == e) { v = j; break; }
@@ -2304,7 +2305,7 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         if (v >= 0) {
             miss[s] = 0;
             map[s] = v;
-            if (v < k) claimed |= 1 << v;
+            if (v < k) claimed |= 1ULL << v;
         } else {
             miss[s] = 1;
             map[s] = -1;
@@ -2313,20 +2314,20 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
     // pass 2: evict the least-used unclaimed resident for each miss
     for (int s = 0; s < nslots; ++s) {
         if (!miss[s]) continue;
-        const int e = ids[s];
+        const int e = ids[s] + key_base;
         int best = -1, bestc = 0x7fffffff;
         for (int j = 0; j < k; ++j) {
-            if (claimed & (1 << j)) continue;
-            const int c = cnt[tag[j]];
+            if (claimed & (1ULL << j)) continue;
+            const int t2 = tag[j];
+            const int c = (t2 < 0) ? 0 : cnt[t2];
             if (c < bestc) { bestc = c; best = j; }
         }
-        if (best < 0) {
-            // no free slot (nslots > k): stream this expert's host descriptors
+        if (best < 0 || force_direct) {
             map[s] = EXL3_DIRECT;
             continue;
         }
         const int v = best;
-        claimed |= 1 << v;
+        claimed |= 1ULL << v;
         tag[v] = e;
         map[s] = v;
         if (pf_hit) atomicAdd(pf_hit + 1, 1);
@@ -2528,7 +2529,8 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const cudaStream_t st = (cudaStream_t)stream;
     inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
         (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
-        (const int*)ptag, (const int*)pready, pf_hit, nullptr);
+        (const int*)ptag, (const int*)pready, pf_hit, nullptr, 0,
+        getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0);
     static cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     static cudaStream_t ss = nullptr;
     {
@@ -2866,7 +2868,7 @@ extern "C" void ink_launch_exl3_moe_ntok(
     int* uids, int* eids, int* euni, int* etok, int* estart, int* epos, int* unexp,
     void* cache, int* tag, int* map, int* miss, int* cnt, int k, int64_t slot_proj,
     void* sdescs_g, void* sdescs_u, void* sdescs_d,
-    int on_dev, void* stream) {
+    int on_dev, void* stream, int key_base) {
     const cudaStream_t st = (cudaStream_t)stream;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     const bool cached = cache != nullptr;
@@ -2901,7 +2903,8 @@ extern "C" void ink_launch_exl3_moe_ntok(
     const uint64_t* D = (const uint64_t*)sdescs_d;
     if (cached) {
         inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(uids,
-            tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr, unexp);
+            tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr, unexp,
+            key_base, getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0);
         inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 1), 32, 0, st>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
@@ -2926,18 +2929,19 @@ extern "C" void ink_launch_exl3_moe_ntok(
     if (dbg) { cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok pre-gu err=%d\n", (int)e); }
     if (dbg == 2) return;
     if (cached) {
+        // hits first: resident already, gemv overlaps the miss bulk copy on ss
+        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
+            2 * NG, KG, miss, 2, euni, etok);
+        if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin2 err=%d\n", (int)cudaGetLastError()); }
+        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2, unexp);
+        cudaStreamWaitEvent(st, ev_join, 0);
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, miss, 1, euni, etok);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin1 err=%d\n", (int)cudaGetLastError()); }
         inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
             (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 1, unexp);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  gemv1 err=%d\n", (int)cudaGetLastError()); }
-        cudaStreamWaitEvent(st, ev_join, 0);
-        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
-            2 * NG, KG, miss, 2, euni, etok);
-        if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin2 err=%d\n", (int)cudaGetLastError()); }
-        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
-            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2, unexp);
     } else {
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, nullptr, 0, euni, etok);

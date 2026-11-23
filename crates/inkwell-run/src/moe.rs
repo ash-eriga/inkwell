@@ -444,6 +444,28 @@ pub fn moe_cb_exl3_addr() -> usize {
     moe_cb_exl3 as usize
 }
 
+/// Global VRAM expert pool shared by all layers' verify (ntok) calls:
+/// keys are (a.layer*128 + expert id) so hot experts persist across layers
+/// and rounds. Enabled via INKWELL_MOE_POOL=<slots> (default 64, cap 64).
+static MOE_POOL: OnceLock<Option<Exl3Cache>> = OnceLock::new();
+
+fn moe_pool() -> Option<&'static Exl3Cache> {
+    MOE_POOL.get_or_init(|| {
+        let pk: usize = std::env::var("INKWELL_MOE_POOL").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(0).min(64);
+        if pk == 0 { return None; }
+        let buf = cu::DevBuf::try_new_bytes(pk * 3 * EXL3_STAGE_PROJ)?;
+        let tag = cu::DevBuf::new_bytes(pk * 4);
+        tag.write_bytes_async(&vec![0xFFu8; pk * 4]);
+        let cnt = cu::DevBuf::new_bytes(128 * 64 * 4);
+        cnt.write_bytes_async(&[0u8; 128 * 64 * 4]);
+        eprintln!("exl3 global pool: k={pk} ({:.0} MiB)",
+            pk as f64 * 3.0 * EXL3_STAGE_PROJ as f64 / 1e6);
+        Some(Exl3Cache { buf, tag, cnt, k: pk as i32,
+            slot: EXL3_STAGE_PROJ, prefetch: None })
+    }).as_ref()
+}
+
 /// Verify-path expanded scratch: 64 (expert,consumer) slots.
 struct VScratch {
     xh_e: Mutex<cu::DevBuf>,   // [64][2304]
@@ -498,11 +520,14 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
     let w8 = src(2) as *const f32;
     let out8 = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
     unsafe {
-        let (cache, tag, cnt, k, slot_proj) = if let Some(c) = &a.cache {
+        let (cache, tag, cnt, k, slot_proj, key_base) = if let Some(p) = moe_pool() {
+            (p.buf.dev_ptr(), p.tag.dev_ptr().cast::<i32>(), p.cnt.dev_ptr().cast::<i32>(),
+             p.k, p.slot as i64, a.layer * 128)
+        } else if let Some(c) = &a.cache {
             (c.buf.dev_ptr(), c.tag.dev_ptr().cast::<i32>(), c.cnt.dev_ptr().cast::<i32>(),
-             c.k, c.slot as i64)
+             c.k, c.slot as i64, 0)
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0, 0)
+            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0, 0, 0)
         };
         cu::exl3_moe_ntok_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev,
             x8, ids8, w8, out8,
@@ -524,7 +549,7 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
             st.sdescs_g.lock().expect("sg").dev_ptr(),
             st.sdescs_u.lock().expect("su").dev_ptr(),
             st.sdescs_d.lock().expect("sd").dev_ptr(),
-            a.on_dev);
+            a.on_dev, key_base);
     }
 }
 
