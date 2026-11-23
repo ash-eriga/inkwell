@@ -333,8 +333,8 @@ pub struct Exl3Cache {
     pub buf: cu::DevBuf,
     /// `k` i32 expert ids (init 0xFF).
     pub tag: cu::DevBuf,
-    /// one i32 round-robin counter.
-    pub rr: cu::DevBuf,
+    /// per-expert use counts (i32[128]) for LFU eviction.
+    pub cnt: cu::DevBuf,
     /// slot count; must be ≥ N_SLOTS to keep per-visit slots distinct.
     pub k: i32,
     /// bytes per slot per proj = this layer's max expert blob.
@@ -415,7 +415,7 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
                 c.buf.dev_ptr(), c.tag.dev_ptr().cast(),
                 st.exl3_map.lock().expect("map").dev_ptr().cast(),
                 st.exl3_miss.lock().expect("miss").dev_ptr().cast(),
-                c.rr.dev_ptr().cast(), c.k, c.slot as i64,
+                c.cnt.dev_ptr().cast(), c.k, c.slot as i64,
                 st.sdescs_g.lock().expect("sg").dev_ptr(),
                 st.sdescs_u.lock().expect("su").dev_ptr(),
                 st.sdescs_d.lock().expect("sd").dev_ptr(),

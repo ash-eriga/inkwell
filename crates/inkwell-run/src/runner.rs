@@ -849,10 +849,10 @@ impl Runner {
                 let Some(buf) = inkwell_cuda::DevBuf::try_new_bytes(cbytes) else { continue };
                 let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
                 tag.write_bytes_async(&vec![0xFFu8; ck * 4]);
-                let rr = inkwell_cuda::DevBuf::new_bytes(4);
-                rr.write_bytes_async(&[0u8; 4]);
+                let cnt = inkwell_cuda::DevBuf::new_bytes(128 * 4);
+                cnt.write_bytes_async(&[0u8; 128 * 4]);
                 a.cache = Some(crate::moe::Exl3Cache {
-                    buf, tag, rr, k: ck as i32, slot: a.max_slot,
+                    buf, tag, cnt, k: ck as i32, slot: a.max_slot,
                     prefetch: std::env::var_os("INKWELL_MOE_NOPREFETCH").is_none()
                         .then(|| crate::moe::Exl3Prefetch::new(a.max_slot)).flatten(),
                 });

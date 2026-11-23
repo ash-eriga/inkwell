@@ -270,3 +270,6 @@
 {"ts":"2026-11-23T06:35:04-03:00","config":"timerfix-v2","i":1,"decode_s":833.971397ms,"ms_tok":104.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T06:35:18-03:00","config":"timerfix-v2","i":2,"decode_s":854.361485ms,"ms_tok":106.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T06:35:30-03:00","config":"timerfix-v2","i":3,"decode_s":819.570725ms,"ms_tok":102.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:51:17-03:00","config":"ctl-lfu","i":1,"decode_s":830.284156ms,"ms_tok":103.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:51:30-03:00","config":"ctl-lfu","i":2,"decode_s":790.172293ms,"ms_tok":98.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:51:39-03:00","config":"ctl-lfu","i":3,"decode_s":793.706095ms,"ms_tok":99.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}

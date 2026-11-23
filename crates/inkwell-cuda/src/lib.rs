@@ -48,7 +48,7 @@ extern "C" {
     fn ink_launch_situ_pair(gu: *const f32, sgu: *const f32, hid: *mut f32, beta: f32, lin_beta: f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_exl3_gemv(trel: *const c_void, suh: *const c_void, svh: *const c_void, x: *const f32, y: *mut f32, k: i64, n: i64, ka: i64, halfk: i64, scratch: *mut f32, stream: *mut c_void);
     fn ink_launch_exl3_moe(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, on_dev: i32);
-    fn ink_launch_exl3_moe_cached(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, rr: *mut i32, k: i32, slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, ptag: *const i32, pready: *const i32, bank: *mut c_void, pf_hit: *mut i32);
+    fn ink_launch_exl3_moe_cached(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, cnt: *mut i32, k: i32, slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, ptag: *const i32, pready: *const i32, bank: *mut c_void, pf_hit: *mut i32);
     fn ink_launch_exl3_prefetch2(dg: *const c_void, du: *const c_void, dd: *const c_void,
         hist: *const i32, tag: *const i32, bank: *mut c_void, ptag: *mut i32, pready: *mut i32,
         pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void);
@@ -714,10 +714,10 @@ pub unsafe fn exl3_moe_async(dg: *const c_void, du: *const c_void, dd: *const c_
 pub unsafe fn exl3_moe_cached_async(dg: *const c_void, du: *const c_void, dd: *const c_void,
     ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32,
     w: *const f32, out: *mut f32, nslots: i32,
-    cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, rr: *mut i32, k: i32,
+    cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, cnt: *mut i32, k: i32,
     slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void,
     ptag: *const i32, pready: *const i32, bank: *mut c_void, pf_hit: *mut i32) {
-    unsafe { ink_launch_exl3_moe_cached(dg, du, dd, ids, x, xh, gu, hid, dn, w, out, nslots, stream(), cache, tag, map, miss, rr, k, slot_proj, sdescs_g, sdescs_u, sdescs_d, ptag, pready, bank, pf_hit) };
+    unsafe { ink_launch_exl3_moe_cached(dg, du, dd, ids, x, xh, gu, hid, dn, w, out, nslots, stream(), cache, tag, map, miss, cnt, k, slot_proj, sdescs_g, sdescs_u, sdescs_d, ptag, pready, bank, pf_hit) };
 }
 /// D2D copy of the 8 router ids via a 1-block kernel (capture-safe).
 ///

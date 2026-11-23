@@ -1944,15 +1944,22 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
         }
         if (live) {
             const uint32_t* rg = rings + g * 128;
+            float xr[4][4];
+#pragma unroll
+            for (int b = 0; b < 4; ++b)
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    xr[b][q] = xhb[b][rp + 4 * q];
             for (int b = 0; b < tkn; ++b) {
 #pragma unroll
-                for (int r = rp; r < 16; r += 4) {
+                for (int q = 0; q < 4; ++q) {
+                    const int r = rp + 4 * q;
                     const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
                                 | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
                     const int bs = (int)__dp4a(exl3_window(rg + b * 32, i, ka, halfk) * 0x83DCD12Du,
                                                0x01010101u, 0u);
-                    s += xhb[b][r] * (float)bs;
-                    sx += xhb[b][r];
+                    s += xr[b][q] * (float)bs;
+                    sx += xr[b][q];
                 }
             }
         }
@@ -2056,16 +2063,18 @@ __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
 #define EXL3_DIRECT 0x20000000
 __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         int* __restrict__ tag, int* __restrict__ map, int* __restrict__ miss,
-        int* __restrict__ rr, int nslots, int k,
+        int* __restrict__ cnt, int nslots, int k,
         const int* __restrict__ ptag, const int* __restrict__ pready,
         int* __restrict__ pf_hit) {
+    // LFU eviction: cnt[e] counts uses; the least-used resident is evicted.
     // pf_hit[0]=bank hits, pf_hit[1]=real misses (filled via serial ccopy)
     if (threadIdx.x != 0) return;
-    // Serial: a victim slot must not be one already claimed this visit,
-    // otherwise a miss could overwrite a slot a hit still needs.
     const int pf = pready ? *pready : 0;
+    int claimed = 0;
+    // pass 1: hits (and prefetch-bank hits) — never evict slots needed now
     for (int s = 0; s < nslots; ++s) {
         const int e = ids[s];
+        ++cnt[e];
         int v = -1;
         for (int j = 0; j < k; ++j) if (tag[j] == e) { v = j; break; }
         int m = 0;
@@ -2073,22 +2082,30 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
             for (int p2 = 0; p2 < nslots; ++p2)
                 if (ptag[p2] == e) { v = EXL3_PF_BASE + p2; if (pf_hit) atomicAdd(pf_hit, 1); break; }
         }
-        if (v < 0) {
-            int t = *rr;
-            for (;;) {
-                const int cand = t % k;
-                int used = 0;
-                for (int q = 0; q < s; ++q) if (map[q] == cand) { used = 1; break; }
-                ++t;
-                if (!used) { v = cand; break; }
-            }
-            *rr = t;
-            tag[v] = e;
-            m = 1;
+        if (v >= 0) {
+            miss[s] = 0;
+            map[s] = v;
+            if (v < k) claimed |= 1 << v;
+        } else {
+            miss[s] = 1;
+            map[s] = -1;
         }
-        miss[s] = m;
+    }
+    // pass 2: evict the least-used unclaimed resident for each miss
+    for (int s = 0; s < nslots; ++s) {
+        if (!miss[s]) continue;
+        const int e = ids[s];
+        int best = -1, bestc = 0x7fffffff;
+        for (int j = 0; j < k; ++j) {
+            if (claimed & (1 << j)) continue;
+            const int c = cnt[tag[j]];
+            if (c < bestc) { bestc = c; best = j; }
+        }
+        const int v = best;
+        claimed |= 1 << v;
+        tag[v] = e;
         map[s] = v;
-        if (m && pf_hit) atomicAdd(pf_hit + 1, 1);
+        if (pf_hit) atomicAdd(pf_hit + 1, 1);
     }
 }
 
@@ -2275,13 +2292,13 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                     const int* ids, const float* x,
                                     float* xh, float* gu, float* hid, float* dn,
                                     const float* w, float* out, int nslots, void* stream,
-                                    void* cache, void* tag, void* map, void* miss, void* rr, int k,
+                                    void* cache, void* tag, void* map, void* miss, void* cnt, int k,
                                     int64_t slot_proj,
                                     void* sdescs_g, void* sdescs_u, void* sdescs_d,
                                     const void* ptag, const void* pready, void* bank, int* pf_hit) {
     const cudaStream_t st = (cudaStream_t)stream;
     inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
-        (int*)tag, (int*)map, (int*)miss, (int*)rr, nslots, k,
+        (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
         (const int*)ptag, (const int*)pready, pf_hit);
     inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, st>>>(
         (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
