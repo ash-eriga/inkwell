@@ -403,3 +403,19 @@ NEXT: (a) moe_ntok inner loop efficiency (vectorize tile_base reads — pfb[]
 loads are 4B/thread; try uint4); (b) per-row swarm ~50ms minor; (c) draft att
 residual 0.28 vs oracle — likely bf16-reference rounding; verify by comparing
 draft logits vs reference api.py if needed; (d) kd-adaptive draft len.
+
+## Spec verify = PCIe-bound on expert reads (root cause found)
+- `descs_g/u/d` are host-PINNED descriptor tables (zero-copy); a miss expert's
+  tile_base points into the host weight blob → `gemv_moe_ntok` reads weights
+  over PCIe inline at ~8-10GB/s.
+- Verify union ≈ 60/128 experts PER LAYER × 48 visits ≈ ~4GB over PCIe ≈
+  ~460ms of the ~570ms verify (moe_ntok ~70% of kernel time). Cache_k=4
+  hits almost nothing; K≥8 OOMs (draft+graphs+caches).
+- Structural: serial reads 8 experts/layer/token → same ~4GB per 8 tokens.
+  Spec can only win via (a) expert dedup across rounds in VRAM, or
+  (b) emit ≥ ~6.
+- NEXT LEVER (chosen): GLOBAL expert pool in VRAM (~256-384 slots × ~2MB
+  ≈ 512-768MB) keyed by (layer,expert), shared across all layers+rounds —
+  replaces per-layer k=4 caches during spec. Expected hit ~40-60% →
+  verify ~300-400ms → spec ≈ breakeven at emit 5, wins at 6.
+- Serial path stays on per-layer caches (K=25 optimal there).
