@@ -314,3 +314,10 @@ Ledger histórico: subtrair ~35ms de tudo.
   kernel de gather), e mapear expert→desc (descs_* pinned já indexa por
   expert id). ~30-60 experts únicos vs 64 leituras → ~2x no gemv_moe.
   DEPOIS: cuda-graph do step_block (mesma maquinaria chunked do step()).
+- MATH spec p/ MoE-Inkling (revisto): união de experts ~40-60/128 por 8
+  tokens → moe reads ~300MB/token (vs 422 serial) = só ~12-18ms/token de
+  economia. verify-8 807ms ≈ 8×97: per-token ops são o custo, não há o
+  3×-por-leitura que o LFM denso teve (todo peso compartilhado lá).
+  Spec ainda paga SE verify < ~500ms E drafter acertar ~4+/8.
+  Levers restantes p/ verify: cuda-graph do bloco (overhead ~13ms×?),
+  batch conv/attn/router por token (small ops ×8 serializam).
