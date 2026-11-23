@@ -40,3 +40,16 @@
 ### Environment gotchas
 - GGML_GDBG=1 prints per-call graph decision (use_graph/upd_req/nodes).
 - GDBG shows serial=6958 nodes use_graph=1; block=26928 nodes.
+
+## 2026-11-23 — global pool experiment + PCIe floor verdict (7fbe1c4)
+- Implemented global expert pool (INKWELL_MOE_POOL=N): resolve+claim keyed
+  by (arch*128+uid). Fixed pass2 tag missing key_base + cnt[-1] OOB.
+- RESULT: pool k=24-32 → verify ~576ms UNCHANGED. Why: union needs ~55
+  experts/layer-visit × 48 visits ≈ ~2600 distinct keys/round (~5.9GB) —
+  a 24-192-slot pool covers <8% → ~0 effective hits. Pool OOMs >32 anyway.
+- VRAM during spec: only ~218MiB free — no room for meaningful residency.
+- FLOOR: verify ≈ 5.9GB expert bytes / ~10GB/s PCIe ≈ ~570ms, irreducible
+  while experts live in host memory. Spec needs emit≥6.3 to beat serial;
+  drafter tops ~4.3-5.3 → spec is structurally bounded ~5-6 tok/s.
+- Kernel-level: miss-gemv ran before ev_join (phase-order race fixed) —
+  kept for correctness, no perf change.

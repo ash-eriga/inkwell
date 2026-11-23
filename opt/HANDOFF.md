@@ -419,3 +419,12 @@ draft logits vs reference api.py if needed; (d) kd-adaptive draft len.
   replaces per-layer k=4 caches during spec. Expected hit ~40-60% →
   verify ~300-400ms → spec ≈ breakeven at emit 5, wins at 6.
 - Serial path stays on per-layer caches (K=25 optimal there).
+
+## Spec verdict: PCIe-bound, cannot beat serial on this model+GPU
+Verify ≈ union ~55 experts × ~2.25MB × 48 visits ≈ 5.9GB over ~10GB/s PCIe
+≈ ~570ms — the byte count is the wall, not the kernel. A VRAM pool can't
+cover the working set (~218MiB free). Spec floor ≈ (430+draft)/emit; even
+perfect accept (emit 8) only reaches ~76ms/tok; realistic emit ~3-4.3 loses
+to serial 97. Options forward: (a) serial-side expert-byte cuts (~48ms of
+the 97 is the same PCIe wall — hot-static residency ~200MB ≈ ~5%), (b) lazy
+verify (~140ms/tok floor — still loses), (c) call spec done mechanically.
