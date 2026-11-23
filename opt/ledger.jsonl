@@ -302,3 +302,30 @@
 {"ts":"2026-11-23T07:27:42-03:00","config":"dp4a-widx","i":2,"decode_s":802.624183ms,"ms_tok":100.3,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T07:27:55-03:00","config":"dp4a-widx","i":3,"decode_s":783.284618ms,"ms_tok":97.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T07:28:07-03:00","config":"dp4a-widx","i":4,"decode_s":749.46674ms,"ms_tok":93.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:39:05-03:00","config":"control-a","i":1,"decode_s":752.636113ms,"ms_tok":94.1,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:39:18-03:00","config":"control-a","i":2,"decode_s":742.162589ms,"ms_tok":92.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:41:45-03:00","config":"ablate-window","i":1,"decode_s":798.301565ms,"ms_tok":99.8,"golden":"no","text":"hitaEnceladus束Prueba씜frayChardonnay Genel"}
+{"ts":"2026-11-23T07:41:59-03:00","config":"ablate-window","i":2,"decode_s":692.846813ms,"ms_tok":86.6,"golden":"no","text":"hitaEnceladus束Prueba씜frayChardonnay Genel"}
+{"ts":"2026-11-23T07:42:09-03:00","config":"ablate-window","i":3,"decode_s":745.292049ms,"ms_tok":93.2,"golden":"no","text":"hitaEnceladus束Prueba씜frayChardonnay Genel"}
+{"ts":"2026-11-23T07:43:09-03:00","config":"pingpong","i":1,"decode_s":783.772941ms,"ms_tok":98.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:43:23-03:00","config":"pingpong","i":2,"decode_s":786.957295ms,"ms_tok":98.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:43:36-03:00","config":"pingpong","i":3,"decode_s":755.965537ms,"ms_tok":94.5,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:43:47-03:00","config":"pingpong","i":4,"decode_s":781.364243ms,"ms_tok":97.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:54:09-03:00","config":"ccopy-overlap","i":1,"decode_s":784.463897ms,"ms_tok":98.1,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:54:21-03:00","config":"ccopy-overlap","i":2,"decode_s":798.885779ms,"ms_tok":99.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:54:33-03:00","config":"ccopy-overlap","i":3,"decode_s":807.760093ms,"ms_tok":101.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:54:45-03:00","config":"ccopy-overlap","i":4,"decode_s":801.960528ms,"ms_tok":100.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:55:20-03:00","config":"ccopy-overlap","i":1,"decode_s":789.345253ms,"ms_tok":98.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:55:35-03:00","config":"ccopy-overlap","i":2,"decode_s":798.796458ms,"ms_tok":99.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:55:47-03:00","config":"ccopy-overlap","i":3,"decode_s":765.558373ms,"ms_tok":95.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:55:59-03:00","config":"ccopy-overlap","i":4,"decode_s":788.667452ms,"ms_tok":98.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:56:40-03:00","config":"ccopy-overlap","i":1,"decode_s":742.932911ms,"ms_tok":92.9,"golden":"no","text":"<|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|>"}
+{"ts":"2026-11-23T07:56:56-03:00","config":"ccopy-overlap","i":2,"decode_s":695.298836ms,"ms_tok":86.9,"golden":"no","text":"<|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|>"}
+{"ts":"2026-11-23T07:57:08-03:00","config":"ccopy-overlap","i":3,"decode_s":758.502112ms,"ms_tok":94.8,"golden":"no","text":"<|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|>"}
+{"ts":"2026-11-23T07:57:20-03:00","config":"ccopy-overlap","i":4,"decode_s":750.416678ms,"ms_tok":93.8,"golden":"no","text":"<|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|>"}
+{"ts":"2026-11-23T07:57:32-03:00","config":"ccopy-overlap","i":5,"decode_s":750.485313ms,"ms_tok":93.8,"golden":"no","text":"<|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|><|content_invoke_tool_text|>"}
+{"ts":"2026-11-23T07:58:23-03:00","config":"ccopy-ovl2","i":1,"decode_s":771.573092ms,"ms_tok":96.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:58:38-03:00","config":"ccopy-ovl2","i":2,"decode_s":772.140123ms,"ms_tok":96.5,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:58:52-03:00","config":"ccopy-ovl2","i":3,"decode_s":751.062965ms,"ms_tok":93.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T07:59:41-03:00","config":"ccopy-ovl2","i":4,"error":"no decode line","tail":"#9  0x00005566186b9795 in main ()|[Inferior 1 (process 59239) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T07:59:58-03:00","config":"ccopy-ovl2","i":5,"decode_s":800.813332ms,"ms_tok":100.1,"golden":"yes","text":" the capital of France.\n\nThe capital"}

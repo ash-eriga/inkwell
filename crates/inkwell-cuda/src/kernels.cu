@@ -2159,7 +2159,8 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
                                        const int64_t slot_proj,
                                        uint64_t* __restrict__ sdescs_g,
                                        uint64_t* __restrict__ sdescs_u,
-                                       uint64_t* __restrict__ sdescs_d) {
+                                       uint64_t* __restrict__ sdescs_d,
+                                       int mode) {
     const int slot = blockIdx.x / 3;
     const int proj = blockIdx.x % 3;
     const int part = blockIdx.y, nparts = gridDim.y;
@@ -2197,9 +2198,13 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
     if (!miss[slot]) return;
     const uint4* s0 = (const uint4*)(uintptr_t)d[0];
     uint4* t0 = (uint4*)dst;
-    const int n0 = (trel_b + suh_b + svh_b) / 16;
+    // mode 1: meta + suh + svh tail (small, main stream — had_in needs suh);
+    // mode 2: trel prefix only (bulk, side stream — gemv joins on it).
+    const int lo_lim = (mode == 1) ? trel_b / 16 : 0;
+    const int hi_lim = (mode == 2) ? trel_b / 16 : (trel_b + suh_b + svh_b) / 16;
+    const int n0 = hi_lim - lo_lim;
     const int chunk = (n0 + nparts - 1) / nparts;
-    const int lo = part * chunk, hi = min(n0, lo + chunk);
+    const int lo = lo_lim + part * chunk, hi = min(hi_lim, lo + chunk);
     for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) t0[i] = s0[i];
 }
 
@@ -2332,11 +2337,30 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
         (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
         (const int*)ptag, (const int*)pready, pf_hit);
-    inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, st>>>(
-        (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
-        ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
-        (uint8_t*)bank, slot_proj,
-        (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
+    static cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
+    static cudaStream_t ss = nullptr;
+    {
+        // meta on the main stream (sdescs only, ~µs); bulk trel copies on the
+        // side stream so they overlap the had_in + their join delays gemv only.
+        if (!ev_fork) {
+            cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming);
+            cudaStreamCreateWithFlags(&ss, cudaStreamNonBlocking);
+        }
+        inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 1), 32, 0, st>>>(
+            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+            ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
+            (uint8_t*)bank, slot_proj,
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1);
+        cudaEventRecord(ev_fork, st);
+        cudaStreamWaitEvent(ss, ev_fork, 0);
+        inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, ss>>>(
+            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+            ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
+            (uint8_t*)bank, slot_proj,
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2);
+        cudaEventRecord(ev_join, ss);
+    }
     const uint64_t* G = (const uint64_t*)sdescs_g;
     const uint64_t* U = (const uint64_t*)sdescs_u;
     const uint64_t* D = (const uint64_t*)sdescs_d;
@@ -2344,6 +2368,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     // gate+up fused in one launch: blockIdx.z selects the descriptor set
     dim3 gin((KG + 511) / 512, nslots, 2);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG);
+    cudaStreamWaitEvent(st, ev_join, 0);
     dim3 gg(NG / 64, nslots, 2);
     inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                              (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND);
