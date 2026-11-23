@@ -250,3 +250,10 @@ Ledger histórico: subtrair ~35ms de tudo.
 - Uncached layers (19-23 at k=25) still use moe_stage serial (~8ms/tok): try routing them through ccopy with tiny cache, or shrink slot to per-proj granularity.
 - Dense gemvs ARE device-resident (exl3_w=145, dev=308MiB) — the 34ms is VRAM latency too, NOT PCIe. PCIe cost = only host expert misses (~15ms).
 - ncu blocked: no sudo/CTRPERM on this box.
+
+## Estado 23-11 ~fim do dia
+- ~96ms/tok (~10.4 TPS) commitado. Breakdown: moe gemv 44ms VRAM-latency, dense gemv 34ms VRAM-latency, copies ~15ms, misc ~8ms.
+- Variance ±30ms entre runs (desktop apps ON) — todo A/B precisa ≥3 samples ou fica ambíguo.
+- IDEIA não testada (maior EV): os 433 launches densos/tok incluem várias projeções pequenas por camada (n=384-3072). Agrupar projeções independentes num único custom op/desc-set (padrão do fused gu+up) corta chains serializadas. Ver runner.rs exl3_w usage e os custom_4d calls ~894/1390.
+- gemv_moe latency ideas esgotadas no formato atual (smem pipeline + prefetch já otimizados; k-split/double-buffer/direct-loads rejeitados).
+- Próximo grande passo teórico: int8 xh → dp4a int8×int8 no inner loop (muda numérica, medir EAR).
