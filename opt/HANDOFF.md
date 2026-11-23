@@ -167,3 +167,11 @@ LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-in
 - Prefetch de experts host-side (side stream, bank/ptag/pready) implementado e correto mas ~neutro: PFSTAT hits ~6/224 visitas — predição fraca. Mantido (machinery pronta).
 - Crashes esporádicos no load = OOM por zumbi ou VRAM apertada; i1 do bench morre às vezes.
 - Próximos: (a) mesmo regpref no had_in/had_out stage loops; (b) fusionar had_out+situ; (c) ccopy serial ainda ~20ms.
+
+## SESSÃO 3d (~131 ms/tok, HEAD 683b4f6)
+- regpref pipeline COMMITADO: ~155→131 mediana.
+- hadamard warp-shuffle (had128_warp): neutro-positive, commitado. g/u had fused z=2 (had_in/had_out), gemv sequencial (fused z=2 quebrava — misterioso).
+- DIRECT misses (sdesc→host zero-copy): ~151ms, PIOR — PCIe streaming no gemv perde pra cópia.
+- tk8 batch: regs demais, 142ms — rejeitado.
+- PFSTAT: ~1-3 misses/visita; bank prefetch ~2% hits — neutro.
+- gemv_moe ~instruction-bound (window+dp4a+fma por elem); DRAM floor é ~10x menor.

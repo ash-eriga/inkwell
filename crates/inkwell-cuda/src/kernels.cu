@@ -1587,7 +1587,8 @@ __device__ __forceinline__ uint32_t exl3_window(const uint32_t* __restrict__ rin
     const int nw = r_bits >> 5;
     const int i0 = b0 >> 5;
     const int s0 = 48 - (b0 & 31);
-    const uint64_t v = ((uint64_t)ring[i0] << 32) | (uint64_t)ring[(i0 + 1) % nw];
+    const int i1 = (i0 + 1 == nw) ? 0 : i0 + 1;
+    const uint64_t v = ((uint64_t)ring[i0] << 32) | (uint64_t)ring[i1];
     return (uint32_t)(v >> s0) & 0xffffu;
 }
 
