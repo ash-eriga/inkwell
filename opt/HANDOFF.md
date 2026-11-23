@@ -447,3 +447,14 @@ verify (~140ms/tok floor — still loses), (c) call spec done mechanically.
 - spec ~3.4-5.1 tok/s, accept 21-50%; serial ~97ms (~10.3 TPS)
 - TO WIN: need verify ~300ms AND emit ~4.3 → gemv inner-loop rewrite is THE
   lever (cut instr/MAC ~2x or pre-decode trellis→fp16 then plain FMA gemv)
+
+## 2026-11-23 late3 — uint4+float4 commit (19def96) + next target found
+- verify ~534-613ms (was ~580-650). spec ~3.6-4.0 tok/s.
+- NEXT TARGET (untried, clean): `had_in_moe`/`had_out_moe` read `suh`/`svh`
+  tables via HOST desc pointers EVERY visit — small per-expert scale vectors
+  (~2-4KB) re-fetched over PCIe 48×/round. If expert staging (cache_resolve
+  /ccopy) already copies the blob, point descs at device copies; else stage
+  suh/svh once into VRAM (~1.5MB total for 128 experts × 3 projs). Could be
+  part of the ~140ms 'had' cost AND gemv's PCIe latency chains.
+- Also unexplained: err=900 flaky crashes ONLY under MNTOK_DBG=6 runs
+  (event timing?). Non-dbg runs stable. Watch when instrumenting.
