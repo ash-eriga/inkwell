@@ -189,3 +189,18 @@ ccopy 19ms (25×~750µs), stage 8.2ms (6×1.37ms), pcopy ~2ms, mul_mat_vec 6ms, 
 - Próximos alvos por payoff: (1) cópias PCIe 29ms — menos misses (pin quente) OU cópia mais rápida (>2.6GB/s);
   (2) gemv_moe 47.6ms instr-bound; (3) 13ms host build/token (ggml sched — difícil); (4) ~4ms graphLaunch (293µs×14).
 - Rejeitado: ccopy nparts 16→32 / 256thr (~155ms — sem ganho; PCIe já satura).
+
+## PRÓXIMAS ALAVANCAS (ordem de payoff)
+1. **Unir os 14 graph chunks em 1-2** (~13ms host gaps + ~4ms launch): o callback moe_cb_exl3 já emite
+   tudo device-side (resolve+ccopy+gemv+had+wsum); a quebra é do lado ggml (nó host/custom-op por visita
+   + readback logits). Estudar ink_sched em crates/inkwell-ggml para fazer a op MoE "stream-capturable"
+   ou fundir visitas num único nó custom por camada.
+2. **gemv_moe 47.6ms** instr-bound: variantes fracassaram por regs. Tentar: 2 tiles/blockDim=512 com
+   smem xhb compartilhado (metade dos blocos, mesma lógica); ou descarte antecipado de pfb words nulos.
+3. **dp4a 33.6ms** (433 launches): split-K já divide; testar maxrregcount local p/ subir occupancy.
+4. **ccopy 19ms**: já pinned; mais paralelismo não ajudou (testado 32×256 ~155ms). Caminho: menos misses
+   (warm cache com experts mais quentes por camada no load — hist já existe em moe.rs) ou K>16 nas
+   camadas de maior miss (VRAM margin ~100MiB → talvez +1-2 slots em 2-3 camadas).
+5. **13ms build/token**: ggml graph build em step() — custo fixo; reduzir via ctx reuse mais agressivo
+   seria projeto grande; deixar por último.
+Mediana atual ~128ms. Meta 15 TPS = 66.7. Alvo 33.
