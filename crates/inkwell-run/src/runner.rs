@@ -854,7 +854,7 @@ impl Runner {
                 cnt.write_bytes_async(&[0u8; 128 * 4]);
                 a.cache = Some(crate::moe::Exl3Cache {
                     buf, tag, cnt, k: ck as i32, slot: a.max_slot,
-                    prefetch: std::env::var_os("INKWELL_MOE_NOPREFETCH").is_none()
+                    prefetch: std::env::var_os("INKWELL_MOE_PREFETCH").is_some()
                         .then(|| crate::moe::Exl3Prefetch::new(a.max_slot)).flatten(),
                 });
                 eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED free={}MiB",
