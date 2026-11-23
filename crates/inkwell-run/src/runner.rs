@@ -844,7 +844,7 @@ impl Runner {
                 if a.on_dev || a.max_slot == 0 { continue; }
                 let cbytes = ck * 3 * a.max_slot;
                 let (f, _) = inkwell_cuda::mem_info();
-                if f <= cbytes + (190usize << 20) { continue; }
+                if f <= cbytes + (100usize << 20) { continue; }
                 let Some(buf) = inkwell_cuda::DevBuf::try_new_bytes(cbytes) else { continue };
                 let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
                 tag.write_bytes_async(&vec![0xFFu8; ck * 4]);
