@@ -2669,11 +2669,19 @@ __global__ void inkwell_exl3_union_expand(
     sh_cnt[e] = cnt;
     __syncthreads();
     if (e == 0) {
+        // Split experts with >8 consumers into multiple union entries so the
+        // gemv's per-slot consumer arrays (xhb[8], s[8]) never overflow.
         int off = 0, nu = 0;
         for (int i = 0; i < 128; ++i) {
+            int c = sh_cnt[i];
             sh_start[i] = off;
-            if (sh_cnt[i]) { uids[nu] = i; sh_uidx[i] = nu; estart[nu] = off; ++nu; }
-            off += sh_cnt[i];
+            sh_uidx[i] = nu;
+            while (c > 0) {
+                const int take = min(8, c);
+                uids[nu] = i;
+                estart[nu] = off;
+                ++nu; off += take; c -= take;
+            }
         }
         for (int i = nu; i <= 64; ++i) estart[i] = 64;
         for (int i = nu; i < 64; ++i) { eids[i] = 0; euni[i] = 0; etok[i] = 0; }
@@ -2684,7 +2692,7 @@ __global__ void inkwell_exl3_union_expand(
         int p = sh_start[e];
         for (int s = 0; s < 64; ++s) {
             if (ids8[s] == e) {
-                eids[p] = e; euni[p] = sh_uidx[e]; etok[p] = s >> 3; epos[s] = p;
+                eids[p] = e; euni[p] = sh_uidx[e] + (p - sh_start[e]) / 8; etok[p] = s >> 3; epos[s] = p;
                 ++p;
             }
         }
@@ -2804,6 +2812,7 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
                     const uint32_t w16 = (uint32_t)(v >> (wi >> 12)) & 0xffffu;
                     const int bs = (int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
 #pragma unroll
+#ifndef MNTOK_NOCOMP
                     for (int c2 = 0; c2 < 8; ++c2) {
                         if (c2 < nc) {
                             const float xr = xhb[c2][b][rp + 4 * q];
@@ -2811,6 +2820,7 @@ __global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
                             sx[c2] += xr;
                         }
                     }
+#endif
                 }
             }
         }

@@ -10,6 +10,7 @@ fn main() {
     let src = Path::new("src/kernels.cu");
 
     println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-env-changed=INKWELL_NVCC_DEFS");
     let obj = format!("{out}/kernels.o");
     let status = Command::new(&nvcc)
         .args([
@@ -18,6 +19,7 @@ fn main() {
             "-gencode", "arch=compute_61,code=sm_61",
             "-c", &src.to_string_lossy(), "-o", &obj,
         ])
+        .args(std::env::var("INKWELL_NVCC_DEFS").map(|d| d.split(',').map(|x| format!("-D{}", x)).collect::<Vec<_>>()).unwrap_or_default())
         .status()
         .expect("nvcc");
     assert!(status.success(), "nvcc failed");
