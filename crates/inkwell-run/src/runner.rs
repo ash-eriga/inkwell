@@ -1736,29 +1736,30 @@ impl Runner {
         }
         fcur = self.norm(fcur, l.ffn_norm.expect("ffn_norm"));
 
-        // MoE per token (router on slices)
+        // MoE: batched router for 8 tokens + union-batched expert chain
+        let logits8 = t::mmq(c, l.ffn_gate_inp.expect("g"), fcur); // [128, 8]
+        let probs8 = t::sigmoid(c, logits8);
+        let sel8 = t::add(c, probs8, l.ffn_exp_probs_b.expect("pb"));
+        let ids8v = t::argsort_top_k(c, sel8, 8); // view — make contiguous
+        let ids8 = t::cont(c, ids8v); // [8, 8] — linear dst[t*8+j]
+        self.dump(&format!("b_ids{il}"), ids8);
+        let probs3 = t::reshape3(c, probs8, 1, 128, 8);
+        let ids3 = t::reshape3(c, ids8, 8, 8, 1); // get_rows: dst[1,8,8] = probs3[0, ids[j,t], t]
+        let weights = t::get_rows(c, probs3, ids3); // [1, 8, 8]
+        let weights2 = t::reshape2(c, weights, 8, 8);
+        let wsum = t::clamp(c, t::sum_rows(c, weights2), 6.103515625e-5, f32::INFINITY);
+        let w8 = t::scale(c, t::div(c, weights2, wsum), self.cfg.expert_weights_scale); // [8, 8]
+        let mi = l.moe_exl3.expect("moe_exl3");
+        let m = &self.moe_args_exl3[mi];
+        let mut args: Vec<*mut std::ffi::c_void> = vec![fcur.0, ids8.0, w8.0];
+        let ffn8 = Ptr(unsafe {
+            inkwell_ggml::custom_4d(c.0, F32, [n_embd, NT as i64, 1, 1], &mut args,
+                crate::moe::moe_cb_exl3_ntok_addr(), (&**m as *const crate::moe::MoeArgsExl3).cast_mut().cast())
+        });
         let mut fouts: Vec<Ptr> = Vec::with_capacity(NT);
         for j in 0..NT {
-            let fcur_j = self.tokslice(c, fcur, n_embd, j as i64);
-            let logits = t::mmq(c, l.ffn_gate_inp.expect("g"), fcur_j);
-            let probs = t::sigmoid(c, logits);
-            let sel = t::add(c, probs, l.ffn_exp_probs_b.expect("pb"));
-            let ids = t::argsort_top_k(c, sel, 8);
-            self.dump(&format!("b_ids{il}t{j}"), ids);
-            let probs3 = t::reshape3(c, probs, 1, 128, 1);
-            let mut weights = t::get_rows(c, probs3, ids);
-            let weights2 = t::reshape2(c, weights, 8, 1);
-            let wsum = t::clamp(c, t::sum_rows(c, weights2), 6.103515625e-5, f32::INFINITY);
-            weights = t::reshape3(c, t::div(c, weights2, wsum), 1, 8, 1);
-            let weights3 = t::scale(c, weights, self.cfg.expert_weights_scale);
-            let mi = l.moe_exl3.expect("moe_exl3");
-            let m = &self.moe_args_exl3[mi];
-            let mut args: Vec<*mut std::ffi::c_void> = vec![fcur_j.0, ids.0, weights3.0];
-            let ffn_out = Ptr(unsafe {
-                inkwell_ggml::custom_4d(c.0, F32, [n_embd, 1, 1, 1], &mut args,
-                    crate::moe::moe_cb_exl3_addr(), (&**m as *const crate::moe::MoeArgsExl3).cast_mut().cast())
-            });
-            fouts.push(self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, &mut Vec::new()));
+            let fj = self.tokslice(c, ffn8, n_embd, j as i64);
+            fouts.push(self.convolve(fj, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, &mut Vec::new()));
         }
         let fcur = self.cat8(c, &fouts);
         let out = t::add(c, ffn_inp, fcur);

@@ -443,3 +443,93 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
 pub fn moe_cb_exl3_addr() -> usize {
     moe_cb_exl3 as usize
 }
+
+/// Verify-path expanded scratch: 64 (expert,consumer) slots.
+struct VScratch {
+    xh_e: Mutex<cu::DevBuf>,   // [64][2304]
+    gu_e: Mutex<cu::DevBuf>,   // [64][2304]
+    hid_e: Mutex<cu::DevBuf>,  // [64][1152]
+    dn_e: Mutex<cu::DevBuf>,   // [64][2304]
+    uids: Mutex<cu::DevBuf>,   // [64] i32
+    eids: Mutex<cu::DevBuf>,   // [64] i32
+    euni: Mutex<cu::DevBuf>,   // [64] i32
+    etok: Mutex<cu::DevBuf>,   // [64] i32
+    estart: Mutex<cu::DevBuf>, // [65] i32
+    epos: Mutex<cu::DevBuf>,   // [64] i32
+    unexp: Mutex<cu::DevBuf>,  // [1] i32
+    map: Mutex<cu::DevBuf>,    // [64] i32
+    miss: Mutex<cu::DevBuf>,   // [64] i32
+}
+
+static VSCRATCH: OnceLock<VScratch> = OnceLock::new();
+
+fn vscratch() -> &'static VScratch {
+    VSCRATCH.get_or_init(|| VScratch {
+        xh_e: Mutex::new(cu::DevBuf::new_bytes(64 * N_EMBD * 4)),
+        gu_e: Mutex::new(cu::DevBuf::new_bytes(64 * N_EMBD * 4)),
+        hid_e: Mutex::new(cu::DevBuf::new_bytes(64 * N_FF * 4)),
+        dn_e: Mutex::new(cu::DevBuf::new_bytes(64 * N_EMBD * 4)),
+        uids: Mutex::new(cu::DevBuf::new_bytes(64 * 4)),
+        eids: Mutex::new(cu::DevBuf::new_bytes(64 * 4)),
+        euni: Mutex::new(cu::DevBuf::new_bytes(64 * 4)),
+        etok: Mutex::new(cu::DevBuf::new_bytes(64 * 4)),
+        estart: Mutex::new(cu::DevBuf::new_bytes(65 * 4)),
+        epos: Mutex::new(cu::DevBuf::new_bytes(64 * 4)),
+        unexp: Mutex::new(cu::DevBuf::new_bytes(4)),
+        map: Mutex::new(cu::DevBuf::new_bytes(64 * 4)),
+        miss: Mutex::new(cu::DevBuf::new_bytes(64 * 4)),
+    })
+}
+
+/// Union-batched MoE callback for the 8-token verify block.
+/// src = [x8 (n_embd×8 f32), ids8 (8×8 i32), w8 (8×8 f32)]; dst = [n_embd, 8].
+#[expect(clippy::cast_ptr_alignment, clippy::too_many_lines, reason = "custom op")]
+unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_void) {
+    let a = unsafe { &*ud.cast::<MoeArgsExl3>() };
+    let st = staging();
+    let v = vscratch();
+    unsafe { cu::set_stream(inkwell_ggml::cuda_stream()) };
+    let src = |i: i32| unsafe {
+        let t = inkwell_ggml::ink_tensor_src(dst, i);
+        inkwell_ggml::ink_tensor_data(t)
+    };
+    let x8 = src(0) as *const f32;
+    let ids8 = src(1) as *const i32;
+    let w8 = src(2) as *const f32;
+    let out8 = inkwell_ggml::ink_tensor_data(dst) as *mut f32;
+    unsafe {
+        let (cache, tag, cnt, k, slot_proj) = if let Some(c) = &a.cache {
+            (c.buf.dev_ptr(), c.tag.dev_ptr().cast::<i32>(), c.cnt.dev_ptr().cast::<i32>(),
+             c.k, c.slot as i64)
+        } else {
+            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0, 0)
+        };
+        cu::exl3_moe_ntok_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev,
+            x8, ids8, w8, out8,
+            v.xh_e.lock().expect("x").dev_ptr().cast(),
+            v.gu_e.lock().expect("g").dev_ptr().cast(),
+            v.hid_e.lock().expect("h").dev_ptr().cast(),
+            v.dn_e.lock().expect("d").dev_ptr().cast(),
+            v.uids.lock().expect("u").dev_ptr().cast(),
+            v.eids.lock().expect("i").dev_ptr().cast(),
+            v.euni.lock().expect("n").dev_ptr().cast(),
+            v.etok.lock().expect("t").dev_ptr().cast(),
+            v.estart.lock().expect("s").dev_ptr().cast(),
+            v.epos.lock().expect("p").dev_ptr().cast(),
+            v.unexp.lock().expect("e").dev_ptr().cast(),
+            cache, tag,
+            v.map.lock().expect("m").dev_ptr().cast(),
+            v.miss.lock().expect("f").dev_ptr().cast(),
+            cnt, k, slot_proj,
+            st.sdescs_g.lock().expect("sg").dev_ptr(),
+            st.sdescs_u.lock().expect("su").dev_ptr(),
+            st.sdescs_d.lock().expect("sd").dev_ptr(),
+            a.on_dev);
+    }
+}
+
+/// Callback address for the union-batched EXL3 MoE custom op.
+#[must_use]
+pub fn moe_cb_exl3_ntok_addr() -> usize {
+    moe_cb_exl3_ntok as usize
+}

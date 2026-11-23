@@ -2039,19 +2039,22 @@ __global__ void inkwell_exl3_had_in_moe(const uint64_t* __restrict__ descs,
                                         const float* __restrict__ x,
                                         float* __restrict__ xh, float* __restrict__ xh2,
                                         int xh2s, int k,
-                                        const int* __restrict__ missf, int skipmode) {
+                                        const int* __restrict__ missf, int skipmode,
+                                        const int* __restrict__ euni, const int* __restrict__ etok) {
     const int slot = blockIdx.y;
-    if (skipmode && ((missf[slot] != 0) == (skipmode == 1))) return;
+    const int sfl = euni ? euni[slot] : slot;
+    if (skipmode && ((missf[sfl] != 0) == (skipmode == 1))) return;
     const uint64_t* dd = blockIdx.z ? descs2 : descs;
     float* xho = blockIdx.z ? xh2 + slot * xh2s : xh + slot * k;
     const uint16_t* suh = (const uint16_t*)(uintptr_t)dd[ids[slot] * 4 + 1];
+    const size_t xoff = etok ? (size_t)etok[slot] * k : (descs2 ? 0 : (size_t)slot * k);
     const int lane = threadIdx.x & 31;
     const int base = blockIdx.x * 512 + (threadIdx.x >> 5) * 128;
     float v[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int e = base + lane * 4 + i;
-        v[i] = (e < k) ? x[(descs2 ? 0 : (size_t)slot * k) + e] * __half2float(__ushort_as_half(suh[e])) : 0.f;
+        v[i] = (e < k) ? x[xoff + e] * __half2float(__ushort_as_half(suh[e])) : 0.f;
     }
     had128_warp(v, lane * 4);
 #pragma unroll
@@ -2316,6 +2319,11 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
             const int c = cnt[tag[j]];
             if (c < bestc) { bestc = c; best = j; }
         }
+        if (best < 0) {
+            // no free slot (nslots > k): stream this expert's host descriptors
+            map[s] = EXL3_DIRECT;
+            continue;
+        }
         const int v = best;
         claimed |= 1 << v;
         tag[v] = e;
@@ -2485,7 +2493,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     // gate + up fused: blockIdx.z selects the descriptor set
     dim3 gin((KG + 511) / 512, nslots, 2);
-    inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG, nullptr, 0);
+    inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG, nullptr, 0, nullptr, nullptr);
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
@@ -2496,7 +2504,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
-    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0);
+    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     dim3 gd(ND / 64, nslots, nky);
     inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
@@ -2554,7 +2562,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     // the missed experts on the side stream; miss slots run right after.
     dim3 gin((KG + 511) / 512, nslots, 2);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
-                                                (const int*)miss, 1);
+                                                (const int*)miss, 1, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     dim3 gg(NG / 64, nslots, 2 * nky);
     inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
@@ -2562,7 +2570,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                              (const int*)miss, 1);
     cudaStreamWaitEvent(st, ev_join, 0);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
-                                                (const int*)miss, 2);
+                                                (const int*)miss, 2, nullptr, nullptr);
     inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                              (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky,
                                              (const int*)miss, 2);
@@ -2570,7 +2578,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
-    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0);
+    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     dim3 gd(ND / 64, nslots, nky);
     inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
@@ -2629,4 +2637,323 @@ extern "C" void ink_launch_conv_step(const float* x_in, float* state, int region
     const int thr = ch < 256 ? ch : 256;
     inkwell_conv_step<<<(ch + thr - 1) / thr, thr, 0, (cudaStream_t)stream>>>(
         x_in, state, region_off, w, dyn, ch, n_heads, scale, out);
+}
+
+// ================= union-batched (verify ntok) MoE =================
+// Expand 8 tokens × top-8 (64 selections) into (expert,consumer) pairs sorted
+// by expert id. ~20 unique experts/visit typical → the gemv reads each expert
+// once for all its consumer tokens (LFM-style weight sharing for MoE).
+__global__ void inkwell_exl3_union_expand(
+    const int* __restrict__ ids8,          // [64] token-major: ids8[t*8+j]
+    int* __restrict__ uids,                // [64] unique expert ids
+    int* __restrict__ pnexp,               // [1]
+    int* __restrict__ eids,                // [64] expert id per expanded slot
+    int* __restrict__ euni,                // [64] union index per expanded slot
+    int* __restrict__ etok,                // [64] token index per expanded slot
+    int* __restrict__ estart,              // [65] consumer range start per union idx
+    int* __restrict__ epos,                // [64] (t*8+j) -> expanded slot
+    const uint64_t* __restrict__ descs_g, const uint64_t* __restrict__ descs_u,
+    const uint64_t* __restrict__ descs_d,
+    uint64_t* __restrict__ udesc_g, uint64_t* __restrict__ udesc_u,
+    uint64_t* __restrict__ udesc_d) {
+    __shared__ int sh_cnt[128], sh_start[128], sh_uidx[128];
+    const int e = threadIdx.x;
+    int cnt = 0;
+    for (int s = 0; s < 64; ++s) cnt += (ids8[s] == e);
+    sh_cnt[e] = cnt;
+    __syncthreads();
+    if (e == 0) {
+        int off = 0, nu = 0;
+        for (int i = 0; i < 128; ++i) {
+            sh_start[i] = off;
+            if (sh_cnt[i]) { uids[nu] = i; sh_uidx[i] = nu; estart[nu] = off; ++nu; }
+            off += sh_cnt[i];
+        }
+        estart[nu] = 64;
+        *pnexp = nu;
+    }
+    __syncthreads();
+    if (cnt) {
+        int p = sh_start[e];
+        for (int s = 0; s < 64; ++s) {
+            if (ids8[s] == e) {
+                eids[p] = e; euni[p] = sh_uidx[e]; etok[p] = s >> 3; epos[s] = p;
+                ++p;
+            }
+        }
+        if (udesc_g) {
+            // uncached path: stage the union's desc entries indexed by expert id
+            const uint64_t* sg = descs_g + e * 4;
+            const uint64_t* su = descs_u + e * 4;
+            const uint64_t* sd = descs_d + e * 4;
+            uint64_t* og = udesc_g + e * 4;
+            uint64_t* ou = udesc_u + e * 4;
+            uint64_t* od = udesc_d + e * 4;
+            for (int q = 0; q < 4; ++q) { og[q] = sg[q]; ou[q] = su[q]; od[q] = sd[q]; }
+        }
+    }
+}
+
+// gemv_moe over the union: blockIdx.y = union index; the expert's tile is read
+// once and applied to estart[u+1]-estart[u] consumer x-vectors (packed
+// consecutive expanded slots). Output dn[expanded_slot][n].
+__global__ void inkwell_exl3_gemv_moe_ntok(const uint64_t* __restrict__ descs,
+                                      const uint64_t* __restrict__ descs2,
+                                      const int* __restrict__ uids,
+                                      const int* __restrict__ estart,
+                                      const float* __restrict__ xh,
+                                      const float* __restrict__ xh2, int xh2s,
+                                      float* __restrict__ t, int tslot, int tzoff,
+                                      int tk, int tn, int k, int n, int nky,
+                                      const int* __restrict__ missf, int skipmode) {
+    const int slot = blockIdx.y;
+    if (skipmode && ((missf[slot] != 0) == (skipmode == 1))) return;
+    const int nsel = descs2 ? 2 : 1;
+    const int ky = blockIdx.z / nsel;
+    const int zsel = blockIdx.z % nsel;
+    const uint64_t* d = (zsel ? descs2 : descs) + uids[slot] * 4;
+    const int sx0 = estart[slot];
+    const int nc = estart[slot + 1] - sx0;
+    const int xstride = zsel ? xh2s : k;
+    const float* xhb_g = (zsel ? xh2 : xh) + (size_t)sx0 * xstride;
+    const int tk_lo = (ky * tk) / nky;
+    const int tk_hi = ((ky + 1) * tk) / nky;
+    const uint32_t* tile_base = (const uint32_t*)(uintptr_t)d[0];
+    const int ka = (int)(d[3] & 0xff);
+    const int halfk = (int)((d[3] >> 8) & 1);
+    const int g = threadIdx.x >> 6;
+    const int u = threadIdx.x & 63;
+    const int c = u >> 2, rp = u & 3;
+    const int tn_i = blockIdx.x * 4 + g;
+    const int w = r_bits_words(ka, halfk);
+    __shared__ uint32_t rings[4 * 8 * 32];
+    __shared__ float xhb[8][8][16];   // [consumer][batch row][16]
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    float s[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    float sx[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    const bool live = tn_i < tn;
+    uint32_t widx[4];
+    {
+        const int r_bits = halfk ? 256 * ka + 128 : 256 * ka;
+        const int nw = r_bits >> 5;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int r = rp + 4 * q;
+            const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                        | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+            const int s_i = halfk ? (i + 1) * ka + ((i + 1) >> 1) : (i + 1) * ka;
+            const int b0 = s_i - 16 + (s_i < 16 ? r_bits : 0);
+            const int i0 = b0 >> 5;
+            const int s0 = 48 - (b0 & 31);
+            const int i1 = (i0 + 1 == nw) ? 0 : i0 + 1;
+            widx[q] = (uint32_t)(i0 | (i1 << 6) | (s0 << 12));
+        }
+    }
+    {
+        const int tkn0 = min(8, tk_hi - tk_lo);
+        for (int idx = threadIdx.x; idx < tkn0 * 16 * nc; idx += 256) {
+            const int cc = idx / (tkn0 * 16), r16 = idx % (tkn0 * 16);
+            xhb[cc][r16 >> 4][r16 & 15] =
+                xhb_g[(size_t)cc * xstride + (tk_lo + (r16 >> 4)) * 16 + (r16 & 15)];
+        }
+        if (live && u < w) {
+            uint32_t* rg = rings + g * 256;
+            for (int b = 0; b < tkn0; ++b)
+                rg[b * 32 + u] = tile_base[((size_t)((tk_lo + b) * tn + tn_i)) * (size_t)w + u];
+        }
+    }
+    __syncthreads();
+    for (int tk0 = tk_lo; tk0 < tk_hi; tk0 += 8) {
+        const int tkn = min(8, tk_hi - tk0);
+        const int nk0 = tk0 + 8;
+        const int tkn2 = min(8, tk_hi - nk0);
+        uint32_t pfb[8];
+        int pfidx[4]; float pfx[4]; int npf = 0;
+        if (live && nk0 < tk_hi && u < w) {
+            for (int b = 0; b < tkn2; ++b)
+                pfb[b] = tile_base[((size_t)((nk0 + b) * tn + tn_i)) * (size_t)w + u];
+        }
+        if (nk0 < tk_hi) {
+            for (int idx = threadIdx.x; idx < nc * tkn2 * 16; idx += 256) {
+                if (npf < 4) {
+                    pfidx[npf] = idx;
+                    const int cc = idx / (tkn2 * 16), r16 = idx % (tkn2 * 16);
+                    pfx[npf] = xhb_g[(size_t)cc * xstride + (nk0 + (r16 >> 4)) * 16 + (r16 & 15)];
+                    ++npf;
+                }
+            }
+        }
+        if (live) {
+            const uint32_t* rg = rings + g * 256;
+            for (int b = 0; b < tkn; ++b) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const uint32_t wi = widx[q];
+                    const uint64_t v = ((uint64_t)rg[b * 32 + (wi & 63)] << 32)
+                                     | (uint64_t)rg[b * 32 + ((wi >> 6) & 63)];
+                    const uint32_t w16 = (uint32_t)(v >> (wi >> 12)) & 0xffffu;
+                    const int bs = (int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
+#pragma unroll
+                    for (int c2 = 0; c2 < 8; ++c2) {
+                        if (c2 < nc) {
+                            const float xr = xhb[c2][b][rp + 4 * q];
+                            s[c2] += xr * (float)bs;
+                            sx[c2] += xr;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (live && nk0 < tk_hi && u < w) {
+            uint32_t* rg = rings + g * 256;
+            for (int b = 0; b < tkn2; ++b) rg[b * 32 + u] = pfb[b];
+        }
+        if (nk0 < tk_hi) {
+            for (int i = 0; i < npf; ++i) {
+                const int idx = pfidx[i];
+                const int cc = idx / (tkn2 * 16), r16 = idx % (tkn2 * 16);
+                xhb[cc][r16 >> 4][r16 & 15] = pfx[i];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int c2 = 0; c2 < 8; ++c2) {
+        s[c2] += __shfl_xor_sync(0xffffffffu, s[c2], 1);
+        sx[c2] += __shfl_xor_sync(0xffffffffu, sx[c2], 1);
+        s[c2] += __shfl_xor_sync(0xffffffffu, s[c2], 2);
+        sx[c2] += __shfl_xor_sync(0xffffffffu, sx[c2], 2);
+    }
+    if (live && rp == 0) {
+        for (int c2 = 0; c2 < nc; ++c2) {
+            float* dstp = &t[(size_t)(sx0 + c2) * n + zsel * tzoff + tn_i * 16 + c];
+            const float vv = fmaf(KINV, s[c2], KOFF * sx[c2]);
+            if (nky > 1) atomicAdd(dstp, vv); else *dstp = vv;
+        }
+    }
+}
+
+// out[t*n+i] = sum_j w8[t*8+j] * dn[epos[t*8+j]*n + i]
+__global__ void inkwell_exl3_expert_wsum8(const float* __restrict__ dn,
+                                          const float* __restrict__ w8,
+                                          const int* __restrict__ epos,
+                                          float* __restrict__ out, int n) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc += w8[t * 8 + j] * dn[(size_t)epos[t * 8 + j] * n + i];
+    out[(size_t)t * n + i] = acc;
+}
+
+// Union-batched verify MoE: one launch chain for 8 tokens.
+// Scratch layout (caller-owned): xh_e[64][2304] gu_e[64][2304] hid_e[64][1152]
+// dn_e[64][2304]; small bufs uids/eids/euni/etok/epos[64], estart[65], unexp[1].
+extern "C" void ink_launch_exl3_moe_ntok(
+    const void* descs_g, const void* descs_u, const void* descs_d,
+    const float* x8, const int* ids8, const float* w8, float* out8,
+    float* xh_e, float* gu_e, float* hid_e, float* dn_e,
+    int* uids, int* eids, int* euni, int* etok, int* estart, int* epos, int* unexp,
+    void* cache, int* tag, int* map, int* miss, int* cnt, int k, int64_t slot_proj,
+    void* sdescs_g, void* sdescs_u, void* sdescs_d,
+    int on_dev, void* stream) {
+    const cudaStream_t st = (cudaStream_t)stream;
+    const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
+    const bool cached = cache != nullptr;
+    if (cached) {
+        inkwell_exl3_union_expand<<<1, 128, 0, st>>>(ids8, uids, unexp,
+            eids, euni, etok, estart, epos, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr);
+    } else {
+        // uncached/on_dev: write per-expert-id desc tables directly (no staging)
+        inkwell_exl3_union_expand<<<1, 128, 0, st>>>(ids8, uids, unexp,
+            eids, euni, etok, estart, epos,
+            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
+    }
+    int nexp = 64;
+    cudaMemcpyAsync(&nexp, unexp, 4, cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+    const int dbg = getenv("INKWELL_MNTOK_DBG") ? atoi(getenv("INKWELL_MNTOK_DBG")) : 0;
+    if (dbg) { cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok expand ok nexp=%d err=%d\n", nexp, (int)e); }
+    if (dbg == 1) return;
+
+    static cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
+    static cudaStream_t ss = nullptr;
+    if (cached && !ev_fork) {
+        cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming);
+        cudaStreamCreateWithFlags(&ss, cudaStreamNonBlocking);
+    }
+    int nky = 1;
+    { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+
+    const uint64_t* G = (const uint64_t*)sdescs_g;
+    const uint64_t* U = (const uint64_t*)sdescs_u;
+    const uint64_t* D = (const uint64_t*)sdescs_d;
+    if (cached) {
+        inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(uids,
+            tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr);
+        inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 1), 32, 0, st>>>(
+            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+            uids, (uint8_t*)cache, map, miss,
+            nullptr, slot_proj,
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1);
+        cudaEventRecord(ev_fork, st);
+        cudaStreamWaitEvent(ss, ev_fork, 0);
+        inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 16), 128, 0, ss>>>(
+            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+            uids, (uint8_t*)cache, map, miss,
+            nullptr, slot_proj,
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2);
+        cudaEventRecord(ev_join, ss);
+    }
+    dim3 gin((KG + 511) / 512, 64, 2);
+    dim3 gg(NG / 64, nexp, 2 * nky);
+    dim3 gout((NG + 511) / 512, 64, 2);
+    dim3 din((KD + 511) / 512, 64);
+    dim3 gd(ND / 64, nexp, nky);
+    dim3 dout((ND + 511) / 512, 64, 1);
+    if (nky > 1) cudaMemsetAsync(dn_e, 0, 64 * ND * 4, st);
+    if (dbg) { cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok pre-gu err=%d\n", (int)e); }
+    if (dbg == 2) return;
+    if (cached) {
+        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
+            2 * NG, KG, miss, 1, euni, etok);
+        if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin1 err=%d\n", (int)cudaGetLastError()); }
+        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 1);
+        if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  gemv1 err=%d\n", (int)cudaGetLastError()); }
+        cudaStreamWaitEvent(st, ev_join, 0);
+        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
+            2 * NG, KG, miss, 2, euni, etok);
+        if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin2 err=%d\n", (int)cudaGetLastError()); }
+        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2);
+    } else {
+        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
+            2 * NG, KG, nullptr, 0, euni, etok);
+        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, nullptr, 0);
+    }
+    if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok gu done err=%d\n", (int)e); }
+    if (dbg == 3) return;
+    inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, eids, dn_e, gu_e, NG, 2 * NG, 0, ND, NG);
+    inkwell_situ_pair<<<(unsigned)((64 * NG + 255) / 256), 256, 0, st>>>(gu_e, nullptr, hid_e, 4.f, 25.f, NG, 64);
+    if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok situ done err=%d\n", (int)e); }
+    if (dbg == 4) return;
+    // down chain: had_in reads hid_e[slot] per expanded slot (etok null → slot offset)
+    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, eids, hid_e, xh_e,
+        nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
+    if (nky > 1) cudaMemsetAsync(dn_e, 0, 64 * ND * 4, st);
+    inkwell_exl3_gemv_moe_ntok<<<gd, 256, 0, st>>>(D, nullptr, uids, estart, xh_e,
+        nullptr, 0, dn_e, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
+    if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok dgemv done err=%d\n", (int)e); }
+    if (dbg == 5) return;
+    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, eids, dn_e, xh_e, ND, ND, 0, ND, 0);
+    inkwell_exl3_expert_wsum8<<<dim3((ND + 255) / 256, 8), 256, 0, st>>>(xh_e, w8, epos, out8, ND);
+    if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok all done err=%d\n", (int)e); }
 }
