@@ -1014,14 +1014,19 @@ impl Runner {
         let scale = 1.0 / ((if dynamic.is_some() { 2.0 } else { 1.0 }) * n_conv as f32 + 1.0).sqrt();
         let idx = self.conv_arg_idx.get();
         let pool = unsafe { &mut *self.conv_args.get() };
+        let fresh = ConvStepArgs {
+            state: unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0) }.cast(),
+            region_off: region_off as i32,
+            ch: ch as i32,
+            n_heads,
+            scale,
+        };
         if idx >= pool.len() {
-            pool.push(Box::new(ConvStepArgs {
-                state: unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0) }.cast(),
-                region_off: region_off as i32,
-                ch: ch as i32,
-                n_heads,
-                scale,
-            }));
+            pool.push(Box::new(fresh));
+        } else {
+            // step_block calls sites in a different order than step(): rebind
+            // every call so a pooled arg never carries another site's fields.
+            *pool[idx] = fresh;
         }
         let arg = &*pool[idx];
         self.conv_arg_idx.set(idx + 1);

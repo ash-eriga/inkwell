@@ -357,3 +357,4 @@
 {"exp": "moe split hit/miss pass", "result": "~97ms golden ok", "verdict": "kept", "note": "correct; helps when misses occur; neutral at k=25"}
 {"exp": "wk||wv Exl3Par 2-stream pair op", "result": "~103-106ms vs ~97", "verdict": "rejected", "note": "SM contention in full pipeline; event overhead ~20us/op; reverted"}
 {"exp": "GEMV_NKY_TGT 256/1024", "result": "~99ms both", "verdict": "neutral", "note": "env kept, default unchanged"}
+{"exp": "moe gemv batch 8->16", "result": "~106-127ms", "verdict": "rejected", "note": "register spill pfb[16]+xr; reverted"}
