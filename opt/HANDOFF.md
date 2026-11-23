@@ -226,3 +226,9 @@ Ledger histórico: subtrair ~35ms de tudo.
   impossível ser golden, mas é. Provável subtileza nos offsets — NÃO mexer sem debug real.
 - pkill gotcha: usar `pkill -9 -x inkwell` (o -f casa com a própria shell).
 - nohup: rodar bg com `nohup env ... < /dev/null &` — subshell (cmd &) morre com a call.
+
+## INCIDENT (2026-11-23) — recovered
+- `git checkout` wiped uncommitted deltas in src-v2/ggml-cuda.cu → runtime broken (illegal memory access).
+- Lost delta reconstructed + COMMITTED (src-v2 `5a99456`): (1) `GGML_OP_CUSTOM` in `ggml_backend_cuda_device_supports_op` → tensors land on device; (2) `case GGML_OP_CUSTOM` in `ggml_cuda_compute_forward` → calls `p.fun(dst,0,1,userdata)`; (3) op-seq `get_key` (hash of op+type+src-count, NOT ne/nb); (4) `ggml_backend_cuda_stream` shim; (5) PASCAL_GRAPHS gate on graph-eval path; (6) CUSTOM exclusions in `graph_update_required`.
+- Rule: ALWAYS commit src-v2 changes immediately.
+- State after recovery: ~100 ms/tok golden at HEAD c292e3f.
