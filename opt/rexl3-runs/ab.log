@@ -1,0 +1,8 @@
+{"ts":"2026-11-22T23:28:56-03:00","config":"ab-base","i":1,"decode_s":1.594685254,"ms_tok":199.3,"golden":"yes"}
+{"ts":"2026-11-22T23:29:14-03:00","config":"ab-lut","i":1,"decode_s":1.725328024,"ms_tok":215.7,"golden":"yes"}
+{"ts":"2026-11-22T23:29:26-03:00","config":"ab-base","i":2,"decode_s":1.599440048,"ms_tok":199.9,"golden":"yes"}
+{"ts":"2026-11-22T23:29:39-03:00","config":"ab-lut","i":2,"decode_s":1.755281887,"ms_tok":219.4,"golden":"yes"}
+{"ts":"2026-11-22T23:29:54-03:00","config":"ab-base","i":3,"decode_s":1.638785424,"ms_tok":204.8,"golden":"yes"}
+{"ts":"2026-11-22T23:30:08-03:00","config":"ab-lut","i":3,"decode_s":1.749698542,"ms_tok":218.7,"golden":"yes"}
+{"ts":"2026-11-22T23:30:21-03:00","config":"ab-base","i":4,"decode_s":1.589832794,"ms_tok":198.7,"golden":"yes"}
+{"ts":"2026-11-22T23:30:33-03:00","config":"ab-lut","i":4,"decode_s":1.698139665,"ms_tok":212.3,"golden":"yes"}

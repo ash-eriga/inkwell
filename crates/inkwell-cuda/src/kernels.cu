@@ -2,6 +2,8 @@
 // Reference implementations — correctness first (golden-test path),
 // fusion comes later per the autotuning ledger.
 
+#include <cstdio>
+
 extern "C" {
 
 // rms_norm over rows: y[c] = x[c] * w[c] / sqrt(mean(x^2) + eps)
@@ -1732,6 +1734,7 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
         x, (const uint16_t*)suh, scratch /* xh */, (int)k);
     const int nb = (tn + 3) / 4;
     // aim for ~256 blocks: split K when tn is small
+    int nky = 1;
     while (nb * nky < 512 && nky < 8 && nky * 16 <= tk) nky *= 2;
     if (nky > 1) cudaMemsetAsync(scratch + k, 0, nky * n * 4, (cudaStream_t)stream);
     dim3 gsz((unsigned)nb, (unsigned)nky, 1);
@@ -1848,7 +1851,7 @@ __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
 // ids[slot]) to point at staging; downstream kernels unchanged.
 // Per (slot,proj) layout: [trellis][suh][svh]; trellis bytes depend on
 // per-expert ka from the descriptor (10368 tiles × r_bits_words×4).
-#define EXL3_STAGE_PROJ 1004544u  // ka<=3 worst case
+#define EXL3_STAGE_PROJ 1334016u  // w<=32: 10368*32*4 + 6912 suh/svh
 __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
                                        const uint64_t* __restrict__ descs_u,
                                        const uint64_t* __restrict__ descs_d,
@@ -1888,6 +1891,76 @@ __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
     }
 }
 
+// Per-layer VRAM expert cache: resolve ids -> K slots, copy only misses.
+// tag[v] = expert id (-1 empty); map[s] = slot chosen for ids[s];
+// miss[s] = 1 when a copy is required. rr = per-layer victim counter.
+__global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
+        int* __restrict__ tag, int* __restrict__ map, int* __restrict__ miss,
+        int* __restrict__ rr, int nslots, int k) {
+    if (threadIdx.x != 0) return;
+    // Serial: a victim slot must not be one already claimed this visit,
+    // otherwise a miss could overwrite a slot a hit still needs.
+    for (int s = 0; s < nslots; ++s) {
+        const int e = ids[s];
+        int v = -1;
+        for (int j = 0; j < k; ++j) if (tag[j] == e) { v = j; break; }
+        int m = 0;
+        if (v < 0) {
+            int t = *rr;
+            for (;;) {
+                const int cand = t % k;
+                int used = 0;
+                for (int q = 0; q < s; ++q) if (map[q] == cand) { used = 1; break; }
+                ++t;
+                if (!used) { v = cand; break; }
+            }
+            *rr = t;
+            tag[v] = e;
+            m = 1;
+        }
+        miss[s] = m;
+        map[s] = v;
+    }
+}
+
+// Copy missing experts into their cache slots and (always) point the staged
+// desc tables at the slots. cache layout: (v*3+proj) * EXL3_STAGE_PROJ.
+__global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
+                                       const uint64_t* __restrict__ descs_u,
+                                       const uint64_t* __restrict__ descs_d,
+                                       const int* __restrict__ ids,
+                                       uint8_t* __restrict__ cache,
+                                       const int* __restrict__ map,
+                                       const int* __restrict__ miss,
+                                       const int64_t slot_proj,
+                                       uint64_t* __restrict__ sdescs_g,
+                                       uint64_t* __restrict__ sdescs_u,
+                                       uint64_t* __restrict__ sdescs_d) {
+    const int slot = blockIdx.x / 3;
+    const int proj = blockIdx.x % 3;
+    const uint64_t* src = (proj == 0 ? descs_g : (proj == 1 ? descs_u : descs_d));
+    uint64_t* sd = (proj == 0 ? sdescs_g : (proj == 1 ? sdescs_u : sdescs_d));
+    const uint64_t* d = src + ids[slot] * 4;
+    const int ka = (int)(d[3] & 0xff);
+    const int halfk = (int)((d[3] >> 8) & 1);
+    const int trel_b = 10368 * r_bits_words(ka, halfk) * 4;
+    const int suh_b = (proj == 2 ? 2304 : 4608);
+    const int svh_b = (proj == 2 ? 4608 : 2304);
+    uint8_t* dst = cache + (size_t)(map[slot] * 3 + proj) * (size_t)slot_proj;
+    if (threadIdx.x == 0) {
+        uint64_t* o = sd + ids[slot] * 4;
+        o[0] = (uint64_t)(uintptr_t)dst;
+        o[1] = (uint64_t)(uintptr_t)(dst + trel_b);
+        o[2] = (uint64_t)(uintptr_t)(dst + trel_b + suh_b);
+        o[3] = d[3];
+    }
+    if (!miss[slot]) return;
+    const uint4* s0 = (const uint4*)(uintptr_t)d[0];
+    uint4* t0 = (uint4*)dst;
+    const int n0 = (trel_b + suh_b + svh_b) / 16;
+    for (int i = threadIdx.x; i < n0; i += blockDim.x) t0[i] = s0[i];
+}
+
 // Full per-slot expert chain: stage -> gate -> situ -> down -> wsum.
 extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, const void* descs_d,
                                     const int* ids, const float* x,
@@ -1918,6 +1991,44 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din(KD / 128, nslots);
     // KD=1152 not multiple of 128*? 1152/128=9 blocks
+    inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
+    dim3 gd(ND / 64, nslots, 1);
+    inkwell_exl3_gemv_moe<<<gd, 64, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
+    dim3 dout(ND / 128, nslots);
+    inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
+    inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
+}
+
+// Cached variant: resolve -> copy misses -> same downstream chain.
+extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* descs_u, const void* descs_d,
+                                    const int* ids, const float* x,
+                                    float* xh, float* gu, float* hid, float* dn,
+                                    const float* w, float* out, int nslots, void* stream,
+                                    void* cache, void* tag, void* map, void* miss, void* rr, int k,
+                                    int64_t slot_proj,
+                                    void* sdescs_g, void* sdescs_u, void* sdescs_d) {
+    const cudaStream_t st = (cudaStream_t)stream;
+    inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
+        (int*)tag, (int*)map, (int*)miss, (int*)rr, nslots, k);
+    inkwell_exl3_moe_ccopy<<<nslots * 3, 256, 0, st>>>(
+        (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+        ids, (uint8_t*)cache, (const int*)map, (const int*)miss, slot_proj,
+        (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
+    const uint64_t* G = (const uint64_t*)sdescs_g;
+    const uint64_t* U = (const uint64_t*)sdescs_u;
+    const uint64_t* D = (const uint64_t*)sdescs_d;
+    const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
+    for (int p = 0; p < 2; ++p) {
+        const uint64_t* dd = p ? U : G;
+        dim3 gin(KG / 128, nslots);
+        inkwell_exl3_had_in_moe<<<gin, 128, 512, st>>>(dd, ids, x, xh, KG);
+        dim3 gg(NG / 64, nslots, 1);
+        inkwell_exl3_gemv_moe<<<gg, 64, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
+        dim3 gout(NG / 128, nslots);
+        inkwell_exl3_had_out_moe<<<gout, 128, 512, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
+    }
+    inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
+    dim3 din(KD / 128, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
     dim3 gd(ND / 64, nslots, 1);
     inkwell_exl3_gemv_moe<<<gd, 64, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);

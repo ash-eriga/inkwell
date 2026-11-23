@@ -93,3 +93,18 @@ LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-in
    usuário antes de gastar nele.
 5. Spec decode (MTP drafter) — só depois dos 30 TPS.
 6. Limpar prints debug (GKEY/CGP/INCPY/GRAPHDIFF em ggml-cuda.cu e ggml-backend.cpp).
+
+## 2026-11-23 progresso (sessão 2)
+- LUT dec(bytesum): REJEITADA (~216 vs ~200 base, A/B intercalado 4×).
+- FIX: extern Rust `ink_launch_exl3_moe` não declarava `on_dev` (lixo na stack) — corrigido.
+- FIX LATENTE: EXL3_STAGE_PROJ 1004544 assumia w≤24 (ka≤3); experts reais têm w até 32
+  (trel_b até 1327104) → stage overflow para slot vizinho. PROJ=1334016 agora.
+- Cache de experts VRAM por camada pinned: kernels.cu tem inkwell_exl3_cache_resolve
+  (serial, victim pula slots reivindicados na visita — atomicAdd%k colidia com hits),
+  inkwell_exl3_moe_ccopy (slot_proj param = max_slot por camada = max_e(trel_b)+6912),
+  ink_launch_exl3_moe_cached. moe.rs: Exl3Cache{buf,tag,rr,k,slot}, Staging +exl3_map/miss.
+  runner.rs: cache alocado p/ pinned se f_free > cbytes + 1100MiB; env INKWELL_EXL3_CACHE_K
+  (default 8, ≥8 obrigatório, 0 desliga).
+- Estado: bench_cache4.log rodando — verificar coerência + ms/tok.
+- OBS: só ~12 camadas pinned (il≥12); cache 32MB/camada; free pós-load ~983-1214MiB;
+  compute buf 835MiB; graph instantiate precisa ~150-200MiB livres → OOM se exagerar.

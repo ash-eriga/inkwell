@@ -734,6 +734,7 @@ impl Runner {
                 let mut host = vec![0u8; total];
                 let mut descs: Vec<u64> = vec![0; 3 * 128 * 4];
                 let mut off = 0usize;
+                let mut max_slot = 0usize;
                 for e in 0..128usize {
                     for (pi, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
                         let base = format!("{pre}.{e}.{proj}");
@@ -746,11 +747,14 @@ impl Runner {
                         }
                         let k16 = tp(&format!("{base}.trellis")).shape[2] as usize;
                         descs[pi * 512 + e * 4 + 3] = (k16 / 16) as u64 | (((k16 % 16 != 0) as u64) << 8);
+                        // per-layer cache slot = max expert blob (trellis+suh+svh)
+                        let w = (k16 / 16) * 8 + usize::from(k16 % 16 != 0) * 4;
+                        max_slot = max_slot.max(10368 * w * 4 + 6912);
                     }
                 }
                 let (f_free, _) = inkwell_cuda::mem_info();
                 eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
-                let base = if (f_free as usize) > total + (1050usize << 20) {
+                let base = if (f_free as usize) > total + (1300usize << 20) {
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
                     blob.write_bytes(&host);
                     drop(host);
@@ -773,11 +777,36 @@ impl Runner {
                     unsafe { std::ptr::copy_nonoverlapping(descs[pi * 512..].as_ptr().cast::<u8>(), pb.host, 128 * 32) };
                     pb
                 };
-                let on_dev = f_free as usize > total + (1050usize << 20);
+                let on_dev = f_free as usize > total + (1300usize << 20);
+                // Pinned layers stage expert blobs over PCIe every visit (~25-40 ms/tok
+                // total). Cache k experts/layer in VRAM; k must be ≥ N_SLOTS(8) so a
+                // single visit never evicts its own slots.
+                let ck: usize = std::env::var("INKWELL_EXL3_CACHE_K")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+                let cbytes = ck * 3 * max_slot;
+                let cache = (!on_dev && ck >= 8
+                    && (f_free as usize) > cbytes + (1100usize << 20)).then(|| {
+                    let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
+                    tag.write_bytes_async(&vec![0xFFu8; ck * 4]);
+                    let rr = inkwell_cuda::DevBuf::new_bytes(4);
+                    rr.write_bytes_async(&[0u8; 4]);
+                    crate::moe::Exl3Cache {
+                        buf: inkwell_cuda::DevBuf::new_bytes(cbytes),
+                        tag,
+                        rr,
+                        k: ck as i32,
+                        slot: max_slot,
+                    }
+                });
+                if !on_dev {
+                    eprintln!("exl3 cache il={il}: k={} slot={}B ({:.0} MiB) {}",
+                        ck, max_slot, cbytes as f64 / 1e6,
+                        if cache.is_some() { "CACHED" } else { "staged" });
+                }
                 l.moe_exl3 = Some(moe_args_exl3.len());
                 moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
-                    on_dev,
+                    on_dev, cache,
                 }));
             }
             l.proj0_off = [-1; 3];

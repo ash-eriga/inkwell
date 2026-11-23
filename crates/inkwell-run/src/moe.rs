@@ -106,6 +106,8 @@ struct Staging {
     sdescs_g: Mutex<cu::DevBuf>,   // staged desc tables (indexed by ids[slot])
     sdescs_u: Mutex<cu::DevBuf>,
     sdescs_d: Mutex<cu::DevBuf>,
+    exl3_map: Mutex<cu::DevBuf>,   // [N_SLOTS] i32 — slot→cache slot (cached path)
+    exl3_miss: Mutex<cu::DevBuf>,  // [N_SLOTS] i32 — miss flags (cached path)
 }
 
 static STAGING: OnceLock<Staging> = OnceLock::new();
@@ -122,10 +124,12 @@ fn staging() -> &'static Staging {
         hid: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_FF * 4)),
         dn: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_EMBD * 4)),
         xh: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * N_EMBD * 4)),
-        exl3_stage: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 3 * 1004544)),
+        exl3_stage: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 3 * EXL3_STAGE_PROJ)),
         sdescs_g: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
         sdescs_u: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
         sdescs_d: Mutex::new(cu::DevBuf::new_bytes(128 * 32)),
+        exl3_map: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 4)),
+        exl3_miss: Mutex::new(cu::DevBuf::new_bytes(N_SLOTS * 4)),
     })
 }
 
@@ -284,7 +288,28 @@ pub struct MoeArgsExl3 {
     pub descs_d: cu::PinnedBuf,
     /// descriptors already point into device memory — staging is a no-op
     pub on_dev: bool,
+    /// per-layer VRAM cache of staged expert blobs (pinned layers only)
+    pub cache: Option<Exl3Cache>,
 }
+
+/// Per-layer VRAM cache: `k` slots × 3 projs × EXL3_STAGE_PROJ bytes,
+/// round-robin replacement tagged by expert id.
+#[derive(Debug)]
+pub struct Exl3Cache {
+    /// `k * 3 * EXL3_STAGE_PROJ` bytes of staged expert blobs.
+    pub buf: cu::DevBuf,
+    /// `k` i32 expert ids (init 0xFF).
+    pub tag: cu::DevBuf,
+    /// one i32 round-robin counter.
+    pub rr: cu::DevBuf,
+    /// slot count; must be ≥ N_SLOTS to keep per-visit slots distinct.
+    pub k: i32,
+    /// bytes per slot per proj = this layer's max expert blob.
+    pub slot: usize,
+}
+
+/// Bytes per cache slot per projection (trellis+suh+svh, w≤32 worst case).
+pub const EXL3_STAGE_PROJ: usize = 1334016;
 
 /// `ggml_custom_op_t` for the EXL3 MoE path.
 ///
@@ -311,15 +336,29 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
     let mut dn = st.dn.lock().expect("dn");
     let mut xh = st.xh.lock().expect("xh");
     unsafe {
-        cu::exl3_moe_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
-            x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
-            dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),
-            N_SLOTS as i32,
-            st.exl3_stage.lock().expect("stg").dev_ptr(),
-            st.sdescs_g.lock().expect("sg").dev_ptr(),
-            st.sdescs_u.lock().expect("su").dev_ptr(),
-            st.sdescs_d.lock().expect("sd").dev_ptr(),
-            a.on_dev);
+        if let Some(c) = &a.cache {
+            cu::exl3_moe_cached_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
+                x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
+                dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),
+                N_SLOTS as i32,
+                c.buf.dev_ptr(), c.tag.dev_ptr().cast(),
+                st.exl3_map.lock().expect("map").dev_ptr().cast(),
+                st.exl3_miss.lock().expect("miss").dev_ptr().cast(),
+                c.rr.dev_ptr().cast(), c.k, c.slot as i64,
+                st.sdescs_g.lock().expect("sg").dev_ptr(),
+                st.sdescs_u.lock().expect("su").dev_ptr(),
+                st.sdescs_d.lock().expect("sd").dev_ptr());
+        } else {
+            cu::exl3_moe_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
+                x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
+                dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),
+                N_SLOTS as i32,
+                st.exl3_stage.lock().expect("stg").dev_ptr(),
+                st.sdescs_g.lock().expect("sg").dev_ptr(),
+                st.sdescs_u.lock().expect("su").dev_ptr(),
+                st.sdescs_d.lock().expect("sd").dev_ptr(),
+                a.on_dev);
+        }
     }
 }
 

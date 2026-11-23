@@ -1,0 +1,6 @@
+{"ts":"2026-11-22T23:25:46-03:00","config":"dec-lut","i":1,"decode_s":1.574599606,"ms_tok":196.8,"golden":"yes","text":" the capital of France.\n\nThe "}
+{"ts":"2026-11-22T23:26:05-03:00","config":"dec-lut","i":2,"decode_s":1.756035363,"ms_tok":219.5,"golden":"yes","text":" the capital of France.\n\nThe "}
+{"ts":"2026-11-22T23:26:23-03:00","config":"dec-lut","i":3,"decode_s":1.696484775,"ms_tok":212.1,"golden":"yes","text":" the capital of France.\n\nThe "}
+{"ts":"2026-11-22T23:26:37-03:00","config":"dec-lut","i":4,"decode_s":1.853295665,"ms_tok":231.7,"golden":"yes","text":" the capital of France.\n\nThe "}
+{"ts":"2026-11-22T23:26:52-03:00","config":"dec-lut","i":5,"decode_s":1.618039731,"ms_tok":202.3,"golden":"yes","text":" the capital of France.\n\nThe "}
+{"ts":"2026-11-22T23:27:06-03:00","config":"dec-lut","i":6,"decode_s":1.752559385,"ms_tok":219.1,"golden":"yes","text":" the capital of France.\n\nThe "}
