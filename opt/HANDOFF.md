@@ -1,5 +1,45 @@
 # HANDOFF — Inkwell REXL3 port (overnight session)
 
+## ★ RESUME AQUI (estado real, HEAD = ce2de91)
+
+**Objetivo do usuário (ordem nova):** fazer SPECULATIVE DECODING vencer o serial
+(~10.3 TPS). "Você precisa fazer o speculative funcionar" — caminho livre.
+Serial está em platô ~97 ms/tok (~10.3 TPS), golden `" Paris. The capital of
+the United States is Washington, D.C. ..."`. Spec funcional: ~3.4-5.1 tok/s,
+accept 21-50% por prompt, emit ~2.3-2.9 tok/round (ref vLLM ~4.34).
+
+**Diagnóstico definitivo do verify (~540-650ms):**
+- União real nu ≈ 8-18 experts (median ~12) → ~1.3GB/verify — PCIe (11-12GB/s
+  medido) NÃO é o muro.
+- `inkwell_exl3_gemv_moe_ntok` (~260ms do verify) é LATÊNCIA de cadeia
+  dependente: 18 janelas × stage→sync→compute→sync; bytes de cada expert lidos
+  uma vez por até 8 consumidores (isso já é o dedup). VRAM-resident = mesmo
+  tempo. ~4-5GB/s efetivo.
+- Resto do verify: dp4a_ntok ~63ms, kernels had/situ/wsum ~140ms (suspeita:
+  launch overhead, mesmas grids 64-slot), draft ~46ms, host gaps ~50ms.
+- JÁ TENTADO e registrado no ledger: pool VRAM (0), nky>1 (-), unroll (-),
+  janela-16 (crash err=900), slot-loop (2x pior), grid.y=32 (quebra nu>32),
+  host readback de nu (ilegal em cudaGraph capture), sx-hoist (marginal).
+- MANTIDO: xhb transposto [c][frag][b] + float4 FMA + uint4 ring fills →
+  +5-7% verify. union_expand split >8 consumers (fix OOB real).
+
+**Para spec vencer precisa dos DOIS:** verify ~300ms (gemv ~2x) **E** emit ~4.3.
+Candidatos não-tentados: (a) reestruturar pipeline de janelas p/ prefetch
+mais profundo ou merge das 18 janelas em menos syncs; (b) emit: draft-len
+adaptativo ou revisar qualidade do ctx vs vLLM; (c) cortar ~140ms de had/situ
+(launch-bound, grids mortas) — fusões ou grids exatas; (d) two-chunk verify.
+
+**Run:** `cd ~/inkwell && cargo build -p inkwell-cli --release && pkill -9 -x
+inkwell; LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/
+build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 INKWELL_GENS=48 INKWELL_MAX_CTX=1024
+INKWELL_EXL3_CACHE_K=4 INKWELL_SPEC=mtp INKWELL_SPEC_GENS=48 ./target/release/
+inkwell ~/models/inkling --run` — INKWELL_SPEC_GENS baixa (8-32) p/ iteração
+rápida. INKWELL_MNTOK_DBG=6 p/ timing por fase (FLAKY: err=900 às vezes, retry).
+O `err=900` aparece em builds modificados aleatoriamente — provável residual
+não-diagnosticado; repetir o run se crashar.
+
+Ledger completo em opt/ledger.md. Abaixo: histórico das sessões.
+
 ## Missão
 **60 ms/tok (~16.7 TPS) no caminho NÃO-spec primeiro**, depois speculative.
 Spec já implementado/verificado mas não paga (verify ~500ms, accept ~14%).
