@@ -628,6 +628,10 @@ pub fn mem_info() -> (usize, usize) {
 ///
 /// # Safety
 /// `dst`/`src` valid for `bytes`.
+pub unsafe fn memcpy_d2h_sync(dst: *mut c_void, src: *const c_void, bytes: usize) {
+    assert_eq!(cudaMemcpy(dst, src, bytes, 2), 0, "memcpy_d2h_sync");
+}
+
 pub unsafe fn memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
     let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, stream()) };
     assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");

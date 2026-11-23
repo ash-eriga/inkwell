@@ -249,6 +249,22 @@ impl Mtp {
     pub fn ctx_append(&mut self, c: i64) {
         if std::env::var_os("INKWELL_MTP_NOCTX").is_some() { if self.lo < 0 { self.lo = c; } return; }
         if self.lo < 0 { self.lo = c; }
+        if std::env::var_os("INKWELL_MTP_DUMP").is_some() {
+            unsafe {
+                inkwell_cuda::DevBuf::sync();
+                let mut h = vec![0f32; 8];
+                let mut b = vec![0u8; 4 * NB * H * 4];
+                inkwell_cuda::memcpy_d2h_sync(b.as_mut_ptr().cast(), self.feats.cast(), b.len());
+                for tap in 0..4 {
+                    let base = tap * NB * H * 4;
+                    for (i, v) in h.iter_mut().enumerate() {
+                        *v = f32::from_le_bytes(b[base + i * 4..base + i * 4 + 4].try_into().unwrap());
+                    }
+                    eprintln!("feats tap{tap} row0[0..4]={:?} row7[0..4]={:?}", &h[..4],
+                        (0..4).map(|i| f32::from_le_bytes(b[base + 7 * H * 4 + i * 4..base + 7 * H * 4 + i * 4 + 4].try_into().unwrap())).collect::<Vec<_>>());
+                }
+            }
+        }
         unsafe {
             let posh: Vec<i32> = (0..NB).map(|i| (c + i as i64) as i32).collect();
             self.posd.write_bytes(bytemuck_cast_i32(&posh));
@@ -357,6 +373,17 @@ impl Mtp {
                 self.amax.read_bytes(&mut tok);
                 prev = u32::from_ne_bytes(tok);
                 out[i] = prev;
+                if i == 1 && std::env::var_os("INKWELL_MTP_BASE").is_some() {
+                    // diagnostic: argmax of unembed(hid_1) alone (no markov/ho)
+                    let (t_, s_, v_, k_, n_, ka_, hk_, scr_) = self.un;
+                    inkwell_cuda::memcpy_d2d_async(self.d(&self.u2).cast(), self.d(&self.h).add(i * H).cast(), H * 4);
+                    inkwell_cuda::exl3_gemv_async(t_, s_, v_, self.d(&self.u2), self.d(&self.z), k_, n_, ka_, hk_, scr_);
+                    inkwell_cuda::draft_argmax_async(self.d(&self.z), VOCAB, CAP, self.d(&self.amax).cast::<i32>());
+                    inkwell_cuda::DevBuf::sync();
+                    let mut t2 = [0u8; 4];
+                    self.amax.read_bytes(&mut t2);
+                    eprintln!("dbg i=1: markov={} base={}", prev, u32::from_ne_bytes(t2));
+                }
             }
             out
         }
