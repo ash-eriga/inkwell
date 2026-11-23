@@ -242,3 +242,11 @@ Ledger histórico: subtrair ~35ms de tudo.
 - REJEITADOS A/B: nky-split moe gemv (108/113ms), direct-loads sem smem (131ms), prefetch-depth-8 (neutro, mantido).
 - gemv_moe não é starved de blocos (~288) nem math-bound (~5Gops); suspeita: latência das chains smem/syncs.
 - Não testado: fundir had_in/out no gemv (economiza 2 launches+roundtrip), batchar os 433 dp4a (proj pequenas agrupáveis?), exl3_moe_stage p/ L21-23 via ccopy k=8.
+
+## Cache tuning results (2026-11-23)
+- WIN: k=25 + margin=50 defaults (commit) → ~96ms/tok. hits>coverage.
+- Rejected: k=32 (fewer layers), k=8 (misses), k=40+noprefetch (103ms), k=32+noprefetch (98.8).
+- Prefetch bank ~0 hits (verified via PFSTAT) — dead weight ~32MB/layer, could be removed to free VRAM.
+- Uncached layers (19-23 at k=25) still use moe_stage serial (~8ms/tok): try routing them through ccopy with tiny cache, or shrink slot to per-proj granularity.
+- Dense gemvs ARE device-resident (exl3_w=145, dev=308MiB) — the 34ms is VRAM latency too, NOT PCIe. PCIe cost = only host expert misses (~15ms).
+- ncu blocked: no sudo/CTRPERM on this box.

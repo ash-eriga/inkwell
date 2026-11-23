@@ -345,3 +345,4 @@
 {"ts":"2026-11-23","config":"moe-gemv nky env + prefetch-depth-8","decode_s":0.8145,"ms_tok":101.7,"golden":true,"note":"nky=2/4 worse (108/113); depth8 neutral vs 100.3 baseline"}
 {"ts":"2026-11-23","config":"moe-gemv direct-loads no-sync","ms_tok":130.8,"golden":true,"note":"REJECTED — worse than cooperative smem pipeline"}
 {"ts":"2026-11-23","config":"cache k=25 margin=50 defaults","decode_s":0.769,"ms_tok":96.1,"golden":true,"note":"WIN vs ~100.3; k=32 worse (fewer layers), k=8 worse (misses)"}
+{"ts":"2026-11-23","config":"moe-gemv double-buffer rings","ms_tok":101,"golden":true,"note":"REJECTED ~101 vs 96 control"}
