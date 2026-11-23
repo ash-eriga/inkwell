@@ -48,7 +48,11 @@ extern "C" {
     fn ink_launch_situ_pair(gu: *const f32, sgu: *const f32, hid: *mut f32, beta: f32, lin_beta: f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_exl3_gemv(trel: *const c_void, suh: *const c_void, svh: *const c_void, x: *const f32, y: *mut f32, k: i64, n: i64, ka: i64, halfk: i64, scratch: *mut f32, stream: *mut c_void);
     fn ink_launch_exl3_moe(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, on_dev: i32);
-    fn ink_launch_exl3_moe_cached(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, rr: *mut i32, k: i32, slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void);
+    fn ink_launch_exl3_moe_cached(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, rr: *mut i32, k: i32, slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, ptag: *const i32, pready: *const i32, bank: *mut c_void, pf_hit: *mut i32);
+    fn ink_launch_exl3_prefetch2(dg: *const c_void, du: *const c_void, dd: *const c_void,
+        hist: *const i32, tag: *const i32, bank: *mut c_void, ptag: *mut i32, pready: *mut i32,
+        pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void);
+    fn ink_launch_exl3_copy8(src: *const c_void, dst: *mut c_void, stream: *mut c_void);
     fn ink_launch_exl3_stage(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, staging: *mut c_void, sg: *mut c_void, su: *mut c_void, sd: *mut c_void, stream: *mut c_void);
     fn ink_launch_conv_step(x_in: *const f32, state: *mut f32, region_off: i32, w: *const f32, dyn_p: *const f32, ch: i32, n_heads: i32, scale: f32, out: *mut f32, stream: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
@@ -711,9 +715,37 @@ pub unsafe fn exl3_moe_cached_async(dg: *const c_void, du: *const c_void, dd: *c
     ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32,
     w: *const f32, out: *mut f32, nslots: i32,
     cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, rr: *mut i32, k: i32,
-    slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void) {
-    unsafe { ink_launch_exl3_moe_cached(dg, du, dd, ids, x, xh, gu, hid, dn, w, out, nslots, stream(), cache, tag, map, miss, rr, k, slot_proj, sdescs_g, sdescs_u, sdescs_d) };
+    slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void,
+    ptag: *const i32, pready: *const i32, bank: *mut c_void, pf_hit: *mut i32) {
+    unsafe { ink_launch_exl3_moe_cached(dg, du, dd, ids, x, xh, gu, hid, dn, w, out, nslots, stream(), cache, tag, map, miss, rr, k, slot_proj, sdescs_g, sdescs_u, sdescs_d, ptag, pready, bank, pf_hit) };
 }
+/// D2D copy of the 8 router ids via a 1-block kernel (capture-safe).
+///
+/// # Safety
+/// `dst`/`src` hold at least 8 i32.
+pub unsafe fn memcpy_ids8_async(dst: *mut c_void, src: *const c_void) {
+    unsafe { ink_launch_exl3_copy8(src, dst, stream()) };
+}
+
+/// A fresh disable-timing event for prefetch join.
+#[must_use]
+pub fn new_event() -> *mut c_void {
+    let mut e = std::ptr::null_mut();
+    assert_eq!(unsafe { cudaEventCreateWithFlags(&raw mut e, 2) }, 0, "cudaEventCreate");
+    e
+}
+
+/// Host-issued prefetch of predicted experts into a layer's bank, side stream.
+///
+/// # Safety
+/// Buffers sized as documented; issue after compute returns.
+#[expect(clippy::too_many_arguments)]
+pub unsafe fn exl3_prefetch2_async(dg: *const c_void, du: *const c_void, dd: *const c_void,
+    hist: *const i32, tag: *const i32, bank: *mut c_void, ptag: *mut i32, pready: *mut i32,
+    pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64) {
+    unsafe { ink_launch_exl3_prefetch2(dg, du, dd, hist, tag, bank, ptag, pready, pf_map, pf_miss, nslots, k, slot_proj, side_stream()) };
+}
+
 fn stream() -> *mut c_void { INK_STREAM.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// ids[s] -> ptrs[s] via device map (misses pushed to missq).

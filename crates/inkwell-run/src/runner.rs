@@ -783,6 +783,7 @@ impl Runner {
                 moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
                     on_dev, cache: None, max_slot,
+                    layer: moe_args_exl3.len() as i32,
                 }));
             }
             l.proj0_off = [-1; 3];
@@ -852,6 +853,8 @@ impl Runner {
                 rr.write_bytes_async(&[0u8; 4]);
                 a.cache = Some(crate::moe::Exl3Cache {
                     buf, tag, rr, k: ck as i32, slot: a.max_slot,
+                    prefetch: std::env::var_os("INKWELL_MOE_NOPREFETCH").is_none()
+                        .then(|| crate::moe::Exl3Prefetch::new(a.max_slot)).flatten(),
                 });
                 eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED",
                     a.max_slot, cbytes as f64 / 1e6);
@@ -1405,6 +1408,27 @@ impl Runner {
         }
         if std::env::var_os("INKWELL_OPCNT").is_some() {
             unsafe { inkwell_ggml::ink_graph_op_counts(g.0) };
+        }
+        // issue this token's expert prefetch on the side stream: predicted
+        // ids are hist[] from the last token (already drained). Overlaps the
+        // graph build + early compute below.
+        for a in &mut self.moe_args_exl3 {
+            let Some(c) = &mut a.cache else { continue };
+            let Some(pf) = &mut c.prefetch else { continue };
+            unsafe {
+                inkwell_cuda::exl3_prefetch2_async(
+                    a.descs_g.dev, a.descs_u.dev, a.descs_d.dev,
+                    pf.hist.dev_ptr().cast(), c.tag.dev_ptr().cast(),
+                    pf.bank.dev_ptr(), pf.ptag.dev_ptr().cast(),
+                    pf.pready.dev_ptr().cast(), pf.pf_map.dev_ptr().cast(),
+                    pf.pf_miss.dev_ptr().cast(), 8, c.k, c.slot as i64);
+            }
+            if pos % 7 == 6 && std::env::var_os("INKWELL_PF_STAT").is_some() {
+                let mut b = [0u8; 36];
+                pf.pf_miss.read_bytes(&mut b);
+                let hits = i32::from_le_bytes(b[32..36].try_into().unwrap());
+                eprintln!("PFSTAT L{} hits={}", a.layer, hits);
+            }
         }
         let prof = std::env::var_os("INKWELL_PROF").is_some();
         let t0 = std::time::Instant::now();

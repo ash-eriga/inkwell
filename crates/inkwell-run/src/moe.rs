@@ -292,6 +292,37 @@ pub struct MoeArgsExl3 {
     pub cache: Option<Exl3Cache>,
     /// per-expert blob stride in bytes (max trel_b + suh+svh) for `cache` sizing
     pub max_slot: usize,
+    /// ordinal of this MoE layer (for INKWELL_MOE_IDLOG histograms)
+    pub layer: i32,
+}
+
+/// Expert-usage histograms: HIST[layer][expert] counts, only when
+/// INKWELL_MOE_IDLOG=path is set and the cb runs eagerly (no cuda graphs).
+static MOE_HIST: std::sync::Mutex<Option<Box<[[u64; 128]; 32]>>> = std::sync::Mutex::new(None);
+
+/// Accumulate one visit's ids into MOE_HIST (host side, eager mode only).
+fn moe_idlog(ids_dev: *const i32, layer: i32) {
+    use std::io::Write as _;
+    let path = match std::env::var("INKWELL_MOE_IDLOG") { Ok(v) => v, Err(_) => return };
+    unsafe extern "C" { fn cudaMemcpy(d: *mut c_void, s: *const c_void, n: usize, k: i32) -> i32; }
+    let mut h = [0i32; 16];
+    unsafe { cudaMemcpy(h.as_mut_ptr().cast(), ids_dev.cast(), 64, 2) };
+    let n = h[0..8].iter().filter(|&&e| (0..128).contains(&e)).count();
+    let mut g = MOE_HIST.lock().expect("hist");
+    let hist = g.get_or_insert_with(|| Box::new([[0u64; 128]; 32]));
+    let l = layer as usize;
+    if l < 32 { for &e in &h[..n] { hist[l][e as usize] += 1; } }
+    let tokens: u64 = hist.iter().map(|r| r.iter().sum::<u64>()).sum::<u64>() / 8;
+    if tokens % 64 == 0 && tokens > 0 {
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            for (li, row) in hist.iter().enumerate() {
+                let mut v: Vec<(u32, u64)> = row.iter().enumerate().filter(|(_, &c)| c > 0)
+                    .map(|(e, &c)| (e as u32, c)).collect();
+                v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+                let _ = writeln!(f, "L{li}: {:?}", v.iter().map(|(e,c)| format!("{e}:{c}")).collect::<Vec<_>>());
+            }
+        }
+    }
 }
 
 /// Per-layer VRAM cache: `k` slots × 3 projs × EXL3_STAGE_PROJ bytes,
@@ -308,6 +339,40 @@ pub struct Exl3Cache {
     pub k: i32,
     /// bytes per slot per proj = this layer's max expert blob.
     pub slot: usize,
+    /// predictive prefetch state (side-stream copies of last-visit ids)
+    pub prefetch: Option<Exl3Prefetch>,
+}
+
+/// Per-layer prefetch bank + seqlock for host-issued side-stream promotion.
+#[derive(Debug)]
+pub struct Exl3Prefetch {
+    /// last visit's router ids (8 i32) — prediction source
+    pub hist: cu::DevBuf,
+    /// 8 slots × 3 projs × slot bytes of prefetched expert blobs
+    pub bank: cu::DevBuf,
+    /// expert id held in each bank slot (8 i32, init 0xFF)
+    pub ptag: cu::DevBuf,
+    /// 1 i32: 0 while the bank is being (re)written, 1 when complete
+    pub pready: cu::DevBuf,
+    /// private resolve outputs for the prefetch pass
+    pub pf_map: cu::DevBuf,
+    /// private miss flags
+    pub pf_miss: cu::DevBuf,
+}
+
+impl Exl3Prefetch {
+    /// Allocate the prefetch buffers (bank = `slot` bytes × 8 × 3).
+    #[must_use]
+    pub fn new(slot: usize) -> Option<Self> {
+        Some(Self {
+            hist: cu::DevBuf::try_new_bytes(32)?,
+            bank: cu::DevBuf::try_new_bytes(8 * 3 * slot)?,
+            ptag: { let mut d = cu::DevBuf::try_new_bytes(32)?; d.write_bytes(&[0xFFu8; 32]); d },
+            pready: cu::DevBuf::try_new_bytes(4)?,
+            pf_map: cu::DevBuf::try_new_bytes(32)?,
+            pf_miss: { let mut d = cu::DevBuf::try_new_bytes(36)?; d.write_bytes(&[0u8; 36]); d },
+        })
+    }
 }
 
 /// Bytes per cache slot per projection (trellis+suh+svh, w≤32 worst case).
@@ -339,6 +404,10 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
     let mut xh = st.xh.lock().expect("xh");
     unsafe {
         if let Some(c) = &a.cache {
+            if std::env::var_os("INKWELL_MOE_IDLOG").is_some() { moe_idlog(ids_dev, a.layer); }
+            if let Some(pf) = &c.prefetch {
+                cu::memcpy_ids8_async(pf.hist.dev_ptr(), ids_dev.cast());
+            }
             cu::exl3_moe_cached_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
                 x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
                 dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),
@@ -349,8 +418,13 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
                 c.rr.dev_ptr().cast(), c.k, c.slot as i64,
                 st.sdescs_g.lock().expect("sg").dev_ptr(),
                 st.sdescs_u.lock().expect("su").dev_ptr(),
-                st.sdescs_d.lock().expect("sd").dev_ptr());
+                st.sdescs_d.lock().expect("sd").dev_ptr(),
+                c.prefetch.as_ref().map_or(std::ptr::null(), |p| p.ptag.dev_ptr().cast()),
+                c.prefetch.as_ref().map_or(std::ptr::null(), |p| p.pready.dev_ptr().cast()),
+                c.prefetch.as_ref().map_or(std::ptr::null_mut(), |p| p.bank.dev_ptr()),
+                c.prefetch.as_ref().map_or(std::ptr::null_mut(), |p| unsafe { p.pf_miss.dev_ptr().cast::<i32>().add(8) }));
         } else {
+            if std::env::var_os("INKWELL_MOE_IDLOG").is_some() { moe_idlog(ids_dev, a.layer); }
             cu::exl3_moe_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
                 x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
                 dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),

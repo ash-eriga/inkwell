@@ -150,3 +150,20 @@ LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-in
 - Env knobs: INKWELL_EXL3_CACHE_K(default 16 agora), INKWELL_MAX_CTX, INKWELL_MOE_SKIP(piso não-MoE 84ms), INKWELL_CG_PROF, INKWELL_MOE_STATS(only non-exl3 path), GGML_CUDA_GRAPH_CHUNK_SIZE, GGML_SCHED_DEBUG.
 - git stash #0 = versão "element-parallel" REJEITADA (~190ms).
 - Meta: 15 TPS=66.7ms (avisa e continua), depois 30 TPS=33ms, depois spec decode (mtp.safetensors markov_rank=256 block=8).
+
+## SESSÃO 3b — PREFETCH WIP (não commitado)
+- dp4a-r4 (256thr, r split 4-way, tk batch x4, stride 80): ~150-157, NEUTRO, golden ok. Commitável.
+- ccopy split gridY=4: neutro.
+- PREFETCH design final (in-flight): resolve-aware bank. Events in-cb ilegais em capture (901/905). Novo design: host-side prefetch pós-compute na side stream; bank dedicado/layer + ptag+pready seqlock; resolve kernel ganhou args (ptag,pready) e map pode codificar EXL3_PF_BASE+p; ccopy ganhou arg bank.
+- kernels.cu: ink_launch_exl3_prefetch2 + pf_resolve/pf_flag/pf_tag + moe_pcopy ADICIONADOS; resolve/ccopy JÁ assinados novos; launch moe_cached JÁ passa args novos.
+- lib.rs: decl ink_launch_exl3_moe_cached extern JÁ atualizada c/ ptag/pready/bank + prefetch2 decl adicionada; falta wrapper exl3_moe_cached_async (args novos) e apagar exl3_prefetch_async/wait órfãos.
+- moe.rs: Exl3Prefetch struct existe {hist,map_p,miss_p,sd_g,u,d,ev_done} — REESCREVER p/ {hist,bank,ptag,pready,pf_map,pf_miss}; cb ainda chama exl3_prefetch_wait/exl3_prefetch_async/moe_idlog — REMOVER chamadas órfãs, MANTER memcpy_ids8_async(pf.hist).
+- runner.rs: cache ctor tem prefetch: Option<Exl3Prefetch>; precisa alocar bank=8*3*slot bytes; host call site: após ink_sched_compute em step(), loop moe_args_exl3 com cache → cu::exl3_prefetch2_async(descs, hist, tag, bank, ptag, pready, pf_map, pf_miss, 8, k, slot).
+- baseline bom ~150ms/tok mediana.
+
+## SESSÃO 3c — regpref pipeline (~135 ms/tok)
+- DESCOBERTA: fill global→smem serializado por __syncthreads era o custo real do gemv (remover math todo = neutro).
+- gemv_moe + gemv_dp4a: prefetch do próximo tk-batch em REGISTRADORES durante o math, store p/ smem depois do sync → 155→~135 ms/tok mediana. Golden.
+- Prefetch de experts host-side (side stream, bank/ptag/pready) implementado e correto mas ~neutro: PFSTAT hits ~6/224 visitas — predição fraca. Mantido (machinery pronta).
+- Crashes esporádicos no load = OOM por zumbi ou VRAM apertada; i1 do bench morre às vezes.
+- Próximos: (a) mesmo regpref no had_in/had_out stage loops; (b) fusionar had_out+situ; (c) ccopy serial ainda ~20ms.

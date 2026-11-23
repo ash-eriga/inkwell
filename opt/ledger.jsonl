@@ -124,3 +124,56 @@
 {"ts":"2026-11-23T01:25:50-03:00","config":"exl3-ctx4k","i":2,"decode_s":1.236355702,"ms_tok":154.5,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T01:26:02-03:00","config":"exl3-ctx4k","i":3,"decode_s":1.240012623,"ms_tok":155.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T01:26:14-03:00","config":"exl3-ctx4k","i":4,"decode_s":1.269690939,"ms_tok":158.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T01:29:14-03:00","config":"exl3-dp4a-r4","i":1,"error":"no decode line","tail":"#9  0x0000556ff2da18c5 in main ()|[Inferior 1 (process 3666742) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:30:13-03:00","config":"exl3-dp4a-r4","i":2,"error":"no decode line","tail":"#9  0x000055b97f5b68c5 in main ()|[Inferior 1 (process 3677046) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:31:20-03:00","config":"exl3-dp4a-r4","i":3,"error":"no decode line","tail":"#9  0x0000560788dd68c5 in main ()|[Inferior 1 (process 3688541) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:32:08-03:00","config":"exl3-dp4a-r4","i":1,"error":"no decode line","tail":"|thread 'main' (3708427) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:32:08-03:00","config":"exl3-dp4a-r4","i":2,"error":"no decode line","tail":"|thread 'main' (3710428) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:32:09-03:00","config":"exl3-dp4a-r4","i":3,"error":"no decode line","tail":"|thread 'main' (3710528) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:32:09-03:00","config":"exl3-dp4a-r4","i":4,"error":"no decode line","tail":"|thread 'main' (3710626) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:37:38-03:00","config":"exl3-dp4a-r4","i":1,"error":"no decode line","tail":"#9  0x000055977ba5a8c5 in main ()|[Inferior 1 (process 3761923) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:38:45-03:00","config":"exl3-dp4a-r4","i":2,"error":"no decode line","tail":"#9  0x000055eb3ee7c8c5 in main ()|[Inferior 1 (process 3777204) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:40:03-03:00","config":"exl3-dp4a-r4","i":3,"error":"no decode line","tail":"#9  0x000055f45266c8c5 in main ()|[Inferior 1 (process 3790582) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:41:16-03:00","config":"exl3-dp4a-r4","i":4,"error":"no decode line","tail":"#9  0x0000560edc2088c5 in main ()|[Inferior 1 (process 3806195) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:42:16-03:00","config":"exl3-dp4a-r4","i":1,"error":"no decode line","tail":"|thread 'main' (3833059) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:42:16-03:00","config":"exl3-dp4a-r4","i":2,"error":"no decode line","tail":"|thread 'main' (3833262) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:42:17-03:00","config":"exl3-dp4a-r4","i":3,"error":"no decode line","tail":"|thread 'main' (3833352) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:42:17-03:00","config":"exl3-dp4a-r4","i":4,"error":"no decode line","tail":"|thread 'main' (3833442) panicked at inkwell-cli/src/main.rs:45:14:|run_e2e panicked: Any { .. }|"}
+{"ts":"2026-11-23T01:43:41-03:00","config":"exl3-dp4a-r4","i":1,"error":"no decode line","tail":"#9  0x000055a7c2849835 in main ()|[Inferior 1 (process 3837596) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:44:44-03:00","config":"exl3-dp4a-r4","i":2,"error":"no decode line","tail":"#9  0x00005607c907f835 in main ()|[Inferior 1 (process 3850580) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:45:54-03:00","config":"exl3-dp4a-r4","i":3,"error":"no decode line","tail":"#9  0x000055b0def3d835 in main ()|[Inferior 1 (process 3863326) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:47:14-03:00","config":"exl3-dp4a-r4","i":4,"error":"no decode line","tail":"#9  0x0000562064d51835 in main ()|[Inferior 1 (process 3877473) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:51:46-03:00","config":"exl3-dp4a-r4","i":1,"error":"no decode line","tail":"#9  0x000055f9b62ba835 in main ()|[Inferior 1 (process 3934303) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:52:56-03:00","config":"exl3-dp4a-r4","i":2,"error":"no decode line","tail":"#9  0x000055657a03e835 in main ()|[Inferior 1 (process 3946321) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:54:18-03:00","config":"exl3-dp4a-r4","i":3,"error":"no decode line","tail":"#9  0x0000559dc1803835 in main ()|[Inferior 1 (process 3960388) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:55:36-03:00","config":"exl3-dp4a-r4","i":4,"error":"no decode line","tail":"#9  0x0000563c62173835 in main ()|[Inferior 1 (process 3977560) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T01:58:58-03:00","config":"exl3-dp4a-r4","i":1,"decode_s":1.25500733,"ms_tok":156.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T01:59:14-03:00","config":"exl3-dp4a-r4","i":2,"decode_s":1.20136127,"ms_tok":150.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T01:59:29-03:00","config":"exl3-dp4a-r4","i":3,"decode_s":1.515808258,"ms_tok":189.5,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T01:59:41-03:00","config":"exl3-dp4a-r4","i":4,"decode_s":1.240522352,"ms_tok":155.1,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:13:52-03:00","config":"exl3-ccopy4","i":1,"error":"no decode line","tail":"#9  0x000056103f759005 in main ()|[Inferior 1 (process 8151) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:15:01-03:00","config":"exl3-ccopy4","i":2,"error":"no decode line","tail":"#9  0x0000561a3205c005 in main ()|[Inferior 1 (process 22357) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:16:01-03:00","config":"exl3-ccopy4","i":3,"error":"no decode line","tail":"#9  0x000055b690f6e005 in main ()|[Inferior 1 (process 35874) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:16:59-03:00","config":"exl3-ccopy4","i":4,"error":"no decode line","tail":"#9  0x00005592fff3c005 in main ()|[Inferior 1 (process 46950) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:17:20-03:00","config":"exl3-ccopy4","i":1,"decode_s":1.431471769,"ms_tok":178.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:17:34-03:00","config":"exl3-ccopy4","i":2,"decode_s":1.338735261,"ms_tok":167.3,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:17:45-03:00","config":"exl3-ccopy4","i":3,"decode_s":1.247225664,"ms_tok":155.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:17:56-03:00","config":"exl3-ccopy4","i":4,"decode_s":1.255197486,"ms_tok":156.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:35:30-03:00","config":"exl3-prefetch2","i":1,"error":"no decode line","tail":"#9  0x000055cddfff3305 in main ()|[Inferior 1 (process 273471) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:35:51-03:00","config":"exl3-prefetch2","i":2,"decode_s":1.243425985,"ms_tok":155.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:36:01-03:00","config":"exl3-prefetch2","i":3,"decode_s":1.23212271,"ms_tok":154.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:36:13-03:00","config":"exl3-prefetch2","i":4,"decode_s":1.221945137,"ms_tok":152.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:37:00-03:00","config":"exl3-pf-start","i":1,"decode_s":1.254675076,"ms_tok":156.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:37:16-03:00","config":"exl3-pf-start","i":2,"decode_s":1.233293061,"ms_tok":154.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:37:28-03:00","config":"exl3-pf-start","i":3,"decode_s":1.246636178,"ms_tok":155.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:37:40-03:00","config":"exl3-pf-start","i":4,"decode_s":1.25435912,"ms_tok":156.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:45:49-03:00","config":"exl3-moe-regpf","i":1,"error":"no decode line","tail":"#9  0x000055679311a115 in main ()|[Inferior 1 (process 400889) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:46:56-03:00","config":"exl3-moe-regpf","i":2,"error":"no decode line","tail":"#9  0x000055d9e48c4115 in main ()|[Inferior 1 (process 413013) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:47:22-03:00","config":"exl3-moe-regpf","i":3,"decode_s":1.125733551,"ms_tok":140.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:47:33-03:00","config":"exl3-moe-regpf","i":4,"decode_s":1.078793185,"ms_tok":134.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:47:43-03:00","config":"exl3-moe-regpf","i":5,"decode_s":1.078594536,"ms_tok":134.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:47:54-03:00","config":"exl3-moe-regpf","i":6,"decode_s":1.077044281,"ms_tok":134.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:49:25-03:00","config":"exl3-regpf2","i":1,"error":"no decode line","tail":"#9  0x0000555b733dcc15 in main ()|[Inferior 1 (process 444471) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T02:49:44-03:00","config":"exl3-regpf2","i":2,"decode_s":1.069605927,"ms_tok":133.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:49:55-03:00","config":"exl3-regpf2","i":3,"decode_s":1.257440303,"ms_tok":157.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T02:50:07-03:00","config":"exl3-regpf2","i":4,"decode_s":1.048195439,"ms_tok":131.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}

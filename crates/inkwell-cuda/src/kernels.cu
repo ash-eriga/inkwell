@@ -1682,44 +1682,89 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
                                        const float* __restrict__ xh,
                                        float* __restrict__ t,
                                        int tk, int tn, int ka, int halfk) {
-    const int g = threadIdx.x >> 4;      // 4 tiles per block
-    const int c = threadIdx.x & 15;      // column within tile
+    const int g = threadIdx.x >> 6;      // 4 tiles per block, 64 threads/tile
+    const int u = threadIdx.x & 63;      // 4 threads per column (r split 4-way)
+    const int c = u >> 2, rp = u & 3;
     const int tn_i = blockIdx.x * 4 + g;
-    const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
-    __shared__ float xhs[16];
-    __shared__ uint32_t rings[4 * 80];
+    const int w = r_bits_words(ka, halfk); // ≤80 u32 per tile
+    __shared__ float xhb[4][16];
+    __shared__ uint32_t rings[4 * 4 * 80]; // 4 tiles × 4 tk-batch × ≤80 words
     const bool live = tn_i < tn;
     // split-K: gridDim.y chunks over the tk dimension
     const int tkc = (tk + gridDim.y - 1) / gridDim.y;
     const int tk0 = blockIdx.y * tkc;
     const int tk1 = min(tk0 + tkc, tk);
-    // dec(i) is affine in bytesum: t = KINV*Σ xh*bs + (1024*KINV+KBIAS)*Σ xh
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
     float s = 0.f, sx = 0.f;
-    for (int tk_i = tk0; tk_i < tk1; ++tk_i) {
-        if (threadIdx.x < 16) xhs[c] = xh[tk_i * 16 + c];
-        if (live) {
-            const uint32_t* ring = trel + (size_t)(tk_i * tn + tn_i) * (size_t)w;
-            uint32_t* rg = rings + g * 80;
-            for (int j = c; j < w; j += 16) rg[j] = ring[j];
+    // prologue fill of batch tk0 (global-load stall happens once)
+    {
+        const int tkn0 = min(4, tk1 - tk0);
+        if (threadIdx.x < 64) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn0) xhb[j >> 4][j & 15] = xh[(tk0 + (j >> 4)) * 16 + (j & 15)];
         }
-        __syncthreads();
         if (live) {
-            const uint32_t* rg = rings + g * 80;
+            uint32_t* rg = rings + g * 320;
+            for (int b = 0; b < tkn0; ++b) {
+                const uint32_t* ring = trel + (size_t)((tk0 + b) * tn + tn_i) * (size_t)w;
+                if (u < w) rg[b * 80 + u] = ring[u];
+                if (u + 64 < w) rg[b * 80 + u + 64] = ring[u + 64];
+            }
+        }
+    }
+    __syncthreads();
+    for (int tkb0 = tk0; tkb0 < tk1; tkb0 += 4) {
+        const int tkn = min(4, tk1 - tkb0);
+        const int nb0 = tkb0 + 4;
+        const int tkn2 = min(4, tk1 - nb0);
+        // prefetch next batch to registers; hide global latency behind math
+        uint32_t pfb[4][2];
+        float pfx = 0.f;
+        if (live && nb0 < tk1) {
+            for (int b = 0; b < tkn2; ++b) {
+                const uint32_t* ring = trel + (size_t)((nb0 + b) * tn + tn_i) * (size_t)w;
+                if (u < w) pfb[b][0] = ring[u];
+                if (u + 64 < w) pfb[b][1] = ring[u + 64];
+            }
+        }
+        if (threadIdx.x < 64 && nb0 < tk1) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn2) pfx = xh[(nb0 + (j >> 4)) * 16 + (j & 15)];
+        }
+        if (live) {
+            const uint32_t* rg = rings + g * 320;
+            for (int b = 0; b < tkn; ++b) {
 #pragma unroll
-            for (int r = 0; r < 16; ++r) {
-                const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
-                            | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                const int bs = (int)__dp4a(exl3_window(rg, i, ka, halfk) * 0x83DCD12Du,
-                                           0x01010101u, 0u);
-                s += xhs[r] * (float)bs;
-                sx += xhs[r];
+                for (int r = rp; r < 16; r += 4) {
+                    const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                                | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+                    const int bs = (int)__dp4a(exl3_window(rg + b * 80, i, ka, halfk) * 0x83DCD12Du,
+                                               0x01010101u, 0u);
+                    s += xhb[b][r] * (float)bs;
+                    sx += xhb[b][r];
+                }
             }
         }
         __syncthreads();
+        if (live && nb0 < tk1) {
+            uint32_t* rg = rings + g * 320;
+            for (int b = 0; b < tkn2; ++b) {
+                if (u < w) rg[b * 80 + u] = pfb[b][0];
+                if (u + 64 < w) rg[b * 80 + u + 64] = pfb[b][1];
+            }
+        }
+        if (threadIdx.x < 64 && nb0 < tk1) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn2) xhb[j >> 4][j & 15] = pfx;
+        }
+        __syncthreads();
     }
-    if (live) t[blockIdx.y * (tn * 16) + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
+    s += __shfl_xor_sync(0xffffffffu, s, 1);
+    sx += __shfl_xor_sync(0xffffffffu, sx, 1);
+    s += __shfl_xor_sync(0xffffffffu, s, 2);
+    sx += __shfl_xor_sync(0xffffffffu, sx, 2);
+    if (live && rp == 0) t[blockIdx.y * (tn * 16) + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
 }
 
 __global__ void inkwell_exl3_gemv_dp4a_dbg(const uint32_t* __restrict__ trel,
@@ -1768,7 +1813,7 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
     while (nb * nky < 512 && nky < 8 && nky * 16 <= tk) nky *= 2;
     if (nky > 1) cudaMemsetAsync(scratch + k, 0, nky * n * 4, (cudaStream_t)stream);
     dim3 gsz((unsigned)nb, (unsigned)nky, 1);
-    inkwell_exl3_gemv_dp4a<<<gsz, 64, 0, (cudaStream_t)stream>>>(
+    inkwell_exl3_gemv_dp4a<<<gsz, 256, 0, (cudaStream_t)stream>>>(
         (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
     inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
         scratch + k, (const uint16_t*)svh, y, (int)n, nky);
@@ -1834,22 +1879,37 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
     float s = 0.f, sx = 0.f;
     const bool live = tn_i < tn;
-    // batch 4 tk per sync round: 0.5 syncs/tile instead of 2
     __shared__ float xhb[4][16];
-    for (int tk0 = 0; tk0 < tk; tk0 += 4) {
-        const int tkn = min(4, tk - tk0);
+    // prologue: fill batch 0 (global loads stall, unavoidable once)
+    {
+        const int tkn0 = min(4, tk);
         if (threadIdx.x < 64) {
             const int j = threadIdx.x;
-            if (j < 16 * tkn) xhb[j >> 4][j & 15] = xh[slot * k + (tk0 + (j >> 4)) * 16 + (j & 15)];
+            if (j < 16 * tkn0) xhb[j >> 4][j & 15] = xh[slot * k + (j >> 4) * 16 + (j & 15)];
         }
-        if (live) {
-            for (int b = 0; b < tkn; ++b) {
-                const uint32_t* ring = tile_base + (size_t)((tk0 + b) * tn + tn_i) * (size_t)w;
-                uint32_t* rg = rings + g * 128;
-                for (int j = u; j < w; j += 64) rg[b * 32 + j] = ring[j];
-            }
+        if (live && u < w) {
+            uint32_t* rg = rings + g * 128;
+            for (int b = 0; b < tkn0; ++b)
+                rg[b * 32 + u] = tile_base[((size_t)(b * tn + tn_i)) * (size_t)w + u];
         }
-        __syncthreads();
+    }
+    __syncthreads();
+    for (int tk0 = 0; tk0 < tk; tk0 += 4) {
+        const int tkn = min(4, tk - tk0);
+        const int nk0 = tk0 + 4;
+        const int tkn2 = min(4, tk - nk0);
+        // prefetch next batch into registers while current smem is consumed —
+        // hides the global-load latency behind this batch's math.
+        uint32_t pfb[4];
+        float pfx = 0.f;
+        if (live && nk0 < tk && u < w) {
+            for (int b = 0; b < tkn2; ++b)
+                pfb[b] = tile_base[((size_t)((nk0 + b) * tn + tn_i)) * (size_t)w + u];
+        }
+        if (threadIdx.x < 64 && nk0 < tk) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn2) pfx = xh[slot * k + (nk0 + (j >> 4)) * 16 + (j & 15)];
+        }
         if (live) {
             const uint32_t* rg = rings + g * 128;
             for (int b = 0; b < tkn; ++b) {
@@ -1863,6 +1923,16 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
                     sx += xhb[b][r];
                 }
             }
+        }
+        __syncthreads();
+        // store next batch from regs (load latency already hidden)
+        if (live && nk0 < tk && u < w) {
+            uint32_t* rg = rings + g * 128;
+            for (int b = 0; b < tkn2; ++b) rg[b * 32 + u] = pfb[b];
+        }
+        if (threadIdx.x < 64 && nk0 < tk) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn2) xhb[j >> 4][j & 15] = pfx;
         }
         __syncthreads();
     }
@@ -1944,17 +2014,26 @@ __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
 // Per-layer VRAM expert cache: resolve ids -> K slots, copy only misses.
 // tag[v] = expert id (-1 empty); map[s] = slot chosen for ids[s];
 // miss[s] = 1 when a copy is required. rr = per-layer victim counter.
+// PF_BASE+p encodes "slot p of the prefetch bank" in map[].
+#define EXL3_PF_BASE 0x40000000
 __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         int* __restrict__ tag, int* __restrict__ map, int* __restrict__ miss,
-        int* __restrict__ rr, int nslots, int k) {
+        int* __restrict__ rr, int nslots, int k,
+        const int* __restrict__ ptag, const int* __restrict__ pready,
+        int* __restrict__ pf_hit) {
     if (threadIdx.x != 0) return;
     // Serial: a victim slot must not be one already claimed this visit,
     // otherwise a miss could overwrite a slot a hit still needs.
+    const int pf = pready ? *pready : 0;
     for (int s = 0; s < nslots; ++s) {
         const int e = ids[s];
         int v = -1;
         for (int j = 0; j < k; ++j) if (tag[j] == e) { v = j; break; }
         int m = 0;
+        if (v < 0 && pf) {
+            for (int p2 = 0; p2 < nslots; ++p2)
+                if (ptag[p2] == e) { v = EXL3_PF_BASE + p2; if (pf_hit) atomicAdd(pf_hit, 1); break; }
+        }
         if (v < 0) {
             int t = *rr;
             for (;;) {
@@ -1982,12 +2061,14 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
                                        uint8_t* __restrict__ cache,
                                        const int* __restrict__ map,
                                        const int* __restrict__ miss,
+                                       uint8_t* __restrict__ bank,
                                        const int64_t slot_proj,
                                        uint64_t* __restrict__ sdescs_g,
                                        uint64_t* __restrict__ sdescs_u,
                                        uint64_t* __restrict__ sdescs_d) {
     const int slot = blockIdx.x / 3;
     const int proj = blockIdx.x % 3;
+    const int part = blockIdx.y, nparts = gridDim.y;
     const uint64_t* src = (proj == 0 ? descs_g : (proj == 1 ? descs_u : descs_d));
     uint64_t* sd = (proj == 0 ? sdescs_g : (proj == 1 ? sdescs_u : sdescs_d));
     const uint64_t* d = src + ids[slot] * 4;
@@ -1996,8 +2077,11 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
     const int trel_b = 10368 * r_bits_words(ka, halfk) * 4;
     const int suh_b = (proj == 2 ? 2304 : 4608);
     const int svh_b = (proj == 2 ? 4608 : 2304);
-    uint8_t* dst = cache + (size_t)(map[slot] * 3 + proj) * (size_t)slot_proj;
-    if (threadIdx.x == 0) {
+    uint8_t* cbase = cache;
+    int mslot = map[slot];
+    if (mslot >= EXL3_PF_BASE) { cbase = bank; mslot -= EXL3_PF_BASE; }
+    uint8_t* dst = cbase + (size_t)(mslot * 3 + proj) * (size_t)slot_proj;
+    if (threadIdx.x == 0 && part == 0) {
         uint64_t* o = sd + ids[slot] * 4;
         o[0] = (uint64_t)(uintptr_t)dst;
         o[1] = (uint64_t)(uintptr_t)(dst + trel_b);
@@ -2008,7 +2092,89 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
     const uint4* s0 = (const uint4*)(uintptr_t)d[0];
     uint4* t0 = (uint4*)dst;
     const int n0 = (trel_b + suh_b + svh_b) / 16;
-    for (int i = threadIdx.x; i < n0; i += blockDim.x) t0[i] = s0[i];
+    const int chunk = (n0 + nparts - 1) / nparts;
+    const int lo = part * chunk, hi = min(n0, lo + chunk);
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) t0[i] = s0[i];
+}
+
+__global__ void inkwell_exl3_copy8(const int* __restrict__ src, int* __restrict__ dst) {
+    if (threadIdx.x < 8) dst[threadIdx.x] = src[threadIdx.x];
+}
+extern "C" void ink_launch_exl3_copy8(const void* src, void* dst, void* stream) {
+    inkwell_exl3_copy8<<<1, 8, 0, (cudaStream_t)stream>>>((const int*)src, (int*)dst);
+}
+
+// Predictive prefetch, host-issued between tokens on the side stream.
+// pf_resolve finds predicted misses among hist_ids and fills pf_map/pf_miss
+// with bank slots; pf_ccopy copies those blobs into the bank; pf_tag writes
+// ptags + pready LAST so a concurrent visit never reads a half-written bank.
+// pready=0 first — a visit that runs while we copy just takes the miss path.
+__global__ void inkwell_exl3_pf_resolve(const int* __restrict__ hist_ids,
+        const int* __restrict__ tag, int* __restrict__ pf_map,
+        int* __restrict__ pf_miss, int k, int nslots) {
+    if (threadIdx.x != 0) return;
+    int p = 0;
+    for (int s = 0; s < nslots; ++s) {
+        const int e = hist_ids[s];
+        int hit = 0;
+        for (int j = 0; j < k; ++j) if (tag[j] == e) { hit = 1; break; }
+        pf_map[s] = hit ? -1 : p;
+        pf_miss[s] = hit ? 0 : 1;
+        if (!hit) ++p;
+    }
+}
+__global__ void inkwell_exl3_moe_pcopy(const uint64_t* __restrict__ descs_g,
+                                       const uint64_t* __restrict__ descs_u,
+                                       const uint64_t* __restrict__ descs_d,
+                                       const int* __restrict__ ids,
+                                       uint8_t* __restrict__ bank,
+                                       const int* __restrict__ pf_map,
+                                       const int* __restrict__ pf_miss,
+                                       const int64_t slot_proj,
+                                       int* __restrict__ ptag) {
+    const int slot = blockIdx.x / 3;
+    const int proj = blockIdx.x % 3;
+    const int part = blockIdx.y, nparts = gridDim.y;
+    if (pf_map[slot] < 0 || !pf_miss[slot]) return;
+    const uint64_t* srcp = (proj == 0 ? descs_g : (proj == 1 ? descs_u : descs_d));
+    const uint64_t* d = srcp + ids[slot] * 4;
+    const int ka = (int)(d[3] & 0xff);
+    const int halfk = (int)((d[3] >> 8) & 1);
+    const int trel_b = 10368 * r_bits_words(ka, halfk) * 4;
+    const int suh_b = (proj == 2 ? 2304 : 4608);
+    const int svh_b = (proj == 2 ? 4608 : 2304);
+    uint8_t* dst = bank + (size_t)(pf_map[slot] * 3 + proj) * (size_t)slot_proj;
+    const uint4* s0 = (const uint4*)(uintptr_t)d[0];
+    uint4* t0 = (uint4*)dst;
+    const int n0 = (trel_b + suh_b + svh_b) / 16;
+    const int chunk = (n0 + nparts - 1) / nparts;
+    const int lo = part * chunk, hi = min(n0, lo + chunk);
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) t0[i] = s0[i];
+}
+__global__ void inkwell_exl3_pf_flag(int* __restrict__ pready, int v) {
+    if (threadIdx.x == 0) *pready = v;
+}
+__global__ void inkwell_exl3_pf_tag(const int* __restrict__ hist_ids,
+        const int* __restrict__ pf_map, int* __restrict__ ptag, int nslots) {
+    __threadfence();
+    if (threadIdx.x == 0)
+        for (int s = 0; s < nslots; ++s)
+            if (pf_map[s] >= 0) ptag[pf_map[s]] = hist_ids[s];
+    __threadfence();
+}
+extern "C" void ink_launch_exl3_prefetch2(const void* descs_g, const void* descs_u, const void* descs_d,
+        const int* hist_ids, const int* tag, void* bank, int* ptag, int* pready,
+        int* pf_map, int* pf_miss, int nslots, int k, long long slot_proj, void* side) {
+    const cudaStream_t ss = (cudaStream_t)side;
+    inkwell_exl3_pf_flag<<<1, 1, 0, ss>>>(pready, 0);
+    inkwell_exl3_pf_resolve<<<1, 32, 0, ss>>>(hist_ids, tag, pf_map, pf_miss, k, nslots);
+    // copy each predicted miss into its bank slot — reuse moe_ccopy with the
+    // private map (map[s] = bank slot or -1); write through `bank`.
+    inkwell_exl3_moe_pcopy<<<dim3(nslots * 3, 4), 256, 0, ss>>>(
+        (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+        hist_ids, (uint8_t*)bank, pf_map, pf_miss, slot_proj, ptag);
+    inkwell_exl3_pf_tag<<<1, 1, 0, ss>>>(hist_ids, pf_map, ptag, nslots);
+    inkwell_exl3_pf_flag<<<1, 1, 0, ss>>>(pready, 1);
 }
 
 // Full per-slot expert chain: stage -> gate -> situ -> down -> wsum.
@@ -2056,13 +2222,16 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                     const float* w, float* out, int nslots, void* stream,
                                     void* cache, void* tag, void* map, void* miss, void* rr, int k,
                                     int64_t slot_proj,
-                                    void* sdescs_g, void* sdescs_u, void* sdescs_d) {
+                                    void* sdescs_g, void* sdescs_u, void* sdescs_d,
+                                    const void* ptag, const void* pready, void* bank, int* pf_hit) {
     const cudaStream_t st = (cudaStream_t)stream;
     inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
-        (int*)tag, (int*)map, (int*)miss, (int*)rr, nslots, k);
-    inkwell_exl3_moe_ccopy<<<nslots * 3, 256, 0, st>>>(
+        (int*)tag, (int*)map, (int*)miss, (int*)rr, nslots, k,
+        (const int*)ptag, (const int*)pready, pf_hit);
+    inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 4), 256, 0, st>>>(
         (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
-        ids, (uint8_t*)cache, (const int*)map, (const int*)miss, slot_proj,
+        ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
+        (uint8_t*)bank, slot_proj,
         (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
     const uint64_t* G = (const uint64_t*)sdescs_g;
     const uint64_t* U = (const uint64_t*)sdescs_u;
