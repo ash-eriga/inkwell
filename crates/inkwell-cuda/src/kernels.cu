@@ -1793,37 +1793,43 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     const uint32_t* tile_base = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff);
     const int halfk = (int)((d[3] >> 8) & 1);
-    const int g = threadIdx.x >> 4;      // 4 tiles per block
+    const int grp = threadIdx.x >> 6;    // 4 k-slices, 64 thr each
+    const int g = (threadIdx.x >> 4) & 3; // 4 tiles per slice
     const int c = threadIdx.x & 15;      // column within tile
     const int tn_i = blockIdx.x * 4 + g;
     const int w = r_bits_words(ka, halfk); // ≤32 u32 per tile
-    __shared__ float xhs[16];            // same xh slice for all 4 tiles
-    __shared__ uint32_t rings[4 * 80];
+    __shared__ float xhs[4][16];
+    __shared__ uint32_t rings[4][4 * 80];
+    __shared__ float part[4][64];
     float s = 0.f;
     const bool live = tn_i < tn;
-    for (int tk_i = 0; tk_i < tk; ++tk_i) {
-        if (threadIdx.x < 16) xhs[c] = xh[slot * k + tk_i * 16 + c];
+    const int tkc = (tk + 3) >> 2;
+    const int tk0 = grp * tkc, tk1 = min(tk0 + tkc, tk);
+    for (int tk_i = tk0; tk_i < tk1; ++tk_i) {
+        if ((threadIdx.x & 63) < 16) xhs[grp][c] = xh[slot * k + tk_i * 16 + c];
         if (live) {
             const uint32_t* ring = tile_base + (size_t)(tk_i * tn + tn_i) * (size_t)w;
-            uint32_t* rg = rings + g * 80;
+            uint32_t* rg = rings[grp] + g * 80;
             for (int j = c; j < w; j += 16) rg[j] = ring[j];
         }
         __syncthreads();
         if (live) {
-            const uint32_t* rg = rings + g * 80;
+            const uint32_t* rg = rings[grp] + g * 80;
 #pragma unroll
             for (int r = 0; r < 16; ++r) {
                 const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
                             | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
-                s += xhs[r] * exl3_mul1(exl3_window(rg, i, ka, halfk));
+                s += xhs[grp][r] * exl3_mul1(exl3_window(rg, i, ka, halfk));
             }
         }
         __syncthreads();
     }
-    if (live) {
-        if (gridDim.z == 1) t[slot * n + tn_i * 16 + c] = s;
-        else atomicAdd(&t[slot * n + tn_i * 16 + c], s);
-    }
+    part[grp][threadIdx.x & 63] = s;
+    __syncthreads();
+    if (live && grp == 0)
+        t[slot * n + tn_i * 16 + c] = part[0][g * 16 + c] + part[1][g * 16 + c]
+                                    + part[2][g * 16 + c] + part[3][g * 16 + c]
+                                    + part[2][g * 16 + c] + part[3][g * 16 + c];
 }
 
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
@@ -1916,7 +1922,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         dim3 gin(KG / 128, nslots);
         inkwell_exl3_had_in_moe<<<gin, 128, 512, st>>>(dd, ids, x, xh, KG);
         dim3 gg(NG / 64, nslots, 1);
-        inkwell_exl3_gemv_moe<<<gg, 64, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
         dim3 gout(NG / 128, nslots);
         inkwell_exl3_had_out_moe<<<gout, 128, 512, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
     }
@@ -1925,7 +1931,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     // KD=1152 not multiple of 128*? 1152/128=9 blocks
     inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
     dim3 gd(ND / 64, nslots, 1);
-    inkwell_exl3_gemv_moe<<<gd, 64, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
+    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
     dim3 dout(ND / 128, nslots);
     inkwell_exl3_had_out_moe<<<dout, 128, 512, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
