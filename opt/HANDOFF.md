@@ -128,3 +128,25 @@ LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-in
 - nsys: ~/lfm-gtx1060-bench/cuda-12.6/bin/nsys profile --trace=cuda + stats --report cuda_gpu_kern_sum
 - Ledger tags: exl3-cache-kv16(~171), exl3-affine(~168), exl3-moe-tkb(~169), exl3-cache-k12(running)
 - K=12 test: INKWELL_EXL3_CACHE_K=12 env (coverage vs hit-rate tradeoff)
+
+## decode kernel profile (inkprof4, graph-trace=node)
+- Per token: gemv_moe ~75ms (346us x216), gemv_dp4a ~40ms (93us x433), ccopy ~23ms, stage ~2ms. GPU ~100% busy.
+- Decode = ~14 chunked graph launches/token (GGML_CUDA_GRAPH_CHUNK_SIZE default 512; chunk0 test = no gain), ~12 streamSyncs, ~10 small memcpyAsync. ZERO eager launches.
+- r8-split e element-parallel gemv_moe PIORARAM; r4+tkb mantido (~346us/call, leve melhoria sobre 369).
+- Margin 190->100MiB: 11 layers cached. K16 > K32/K48/K64.
+- nsys decode-only trick: --delay/--duration p/ pular load+encode; kernels em graph precisam --cuda-graph-trace=node.
+
+## SESSÃO 3 estado (commit e6914bf + margin 100)
+- RUN: cd ~/inkwell && cargo build -p inkwell-cli --release && LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 INKWELL_GENS=8 ./target/release/inkwell ~/models/inkling --run
+- Bench: bash opt/rexl3_bench.sh <cfg> <N> → opt/ledger.jsonl
+- Profile: ~/lfm-gtx1060-bench/cuda-12.6/bin/nsys profile --trace=cuda --cuda-graph-trace=node -o /tmp/p ./target/release/inkwell ... ; stats --report cuda_gpu_kern_sum|cuda_api_sum. GGML lib = src-v2 (build-inkwell-dp4a).
+- CG_PROF: INKWELL_CG_PROF=1 → eval/drain por step (eval=CPU dispatch, drain=GPU exec).
+- ATUAL: ~150 ms/tok mediana (variância desktop ±20). Ledger: exl3-cache-k16~149.5, m100~164(noise), chunk0~159, moe-r8/elem=PIOR, ctx4k~153.
+- GPU-bound confirmado: per-tok = gemv_moe 75ms + dp4a 40ms + ccopy 23ms + stage 2ms + resto ~25ms.
+- gemv_moe: kernel atual = r4-split (64thr/tile, 4 tiles/blk, 256 thr, grid tn/4 × nslots), tk batch ×4 por sync, acumulador afim KINV*bs+KOFF. Launches <<<gg/gd,256>>> com dim3(NG/64,nslots) e (ND/64,nslots) — NÃO mudar o /64 (kernel usa blockIdx.x*4+g). Staged path NÃO foi convertido (ainda roda o mesmo kernel r4 — consistente).
+- dp4a (dense exl3 gemv): ainda layout velho 4 tiles×16thr×64thr, r-loop serial 16 — mesmo padrão do moe ANTES do r4. Aplicar o mesmo r4/tkb ali é experimento pendente.
+- PRÓXIMA ALAVANCA: markov prefetch — hist[layer][8] ids do token anterior; na visita da camada L, prefetch na side-stream p/ cache da camada L+1. Cuidado: custom ops SÃO capturados no CUDA graph → side-stream requer event fork/join capturável; ccopy ~0.7ms/miss, ~30 misses/tok.
+- Cobertura cache: 11/12 pinned (moe=12 sobra por ~30MB). Margin=100MiB em runner.rs ~linha 847.
+- Env knobs: INKWELL_EXL3_CACHE_K(default 16 agora), INKWELL_MAX_CTX, INKWELL_MOE_SKIP(piso não-MoE 84ms), INKWELL_CG_PROF, INKWELL_MOE_STATS(only non-exl3 path), GGML_CUDA_GRAPH_CHUNK_SIZE, GGML_SCHED_DEBUG.
+- git stash #0 = versão "element-parallel" REJEITADA (~190ms).
+- Meta: 15 TPS=66.7ms (avisa e continua), depois 30 TPS=33ms, depois spec decode (mtp.safetensors markov_rank=256 block=8).
