@@ -1861,11 +1861,15 @@ __device__ __forceinline__ void had128_warp(float* __restrict__ v, int ebase) {
 }
 
 __global__ void inkwell_exl3_had_in_moe(const uint64_t* __restrict__ descs,
+                                        const uint64_t* __restrict__ descs2,
                                         const int* __restrict__ ids,
                                         const float* __restrict__ x,
-                                        float* __restrict__ xh, int k) {
+                                        float* __restrict__ xh, float* __restrict__ xh2,
+                                        int xh2s, int k) {
     const int slot = blockIdx.y;
-    const uint16_t* suh = (const uint16_t*)(uintptr_t)descs[ids[slot] * 4 + 1];
+    const uint64_t* dd = blockIdx.z ? descs2 : descs;
+    float* xho = blockIdx.z ? xh2 + slot * xh2s : xh + slot * k;
+    const uint16_t* suh = (const uint16_t*)(uintptr_t)dd[ids[slot] * 4 + 1];
     const int lane = threadIdx.x & 31;
     const int base = blockIdx.x * 512 + (threadIdx.x >> 5) * 128;
     float v[4];
@@ -1878,18 +1882,21 @@ __global__ void inkwell_exl3_had_in_moe(const uint64_t* __restrict__ descs,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int e = base + lane * 4 + i;
-        if (e < k) xh[slot * k + e] = v[i] * 0.08838834764831845f;
+        if (e < k) xho[e] = v[i] * 0.08838834764831845f;
     }
 }
 
 // grid (tn, nslots): block decodes tile tn_i of expert ids[slot]; acc -> t[slot][n]
 __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
+                                      const uint64_t* __restrict__ descs2,
                                       const int* __restrict__ ids,
                                       const float* __restrict__ xh,
-                                      float* __restrict__ t,
+                                      const float* __restrict__ xh2, int xh2s,
+                                      float* __restrict__ t, int tslot, int tzoff,
                                       int tk, int tn, int k, int n) {
     const int slot = blockIdx.y;
-    const uint64_t* d = descs + ids[slot] * 4;
+    const uint64_t* d = (blockIdx.z ? descs2 : descs) + ids[slot] * 4;
+    const float* xhb_g = blockIdx.z ? xh2 + slot * xh2s : xh + slot * k;
     const uint32_t* tile_base = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff);
     const int halfk = (int)((d[3] >> 8) & 1);
@@ -1909,7 +1916,7 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
         const int tkn0 = min(4, tk);
         if (threadIdx.x < 64) {
             const int j = threadIdx.x;
-            if (j < 16 * tkn0) xhb[j >> 4][j & 15] = xh[slot * k + (j >> 4) * 16 + (j & 15)];
+            if (j < 16 * tkn0) xhb[j >> 4][j & 15] = xhb_g[(j >> 4) * 16 + (j & 15)];
         }
         if (live && u < w) {
             uint32_t* rg = rings + g * 128;
@@ -1932,7 +1939,7 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
         }
         if (threadIdx.x < 64 && nk0 < tk) {
             const int j = threadIdx.x;
-            if (j < 16 * tkn2) pfx = xh[slot * k + (nk0 + (j >> 4)) * 16 + (j & 15)];
+            if (j < 16 * tkn2) pfx = xhb_g[(nk0 + (j >> 4)) * 16 + (j & 15)];
         }
         if (live) {
             const uint32_t* rg = rings + g * 128;
@@ -1969,18 +1976,22 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
 }
 
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
+                                         const uint64_t* __restrict__ descs2,
                                          const int* __restrict__ ids,
                                          const float* __restrict__ t,
-                                         float* __restrict__ y, int n, int stride, int off) {
+                                         float* __restrict__ y, int n, int stride, int off,
+                                         int tslot, int tzoff) {
     const int slot = blockIdx.y;
-    const uint16_t* svh = (const uint16_t*)(uintptr_t)descs[ids[slot] * 4 + 2];
+    const uint64_t* dd = blockIdx.z ? descs2 : descs;
+    const uint16_t* svh = (const uint16_t*)(uintptr_t)dd[ids[slot] * 4 + 2];
+    off += blockIdx.z * n;
     const int lane = threadIdx.x & 31;
     const int base = blockIdx.x * 512 + (threadIdx.x >> 5) * 128;
     float v[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int e = base + lane * 4 + i;
-        v[i] = (e < n) ? t[slot * n + e] : 0.f;
+        v[i] = (e < n) ? t[slot * tslot + blockIdx.z * tzoff + e] : 0.f;
     }
     had128_warp(v, lane * 4);
 #pragma unroll
@@ -2234,23 +2245,27 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     const uint64_t* U = on_dev ? (const uint64_t*)descs_u : (const uint64_t*)sdescs_u;
     const uint64_t* D = on_dev ? (const uint64_t*)descs_d : (const uint64_t*)sdescs_d;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
-    // gate + up into gu[slot][0..1152] and gu[slot][1152..2304]
+    // gate + up fused: blockIdx.z selects the descriptor set
+    dim3 gin((KG + 511) / 512, nslots, 2);
+    inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG);
     for (int p = 0; p < 2; ++p) {
         const uint64_t* dd = p ? U : G;
-        dim3 gin((KG + 511) / 512, nslots);
-        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(dd, ids, x, xh, KG);
+        const float* xhp = p ? (const float*)gu : xh;
+        const int xhs = p ? 2 * NG : KG;
         dim3 gg(NG / 64, nslots, 1);
-        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
-        dim3 gout((NG + 511) / 512, nslots);
-        inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, nullptr, ids, xhp, nullptr, xhs,
+                                                 (float*)dn + p * NG, ND, 0, KG / 16, NG / 16, KG, NG);
     }
+    dim3 gout((NG + 511) / 512, nslots, 2);
+    inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
-    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, ids, hid, xh, KD);
+    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD);
     dim3 gd(ND / 64, nslots, 1);
-    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
-    dim3 dout((ND + 511) / 512, nslots);
-    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
+    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
+                                             dn, ND, 0, KD / 16, ND / 16, KD, ND);
+    dim3 dout((ND + 511) / 512, nslots, 1);
+    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
 }
 
@@ -2276,22 +2291,27 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const uint64_t* U = (const uint64_t*)sdescs_u;
     const uint64_t* D = (const uint64_t*)sdescs_d;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
+    // gate+up fused in one launch: blockIdx.z selects the descriptor set
+    dim3 gin((KG + 511) / 512, nslots, 2);
+    inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG);
     for (int p = 0; p < 2; ++p) {
         const uint64_t* dd = p ? U : G;
-        dim3 gin((KG + 511) / 512, nslots);
-        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(dd, ids, x, xh, KG);
+        const float* xhp = p ? (const float*)gu : xh;
+        const int xhs = p ? 2 * NG : KG;
         dim3 gg(NG / 64, nslots, 1);
-        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, ids, xh, dn /*reuse dn as t*/, KG / 16, NG / 16, KG, NG);
-        dim3 gout((NG + 511) / 512, nslots);
-        inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(dd, ids, dn, gu, NG, 2 * NG, p * NG);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(dd, nullptr, ids, xhp, nullptr, xhs,
+                                                 (float*)dn + p * NG, ND, 0, KG / 16, NG / 16, KG, NG);
     }
+    dim3 gout((NG + 511) / 512, nslots, 2);
+    inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
-    dim3 din(KD / 128, nslots);
-    inkwell_exl3_had_in_moe<<<din, 128, 512, st>>>(D, ids, hid, xh, KD);
+    dim3 din((KD + 511) / 512, nslots);
+    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD);
     dim3 gd(ND / 64, nslots, 1);
-    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, ids, xh, dn, KD / 16, ND / 16, KD, ND);
-    dim3 dout((ND + 511) / 512, nslots);
-    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, ids, dn, xh /*reuse xh as y*/, ND, ND, 0);
+    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
+                                             dn, ND, 0, KD / 16, ND / 16, KD, ND);
+    dim3 dout((ND + 511) / 512, nslots, 1);
+    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
 }
 

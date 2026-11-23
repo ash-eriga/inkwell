@@ -191,3 +191,21 @@
 {"ts":"2026-11-23T02:59:21-03:00","config":"exl3-direct","i":4,"decode_s":1.206830131,"ms_tok":150.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T02:59:34-03:00","config":"exl3-direct","i":5,"decode_s":1.429998893,"ms_tok":178.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T02:59:45-03:00","config":"exl3-direct","i":6,"decode_s":1.212909472,"ms_tok":151.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:00:27-03:00","config":"control","i":1,"decode_s":1.107279231,"ms_tok":138.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:00:39-03:00","config":"control","i":2,"decode_s":1.01911776,"ms_tok":127.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:00:53-03:00","config":"control","i":3,"decode_s":1.079558063,"ms_tok":134.9,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:01:44-03:00","config":"control","i":4,"error":"no decode line","tail":"#9  0x00005564cd063f15 in main ()|[Inferior 1 (process 597633) detached]|timeout: the monitored command dumped core|"}
+{"ts":"2026-11-23T03:01:59-03:00","config":"control","i":5,"decode_s":1.107269434,"ms_tok":138.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:02:10-03:00","config":"control","i":6,"decode_s":1.026459148,"ms_tok":128.3,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T03:03:59-03:00","config":"exl3-gu-fused","i":1,"decode_s":1.090006271,"ms_tok":136.3,"golden":"no","text":" capital capital capital capital capital capital capital capital"}
+{"ts":"2026-11-23T03:04:13-03:00","config":"exl3-gu-fused","i":2,"decode_s":1.403465438,"ms_tok":175.4,"golden":"no","text":" or , , , , Vs ,"}
+{"ts":"2026-11-23T03:04:27-03:00","config":"exl3-gu-fused","i":3,"decode_s":1.104114392,"ms_tok":138.0,"golden":"no","text":" capital capital France France capital capital France capital"}
+{"ts":"2026-11-23T03:04:39-03:00","config":"exl3-gu-fused","i":4,"decode_s":1.080143477,"ms_tok":135.0,"golden":"no","text":" capital capital capital France France France France France"}
+{"ts":"2026-11-23T03:04:50-03:00","config":"exl3-gu-fused","i":5,"decode_s":1.132836973,"ms_tok":141.6,"golden":"no","text":" capitalOLED islower … . . . ."}
+{"ts":"2026-11-23T03:05:00-03:00","config":"exl3-gu-fused","i":6,"decode_s":1.118143747,"ms_tok":139.8,"golden":"no","text":" capital sut , capital , , ,"}
+{"ts":"2026-11-23T03:06:45-03:00","config":"exl3-gu-fused2","i":1,"decode_s":1.172577999,"ms_tok":146.6,"golden":"no","text":" the 0   1 "}
+{"ts":"2026-11-23T03:07:00-03:00","config":"exl3-gu-fused2","i":2,"decode_s":1.152013532,"ms_tok":144.0,"golden":"no","text":" the 0   1 "}
+{"ts":"2026-11-23T03:07:13-03:00","config":"exl3-gu-fused2","i":3,"decode_s":1.065014024,"ms_tok":133.1,"golden":"no","text":" the 0   4 "}
+{"ts":"2026-11-23T03:07:23-03:00","config":"exl3-gu-fused2","i":4,"decode_s":1.181760974,"ms_tok":147.7,"golden":"no","text":" the \u{a0}\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}"}
+{"ts":"2026-11-23T03:07:33-03:00","config":"exl3-gu-fused2","i":5,"decode_s":1.056265542,"ms_tok":132.0,"golden":"no","text":" the 0   1 "}
+{"ts":"2026-11-23T03:07:43-03:00","config":"exl3-gu-fused2","i":6,"decode_s":1.105971973,"ms_tok":138.2,"golden":"no","text":" the 0  0  capital"}
