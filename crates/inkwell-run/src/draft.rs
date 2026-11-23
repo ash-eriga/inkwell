@@ -74,6 +74,46 @@ impl Exl {
     }
 }
 
+/// Oracle: dequantize an Exl matrix by feeding unit vectors through gemv8.
+/// Writes column-major [k][n] f32: W[:,i] at byte offset i*n*4.
+#[cfg(feature = "nope")]
+fn _unused() {}
+unsafe fn dequant_dump(e: &Exl, path: &str) {
+    let mut xh = inkwell_cuda::DevBuf::new(NB * e.k);
+    let mut y = inkwell_cuda::DevBuf::new(NB * e.n);
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let mut buf = vec![0f32; NB * e.n];
+    let mut c0 = 0usize;
+    while c0 < e.k {
+        let rows = (e.k - c0).min(NB);
+        let mut x = vec![0f32; NB * e.k];
+        for t in 0..rows { x[t * e.k + c0 + t] = 1.0; }
+        xh.write(&x);
+        e.gemv8(xh.dev_ptr().cast_const().cast::<f32>(), y.dev_ptr().cast::<f32>());
+        inkwell_cuda::DevBuf::sync();
+        y.read_bytes(&mut vec_to_bytes_mut(&mut buf));
+        for t in 0..rows {
+            std::io::Write::write_all(&mut f, f32_as_bytes(&buf[t * e.n..(t + 1) * e.n])).unwrap();
+        }
+        c0 += rows;
+    }
+}
+
+/// dump a DevBuf<f32> to a file (n floats)
+unsafe fn dev_dump(b: &inkwell_cuda::DevBuf, n: usize, path: &str) {
+    let mut v = vec![0f32; n];
+    inkwell_cuda::DevBuf::sync();
+    b.read_bytes(vec_to_bytes_mut(&mut v));
+    std::fs::write(path, f32_as_bytes(&v)).unwrap();
+}
+
+/// dump raw bytes from a device ptr
+unsafe fn dev_dump_ptr(p: *const f32, n: usize, path: &str) {
+    let mut v = vec![0f32; n];
+    inkwell_cuda::memcpy_d2h_sync(v.as_mut_ptr().cast(), p.cast(), n * 4);
+    std::fs::write(path, f32_as_bytes(&v)).unwrap();
+}
+
 fn bf16_to_f32(src: &[u8], dst: &mut [f32]) {
     for (i, d) in dst.iter_mut().enumerate() {
         *d = f32::from_bits((u16::from_le_bytes([src[2 * i], src[2 * i + 1]]) as u32) << 16);
@@ -193,7 +233,7 @@ impl Mtp {
         let mut w1 = inkwell_cuda::DevBuf::new_bytes(w1t.nbytes() as usize);
         w1.write_bytes(repo.data("markov_head.markov_w1.weight").unwrap());
         let t = (maxctx + NB + 8) * NKV * HD;
-        Self {
+        let slf = Self {
             w,
             rnn: Exl::load(repo, "markov_head.rnn_proj"),
             hout: Exl::load(repo, "markov_head.hidden_out"),
@@ -239,7 +279,23 @@ impl Mtp {
             _repo: repo,
             feats,
             lo: -1,
+        };
+        if std::env::var_os("INKWELL_MTP_ORACLE").is_some() {
+            unsafe {
+                std::fs::create_dir_all("/tmp/mtp_dense").unwrap();
+                for (l, w) in slf.w.iter().enumerate() {
+                    for (nm, e) in [("q", &w.q), ("k", &w.k), ("v", &w.v), ("o", &w.o),
+                                    ("kctx", &w.kctx), ("vctx", &w.vctx),
+                                    ("gate", &w.gate), ("up", &w.up), ("down", &w.down)] {
+                        dequant_dump(e, &format!("/tmp/mtp_dense/l{l}_{nm}.bin"));
+                        eprintln!("deq l{l}_{nm} [{}x{}]", e.k, e.n);
+                    }
+                }
+                dequant_dump(&slf.rnn, "/tmp/mtp_dense/rnn.bin");
+                dequant_dump(&slf.hout, "/tmp/mtp_dense/hout.bin");
+            }
         }
+        slf
     }
 
     fn d(&self, b: &inkwell_cuda::DevBuf) -> *mut f32 { b.dev_ptr().cast() }
@@ -307,6 +363,21 @@ impl Mtp {
             }
             let posh: Vec<i32> = (0..NB).map(|i| (c + i as i64) as i32).collect();
             self.posd.write_bytes(bytemuck_cast_i32(&posh));
+            if std::env::var_os("INKWELL_MTP_ORACLE").is_some()
+                && !std::path::Path::new("/tmp/mtp_in/feats.bin").exists() {
+                std::fs::create_dir_all("/tmp/mtp_in").unwrap();
+                dev_dump_ptr(self.feats, 4 * NB * H, "/tmp/mtp_in/feats.bin");
+                let t = (1024 + NB + 8) * NKV * HD;
+                for l in 0..3 {
+                    dev_dump(&self.kc[l], t, &format!("/tmp/mtp_in/kc{l}.bin"));
+                    dev_dump(&self.vc[l], t, &format!("/tmp/mtp_in/vc{l}.bin"));
+                }
+                dev_dump(&self.x, NB * H, "/tmp/mtp_in/x.bin");
+                std::fs::write("/tmp/mtp_in/meta.json",
+                    format!("{{\"c\":{c},\"lo\":{},\"anchor\":{anchor},\"frow\":{frow}}}", self.lo)).unwrap();
+                std::fs::write("/tmp/mtp_in/x0.bin", f32_as_bytes(&e)).unwrap();
+                dev_dump(&self.f, H, "/tmp/mtp_in/f.bin");
+            }
             for (l, w) in self.w.iter().enumerate() {
                 if l == 0 {
                     inkwell_cuda::memcpy_d2d_async(self.d(&self.res).cast(), self.d(&self.x).cast(), NB * H * 4);
@@ -316,9 +387,19 @@ impl Mtp {
                     inkwell_cuda::draft_rms_async(self.d(&self.x), self.d(&self.res),
                         self.d(&w.in_ln).cast_const(), self.d(&self.h), self.d(&self.res), NB, H, EPS);
                 }
+                if std::env::var_os("INKWELL_MTP_ORACLE").is_some()
+                    && !std::path::Path::new(&format!("/tmp/mtp_in/lhin{l}.bin")).exists() {
+                    dev_dump(&self.h, NB * H, &format!("/tmp/mtp_in/lhin{l}.bin"));
+                }
                 w.q.gemv8(self.d(&self.h), self.d(&self.qb));
                 w.k.gemv8(self.d(&self.h), self.d(&self.kb));
                 w.v.gemv8(self.d(&self.h), self.d(&self.vb));
+                if std::env::var_os("INKWELL_MTP_ORACLE").is_some()
+                    && !std::path::Path::new(&format!("/tmp/mtp_in/lqraw{l}.bin")).exists() {
+                    dev_dump(&self.qb, NB * NH * HD, &format!("/tmp/mtp_in/lqraw{l}.bin"));
+                    dev_dump(&self.kb, NB * NKV * HD, &format!("/tmp/mtp_in/lkraw{l}.bin"));
+                    dev_dump(&self.vb, NB * NKV * HD, &format!("/tmp/mtp_in/lv{l}.bin"));
+                }
                 inkwell_cuda::draft_rms_async(self.d(&self.qb), std::ptr::null(),
                     self.d(&w.qn).cast_const(), self.d(&self.qb), std::ptr::null_mut(), NB * NH, HD, EPS);
                 inkwell_cuda::draft_rms_async(self.d(&self.kb), std::ptr::null(),
@@ -338,13 +419,34 @@ impl Mtp {
                 w.up.gemv8(self.d(&self.h), self.d(&self.ub));
                 inkwell_cuda::draft_silu_async(self.d(&self.gb), self.d(&self.ub), self.d(&self.act), NB, FF);
                 w.down.gemv8(self.d(&self.act), self.d(&self.x));
+                if std::env::var_os("INKWELL_MTP_ORACLE").is_some()
+                    && std::path::Path::new("/tmp/mtp_in/meta.json").exists()
+                    && !std::path::Path::new(&format!("/tmp/mtp_in/lx{l}.bin")).exists() {
+                    dev_dump(&self.h, NB * H, &format!("/tmp/mtp_in/lh{l}.bin"));
+                    dev_dump(&self.qb, NB * NH * HD, &format!("/tmp/mtp_in/lq{l}.bin"));
+                    dev_dump(&self.kb, NB * NKV * HD, &format!("/tmp/mtp_in/lk{l}.bin"));
+                    dev_dump(&self.att, NB * NH * HD, &format!("/tmp/mtp_in/latt{l}.bin"));
+                    dev_dump(&self.act, NB * FF, &format!("/tmp/mtp_in/lact{l}.bin"));
+                    dev_dump(&self.gb, NB * FF, &format!("/tmp/mtp_in/lgb{l}.bin"));
+                    dev_dump(&self.ub, NB * FF, &format!("/tmp/mtp_in/lub{l}.bin"));
+                    dev_dump(&self.res, NB * H, &format!("/tmp/mtp_in/lres{l}.bin"));
+                    dev_dump(&self.x, NB * H, &format!("/tmp/mtp_in/lx{l}.bin"));
+                }
             }
             // hid = addrms(x, res, norm); markov uses rows 1..7
             inkwell_cuda::draft_rms_async(self.d(&self.x), self.d(&self.res),
                 self.d(&self.norm).cast_const(), self.d(&self.h), std::ptr::null_mut(), NB, H, EPS);
+            if std::env::var_os("INKWELL_MTP_ORACLE").is_some()
+                && !std::path::Path::new("/tmp/mtp_in/hid.bin").exists() {
+                dev_dump(&self.h, NB * H, "/tmp/mtp_in/hid.bin");
+            }
             // f = mix(feats[frow], alpha[3], m_norm) -> [2304]
             inkwell_cuda::draft_mix_async(self.feats.add(frow * H), self.d(&self.alpha).add(3 * 4),
                 self.d(&self.m_norm).cast_const(), self.d(&self.f), 1, NB, H, EPS);
+            if std::env::var_os("INKWELL_MTP_ORACLE").is_some()
+                && !std::path::Path::new("/tmp/mtp_in/f2.bin").exists() {
+                dev_dump(&self.f, H, "/tmp/mtp_in/f2.bin");
+            }
             self.state.zero();
             let mut prev = anchor;
             let mut out = [0u32; NB];
@@ -368,6 +470,11 @@ impl Mtp {
                 inkwell_cuda::exl3_gemv_async(t_, s_, v_, self.d(&self.u2), self.d(&self.z),
                     k_, n_, ka_, hk_, scr_);
                 inkwell_cuda::draft_argmax_async(self.d(&self.z), VOCAB, CAP, self.d(&self.amax).cast::<i32>());
+                if std::env::var_os("INKWELL_MTP_ORACLE").is_some() {
+                    dev_dump(&self.u2, H, &format!("/tmp/mtp_in/u2_{i}.bin"));
+                    dev_dump(&self.raw, 3 * RANK, &format!("/tmp/mtp_in/raw_{i}.bin"));
+                    dev_dump(&self.state, RANK, &format!("/tmp/mtp_in/state_{i}.bin"));
+                }
                 inkwell_cuda::DevBuf::sync();
                 let mut tok = [0u8; 4];
                 self.amax.read_bytes(&mut tok);
@@ -404,6 +511,12 @@ impl Mtp {
     }
 }
 
+fn f32_as_bytes(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4) }
+}
+fn vec_to_bytes_mut(v: &mut [f32]) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), v.len() * 4) }
+}
 fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4) }
 }
