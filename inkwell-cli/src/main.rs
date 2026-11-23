@@ -314,27 +314,38 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let mut gen_ids = Vec::new();
     let n_gen: usize = std::env::var("INKWELL_GENS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     for g in 0..n_gen {
+        let ts = Instant::now();
         logits = r.step(id, pos);
+        eprintln!("stepwall={:.1}ms", ts.elapsed().as_secs_f64()*1e3);
         pos += 1;
+        let ta = Instant::now();
         let (best, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
         if g == 0 { eprintln!("gen0-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]); }
         eprintln!("gen {g}: id={id} next={best} top5={:?}",
             top(&logits, 5));
         id = best as u32;
         gen_ids.push(id);
+        eprintln!("poststep={:.1}ms", ta.elapsed().as_secs_f64()*1e3);
     }
+    let dec_t = t1.elapsed();
     let text = inkwell_tokenizer::Tokenizer::from_gguf(gg)
         .expect("tokenizer")
         .decode(&gen_ids)
         .unwrap_or_else(|_| "<decode error>".into());
     eprintln!("generated text: {text:?}");
-    eprintln!("decode 8 tok in {:?}", t1.elapsed());
+    eprintln!("decode 8 tok in {:?}", dec_t);
 }
 
 fn top(l: &[f32], n: usize) -> Vec<(usize, f32)> {
-    let mut v: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
-    v.select_nth_unstable_by(n, |a, b| b.1.total_cmp(&a.1));
-    v.truncate(n);
-    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // linear top-k: keep a sorted best-n, no big allocations
+    let mut v: Vec<(usize, f32)> = Vec::with_capacity(n + 1);
+    for (i, &x) in l.iter().enumerate() {
+        if v.len() < n || x > v[n - 1].1 {
+            v.push((i, x));
+            let mut j = v.len() - 1;
+            while j > 0 && v[j].1 > v[j - 1].1 { v.swap(j, j - 1); j -= 1; }
+            v.truncate(n);
+        }
+    }
     v
 }

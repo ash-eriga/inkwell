@@ -1229,6 +1229,7 @@ impl Runner {
     /// # Panics
     /// On graph/alloc/compute failure.
     pub fn step(&mut self, id: u32, pos: i64) -> Vec<f32> {
+        let tb0 = std::time::Instant::now();
         // persistent ctx + reset: tensor addresses repeat every token so the
         // CUDA graph cache key (nodes[0]) matches and capture can warm up
         if self.cur_ctx.0.is_null() {
@@ -1432,12 +1433,14 @@ impl Runner {
             }
         }
         let prof = std::env::var_os("INKWELL_PROF").is_some();
+        if prof { eprintln!("PROF build={:.1}ms", tb0.elapsed().as_secs_f64()*1e3); }
         let t0 = std::time::Instant::now();
         unsafe {
             assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
             self.dump_all();
         }
         if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        let tl0 = std::time::Instant::now();
         let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
         if let Some((w, x_dev, y_dev)) = self.out_head.as_mut() {
             let mut normed = vec![0f32; self.cfg.n_embd as usize];
@@ -1456,6 +1459,7 @@ impl Runner {
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         // release the cached split plan so the next step's graph gets re-allocated
         unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
+        if prof { eprintln!("PROF logits={:.1}ms", tl0.elapsed().as_secs_f64()*1e3); }
         logits
     }
 }

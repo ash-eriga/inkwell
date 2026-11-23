@@ -259,3 +259,14 @@
 {"ts":"2026-11-23T03:55:17-03:00","config":"cand-2048","i":1,"decode_s":1.36577607,"ms_tok":170.7,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T03:55:29-03:00","config":"cand-2048","i":2,"decode_s":1.328280588,"ms_tok":166.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
 {"ts":"2026-11-23T03:55:39-03:00","config":"cand-2048","i":3,"decode_s":1.090784603,"ms_tok":136.3,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:29:35-03:00","config":"cli-topk","i":1,"decode_s":1.082938634,"ms_tok":135.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:29:48-03:00","config":"cli-topk","i":2,"decode_s":1.171995184,"ms_tok":146.5,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:30:01-03:00","config":"cli-topk","i":3,"decode_s":1.429102724,"ms_tok":178.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:30:15-03:00","config":"cli-topk","i":4,"decode_s":1.104272863,"ms_tok":138.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:33:15-03:00","config":"timer-fix","i":1,"decode_s":890.88035,"ms_tok":111360.0,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:33:27-03:00","config":"timer-fix","i":2,"decode_s":830.750613,"ms_tok":103843.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:33:44-03:00","config":"timer-fix","i":3,"decode_s":791.264956,"ms_tok":98908.1,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:33:56-03:00","config":"timer-fix","i":4,"decode_s":791.580412,"ms_tok":98947.6,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:35:04-03:00","config":"timerfix-v2","i":1,"decode_s":833.971397ms,"ms_tok":104.2,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:35:18-03:00","config":"timerfix-v2","i":2,"decode_s":854.361485ms,"ms_tok":106.8,"golden":"yes","text":" the capital of France.\n\nThe capital"}
+{"ts":"2026-11-23T06:35:30-03:00","config":"timerfix-v2","i":3,"decode_s":819.570725ms,"ms_tok":102.4,"golden":"yes","text":" the capital of France.\n\nThe capital"}
