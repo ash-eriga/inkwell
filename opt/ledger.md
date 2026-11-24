@@ -163,3 +163,12 @@ Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8
 - v2 no serial: ~128ms vs ~127ms controle — neutro (1 consumidor/entry).
 - **VEREDITO**: spec teto ~5.2-5.5 tok/s; emit ~2.5 real do drafter; spec não
   vence serial (~127ms/tok aqui). Bloqueio = qualidade do drafter, não verify.
+
+## DP4A/DP2A dead-end (medido, 2026-11-23)
+- Peso EXL3 decodifica em ±487 (varrido em rexl3-00001) -> nao cabe int8.
+- __dp2a_lo verificado on-device: NAO e dot int16x2 (0x00020003*0x00040005=15,
+  e int8-pair x int16). Pascal nao tem dot int16 -> peso int16 nao entra em dot.
+- fp16x2 hfma2 no MAC: +2 pack -2 fma + cvt -> neutro/pior (decode domina ~20/27).
+- dp4a JA esta maximo: dentro do bs_f32 (mul+dp4a) do decode trellis.
+- Conclusao: MAC int no EXL3 exige re-quant de peso p/ int8 (EAR, vetado).
+- d2a (tile_row_d2 + quant_x_i16 + env INKWELL_MOE_D2A) REVERTIDO — saida garbage.
