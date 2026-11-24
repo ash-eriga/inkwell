@@ -6,3 +6,4 @@ opt/kbench/kb_*
 opt/kbench/sgemv_bench
 opt/kbench/sgemv_gold
 opt/kbench/sgemv_dense_gold
+opt/kbench/sgemv_var

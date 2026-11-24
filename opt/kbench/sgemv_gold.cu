@@ -179,28 +179,26 @@ int main(int argc, char** argv) {
             inkwell_exl3_gemv_moe<<<dim3((tn + 3) / 4, nslots, S.nsel * 2), 256>>>(
                 DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, 2, nullptr, 0);
         };
-        auto newk = [&](int nkyv, int x4v) {
-            return [&, nkyv, x4v]() {
+        auto newk = [&](int nkyv) {
+            return [&, nkyv]() {
                 if (nkyv > 1) CK(cudaMemsetAsync(dt, 0, (size_t)nslots * n * 4));
                 inkwell_exl3_gemv_moe_s<<<dim3((tn + 7) / 8, nslots, S.nsel * nkyv), 256>>>(
-                    DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, nkyv, nullptr, 0, x4v);
+                    DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, nkyv, nullptr, 0);
             };
         };
         CK(cudaMemset(dt, 0, (size_t)nslots * n * 4)); old1(); verdict("old nky=1", rel());
         CK(cudaMemset(dt, 0, (size_t)nslots * n * 4)); old2(); verdict("old nky=2", rel());
-        auto nk1 = newk(1, 1);
-        auto nk2 = newk(2, 1);
-        auto nk1x0 = newk(1, 0);
+        auto nk1 = newk(1);
+        auto nk2 = newk(2);
         CK(cudaMemset(dt, 0, (size_t)nslots * n * 4)); nk1(); verdict("new nky=1", rel());
         CK(cudaMemset(dt, 0, (size_t)nslots * n * 4)); nk2(); verdict("new nky=2", rel());
-        CK(cudaMemset(dt, 0, (size_t)nslots * n * 4)); nk1x0(); verdict("new nky=1 x4=0", rel());
         // ---- skipmode 1/2: sentinel-prefill t, run, skipped slots must stay sentinel
         const int miss[8] = {0, 1, 1, 0, 1, 0, 0, 1};
         for (int sm = 1; sm <= 2; ++sm) {
             std::vector<float> sent((size_t)nslots * n, -777.f);
             CK(cudaMemcpy(dt, sent.data(), sent.size() * 4, cudaMemcpyHostToDevice));
             inkwell_exl3_gemv_moe_s<<<dim3((tn + 7) / 8, nslots, S.nsel), 256>>>(
-                DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, 1, dmiss, sm, 1);
+                DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, 1, dmiss, sm);
             CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
             CK(cudaMemcpy(outbuf.data(), dt, outbuf.size() * 4, cudaMemcpyDeviceToHost));
             double e = 0; int untouched = 1;

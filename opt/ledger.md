@@ -522,3 +522,9 @@ VERDICT: **ACCEPT** — x4 core is default ON for dense gemv (no occupancy cost,
 kbench+e2e win); MoE keeps sgemv_run by default because +8 regs cost a block/SM
 on the small real grids (opt back in via INKWELL_SGEMV_X4_MOE). Net e2e 57.0
 ms/tok.
+- Review repro on master 1456237+ (placement in): 8 interleaved pairs, both orders, BEST env.
+  ctl(NO_SGEMV_X4=1) 58.41/58.16/57.62/58.75/58.91/58.80/59.17/60.02 -> median 58.78
+  x4 (dense on)      59.99/59.92/59.69/57.94/58.41/59.85/58.53/58.63 -> median 59.16
+  md5 5cbe8e06 in all 16. The child's -4.2% does not reproduce; inside noise -> REJECTED, kernel change reverted.
+  Kept opt/kbench/sgemv_var.cu (13 inner-loop variants) for the next attempt. Diagnosis stands: f32 core
+  9.47 issued instr/weight, ~92% issue-bound -> only fewer instructions/weight can help (see exl3_math C1c).

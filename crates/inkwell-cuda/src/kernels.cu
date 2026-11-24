@@ -1934,14 +1934,6 @@ template <int KA, int H>
 __device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
                                           int tk_lo, int tk_hi, const float* __restrict__ xs,
                                           float& a0, float& a1);
-template <int KA, int H>
-__device__ __forceinline__ void sgemv_run4(const uint32_t* __restrict__ tb, int tn, int tn_i,
-                                           int tk_lo, int tk_hi, const float* __restrict__ xs,
-                                           float& a0, float& a1);
-// xs staging layout for the x4 variant: lane t's four rows {r0,r0+1,r0+8,r0+9}
-// (r0 = 2*(t&3)) sit contiguously so one LDS.128 replaces two LDS.64.
-// row r in tile a -> xs[a*16 + SGEMV_X4_PERM(r)]; staging write: xs[(e & ~15) + p(e&15)].
-#define SGEMV_X4_PERM(r) (4 * (((r) & 7) >> 1) + ((r) & 1) + 2 * ((r) >> 3))
 
 // "stream-decode" dense single-token gemv (same design as inkwell_exl3_gemv_moe_s):
 // one warp per 16-wide tile column, 256 threads = 8 warps = 8 tile columns;
@@ -1956,7 +1948,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_s(
                                        const uint32_t* __restrict__ trel,
                                        const float* __restrict__ xh,
                                        float* __restrict__ t,
-                                       int tk, int tn, int ka, int halfk, int x4) {
+                                       int tk, int tn, int ka, int halfk) {
     const int tkc = (tk + gridDim.y - 1) / gridDim.y;
     const int tk_lo = blockIdx.y * tkc;
     const int tk_hi = min(tk_lo + tkc, tk);
@@ -1967,7 +1959,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_s(
     for (int e = tk_lo * 16 + threadIdx.x; e < tk_hi * 16; e += 256) {
         const float v = xh[e];
         sxl += v;
-        xs[x4 ? (e & ~15) + SGEMV_X4_PERM(e & 15) : e] = v;
+        xs[e] = v;
     }
 #pragma unroll
     for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
@@ -1979,17 +1971,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_s(
     const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tn_i >= tn) return;
     float a0 = 0.f, a1 = 0.f;
-    if (x4) switch (ka * 2 + halfk) {
-        case 3:  sgemv_run4<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 4:  sgemv_run4<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 5:  sgemv_run4<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 6:  sgemv_run4<3, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 7:  sgemv_run4<3, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 8:  sgemv_run4<4, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 10: sgemv_run4<5, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        default: __trap();
-    }
-    else switch (ka * 2 + halfk) {
+    switch (ka * 2 + halfk) {
         case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
@@ -2211,9 +2193,8 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
           while (nb * nky < tgt && nky < 8 && nky * 2 <= tk) nky *= 2; }
         if (nky > 1) cudaMemsetAsync(scratch + k, 0, (size_t)nky * n * 4, (cudaStream_t)stream);
         dim3 gsz((unsigned)nb, (unsigned)nky, 1);
-        static int no_x4 = -1; if (no_x4 < 0) { const char* e = getenv("INKWELL_NO_SGEMV_X4"); no_x4 = e ? atoi(e) : 0; }
         inkwell_exl3_gemv_s<<<gsz, 256, 0, (cudaStream_t)stream>>>(
-            (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk, !no_x4);
+            (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
         inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
             scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
         return;
@@ -2499,39 +2480,6 @@ __device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int t
     }
 }
 
-// x4 variant of sgemv_run: xs staged via SGEMV_X4_PERM so lane t's four rows sit
-// contiguous -> one LDS.128 per tile instead of two LDS.64, and the x load is
-// issued before the decode so the LDG latency covers it. Same math, same order.
-template <int KA, int H>
-__device__ __forceinline__ void sgemv_run4(const uint32_t* __restrict__ tb, int tn, int tn_i,
-                                           int tk_lo, int tk_hi, const float* __restrict__ xs,
-                                           float& a0, float& a1) {
-    constexpr int NW = 8 * KA + 4 * H;
-    const int t = threadIdx.x & 31;
-    const int R = 32 * NW;
-    int B = (H ? (8 * t + 1) * KA + ((8 * t + 1) >> 1) : (8 * t + 1) * KA) - 16;
-    if (B < 0) B += R;
-    const int w0 = B >> 5, o = B & 31;
-    const int w1 = (w0 + 1 == NW) ? 0 : w0 + 1;
-    const int w2 = (w1 + 1 == NW) ? 0 : w1 + 1;
-    const int x4 = t & 3;
-    const size_t stride = (size_t)tn * NW;
-    const uint32_t* p = tb + (size_t)tn_i * NW;
-#pragma unroll 4
-    for (int a = tk_lo; a < tk_hi; ++a) {
-        const uint32_t* q = p + (size_t)a * stride;
-        const uint32_t W0 = __ldg(q + w0), W1 = __ldg(q + w1), W2 = __ldg(q + w2);
-        const float4 xv = *(const float4*)&xs[a * 16 + 4 * x4];
-        const uint32_t hi = __funnelshift_l(W1, W0, o), lo = __funnelshift_l(W2, W1, o);
-#define SG_D(j) ((j) * KA + H * (((j) + 1) >> 1))
-#define SG_F(j) ((float)(int)__dp4a(sgemv_mul16(sgemv_win<SG_D(j)>(hi, lo)), 0x01010101u, 0u))
-        a0 = fmaf(xv.x, SG_F(0), a0); a0 = fmaf(xv.y, SG_F(1), a0); a0 = fmaf(xv.z, SG_F(2), a0); a0 = fmaf(xv.w, SG_F(3), a0);
-        a1 = fmaf(xv.x, SG_F(4), a1); a1 = fmaf(xv.y, SG_F(5), a1); a1 = fmaf(xv.z, SG_F(6), a1); a1 = fmaf(xv.w, SG_F(7), a1);
-#undef SG_F
-#undef SG_D
-    }
-}
-
 #define SGEMV_MAXK 2304
 // Drop-in for inkwell_exl3_gemv_moe: same params/semantics.
 // grid ((tn+7)/8, nslots, nsel*nky), 256 threads = 8 warps = 8 tn tiles of one slot.
@@ -2543,7 +2491,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
                                       const float* __restrict__ xh2, int xh2s,
                                       float* __restrict__ t, int tslot, int tzoff,
                                       int tk, int tn, int k, int n, int nky,
-                                      const int* __restrict__ missf, int skipmode, int x4) {
+                                      const int* __restrict__ missf, int skipmode) {
     const int slot = blockIdx.y;
     // skipmode 1: hits only; 2: misses only; 0: all slots (uniform per block)
     if (skipmode && ((missf[slot] != 0) == (skipmode == 1))) return;
@@ -2561,7 +2509,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     for (int e = tk_lo * 16 + threadIdx.x; e < tk_hi * 16; e += 256) {
         const float v = xg[e];
         sxl += v;
-        xs[x4 ? (e & ~15) + SGEMV_X4_PERM(e & 15) : e] = v;
+        xs[e] = v;
     }
 #pragma unroll
     for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
@@ -2575,17 +2523,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     const uint32_t* tb = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff), hk = (int)((d[3] >> 8) & 1);
     float a0 = 0.f, a1 = 0.f;
-    if (x4) switch (ka * 2 + hk) {
-        case 3:  sgemv_run4<1, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 4:  sgemv_run4<2, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 5:  sgemv_run4<2, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 6:  sgemv_run4<3, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 7:  sgemv_run4<3, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 8:  sgemv_run4<4, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        case 10: sgemv_run4<5, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-        default: __trap();
-    }
-    else switch (ka * 2 + hk) {
+    switch (ka * 2 + hk) {
         case 3:  sgemv_run<1, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 4:  sgemv_run<2, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 5:  sgemv_run<2, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
@@ -2991,13 +2929,6 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     static int no_sgemv = -1;
     if (no_sgemv < 0) no_sgemv = getenv("INKWELL_NO_SGEMV") ? atoi(getenv("INKWELL_NO_SGEMV")) : 0;
     const bool sg = !no_sgemv;                  // stream-decode gemv replaces v1+v2 serial
-    static int no_x4 = -1;
-    if (no_x4 < 0) no_x4 = getenv("INKWELL_NO_SGEMV_X4") ? atoi(getenv("INKWELL_NO_SGEMV_X4")) : 0;
-    static int x4m_env = -1;
-    if (x4m_env < 0) x4m_env = getenv("INKWELL_SGEMV_X4_MOE") ? atoi(getenv("INKWELL_SGEMV_X4_MOE")) : 0;
-    // x4 costs +8 regs (48 vs 40) -> 5 blocks/SM instead of 6, which lost e2e;
-    // default OFF for MoE, opt back in with INKWELL_SGEMV_X4_MOE=1.
-    const int x4 = !no_x4 && x4m_env;
     static int v2_env = -1;
     if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
     int v2_ok = !sg && (v2_env > 0) && nky == 1;
@@ -3031,7 +2962,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0, x4);
+                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, nullptr, 0,
         nullptr, nullptr, nullptr, nullptr);   // GU stays fp32: int8-x loses ~10%/window
@@ -3051,7 +2982,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
         inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, x4);
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, nullptr, nullptr);
@@ -3114,13 +3045,6 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     static int no_sgemv = -1;
     if (no_sgemv < 0) no_sgemv = getenv("INKWELL_NO_SGEMV") ? atoi(getenv("INKWELL_NO_SGEMV")) : 0;
     const bool sg = !no_sgemv;                  // stream-decode gemv replaces v1+v2 serial
-    static int no_x4 = -1;
-    if (no_x4 < 0) no_x4 = getenv("INKWELL_NO_SGEMV_X4") ? atoi(getenv("INKWELL_NO_SGEMV_X4")) : 0;
-    static int x4m_env = -1;
-    if (x4m_env < 0) x4m_env = getenv("INKWELL_SGEMV_X4_MOE") ? atoi(getenv("INKWELL_SGEMV_X4_MOE")) : 0;
-    // x4 costs +8 regs (48 vs 40) -> 5 blocks/SM instead of 6, which lost e2e;
-    // default OFF for MoE, opt back in with INKWELL_SGEMV_X4_MOE=1.
-    const int x4 = !no_x4 && x4m_env;
     static int v2_env = -1;
     if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
     int v2_ok = !sg && (v2_env > 0) && nky == 1;
@@ -3161,7 +3085,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                                    (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 1, x4);
+                                                   (const int*)miss, 1);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1,
         nullptr, nullptr, nullptr, nullptr);
@@ -3178,7 +3102,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                                    (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 2, x4);
+                                                   (const int*)miss, 2);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2,
         nullptr, nullptr, nullptr, nullptr);
@@ -3198,7 +3122,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
         inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, x4);
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, nullptr, nullptr);
