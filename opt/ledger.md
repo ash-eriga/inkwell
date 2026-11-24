@@ -664,3 +664,52 @@ Per-token union idle 12.4 -> ~3.4 ms/tok median under nsys.
   - gc median 51.29 ms/tok (49.89–56.34);
   - **−11.5%**; gc wins 8/8 neighbouring pairs; md5 5cbe8e06 on every valid run; warnings 62.
 - One ctl run FAILed with no output. At that moment `nvidia-smi` showed another agent's inkwell holding 3770 MiB, probably a job run outside the flock. 3 ctl re-runs passed (57.6/56.6/56.4 ms).
+
+## 2026-11-24 — sgemv paired-window core (M=32/lane, A1/A2/A3+B1): verified, slower, reverted
+
+GOAL: port the REPORT.md paired-window extraction into sgemv_run: lane owns 32
+consecutive ring windows, pairs (D,D+16)/(D-1)+IADD share one funnel shift,
+mul16 reads .H1/.H0 halves directly (3 XMAD, zero BFE/LOP), exact f32 MAC kept
+bit-identical via magic FADD(-2^23) (same (float)bs FMA input as I2F). 8 accs
+per lane reproduce the OLD per-lane FMA order exactly, so the column tree is
+bit-identical (relerr 9.95e-07 == baseline in bench; e2e would be text-identical).
+
+NO load-time transform needed: pairing is translation-invariant. For integer K
+the per-lane chunk offset o = (KA+16) mod 32 is identical for all 8 lanes ->
+folded into compile-time extraction offsets E_j = D_j + o on raw words
+(w0 = g*KA-1 mod NW). For half-K o alternates 16 by lane parity -> per-tile
+realign W[m]=shf(R[m+1],R[m],o) (2-4 SHF/32w). All in-kernel, no re-layout.
+
+CPU verification (opt/kbench/exl3_math/plan_pw.cpp, KEPT): greedy staged
+planner (aligned -> (d,d+16)+bonus -> d%32==1 IADD -> (d,d+15) -> singles)
+generates the emission-ordered op list per K and simulates every lane's
+extraction vs ref_window: PASS all 7 K, 512000 checks each, 0 fails. Extract
+instr/w: K1.5=0.69, K2=0.44, K2.5=1.03, K3=0.94, K3.5=1.06 (no pair structure
+exists for 3.5: 2 aligned+30 singles), K4=0.38, K5=0.94. SASS check on the
+compiled K=2 loop: ~7.2 issued instr/w vs 9.47 today (-24%). Mul16 folded to
+4-XMAD+BFE until CM was sourced from shared memory (opaque) -> clean 3-XMAD.
+
+MEASURED (sgemv_var pw32 vs f32-i2f baseline, interleaved, real K-mix):
+  launch_bounds(256,6): 40 regs + STACK:32 spills -> GU+down 443-495us vs 311us
+  launch_bounds(256,5): 48 regs, no stack    -> 370-375us vs 254-263us  (-42%)
+  unroll 2:                                 -> 495us (stack 72, worse)
+  pw32 relerr 9.95e-07 (GU) 1.27e-06 both stages -> math correct, perf wrong.
+  Regs: MoE pw 48 (5 blk/SM, or 40+spills at 6) vs 40 baseline; dense pw 48 vs 40.
+
+WHY IT LOST: ~25% fewer issued instr/weight but ~40% SLOWER -> the 92%
+issue-bound model did not transfer. Structural suspects, ranked:
+  1. warp=4 tile columns -> ceil(tn/32) grids: down stage 80 blocks, GU 96
+     (with 25-10% idle tail groups) vs 144/288 baseline -> fewer resident warps
+     on the small real grids; per-tile critical path is 4x longer with only
+     ~2-4 LDGs in flight per lane (unroll-1 needed for regs -> no overlap).
+  2. 8 accs + up-to-7 stash regs + NR word-index regs -> 48 regs (5 blk/SM);
+     forcing 40 spills the inner loop.
+  3. giant per-K bodies (K=3.5 all-singles) -> icache pressure across mixed-K blocks.
+Lesson: on sm_61 this inner loop is closer to latency/scheduling-bound than the
+issued-instr model suggests; M=32's 4x-less-parallelism tradeoff needs a
+different shape (e.g., M=16 with 2 lanes/col + xor-reduce, or keeping M=8 with
+cross-lane pair sharing via shfl) to keep warp count up.
+
+VERDICT: **REJECTED** — code reverted (kernels.cu, sgemv_var.cu). Kept
+plan_pw.cpp (the verified extraction planner: emits + validates the per-K op
+lists; reuse for any future paired-window attempt).
