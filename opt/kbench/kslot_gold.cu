@@ -178,8 +178,18 @@ static bool run_one(Ctx& c, const CallInput& in, int kmax, int key_base,
     CK(cudaMemcpy(c.d_ids, in.ids.data(), 64 * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(c.d_ptag, in.ptag.data(), 64 * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(c.d_pready, &in.pready, 4, cudaMemcpyHostToDevice));
-    if (in.use_pnexp) CK(cudaMemcpy(c.d_pnexp, &in.ns, 4, cudaMemcpyHostToDevice));
     CK(cudaMemset(c.dflag, 0xff, 4));
+
+    int ns_dev = in.ns;
+    if (in.use_pnexp) {
+        ns_dev = 0;
+        for (int i = 0; i < in.ns; ++i) {
+            bool seen = false;
+            for (int j = 0; j < i; ++j) seen |= in.ids[j] == in.ids[i];
+            ns_dev += !seen;
+        }
+        CK(cudaMemcpy(c.d_pnexp, &ns_dev, 4, cudaMemcpyHostToDevice));
+    }
 
     const int* pnx = in.use_pnexp ? c.d_pnexp : nullptr;
     const int* pt = in.pf_on ? c.d_ptag : nullptr;
@@ -312,6 +322,15 @@ static bool random_phase(Ctx& c, long target, long& calls, long& pf_calls,
                     in.ids[s2] = rk[r % rk.size()] - sc.key_base;
                 else
                     in.ids[s2] = rint(0, 127);
+            }
+            if (in.use_pnexp) {
+                int u = 0;
+                for (int i = 0; i < in.ns; ++i) {
+                    bool seen = false;
+                    for (int j = 0; j < u; ++j) seen |= in.ids[j] == in.ids[i];
+                    if (!seen) in.ids[u++] = in.ids[i];
+                }
+                in.ns = u;
             }
             in.pf_on = rnd() % 5 == 0;
             in.pready = in.pf_on ? rint(1, 3) : 0;
