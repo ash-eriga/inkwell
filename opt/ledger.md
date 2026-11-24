@@ -528,3 +528,60 @@ ms/tok.
   md5 5cbe8e06 in all 16. The child's -4.2% does not reproduce; inside noise -> REJECTED, kernel change reverted.
   Kept opt/kbench/sgemv_var.cu (13 inner-loop variants) for the next attempt. Diagnosis stands: f32 core
   9.47 issued instr/weight, ~92% issue-bound -> only fewer instructions/weight can help (see exl3_math C1c).
+
+## 2026-11-24 — graphs-ON glue profile (nsys) + sgemv epilogue fold
+
+### PHASE 1 — per-kernel profile under graphs (GGML_PASCAL_GRAPHS=1)
+nsys 2024.5.1 `--trace=cuda --cuda-graph-trace=node` (kernels inside graph
+replays visible), whole `--run` decode, exported sqlite; token windows =
+intervals between the ~800KB logits DtoH memcpys; last 16 complete windows
+(discard first/last partial). GPU busy union = merged intervals across all
+streams; idle = span - busy. decode under nsys ~60.9 ms/tok span.
+
+| bucket | kernel ms/tok | gap ms/tok | n launches/tok | us avg |
+|---|---|---|---|---|
+| EXL3 MoE GEMV (gemv_moe_s) | 19.84 | 0.21 | 120 | 165.4 |
+| EXL3 dense GEMV+had (gemv_s + had_in/out) | 16.00 | 1.50 | 867 | 18.5 |
+| MoE non-GEMV (ccopy staging 9.84 + had_in/out_moe + resolve + wsum) | 13.58 | 0.77 | 384 | 35.4 |
+| mix/conv/clip/router custom cbs | 4.05 | 1.22 | 504 | 8.0 |
+| glue: generic mul_mat (mul_mat_vec_f 304 + sgemm 48) | 3.76 | 0.77 | 352 | 10.7 |
+| glue: concat/cont/cpy/set_rows/get_rows | 1.82 | 1.32 | 511 | 3.6 |
+| glue: elementwise (k_bin_bcast 536, unary 193+) | 1.72 | 1.68 | 782 | 2.2 |
+| glue: rms_norm | 1.00 | 0.92* | 394 | 2.5 |
+| attention (attn_decode) | 0.93 | 0.06 | 48 | 19.3 |
+
+\* rms_norm gap shows 4.86 in raw attribution but includes the single ~3.94 ms
+token-boundary hole (memcpy_HtoD_9216B -> first rms_norm of next replay =
+host turnaround: argmax + graph build/launch); subtracted here.
+Union idle total: 12.39 ms/tok (~1600 micro-bubbles, p50 ~4-5 us, driven by
+launch density; ~3.9 ms of it is the one host-turnaround hole).
+
+GLUE total = kernel 8.30 + attributable gap ~4.7 (excl. boundary hole) ~
+**13 ms/tok >> 4 ms gate -> PHASE 2 ON**. Kernel time alone (8.30) or even
+elementwise+rms+concat/cpy alone (4.54) already exceeds the gate.
+
+### PHASE 2 attempt A — full fuse (had_in+gemv+had_out in 1 launch)
+`inkwell_exl3_gemv_sf` v1: per-block H128 transform of own k-chunk +
+atomic-ticket last-block reduce. Golden OK after fixing a had_in ordering
+bug, but A/B: control 3.71/3.65/3.71/3.81 vs cand 3.79/3.78/3.69/3.81 ->
+**REJECTED (~+2-3% slower)**: redundant chunk transforms across all nb
+blocks, worst on nky==1 unembed (1571 blocks x 2304-elem transform each).
+
+### PHASE 2 attempt B — epilogue fold only (ACCEPTED)
+had_in stays a shared launch; gemv absorbs memset + had_out via atomic
+ticket ctr[bx] (scratch[k+8n..+512], zeroed at load, self-resetting) +
+last-block 128-butterfly+svh. Bit-identical math (same z-sum order, same
+butterflies). -2 launches per dense GEMV (~-440/tok incl memsets).
+Killswitch: INKWELL_NO_SGEMV_FUSE=1 -> old 4-launch chain.
+
+e2e A/B (BEST env + graphs, alternating C/A x4):
+| run | control (NO_SGEMV_FUSE=1) | candidate |
+| 1 | 3.6869s = 57.61 | 3.6058s = 56.34 |
+| 2 | 3.7510s = 58.61 | 3.5900s = 56.09 |
+| 3 | 3.6508s = 57.04 | 3.6930s = 57.70 |
+| 4 | 3.8069s = 59.48 | 3.6114s = 56.43 |
+| median | 3.7190s = **58.11** | 3.6086s = **56.39** (-3.0%) |
+
+Candidate beats neighbouring control in 3/4 pairs; generated text
+byte-identical (md5 5cbe8e06f2d8d82feb7f2ca287a7bc59) in all 8 runs;
+warnings 60 before = after. VERDICT: **ACCEPT**.
