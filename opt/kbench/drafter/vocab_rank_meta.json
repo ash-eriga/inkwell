@@ -1,0 +1,130 @@
+{
+  "source": "Independent local corpus (Linux manpages + /usr/share/doc + Python 3.14 stdlib + /usr/include C headers), domain-balanced, with GGUF BPE merge-rank tie-breaker for unseen ASCII tokens. Zero overlap with evaluation prompts.",
+  "domains": {
+    "docs_prose": {
+      "chars": 3545341,
+      "tokens": 1257158,
+      "unique": 16247
+    },
+    "man_pages": {
+      "chars": 4002260,
+      "tokens": 1347122,
+      "unique": 18707
+    },
+    "python_stdlib": {
+      "chars": 3014451,
+      "tokens": 1026183,
+      "unique": 12100
+    },
+    "c_headers": {
+      "chars": 1501009,
+      "tokens": 494153,
+      "unique": 8530
+    }
+  },
+  "total_corpus_tokens": 4124616,
+  "unique_corpus_tokens": 25625,
+  "ascii_tokens_total": 103350,
+  "top_nonbyte_20": [
+    [
+      200006,
+      "<|content_model_end_sampling|>",
+      0.0
+    ],
+    [
+      149862,
+      "\u0120\u0120\u0120",
+      0.015959
+    ],
+    [
+      149876,
+      "\u0120the",
+      0.012559
+    ],
+    [
+      68014,
+      "\u010a\u010a",
+      0.007776
+    ],
+    [
+      149860,
+      "\u0120\u0120\u0120\u0120",
+      0.007267
+    ],
+    [
+      149882,
+      "\u0120to",
+      0.006606
+    ],
+    [
+      149861,
+      "\u0120\u0120\u0120\u0120\u0120\u0120\u0120\u0120",
+      0.00633
+    ],
+    [
+      196987,
+      "\u0120*",
+      0.005953
+    ],
+    [
+      196978,
+      "\u0120\\",
+      0.005795
+    ],
+    [
+      149884,
+      "\u0120is",
+      0.004871
+    ],
+    [
+      149878,
+      "\u0120a",
+      0.00483
+    ],
+    [
+      196976,
+      "\u0120(",
+      0.004827
+    ],
+    [
+      196980,
+      "\u0120\"",
+      0.004391
+    ],
+    [
+      2250,
+      "span",
+      0.004321
+    ],
+    [
+      149879,
+      "\u0120of",
+      0.004292
+    ],
+    [
+      149880,
+      "\u0120and",
+      0.003837
+    ],
+    [
+      196994,
+      "\u0120#",
+      0.003644
+    ],
+    [
+      149881,
+      "\u0120in",
+      0.003627
+    ],
+    [
+      149887,
+      "\u0120for",
+      0.003218
+    ],
+    [
+      68672,
+      "46",
+      0.00315
+    ]
+  ]
+}

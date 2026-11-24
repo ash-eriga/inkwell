@@ -1,0 +1,114 @@
+{
+  "n_tokens": 640,
+  "prompts": {
+    "factual": 128,
+    "prose": 128,
+    "python": 128,
+    "rust": 128,
+    "tech": 128
+  },
+  "corpus_ranked": {
+    "4096": {
+      "overall": 0.7140625,
+      "per_domain": {
+        "factual": 0.609375,
+        "prose": 0.609375,
+        "python": 0.890625,
+        "rust": 0.78125,
+        "tech": 0.6796875
+      }
+    },
+    "8192": {
+      "overall": 0.778125,
+      "per_domain": {
+        "factual": 0.609375,
+        "prose": 0.703125,
+        "python": 0.8984375,
+        "rust": 0.8125,
+        "tech": 0.8671875
+      }
+    },
+    "16384": {
+      "overall": 0.8671875,
+      "per_domain": {
+        "factual": 0.734375,
+        "prose": 0.8359375,
+        "python": 0.8984375,
+        "rust": 0.8984375,
+        "tech": 0.96875
+      }
+    },
+    "32768": {
+      "overall": 0.9484375,
+      "per_domain": {
+        "factual": 0.8671875,
+        "prose": 0.9375,
+        "python": 1.0,
+        "rust": 0.9375,
+        "tech": 1.0
+      }
+    },
+    "65536": {
+      "overall": 0.959375,
+      "per_domain": {
+        "factual": 0.8828125,
+        "prose": 0.96875,
+        "python": 1.0,
+        "rust": 0.9453125,
+        "tech": 1.0
+      }
+    }
+  },
+  "naive_id_prefix": {
+    "4096": {
+      "overall": 0.315625,
+      "per_domain": {
+        "factual": 0.2109375,
+        "prose": 0.203125,
+        "python": 0.484375,
+        "rust": 0.4765625,
+        "tech": 0.203125
+      }
+    },
+    "8192": {
+      "overall": 0.321875,
+      "per_domain": {
+        "factual": 0.2109375,
+        "prose": 0.203125,
+        "python": 0.5078125,
+        "rust": 0.4765625,
+        "tech": 0.2109375
+      }
+    },
+    "16384": {
+      "overall": 0.321875,
+      "per_domain": {
+        "factual": 0.2109375,
+        "prose": 0.203125,
+        "python": 0.5078125,
+        "rust": 0.4765625,
+        "tech": 0.2109375
+      }
+    },
+    "32768": {
+      "overall": 0.33125,
+      "per_domain": {
+        "factual": 0.2109375,
+        "prose": 0.2265625,
+        "python": 0.5078125,
+        "rust": 0.484375,
+        "tech": 0.2265625
+      }
+    },
+    "65536": {
+      "overall": 0.35625,
+      "per_domain": {
+        "factual": 0.2734375,
+        "prose": 0.25,
+        "python": 0.515625,
+        "rust": 0.5,
+        "tech": 0.2421875
+      }
+    }
+  }
+}

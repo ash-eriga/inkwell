@@ -911,3 +911,22 @@ INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_V2=1 INKWELL_MOE_NKY=2, flock, 8 pairs ctl,c
   cand s: 3.079 3.044 3.044 3.139 3.072 3.008 3.106 3.069  -> median 3.070 (48.0 ms/tok)
   cand median -2.5%, pair wins 6/8 -> ACCEPT.
   generated text md5 identical ctl==cand (no divergent token).
+
+## 2026-11-24 — Speculative drafter cost model, sm_61 kernels & real acceptance proxy (`opt/kbench/drafter/`)
+
+Full study (`opt/kbench/drafter/REPORT.md`) answering cost model, head/body design, `sm_61` CUDA-graph kernels, reduced-vocab coverage, and real DSpark quantization proxy against `46.8 ms/tok` (`21.37 tok/s`) serial on GTX 1060 6GB:
+
+- **Cost model & binding constraint (`cost_model.py`, anchored to 46.8 ms serial + 384-visit `ids_block.bin` + `exl3_math2` `M=16-Batch C0c`):**
+  - Mean union `U(B)` grows `8.00 -> 12.89 (B=2) -> 16.59 (B=3) -> 19.96 (B=4) -> 22.91 (B=5)`, with `61–76%` of union experts hit by only 1 token. Even with an ideal ragged batched MoE verify kernel, `verify(k)` is modeled at `69.9 ms` (`k=1, 1.49×`), `90.4 ms` (`k=2, 1.93×`), `108.9 ms` (`k=3, 2.33×`), `126.1 ms` (`k=4, 2.69×`).
+  - Under strict prompt acceptance (`p1=0.75, q=0.18`), **only `k=1 (B=2)` beats serial** (`emit=1.75`, budget `+12.0 ms` break-even / `+4.5 ms` for +10%); `k=2` has negative break-even budget (`−2.2 ms`). Under ledger empirical (`emit(2)=2.10`), `k=2` budget is `+7.7 ms` (0%) / `−1.3 ms` (+10%). Reaching +20% requires ragged `B=2..3` verify AND `p1 >= 0.83` (`k=1`) or `emit(2) >= 2.36` (`k=2`).
+  - VRAM theft from expert caches costs `~+0.0148 ms/MiB × (U(B)/8)` per verify round (`+3.1 ms/100 MiB` at `B=3`).
+- **Measured `sm_61` kernels (`drafter_kernels.cuh` + `bench_drafter.cu`, verified bit-exact `relerr ~6e-8`, single CUDA Graph, zero host sync, device-side argmax):**
+  - `head_argmax_i8_dp4a<3>` (`40` regs, `0` spills, `6` blk/SM): **173.7–176.2 GB/s (85–86% of 204 GB/s DRAM peak)**; `V'=32K H=2304` = `436 us`, `H=1024` = `202 us`.
+  - `head_argmax_i4g128_dp4a<1..3>` (`38–40` regs, `0` spills, `6` blk/SM, `+8` unsigned nibble pack + fp16 g128 scales): `V'=32K H=1024` (`16.6 MiB`) = **`108.5 / 115.5 / 146.4 us` (160.6 GB/s)**; `H=2304` (`37.2 MiB`) = `238.6 us` (`163.7 GB/s`).
+  - `gemv_i8_dp2a<3>` (int16 act × int8 W, `40` regs, `0` spills, `6` blk/SM): `150.7 GB/s` (+13% time vs `dp4a`). `fused_rmsnorm_quant<i8/i16>`: `3.1–4.1 us`.
+  - Resident EXL3 K=4.0 unembed (`unembed.bin`, `0 MiB` extra VRAM): `B=1..4` = **`1.76 / 2.11 / 2.61 / 3.00 ms`** (`273 -> 666 GMAC/s`, `2.44×`).
+- **Reduced-vocab coverage (`vocab_coverage.py`, 640 real target greedy tokens across 5 prompts vs independent 4.12M-token corpus ranking `vocab_rank_corpus.bin`):** `4K: 71.4%`, `8K: 77.8%`, `16K: 86.7%`, **`32K: 94.84%`** (Python/tech 100%, prose/Rust 93.8%), `64K: 95.94%`. Naive `id < V'` collapses to `33.1%` at `32K` because Inkling's leading-space English tokens sit in `149860..199999`.
+- **Real DSpark acceptance proxy (`acceptance_proxy.cu`, 12 prompts = 84 real draft steps, 84/84 oracle verified):**
+  - Full 3L + Markov + `32K` head: **`Int8 + Int16 X (dp2a)` = `84/84 (100.0%)`**, **`Int8 + Int8 X (dp4a)` = `36/36 (100.0%)` on d1..3 / `80/84 (95.2%)` on d1..7**, zero loss in real target `emit`.
+  - Head-only `Int4-g128 + Int8 X (32K)` = **`12/12 (100%)` d1 / `34/36 (94.4%)` d1..3** (zero loss in target `emit`), whereas **per-row `Int4` collapses to `67%` head-only / `58%` full on d1** (disqualified).
+- **Recommended design:** **`EAGLE-1-Med`** (`1L, D=1024, FF=2816, 16q/4kv hd=64, SWA-128`, 4-tap fuse, symmetric per-row `int8` `dp4a` body) + **tied `V'=32,768` `int4-g128` nibble-unpack head** (`29.9 MiB` VRAM; measured CUDA-graph round **`0.24 / 0.46 / 0.68 ms`** for `k=1/2/3`; modeled **`24.14 tok/s` (+13.0%)** at `k=1` under current acceptance and **`25.08 tok/s` (+17.4%)** with trained EAGLE acceptance). Requires compact ragged `B=2..3` verifier in Inkwell.
