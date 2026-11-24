@@ -1470,3 +1470,27 @@ Build: `cargo build --release` rc=0, warnings **62** (master budget ≤64), `ker
   - 1 FFMA + 1 I2F, LDS or SHFL was held to 1 pair per cycle.
 - Shipped expert loop under the max(N, 2H, 4Q)/Wp model: issue-bound at every K, e.g. K=2 has N=270, H=36, Q=40 per 32 weights.
 - Use: this is the cost model of `opt/MATH_CHALLENGE_STEP2.md` §2.5. Pipe sharing between slow classes is still open, and the mix run is queued.
+
+## 2026-11-24 — process VRAM cap, runtime trims, and context-aware expert caches accepted
+
+Implementation commits: `e3934a2` lazy `Exl3Blk` scratch, `fdec037` direct controller gain/forget concat, `628a427` measured `dev_buf` sizing, `9b49dd4` process VRAM cap + budgeted cache tables. Validated after rebasing on device-resident MoE descriptors (`1218f58`); the later `60c73af` master delta was documentation-only. Build warnings **63** (budget ≤64).
+
+- **Runtime trims.** `INKWELL_NO_LAZY_BLKSCRATCH=1` restores eager 8-row verify scratch allocation; `INKWELL_NO_GFCAT_TRIM=1` restores separate device gain/forget weights plus their concatenated duplicate; `INKWELL_NO_DEVBUF_TRIM=1` restores the 160 MiB `dev_buf` reserve. The control arm measured the review's claims exactly: `dev_buf use=105.4 MiB alloc=237.0 MiB slack=131.6 MiB`; the trimmed arm measured `use=78.4 MiB alloc=85.0 MiB slack=6.6 MiB`. Pre-cache process VRAM fell from 4,050 MiB (ctl) to 3,772 MiB (candidate), freeing **278 MiB** for caches on the paths tested.
+- **Cap accounting.** `nvmlDeviceGetComputeRunningProcesses_v2` reports the process's own device memory; a `cudaMemGetInfo` baseline fallback remains for systems without NVML. Default target `INKWELL_VRAM_CAP_MB=5080`; default runtime reserve `INKWELL_RUNTIME_RESERVE_MB=96` (measured post-cache 4,972 → external peak 5,034 MiB, +62 MiB). `INKWELL_NO_VRAMCAP=1` restores physical-free-memory sizing; `INKWELL_NO_CACHE_BUDGET=1` restores the fixed legacy 940 MiB table.
+- **Budget logs.** ctx 512: `target=5080 reserve=96 used_pre_cache=3772 budget=1212 table=1200`; `cache_allocated=1200 used_post_cache=4972`. ctx 32768: `target=5080 reserve=96 used_pre_cache=4780 budget=204 table=192`; `cache_allocated=192 used_post_cache=4972`.
+- **Cache tables** (24 layers; layers 6–15 are device-resident and therefore zero). ctx 512 selected total 1,200 MiB: `[100,80,68,80,84,96, 0×10, 156,164,52,48,64,68,64,76]`. ctx 32768 selected total 192 MiB: `[0,4,0,4,4,0, 0×10, 56,12,24,24,24,20,12,8]`. The legacy ctl table is 940 MiB: `[56,56,56,48,56,64, 0×10, 156,156,48,44,48,52,48,52]`. Replay on the 68-token routing trace estimates 53.4 → 34.8 MiB/tok of streamed-layer misses at ctx 512 (940-table greedy vs 1,200) and 336.8 → 189.6 MiB/tok at 32K (zero vs 192). Tables were produced by the existing kslot greedy marginal-value replay in 4 MiB steps.
+- **Correctness/peak probe**, one flock, 100 ms `nvidia-smi --query-compute-apps` polling: ctx 512 rc 0, md5 `5cbe8e06`, peak **5,034 MiB**; ctx 32768 load plus short decode rc 0, peak **5,034 MiB**. Both are below the 5,080 MiB target.
+- **A/B at ctx 512**, one flock, 16 interleaved neighbour pairs in order ctl,cand,cand,ctl ×8. ctl = all new killswitches (`INKWELL_NO_LAZY_BLKSCRATCH`, `INKWELL_NO_GFCAT_TRIM`, `INKWELL_NO_DEVBUF_TRIM`, `INKWELL_NO_VRAMCAP`, `INKWELL_NO_CACHE_BUDGET`); cand = defaults. All 32 runs rc 0 and md5 `5cbe8e06`. ctl peak 5,052 MiB on every run; cand peak 5,034 MiB on every run.
+
+| rep | ctl1 | cand1 | cand2 | ctl2 |
+|---:|---:|---:|---:|---:|
+| 1 | 36.31 | 35.31 | 35.21 | 37.08 |
+| 2 | 37.59 | 35.69 | 35.19 | 38.34 |
+| 3 | 39.46 | 36.39 | 35.82 | 36.75 |
+| 4 | 37.67 | 35.60 | 35.96 | 37.61 |
+| 5 | 37.80 | 36.13 | 34.32 | 38.28 |
+| 6 | 37.72 | 36.21 | 35.88 | 37.74 |
+| 7 | 38.28 | 37.57 | 36.42 | 38.19 |
+| 8 | 38.79 | 35.92 | 36.05 | 39.13 |
+
+  ctl median **37.77** ms/tok; cand median **35.90** ms/tok; candidate **−1.87 ms/tok (−4.9%)**. Pair wins **16/16** (bar ≥12/16). Verdict: **ACCEPTED**.
