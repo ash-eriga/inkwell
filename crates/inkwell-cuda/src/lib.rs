@@ -81,6 +81,8 @@ extern "C" {
     fn ink_launch_gf_apply(x: *const c_void, x_is_bf16: i32, y: *const f32, cur: *const f32, msg: *const f32, dst: *mut f32, n: i32, fo: i32, stream: *mut c_void);
     fn ink_launch_rms2down(x0: *const f32, x1: *const f32, w: *const c_void, w_is_bf16: i32, dst: *mut f32, n: i32, nrows: i32, eps: f32, stream: *mut c_void);
     fn ink_launch_ctrl_triad(io: *const c_void, n: i32, eps: f32, fo: i32, stream: *mut c_void);
+    fn ink_launch_kv_sconv_batched(wk: *const c_void, wv: *const c_void, xk: *const f32, xv: *const f32,
+        dk: *mut f32, dv: *mut f32, nrows: i32, ncols2: i32, stream: *mut c_void);
     fn ink_launch_relbias_gather(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, y: *mut f32, nkv: i32, nh: i32, ext: i32, stream: *mut c_void);
     fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_exl3_gemv_mz(trel: *const *const c_void, suh: *const *const c_void, svh: *const *const c_void, x: *const *const f32, y: *mut f32, ystride: i64, scr: *const *mut f32, k: *const i64, n: *const i64, ka: *const i64, halfk: *const i64, nz: i32, stream: *mut c_void);
@@ -853,6 +855,16 @@ pub unsafe fn rms2down_async(x0: *const f32, x1: *const f32, w: *const c_void,
     w_is_bf16: i32, dst: *mut f32, n: i32, nrows: i32, eps: f32) {
     unsafe { ink_launch_rms2down(x0, x1, w, w_is_bf16, dst, n, nrows, eps, stream()) };
 }
+/// Batched k/v short-conv projection GEMV.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn kv_sconv_batched_async(wk: *const c_void, wv: *const c_void,
+    xk: *const f32, xv: *const f32, dk: *mut f32, dv: *mut f32, nrows: i32, ncols2: i32) {
+    unsafe { ink_launch_kv_sconv_batched(wk, wv, xk, xv, dk, dv, nrows, ncols2, stream()) };
+}
+
 /// Batched q/k/v controller triad. `io` is the C-compatible pointer table
 /// consumed by `ink_launch_ctrl_triad` and copied into by-value kernel args.
 ///

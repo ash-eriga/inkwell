@@ -4669,6 +4669,69 @@ extern "C" void ink_launch_exl3_gemv_mz(
     }
 }
 
+// Batched k/v short-conv projection GEMVs (exact mmvf-256 reduction order).
+template <int R>
+__global__ void inkwell_kv_sconv_batched(
+        const __nv_bfloat16* __restrict__ wk,
+        const __nv_bfloat16* __restrict__ wv,
+        const float* __restrict__ xk,
+        const float* __restrict__ xv,
+        float* __restrict__ dk,
+        float* __restrict__ dv,
+        int nrows, int ncols2) {
+    const __nv_bfloat16* x = blockIdx.y ? wv : wk;
+    const float* y = blockIdx.y ? xv : xk;
+    float* dst = blockIdx.y ? dv : dk;
+    const int r0 = blockIdx.x * R;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5, lane = tid & 31;
+    __shared__ float buf[R][32];
+    if (tid < 32) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) buf[r][tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const float2* y2 = (const float2*)y;
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
+    const size_t stride2 = (size_t)ncols2;
+    const __nv_bfloat162* base = (const __nv_bfloat162*)x + (size_t)r0 * stride2;
+    for (int col2 = tid; col2 < ncols2; col2 += 256) {
+        const float2 tmpy = __ldg(&y2[col2]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r0 + r < nrows) {
+                const __nv_bfloat162 tw = base[(size_t)r * stride2 + col2];
+                sum[r] += __bfloat162float(tw.x) * tmpy.x;
+                sum[r] += __bfloat162float(tw.y) * tmpy.y;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], m);
+        if (lane == 0) buf[r][wid] = sum[r];
+    }
+    __syncthreads();
+    if (wid < R) {
+        const int r = wid;
+        float v = buf[r][lane];
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+        if (lane == 0 && r0 + r < nrows) dst[r0 + r] = v;
+    }
+}
+
+extern "C" void ink_launch_kv_sconv_batched(const void* wk, const void* wv,
+        const float* xk, const float* xv, float* dk, float* dv,
+        int nrows, int ncols2, void* stream) {
+    inkwell_kv_sconv_batched<1><<<dim3((unsigned)nrows, 2), 256, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)wk, (const __nv_bfloat16*)wv, xk, xv, dk, dv, nrows, ncols2);
+}
+
 // ===================== fused router: sigmoid+bias+top-k+normalize =====================
 // out[0..8) = normalized*scale weights of the selected experts;
 // out[8..16) = selected expert ids as i32 bit patterns (read as f32 tensor).

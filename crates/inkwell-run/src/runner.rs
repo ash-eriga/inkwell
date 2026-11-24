@@ -311,6 +311,20 @@ unsafe extern "C" fn gf_apply_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i3
     };
 }
 
+/// `ggml_custom_op_t`: batched k/v_sconv projection GEMV.
+/// srcs = [wk, xk, wv, xv]; dst is [32,2].
+unsafe extern "C" fn kv_sconv_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let t = |i: i32| unsafe { inkwell_ggml::ink_tensor_src(dst, i) };
+    let d = |i: i32| unsafe { inkwell_ggml::ink_tensor_data(t(i)) };
+    let wk = unsafe { t(0) };
+    let nrows = unsafe { inkwell_ggml::ink_tensor_ne(wk, 1) } as i32;
+    let ncols2 = (unsafe { inkwell_ggml::ink_tensor_ne(wk, 0) } / 2) as i32;
+    let out = unsafe { inkwell_ggml::ink_tensor_data(dst) as *mut f32 };
+    unsafe { inkwell_cuda::kv_sconv_batched_async(d(0), d(2), d(1) as *const f32, d(3) as *const f32,
+        out, out.add(nrows as usize), nrows, ncols2) };
+}
+
 #[repr(C)]
 struct CtrlTriadIo {
     cur: [*const f32; 3],
@@ -1791,8 +1805,25 @@ impl Runner {
                 self.proj(c, l, "wk", l.wk, inputs[1]),
                 self.proj(c, l, "wv", l.wv, inputs[2]))
         };
-        let k_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
-        let v_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
+        let (k_dyn, v_dyn) = if is_swa {
+            (None, None)
+        } else {
+            let (wk, wv) = (l.attn_k_conv_proj.expect("kcp"), l.attn_v_conv_proj.expect("vcp"));
+            let batch = std::env::var_os("INKWELL_NO_KVBATCH").is_none() && unsafe {
+                inkwell_ggml::ink_tensor_type(wk.0) == BF16 && inkwell_ggml::ink_tensor_type(wv.0) == BF16
+                    && inkwell_ggml::ink_tensor_ne(wk.0, 0) == 2304 && inkwell_ggml::ink_tensor_ne(wk.0, 1) == 32
+                    && inkwell_ggml::ink_tensor_ne(wv.0, 0) == 2304 && inkwell_ggml::ink_tensor_ne(wv.0, 1) == 32
+            };
+            if batch {
+                let mut args = [wk.0, inputs[1].0, wv.0, inputs[2].0];
+                let out = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [32, 2, 1, 1], &mut args,
+                    kv_sconv_cb as *const () as usize, std::ptr::null_mut()) });
+                let stride = t::nb(out, 1);
+                (Some(t::view2(c, out, 32, 1, stride, 0)), Some(t::view2(c, out, 32, 1, stride, stride)))
+            } else {
+                (Some(t::mmq(c, wk, inputs[1])), Some(t::mmq(c, wv, inputs[2])))
+            }
+        };
         let k = self.convolve(wk_p, l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores, std::ptr::null_mut());
         let gqa = (hd * hkv) as i64;
         let v = self.convolve(wv_p, l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores, std::ptr::null_mut());
