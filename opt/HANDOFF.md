@@ -687,3 +687,10 @@ Bench: `bash opt/kbench/build.sh gemv_v2_bench && ./opt/kbench/gemv_v2_bench opt
 - Implementar tile_row_dp4a em gemv_moe_n (v2, bench valida vs v1), xh quantizado
   p/ xq(int8)+xqs por had_out_moe ou kernel separado; serial via INKWELL_MOE_V2.
 - dz async já commitado; spec ~5.2 tok/s é teto do drafter — foco é serial ~127ms.
+
+## d4a WIP (INKWELL_MOE_D4A) — INCOMPLETO
+tile_row_d4 (dp4a broadcast, peso exato via plane-bytes, x int8/grupo-16 packed
+por lane) + inkwell_exl3_quant_x_i8p wired nas duas launchers seriais. Compila;
+saida era garbage ANTES do fix de mascara shfl (0xffff) — nao medido depois do
+fix. Se ainda divergir: checar xqb mapping (pack g*4+m) e ordem f0..f3 vs bytes.
+Doc de claims falsificaveis: opt/EXL3_PASCAL_CEILING.md

@@ -161,6 +161,46 @@ __device__ __forceinline__ void tile_row(const uint32_t* __restrict__ ring, cons
     }
 }
 
+// DP4A variant: x pre-quantized to int8 per-16-group AND pre-packed so lane m's
+// four elements {2m, 2m+1, 2m+8, 2m+9} sit in one u32. Weight = the four
+// plane-bytes of p = w16*K (native int8); dp4a([x,x,x,x], p) == x*w exactly.
+// Loop cost ~5.75 instr/weight vs ~6.75 fp32, plus no float x traffic.
+template <int NC>
+__device__ __forceinline__ void tile_row_d4(const uint32_t* __restrict__ ring, const WinGeo& geo,
+                                            const uint32_t* const (&xq)[NC], const float* const (&xqs)[NC],
+                                            int roff, float (&s)[NC]) {
+    const uint32_t X = __funnelshift_l(ring[geo.m1], ring[geo.m0], geo.d);
+    const uint32_t p0 = (X >> 16) * 0x83DCD12Du;
+    const uint32_t p1 = ((X >> (16 - geo.s1)) & 0xffffu) * 0x83DCD12Du;
+    const uint32_t p2 = ((X >> (16 - geo.s2)) & 0xffffu) * 0x83DCD12Du;
+    const uint32_t p3 = ((X >> (16 - geo.s3)) & 0xffffu) * 0x83DCD12Du;
+    const int gidx = roff >> 4;
+#pragma unroll
+    for (int tt = 0; tt < NC; ++tt) {
+        const uint32_t xp = xq[tt][roff >> 2];   // pack index g*4+m, base already +m
+        int isum = __dp4a((int)__byte_perm(xp, 0, 0x0000), (int)p0, 0);
+        isum = __dp4a((int)__byte_perm(xp, 0, 0x1111), (int)p1, isum);
+        isum = __dp4a((int)__byte_perm(xp, 0, 0x2222), (int)p2, isum);
+        isum = __dp4a((int)__byte_perm(xp, 0, 0x3333), (int)p3, isum);
+        s[tt] = fmaf((float)isum, xqs[tt][gidx], s[tt]);
+    }
+}
+
+template <int NC, int TB, int WM>
+__device__ __forceinline__ void batch_full_d4(const Ring<TB, WM>& ring, int st, int g, const WinGeo& geo,
+                                              const uint32_t* const (&xq)[NC], const float* const (&xqs)[NC],
+                                              int xbase, float (&s)[NC]) {
+#pragma unroll
+    for (int r = 0; r < TB; ++r) tile_row_d4<NC>(ring.row(st, g, r), geo, xq, xqs, xbase + r * 16, s);
+}
+
+template <int NC, int TB, int WM>
+__device__ __forceinline__ void batch_tail_d4(const Ring<TB, WM>& ring, int st, int g, const WinGeo& geo,
+                                              const uint32_t* const (&xq)[NC], const float* const (&xqs)[NC],
+                                              int xbase, float (&s)[NC], int nrows) {
+    for (int r = 0; r < nrows; ++r) tile_row_d4<NC>(ring.row(st, g, r), geo, xq, xqs, xbase + r * 16, s);
+}
+
 // A full batch of TB tile rows (roff is a compile-time multiple of 16).
 template <int NC, int TB, int WM>
 __device__ __forceinline__ void batch_full(const Ring<TB, WM>& ring, int st, int g, const WinGeo& geo,
@@ -285,7 +325,11 @@ __global__ void __launch_bounds__(256) gemv_moe_n(const uint64_t* __restrict__ d
                                                   int tk, int tn,
                                                   const int* __restrict__ pnexp,
                                                   const int* __restrict__ missf = nullptr,
-                                                  int skipmode = 0) {
+                                                  int skipmode = 0,
+                                                  const uint32_t* __restrict__ xq = nullptr,
+                                                  const float* __restrict__ xqs = nullptr,
+                                                  const uint32_t* __restrict__ xq2 = nullptr,
+                                                  const float* __restrict__ xqs2 = nullptr) {
     constexpr int TB = 8, WM = 32;
     using SL = Slots<TB, WM>;
     __shared__ Ring<TB, WM> ring;
@@ -316,9 +360,23 @@ __global__ void __launch_bounds__(256) gemv_moe_n(const uint64_t* __restrict__ d
         constexpr int NC = decltype(ncc)::value;
         float sx[NC], s[NC];
         const float* xb[NC];
+        const uint32_t* xqu = zsel ? xq2 : xq;
+        const float* xqsu = zsel ? xqs2 : xqs;
+        const uint32_t* xqb[NC];
+        const float* xqsb[NC];
         block_sum_rows<NC>(xg, xstride, 0, tk * 4, red, sx);
 #pragma unroll
         for (int tt = 0; tt < NC; ++tt) { s[tt] = 0.f; xb[tt] = xg + (size_t)tt * xstride + 2 * m; }
+        if (xqu) {
+            // xq row = tk u32 (one per 16-group), m already selects the lane's pack
+            const uint32_t* xqrow = xqu + (size_t)sx0 * tk * 4 + m;
+            const float* xqsrow = xqsu + (size_t)sx0 * tk;
+#pragma unroll
+            for (int tt = 0; tt < NC; ++tt) {
+                xqb[tt] = xqrow + (size_t)tt * tk * 4;   // 4 packs per group per lane? see quant layout
+                xqsb[tt] = xqsrow + (size_t)tt * tk;
+            }
+        }
         const int nb = (tk + TB - 1) / TB;
         uint4 pf[DEPTH][SL::NS];
         const auto load = [&](int bi, uint4 (&dst)[SL::NS]) {
@@ -344,8 +402,13 @@ __global__ void __launch_bounds__(256) gemv_moe_n(const uint64_t* __restrict__ d
                 if (bi + DEPTH < nb) load(bi + DEPTH, pf[jj]);   // slot jj is free (see gemv_n)
                 if (live) {
                     const int nrows = tk - bi * TB;
-                    if (nrows >= TB) batch_full<NC, TB, WM>(ring, bi & 1, g, geo, xb, bi * TB * 16, s);
-                    else batch_tail<NC, TB, WM>(ring, bi & 1, g, geo, xb, bi * TB * 16, s, nrows);
+                    if (xqu) {
+                        if (nrows >= TB) batch_full_d4<NC, TB, WM>(ring, bi & 1, g, geo, xqb, xqsb, bi * TB * 16, s);
+                        else batch_tail_d4<NC, TB, WM>(ring, bi & 1, g, geo, xqb, xqsb, bi * TB * 16, s, nrows);
+                    } else {
+                        if (nrows >= TB) batch_full<NC, TB, WM>(ring, bi & 1, g, geo, xb, bi * TB * 16, s);
+                        else batch_tail<NC, TB, WM>(ring, bi & 1, g, geo, xb, bi * TB * 16, s, nrows);
+                    }
                 }
                 if (bi + 1 < nb) {
                     ring.store<SL::NS>((bi + 1) & 1, sl, pf[(jj + 1) % DEPTH]);

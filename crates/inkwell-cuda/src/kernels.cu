@@ -2482,6 +2482,36 @@ extern "C" void ink_launch_exl3_prefetch2(const void* descs_g, const void* descs
 }
 
 // Full per-slot expert chain: stage -> gate -> situ -> down -> wsum.
+// x fp32 -> int8 per-16-group, PRE-PACKED for tile_row_d4: out u32 at
+// [slot*tk*4 + g*4 + m] holds int8x4 {x[2m], x[2m+1], x[2m+8], x[2m+9]} of group
+// g; xqs[slot*tk + g] = amax/127 (1 when amax==0). grid (nslots, tk), 16 threads
+// = lanes' 16 elements; each of lanes m=0..3 writes one pack via shfl gather.
+__global__ void inkwell_exl3_quant_x_i8p(const float* __restrict__ x,
+                                         uint32_t* __restrict__ xq,
+                                         float* __restrict__ xqs, int n) {
+    const int slot = blockIdx.x;
+    const int g = blockIdx.y;
+    const int lane = threadIdx.x;                 // 16 threads -> element index
+    const float* xr = x + (size_t)slot * n + g * 16;
+    const float v = xr[lane];
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffu, am, o, 16));
+    const float sc = am > 0.f ? am / 127.f : 1.f;
+    const int qi = __float2int_rn(v / sc);
+    // lane m gathers elements {2m, 2m+1, 2m+8, 2m+9}
+    if (lane < 4) {
+        int a = __shfl_sync(0xffffu, qi, 2 * lane, 16);
+        int b = __shfl_sync(0xffffu, qi, 2 * lane + 1, 16);
+        int c = __shfl_sync(0xffffu, qi, 2 * lane + 8, 16);
+        int d = __shfl_sync(0xffffu, qi, 2 * lane + 9, 16);
+        xq[(size_t)slot * (n >> 4) * 4 + g * 4 + lane] =
+            (uint32_t)(a & 0xff) | ((uint32_t)(b & 0xff) << 8) |
+            ((uint32_t)(c & 0xff) << 16) | ((uint32_t)(d & 0xff) << 24);
+    }
+    if (lane == 0) xqs[slot * (n >> 4) + g] = sc;
+}
+
 extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, const void* descs_d,
                                     const int* ids, const float* x,
                                     float* xh, float* gu, float* hid, float* dn,
@@ -2524,8 +2554,20 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         cudaMemcpy(e8, h, 260, cudaMemcpyHostToDevice);
     }
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    static uint32_t* xq8 = nullptr; static float* xqs8 = nullptr;
+    static uint32_t* xq8b = nullptr; static float* xqs8b = nullptr;
+    const bool d4 = v2_ok && getenv("INKWELL_MOE_D4A");
+    if (d4 && !xq8) {
+        cudaMalloc(&xq8, 64 * 2304); cudaMalloc(&xqs8, 64 * 144 * 4);
+        cudaMalloc(&xq8b, 64 * 2304); cudaMalloc(&xqs8b, 64 * 144 * 4);
+    }
+    if (d4) {
+        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>(xh, xq8, xqs8, KG);
+        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>((const float*)gu, xq8b, xqs8b, KG);
+    }
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
-        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr);
+        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, nullptr, 0,
+        d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, d4 ? xq8b : nullptr, d4 ? xqs8b : nullptr);
     else {
         dim3 gg(NG / 64, nslots, 2 * nky);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
@@ -2537,8 +2579,10 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     dim3 din((KD + 511) / 512, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8, xqs8, KD);
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
-        nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr);
+        nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
+        d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, nullptr, nullptr);
     else {
         dim3 gd(ND / 64, nslots, nky);
         inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
@@ -2613,6 +2657,13 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         int h[65]; for (int i = 0; i < 65; ++i) h[i] = i;
         cudaMemcpy(e8, h, 260, cudaMemcpyHostToDevice);
     }
+    static uint32_t* xq8c = nullptr; static float* xqs8c = nullptr;
+    static uint32_t* xq8d = nullptr; static float* xqs8d = nullptr;
+    const bool d4 = v2_ok && getenv("INKWELL_MOE_D4A");
+    if (d4 && !xq8c) {
+        cudaMalloc(&xq8c, 64 * 2304); cudaMalloc(&xqs8c, 64 * 144 * 4);
+        cudaMalloc(&xq8d, 64 * 2304); cudaMalloc(&xqs8d, 64 * 144 * 4);
+    }
     // gate+up fused in one launch: blockIdx.z selects the descriptor set.
     // Hit slots run BEFORE ev_join so their gemv overlaps the bulk copy of
     // the missed experts on the side stream; miss slots run right after.
@@ -2620,8 +2671,13 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 1, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    if (d4) {
+        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>(xh, xq8c, xqs8c, KG);
+        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>((const float*)gu, xq8d, xqs8d, KG);
+    }
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
-        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1);
+        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1,
+        d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, d4 ? xq8d : nullptr, d4 ? xqs8d : nullptr);
     else {
         dim3 gg(NG / 64, nslots, 2 * nky);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
@@ -2632,7 +2688,8 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 2, nullptr, nullptr);
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
-        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2);
+        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2,
+        d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, d4 ? xq8d : nullptr, d4 ? xqs8d : nullptr);
     else {
         dim3 gg(NG / 64, nslots, 2 * nky);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
@@ -2645,8 +2702,10 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     dim3 din((KD + 511) / 512, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8c, xqs8c, KD);
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
-        nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr);
+        nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
+        d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, nullptr, nullptr);
     else {
         dim3 gd(ND / 64, nslots, nky);
         inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
