@@ -513,6 +513,26 @@ fn bf16_to_f32(d: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Tensor layout and bytes for a safetensors mul_mat weight, using the same
+/// BF16-storage rule as the `densew!` loader macro.
+fn st_densew_parts(repo: &inkwell_st::StRepo, name: &str, bf16w: bool) -> (i32, Vec<i64>, Vec<u8>) {
+    let ti = repo.tensor(name).unwrap_or_else(|| panic!("missing {name}"));
+    let mut dims: Vec<i64> = ti.shape.iter().rev().map(|&d| d as i64).collect();
+    dims.retain(|&d| d != 1);
+    let keep_bf16 = bf16w && ti.dtype == "BF16" && (name.contains(".controllers.")
+        || name.ends_with("mlp.gate.weight") || name.ends_with("attn.attn_sink_proj.weight")
+        || name.ends_with("sconv.weight_proj"));
+    let bytes = if keep_bf16 {
+        repo.data(name).unwrap_or_else(|| panic!("missing data {name}")).to_vec()
+    } else if ti.dtype == "BF16" {
+        bf16_to_f32(repo.data(name).unwrap_or_else(|| panic!("missing data {name}")))
+    } else {
+        assert_eq!(ti.dtype, "F32");
+        repo.data(name).unwrap_or_else(|| panic!("missing data {name}")).to_vec()
+    };
+    ((if keep_bf16 { BF16 } else { F32 }), dims, bytes)
+}
+
 impl Runner {
     /// Load the model: tensors → device buffer (dense) / cpu buffer (experts).
     ///
@@ -1119,8 +1139,32 @@ impl Runner {
                 for (ci, cn) in CTRL_NAMES.iter().enumerate() {
                     let hn = match *cn { "q" => "attn", "ffn" => "mlp", x => x };
                     l.ctrl_down[ci] = Some(densew!(&lp(il, &format!("controllers.{hn}.down_weight"))));
-                    l.ctrl_gain[ci] = Some(densew!(&lp(il, &format!("controllers.{hn}.gain_weight"))));
-                    l.ctrl_forget[ci] = Some(densew!(&lp(il, &format!("controllers.{hn}.forget_weight"))));
+                    let gain_name = lp(il, &format!("controllers.{hn}.gain_weight"));
+                    let forget_name = lp(il, &format!("controllers.{hn}.forget_weight"));
+                    // Concatenate directly from host bytes instead of uploading
+                    // gain/forget and then a second concatenated copy.
+                    // INKWELL_NO_GFCAT_TRIM=1 restores the duplicate copies.
+                    if std::env::var_os("INKWELL_NO_GFCAT_TRIM").is_none()
+                        && std::env::var_os("INKWELL_NOCTRLCAT").is_none() {
+                        let (tg, dg, bg) = st_densew_parts(repo, &gain_name, bf16w);
+                        let (tf, df, bf) = st_densew_parts(repo, &forget_name, bf16w);
+                        if tg == tf && dg.len() == 2 && df.len() == 2 && dg[0] == df[0] {
+                            let cat = t::new(rt.ctx(), tg, &[dg[0], dg[1] + df[1]]);
+                            let o = (off_dev + 127) & !127;
+                            dev_buf.assign(cat, o);
+                            let mut bytes = Vec::with_capacity(bg.len() + bf.len());
+                            bytes.extend_from_slice(&bg);
+                            bytes.extend_from_slice(&bf);
+                            unsafe { t::set(cat, bytes.as_ptr(), 0, bytes.len()) };
+                            l.ctrl_gf_cat[ci] = Some(cat);
+                            l.ctrl_gf_off[ci] = [0, dg[1]];
+                            off_dev = o + t::nbytes(cat);
+                        }
+                    }
+                    if l.ctrl_gf_cat[ci].is_none() {
+                        l.ctrl_gain[ci] = Some(densew!(&gain_name));
+                        l.ctrl_forget[ci] = Some(densew!(&forget_name));
+                    }
                 }
             }
             // concat same-type {ctrl_gain, ctrl_forget} -> one GEMV on shared input
