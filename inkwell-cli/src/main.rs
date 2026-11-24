@@ -449,7 +449,8 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         // pos..pos+7 (same frame as VTEST / Mtp::cycle), not pos+1 — a +1 base
         // processes the anchor twice ("capital of of ...").
         let mut c = pos;
-        let mut vtok = mtp.propose(c, id, 0);
+        let mut kp = 8usize;
+        let mut vtok = mtp.propose(c, id, 0, &mut kp);
         let target: usize = std::env::var("INKWELL_SPEC_GENS").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(32);
         let mut spec_ids: Vec<u32> = Vec::new();
@@ -508,13 +509,14 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
             r.rollback_conv(ne);
             let td = Instant::now();
             mtp.ctx_append(c_old);
-            vtok = mtp.propose(c, id, n);
+            vtok = mtp.propose(c, id, n, &mut kp);
             // fewer distinct tokens -> smaller expert union in verify: pad
             // rows past dlen with the anchor (they can never be emitted).
             // fewer distinct tokens -> smaller expert union in verify: pad
             // rows past INKWELL_SPEC_DLEN with the anchor (never emitted).
             let dlen: usize = std::env::var("INKWELL_SPEC_DLEN").ok()
-                .and_then(|v| v.parse().ok()).unwrap_or(7);
+                .and_then(|v| v.parse().ok()).unwrap_or(7)
+                .min(kp - 1);
             for j in dlen + 1..8 { vtok[j] = vtok[0]; }
             eprintln!("          draft={:.1}ms", td.elapsed().as_secs_f64() * 1e3);
         }

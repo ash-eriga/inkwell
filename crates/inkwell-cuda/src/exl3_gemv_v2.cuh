@@ -283,13 +283,16 @@ __global__ void __launch_bounds__(256) gemv_moe_n(const uint64_t* __restrict__ d
                                                   const float* __restrict__ xh2, int xh2s,
                                                   float* __restrict__ t, int n, int tzoff,
                                                   int tk, int tn,
-                                                  const int* __restrict__ pnexp) {
+                                                  const int* __restrict__ pnexp,
+                                                  const int* __restrict__ missf = nullptr,
+                                                  int skipmode = 0) {
     constexpr int TB = 8, WM = 32;
     using SL = Slots<TB, WM>;
     __shared__ Ring<TB, WM> ring;
     __shared__ float red[8 * NTOK_MAX];
     const int u = blockIdx.y;
     if (pnexp && u >= *pnexp) return;
+    if (skipmode && ((missf[u] != 0) == (skipmode == 1))) return;
     const int nsel = descs2 ? 2 : 1;
     const int zsel = blockIdx.z % nsel;
     const uint64_t* d = (zsel ? descs2 : descs) + uids[u] * 4;

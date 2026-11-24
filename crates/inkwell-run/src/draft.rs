@@ -350,7 +350,9 @@ impl Mtp {
 
     /// propose: returns `[anchor, d1..d7]` at base position `c` (c_new).
     /// `frow` = feats row of the anchor (its index in the last verify block).
-    pub fn propose(&mut self, c: i64, anchor: u32, frow: usize) -> [u32; NB] {
+    /// `kp` receives the adaptive verify length (1 + kd drafts that clear the
+    /// confidence cumprod threshold, reference draft.py semantics).
+    pub fn propose(&mut self, c: i64, anchor: u32, frow: usize, kp: &mut usize) -> [u32; NB] {
         unsafe {
             // x[0] = rms(embd[anchor]) * embed_norm (host) ; rows 1..7 = mask_embed
             let mut e = vec![0f32; H];
@@ -505,6 +507,22 @@ impl Mtp {
                     eprintln!("dbg i=1: markov={} base={}", prev, u32::from_ne_bytes(t2));
                 }
             }
+            // adaptive draft length (reference): kd = leading drafts whose
+            // confidence cumprod stays >= theta; verify gets kp = kd+1 rows.
+            let theta: f64 = std::env::var("MK_CUM_TH").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(0.4);
+            let mut cum = 1.0f64;
+            let mut kd = 0usize;
+            for i in 1..NB {
+                let mx = self.dz[i].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let lse = mx + self.dz[i].iter().map(|v| (v - mx).exp()).sum::<f32>().ln();
+                cum += 0.0; // keep f64
+                let p = (mx - lse).exp() as f64;
+                if cum * p < theta { break; }
+                cum *= p;
+                kd += 1;
+            }
+            *kp = (kd + 1).min(NB);
             out
         }
     }
@@ -519,7 +537,8 @@ impl Mtp {
         self.ctx_append(c_old);
         let c_new = c_old + a as i64 + 1;
         let anchor = tgt[a];
-        let out = self.propose(c_new, anchor, a);
+        let mut kp = NB;
+        let out = self.propose(c_new, anchor, a, &mut kp);
         (out, c_new)
     }
 }
