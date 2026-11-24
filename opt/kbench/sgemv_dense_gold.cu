@@ -154,15 +154,17 @@ int main(int argc, char** argv) {
         printf("%-9s %-22s %10s %10.1f\n", S.name.c_str(), "old (timed)", "", told[si]);
         // ---- new kernel at nky in {1,2,4,8}
         for (int nky = 1; nky <= 8; nky <<= 1) {
-            auto newk = [&]() {
-                if (nky > 1) CK(cudaMemsetAsync(S.dt, 0, (size_t)nky * n * 4));
-                inkwell_exl3_gemv_s<<<dim3((tn + 7) / 8, nky, 1), 256>>>(
-                    S.dtr, S.dxh, S.dt, tk, tn, S.ka, S.hk);
-            };
-            char cfg[32]; snprintf(cfg, sizeof cfg, "new nky=%d", nky);
-            newk(); const double e = sum_and_rel(nky);
-            tnew[si][nky] = timeit(newk) * 1e3f;
-            verdict(cfg, e, tnew[si][nky]);
+            for (int x4 = 1; x4 >= 0; --x4) {
+                auto newk = [&, x4]() {
+                    if (nky > 1) CK(cudaMemsetAsync(S.dt, 0, (size_t)nky * n * 4));
+                    inkwell_exl3_gemv_s<<<dim3((tn + 7) / 8, nky, 1), 256>>>(
+                        S.dtr, S.dxh, S.dt, tk, tn, S.ka, S.hk, x4);
+                };
+                char cfg[32]; snprintf(cfg, sizeof cfg, "new nky=%d x4=%d", nky, x4);
+                newk(); const double e = sum_and_rel(nky);
+                if (x4) tnew[si][nky] = timeit(newk) * 1e3f;
+                verdict(cfg, e, x4 ? tnew[si][nky] : 0.f);
+            }
         }
         // ---- empty-chunk robustness: nky > tk on the smallest shape
         if (S.name == "wr_du") {   // smallest shape; nky > tk => all-empty tail chunks write 0
@@ -170,7 +172,7 @@ int main(int argc, char** argv) {
             std::vector<float> big((size_t)nky * n);
             float* dtl; CK(cudaMalloc(&dtl, (size_t)nky * n * 4));
             inkwell_exl3_gemv_s<<<dim3((tn + 7) / 8, nky, 1), 256>>>(
-                S.dtr, S.dxh, dtl, tk, tn, S.ka, S.hk);
+                S.dtr, S.dxh, dtl, tk, tn, S.ka, S.hk, 1);
             CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
             CK(cudaMemcpy(big.data(), dtl, big.size() * 4, cudaMemcpyDeviceToHost));
             double e = 0;
@@ -246,7 +248,7 @@ int main(int argc, char** argv) {
                     Shape& S = *ms[z]; const int nky = pick_new(S.tn, S.tk, tgt);
                     if (nky > 1) cudaMemsetAsync(S.dt, 0, (size_t)nky * S.n() * 4, st[z]);
                     inkwell_exl3_gemv_s<<<dim3((S.tn + 7) / 8, nky, 1), 256, 0, st[z]>>>(
-                        S.dtr, S.dxh, S.dt, S.tk, S.tn, S.ka, S.hk);
+                        S.dtr, S.dxh, S.dt, S.tk, S.tn, S.ka, S.hk, 1);
                 }
                 for (int z = 0; z < 5; ++z) CK(cudaStreamSynchronize(st[z]));
             };

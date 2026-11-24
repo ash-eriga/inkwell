@@ -465,3 +465,60 @@ layers once a ~2.2bpw quant makes all loop layers fit.
   (3 XMAD for h*C via ptxas + 1 IDP + >=1 MAC + extract). "Native 2-XMAD" needs cubin patching: not pursued.
 - Next: port C1c (exact, also more accurate than today) + paired-window extraction into sgemv_run after the
   occupancy/ILP agent lands; C4 as a separate gated variant (needs e2e text check).
+
+## 2026-11-25 — sgemv inner loop: permuted-x4 x staging (dense on, MoE gated)
+
+Hypothesis: the f32 stream-decode core is latency-bound at ~211 Gw/s vs a
+~380 Gw/s issue ceiling (prior note) -> more ILP / occupancy should pay.
+
+Diagnosis FIRST (before touching code):
+- regs/smem (cuobjdump): gemv_moe_s 40 reg + 9248 B smem -> 6 blocks/SM (75%);
+  gemv_s 40 reg + 12320 B -> 5 blocks (62.5%, smem-bound).
+- SASS inner loop of gemv_moe_s<0> (unrolled 4 tiles = 32 weights): 303 instrs
+  = 9.47 instr/weight: 32 IDP + 32 I2F + 32 FFMA (3.0/w) + 96 XMAD in mul16
+  (3.0/w) + 36 SHF/BFE window extract (1.1/w) + 12 LDG + 8 LDS.64 + 7 DEPBAR +
+  ~30 addressing (2.3/w).
+- Issue ceiling at 4 warp-instr/clk: ~229 Gw/s vs ~211-234 achieved -> the f32
+  core is ~92%+ ISSUE-bound, not latency-bound. The ledger's 5.4 instr/w /
+  380 Gw/s figure was the kbench-only dp2a variant (error 1e-4), not this path.
+- nvprof --metrics fails (Internal 4211:27); ncu runs but ERR_NVGPUCTRPERM
+  (no perf-counter permission). Stall metrics unavailable -> relied on SASS
+  counts + A/B timing.
+
+Variants tried in opt/kbench/sgemv_var.cu (same harness as sgemv_bench, real
+K-mix MoE GU+down, us/visit; two runs interleaved; all exact relerr ~1.7e-6
+unless noted):
+  f32-i2f 267.3/294.5 | i2f-x4 261.8/289.4 | x4-ord 249.9/289.4 |
+  f32-mag 284.6/312.3 | dp2a-16 276.5 (err 1e-4) | dp4a-8 258.7 (err 2e-2) |
+  mag-x4u8 290.8 | mag-pf 326.0 | x4-u2 283.5 | x4-u1 393.0 | x4-b6 304.1 |
+  x-glob 306.1
+- dp4a-bias "mag" trick: slower. prefetch: much slower. unroll 1/2/3: slower or
+  wash. forced 6 blocks (__launch_bounds__(256,6)): 40 reg but STACK:104 spill.
+  x via __ldg straight from global (no smem): much slower.
+- WINNER in kbench: permuted-xs staging so lane t's four x rows are contiguous
+  -> 1x LDS.128 per tile instead of 2x LDS.64, xv loaded before the decode
+  (x4-ord). Exact f32 math (bit-identical relerr vs old).
+
+Shipped (kernels.cu): sgemv_run4<KA,H> + SGEMV_X4_PERM staging, an `x4` kernel
+param on both inkwell_exl3_gemv_s and inkwell_exl3_gemv_moe_s (old path kept),
+INKWELL_NO_SGEMV_X4 master killswitch + INKWELL_SGEMV_X4_MOE opt-in for MoE.
+
+First e2e A/B (x4 in BOTH kernels, 4 pairs, BEST env): control median
+3.7175s = 58.09 ms/tok vs candidate 3.850s = 60.16 ms/tok -> x4 LOST ~3.5%.
+Cause: sgemv_run4 needs 48 regs -> MoE kernel drops 6->5 blocks/SM; the small
+real grids (GU 144 blocks, down 144 blocks) can't hide the occupancy loss even
+though kbench (larger effective overlap) won. Dense kernel stays 40 regs and is
+smem-bound at 5 blocks either way -> zero occupancy cost.
+
+Second e2e A/B (x4 dense-only; MoE gated off by default, INKWELL_SGEMV_X4_MOE=1
+re-enables): control median 3.8085s = 59.51 ms/tok vs candidate 3.6478s =
+57.00 ms/tok -> -4.2%, candidate faster in 4/4 pairs. Raw decode lines:
+  ctrl: 3.8555 3.9051 3.7614 3.7084 | cand: 3.6283 3.7452 3.6324 3.6631
+Generated text byte-identical (md5 5cbe8e06f2d8d82feb7f2ca287a7bc59) in all 8
+runs of BOTH A/Bs. Gold: MoE PASS (all nky/skipmode, x4=0 and x4=1 identical
+relerr ~1.5-2.2e-6), dense PASS all K/nky both x4 values. Warnings 60->60.
+
+VERDICT: **ACCEPT** — x4 core is default ON for dense gemv (no occupancy cost,
+kbench+e2e win); MoE keeps sgemv_run by default because +8 regs cost a block/SM
+on the small real grids (opt back in via INKWELL_SGEMV_X4_MOE). Net e2e 57.0
+ms/tok.
