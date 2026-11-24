@@ -32,7 +32,7 @@ adaptativo ou revisar qualidade do ctx vs vLLM; (c) cortar ~140ms de had/situ
 **Run:** `cd ~/inkwell && cargo build -p inkwell-cli --release && pkill -9 -x
 inkwell; LD_LIBRARY_PATH=~/lfm-gtx1060-bench/cuda-12.6/lib64:~/lfm-gtx1060-bench/
 build-inkwell-dp4a/bin GGML_PASCAL_GRAPHS=1 INKWELL_GENS=48 INKWELL_MAX_CTX=1024
-INKWELL_EXL3_CACHE_K=4 INKWELL_SPEC=mtp INKWELL_SPEC_GENS=48 ./target/release/
+INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_NKY=2 INKWELL_SPEC=mtp INKWELL_SPEC_GENS=48 ./target/release/
 inkwell ~/models/inkling --run` — INKWELL_SPEC_GENS baixa (8-32) p/ iteração
 rápida. INKWELL_MNTOK_DBG=6 p/ timing por fase (FLAKY: err=900 às vezes, retry).
 O `err=900` aparece em builds modificados aleatoriamente — provável residual

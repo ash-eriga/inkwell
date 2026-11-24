@@ -192,3 +192,9 @@ Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8
 - Cache K sweep: K=4 ~181ms, K=12 ~121ms, K=16 ~117ms, K=20 ~115ms (ctx512+margin10), K=24+ OOM.
 - BEST serial env: GGML_PASCAL_GRAPHS=1 INKWELL_MAX_CTX=512 INKWELL_CACHE_MARGIN_MB=10 INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_V2=1 → ~115ms/tok ≈ 8.7 TPS.
 - PLATEAU: VRAM (6GB) capa o cache; bytes PCIe/tok é o piso. Próximos levers rankeados: (1) mais VRAM p/ cache — precisa liberar ~50MiB/camada (dev_buf/KV/head) (2) occupancy/ILP do gemv_moe_n — mas serial já é byte-bound, upside pequeno (3) CUDA-graph da cadeia MoE — ~300 launches, ~2-3ms upside.
+
+## 2026-11-24 — INKWELL_MOE_NKY=2 → ~99ms/tok (~10.1 TPS) ACEITO
+- NKY divide K dos DOIS gemvs MoE (GU z=2·nky, down z=nky) no kernel antigo (v2_ok exige nky==1 → desarma). Mais blocos em voo escondem latência.
+- A/B: control ~115ms / NKY=2 ~96-101ms (2 runs) / control ~113-118 / NKY=3 ~110 / NKY=4 ~111 → NKY=2 é o sweet spot.
+- BEST env serial: GGML_PASCAL_GRAPHS=1 INKWELL_MAX_CTX=512 INKWELL_CACHE_MARGIN_MB=10 INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_V2=1 INKWELL_MOE_NKY=2 → ~99ms/tok ≈ 10.1 TPS (era 117).
+- Nota: o gemv_moe_n (v2) não suporta split-K (escreve dn direto, sem atomics); o kernel antigo inkwell_exl3_gemv_moe faz memset+atomicAdd. Candidato: portar split-K pro v2.
