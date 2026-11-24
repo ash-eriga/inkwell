@@ -3542,6 +3542,7 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
     const int pf = pready ? *pready : 0;
     __shared__ int st_tag[KSLOT_WARP_KMAX];
     __shared__ int st_scnt[KSLOT_WARP_KMAX];
+    __shared__ int st_cnt[128];
     __shared__ int st_sg[3 * KSLOT_WARP_KMAX];   // soff in granules
     __shared__ int st_fl[2 * KSLOT_FLMAX + 1];   // mirrors fl: n,bases,lens
     __shared__ int st_ids[KSLOT_WARP_KMAX];
@@ -3555,6 +3556,8 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
     for (int s = lane; s < nslots; s += 32) st_ids[s] = ids[s];
     if (pf)
         for (int s = lane; s < nslots; s += 32) st_ptag[s] = ptag[s];
+    const bool shared_cnt = key_base == 0;
+    for (int i = lane; shared_cnt && i < 128; i += 32) st_cnt[i] = cnt[i];
     int nfl = fl[0];
     int flhi = nfl;
     for (int i = lane; i < nfl; i += 32) {
@@ -3567,8 +3570,10 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
     int nhits = 0, nbank = 0, nreal = 0;
     // Count increments are commutative and all complete before the first
     // victim scan, so issue them across the warp instead of serially on lane 0.
-    for (int s = lane; s < nslots; s += 32)
-        atomicAdd(cnt + st_ids[s] + key_base, 1);
+    for (int s = lane; s < nslots; s += 32) {
+        if (shared_cnt) atomicAdd(st_cnt + st_ids[s], 1);
+        else atomicAdd(cnt + st_ids[s] + key_base, 1);
+    }
     // pass 1: tag/bank hits. tag is read-only here, so each selection's
     // first-match search is one ballot round per 32 slots — the lowest set
     // lane reproduces the serial loop's break-on-first-match.
@@ -3605,7 +3610,8 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
     // claimed and never scanned).
     for (int j = lane; j < kmax; j += 32) {
         const int t = st_tag[j];
-        st_scnt[j] = (t >= 0) ? atomicAdd(cnt + t, 0) : 0;
+        st_scnt[j] = (t >= 0)
+            ? (shared_cnt ? st_cnt[t] : atomicAdd(cnt + t, 0)) : 0;
     }
     __syncwarp();
 
@@ -3653,10 +3659,8 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
             }
             if (v >= 0 && ng == 3) break;
             // lowest-cnt unclaimed resident; strict-< upward scan -> lowest
-            // j wins ties. Packed as (flip32(cnt), j): unsigned min picks the
-            // least cnt, ties the least j. Slots at cnt==INT_MAX can't win in
-            // the serial code either (c<bestc starts at 0x7fffffff), so they
-            // are ineligible here as well.
+            // j wins ties. Slots at cnt==INT_MAX can't win in the serial code
+            // either (c<bestc starts at 0x7fffffff), so they are ineligible.
             int bestc = 0x7fffffff, bj = -1;
             for (int c = 0; c < kmax; c += 32) {
                 const int j = c + lane;
@@ -3710,6 +3714,7 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
         fl[1 + i] = st_flb[i];
         fl[1 + KSLOT_FLMAX + i] = st_fln[i];
     }
+    for (int i = lane; shared_cnt && i < 128; i += 32) cnt[i] = st_cnt[i];
     if (lane == 0) {
         fl[0] = nfl;
         if (hm) { atomicAdd(hm, nhits); atomicAdd(hm + 1, nslots - nhits); }
