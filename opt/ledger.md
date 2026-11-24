@@ -205,3 +205,40 @@ Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8
 - stage threads 256→512: sem efeito (~99ms). Mantido 512 (neutro).
 - K=22@ctx256+margin0: ~97-116ms — igual K=20. Cap VRAM segue.
 - ESTADO FINAL serial: ~99ms/tok ≈ 10.1 TPS golden. Próximos levers reais restantes: (a) CUDA-graph explícito da cadeia MoE (~2-3ms), (b) descobrir decomposição dos ~53ms non-MoE (lm head? attn?), (c) hit-rate da cache (K=20/128).
+
+### dp4a_1s double-buffer (2026-11-24)
+- hypothesis: 2 __syncthreads per 4-window batch dominate the ~95us gemv latency
+- result: ~97ms vs ~98ms control — within noise. Barrier count is not the bottleneck; serial global-load latency per window is.
+- status: reverted (uncommitted experiment)
+
+### RESOLVE_DIRECT (2026-11-24)
+- hypothesis: stream miss experts over PCIe inside the gemv (skip serial ccopy)
+- result: ~155ms vs ~97ms — REJECTED. Host-mapped ring loads ~2.5x slower; serial ccopy saturates PCIe better than interleaved compute+load.
+
+### MOE_NKY=4,8 (2026-11-24)
+- result: nky=4 ~111ms, nky=8 ~132ms vs nky=2 ~97ms — REJECTED, nky=2 stays the optimum
+
+### GEMV_NKY_TGT sweep (2026-11-24)
+- tgt=100 ~103ms, 256 ~98ms, 1024 ~105ms vs default 512 ~97ms — default confirmed optimal
+
+### MOE_V2+nky1 (2026-11-24)
+- ~115ms vs old-kernel+nky2 ~97ms — REJECTED; v2 only helps batched-ntok (verify), serial old+nky2 wins
+
+### EXL3_CACHE_K sweep + prefetch (2026-11-24)
+- K=4 (off): ~139ms vs K=20 ~97 — cache worth ~42ms/tok
+- K=22 ~96ms median w/ ~110ms outliers (VRAM pressure) — kept K=20
+- K=24: OOM in dev_buf alloc (post-cache free ~108MiB)
+- INKWELL_MOE_PREFETCH=1: OOM at K=20, coredump at K=14 — path broken, not pursued
+
+### WO_NKY (2026-11-24)
+- nky=2 ~98.5ms, nky=4 ~98.7ms vs ~97ms — REJECTED, wo not split-K limited; reverted
+
+## PLATEAU DECLARATION (2026-11-24)
+~10 levers exhausted in noise on serial: dp4a (3 variants), 1-sync double-buffer,
+RESOLVE_DIRECT, MOE_NKY 4/8, MOE_V2 serial, GEMV_NKY_TGT sweep, WO_NKY,
+CACHE_K 22/24, MOE_PREFETCH (OOM/crash). Per-block analysis: gemv is
+instruction-throughput-bound at ~90M occupancy (~1.3us per 4-window batch,
+near the ~1500-instr estimate). No scheduling trick helps; only fewer instr/weight
+(dp4a — dead on x-int8 accuracy) or re-quant (vetoed). Serial sits ~97ms/tok,
+~10.3 TPS. Remaining upside <10 0.000000rom here absent a new quant or a GPU with
+native low-bit MMA.
