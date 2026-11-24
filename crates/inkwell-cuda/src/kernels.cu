@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cuda_fp16.h>
+#include "exl3_gemv_v2.cuh"
 
 extern "C" {
 
@@ -2936,6 +2937,22 @@ extern "C" void ink_launch_exl3_moe_ntok(
     }
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+    // v2 kernel: ka <= 4 (WM=32) and pairable window layout, all experts.
+    // desc tables are pinned host memory -- scan once per call (~12KB).
+    static int v2_env = -1;
+    if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
+    int v2_ok = (v2_env > 0) && nky == 1;
+    if (v2_ok) {
+        const void* dd[3] = {descs_g, descs_u, descs_d};
+        for (int pi = 0; pi < 3 && v2_ok; ++pi) {
+            const uint64_t* dt = (const uint64_t*)dd[pi];
+            for (int e = 0; e < 128; ++e) {
+                const int ka = (int)(dt[e * 4 + 3] & 0xff);
+                const int hf = (int)((dt[e * 4 + 3] >> 8) & 1);
+                if (exl3v2::words_of(ka, hf) > 32 || !exl3v2::pairable_ka(ka, hf)) { v2_ok = 0; break; }
+            }
+        }
+    }
 
     const uint64_t* G = (const uint64_t*)sdescs_g;
     const uint64_t* U = (const uint64_t*)sdescs_u;
@@ -2972,19 +2989,25 @@ extern "C" void ink_launch_exl3_moe_ntok(
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, miss, 2, euni, etok);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin2 err=%d\n", (int)cudaGetLastError()); }
-        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+        if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, 64, 2), 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, unexp, miss, 2);
+        else inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
             (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2, unexp);
         cudaStreamWaitEvent(st, ev_join, 0);
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, miss, 1, euni, etok);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin1 err=%d\n", (int)cudaGetLastError()); }
-        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+        if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, 64, 2), 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, unexp, miss, 1);
+        else inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
             (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 1, unexp);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  gemv1 err=%d\n", (int)cudaGetLastError()); }
     } else {
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, nullptr, 0, euni, etok);
-        inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+        if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, 64, 2), 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, unexp);
+        else inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
             (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, nullptr, 0, unexp);
     }
     if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok gu done err=%d\n", (int)e); }
@@ -2997,7 +3020,9 @@ extern "C" void ink_launch_exl3_moe_ntok(
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, eids, hid_e, xh_e,
         nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn_e, 0, 64 * ND * 4, st);
-    inkwell_exl3_gemv_moe_ntok<<<gd, 256, 0, st>>>(D, nullptr, uids, estart, xh_e,
+    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, 64, 1), 256, 0, st>>>(D, nullptr, uids, estart, xh_e,
+        nullptr, 0, dn_e, ND, 0, KD / 16, ND / 16, unexp);
+    else inkwell_exl3_gemv_moe_ntok<<<gd, 256, 0, st>>>(D, nullptr, uids, estart, xh_e,
         nullptr, 0, dn_e, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0, unexp);
     if (dbg) { cudaStreamSynchronize(st); cudaError_t e = cudaGetLastError(); fprintf(stderr, "moe_ntok dgemv done err=%d\n", (int)e); }
     if (dbg == 5) return;
