@@ -8,3 +8,5 @@ opt/kbench/sgemv_gold
 opt/kbench/sgemv_dense_gold
 opt/kbench/sgemv_var
 opt/kbench/isa_rates/isa_rates
+opt/kbench/kslot_gold
+opt/kbench/kslot_replay
