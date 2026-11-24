@@ -3599,7 +3599,7 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
     // claimed and never scanned).
     for (int j = lane; j < kmax; j += 32) {
         const int t = st_tag[j];
-        st_scnt[j] = (t >= 0) ? cnt[t] : 0;
+        st_scnt[j] = (t >= 0) ? atomicAdd(cnt + t, 0) : 0;
     }
     __syncwarp();
 
@@ -3651,23 +3651,24 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
             // least cnt, ties the least j. Slots at cnt==INT_MAX can't win in
             // the serial code either (c<bestc starts at 0x7fffffff), so they
             // are ineligible here as well.
-            unsigned long long best = ~0ULL;
+            int bestc = 0x7fffffff, bj = -1;
             for (int c = 0; c < kmax; c += 32) {
                 const int j = c + lane;
                 const bool ok = j < kmax && !(claimed & (1ULL << j))
                     && st_tag[j] >= 0 && st_scnt[j] < 0x7fffffff;
-                unsigned long long key = ~0ULL;
-                if (ok) key = ((unsigned long long)
-                              ((unsigned)st_scnt[j] ^ 0x80000000u) << 32)
-                              | (unsigned)j;
-                for (int o = 16; o; o >>= 1) {
-                    const unsigned long long o2 = __shfl_xor_sync(0xffffffffu, key, o);
-                    if (o2 < key) key = o2;
+                int cv = ok ? st_scnt[j] : 0x7fffffff;
+                for (int o = 16; o; o >>= 1)
+                    cv = min(cv, __shfl_xor_sync(0xffffffffu, cv, o));
+                const unsigned m = __ballot_sync(0xffffffffu, ok && st_scnt[j] == cv);
+                if (m) {
+                    const int cj = c + __ffs(m) - 1;
+                    if (cv < bestc || (cv == bestc && (bj < 0 || cj < bj))) {
+                        bestc = cv;
+                        bj = cj;
+                    }
                 }
-                if (key < best) best = key;
             }
-            if (best == ~0ULL) break;
-            const int bj = (int)(unsigned)best;
+            if (bj < 0) break;
             const int tv = st_tag[bj];
             for (int p = 0; p < 3; ++p)
                 nfl = ks_free_w(st_flb, st_fln, nfl,

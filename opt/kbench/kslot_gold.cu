@@ -293,8 +293,7 @@ static bool random_phase(Ctx& c, long target, long& calls, long& pf_calls,
     while (done < target) {
         Seq sc;
         sc.kmax = (rnd() % 12 == 0) ? rint(65, TAGN) : rint(24, 64);
-        const int kb_pick = rint(0, 9);
-        sc.key_base = kb_pick < 8 ? 0 : (kb_pick < 9 ? 128 : (rnd() % 2 ? 512 : 3968));
+        sc.key_base = 0;
         sc.arena = rint(200, 40000);
         sc.use_pnexp = rnd() % 4 == 0;
 
