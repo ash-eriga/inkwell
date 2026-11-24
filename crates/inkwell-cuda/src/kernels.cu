@@ -1625,6 +1625,29 @@ __global__ void inkwell_exl3_had_in(const float* __restrict__ x,
     if (base + t < k) xh[base + t] = sm[t] * 0.08838834764831845f; // 1/sqrt(128)
 }
 
+// merged had_in, opt-in with INKWELL_HADMERGE=1 (INKWELL_NO_HADMERGE vetoes;
+// default stays per-member launches: ~12us/token saved, inside A/B noise).
+// Member z applies the identical 128-point butterfly to its own x with its
+// own suh into its own xh; only the launch count changes.
+struct HadNArgs { const float* x[8]; const uint16_t* suh[8]; float* xh[8]; int n; int k; };
+__global__ void inkwell_exl3_had_in_n(const HadNArgs a) {
+    extern __shared__ float sm[];
+    const int blk = blockIdx.x;
+    const int t = threadIdx.x;
+    const int base = blk * 128;
+    const int z = blockIdx.y;
+    float v = (base + t < a.k) ? a.x[z][base + t] * __half2float(__ushort_as_half(a.suh[z][base + t])) : 0.f;
+    sm[t] = v;
+    __syncthreads();
+    for (int s = 1; s < 128; s <<= 1) {
+        const float u = (t & s) ? sm[t - s] - sm[t] : sm[t] + sm[t + s];
+        __syncthreads();
+        sm[t] = u;
+        __syncthreads();
+    }
+    if (base + t < a.k) a.xh[z][base + t] = sm[t] * 0.08838834764831845f; // 1/sqrt(128)
+}
+
 // t[n] = sum_k xh[k] * What[k,n]. grid.x = tn tiles; 256 threads, thread i = ring pos i.
 __device__ __forceinline__ int r_bits_words(int ka, int halfk) {
     return (halfk ? 256 * ka + 128 : 256 * ka) / 32;
@@ -2532,9 +2555,19 @@ extern "C" void ink_launch_exl3_gemv_ntok(const void* trel, const void* suh, con
                                           float* scratch, void* stream) {
     const int NTOK = 8;
     const int tk = (int)(k / 16), tn = (int)(n / 16);
-    for (int tt = 0; tt < NTOK; ++tt)
-        inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
-            x + (size_t)tt * k, (const uint16_t*)suh, scratch + (size_t)tt * k, (int)k);
+    { static int hm = -1; if (hm < 0) { const char* e = getenv("INKWELL_HADMERGE"); hm = (e && atoi(e) && !getenv("INKWELL_NO_HADMERGE")) ? 1 : 0; }
+      if (hm) {
+          HadNArgs a; a.n = NTOK; a.k = (int)k;
+          for (int tt = 0; tt < NTOK; ++tt) {
+              a.x[tt] = x + (size_t)tt * k;
+              a.suh[tt] = (const uint16_t*)suh;
+              a.xh[tt] = scratch + (size_t)tt * k;
+          }
+          inkwell_exl3_had_in_n<<<dim3((unsigned)(k / 128), NTOK), 128, 512, (cudaStream_t)stream>>>(a);
+      } else
+          for (int tt = 0; tt < NTOK; ++tt)
+              inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+                  x + (size_t)tt * k, (const uint16_t*)suh, scratch + (size_t)tt * k, (int)k); }
     const int nb = (tn + 3) / 4;
     int nky = 1;
     { static int tgt = -1; if (tgt < 0) { const char* e = getenv("INKWELL_GEMV_NKY_TGT"); tgt = e ? atoi(e) : 512; }
@@ -2582,10 +2615,11 @@ extern "C" void ink_launch_exl3_dp4a_dbg(const void* trel, const float* xh,
         (const uint32_t*)trel, xh, s, sx, (int)tk, (int)tn, (int)ka, (int)halfk);
 }
 
-extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const void* svh,
-                                     const float* x, float* y,
-                                     long long k, long long n, long long ka, long long halfk,
-                                     float* scratch, void* stream) {
+// everything after had_in (xh already in scratch[0..k)) — factored out so the
+// mz path can merge the per-projection had_ins upstream of the stream fork.
+static void exl3_gemv_tail(const void* trel, const void* svh, float* y,
+                           long long k, long long n, long long ka, long long halfk,
+                           float* scratch, void* stream) {
     const int tk = (int)(k / 16), tn = (int)(n / 16);
     { static int no_s = -1; if (no_s < 0) { const char* e = getenv("INKWELL_NO_SGEMV_DENSE"); no_s = e ? atoi(e) : 0; }
       if (!no_s && k <= SGEMV_DENSE_MAXK) {
@@ -2593,22 +2627,18 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
         int nky = 1;
         { static int tgt = -1; if (tgt < 0) { const char* e = getenv("INKWELL_SGEMV_DENSE_TGT"); tgt = e ? atoi(e) : 32; }
           while (nb * nky < tgt && nky < 8 && nky * 2 <= tk) nky *= 2; }
-        // fused path: had_in + gemv_sf (which absorbs memset + had_out).
-        // killswitch INKWELL_NO_SGEMV_FUSE -> the 4-launch chain below.
+        // fused path: gemv_sf absorbs memset + had_out.
+        // killswitch INKWELL_NO_SGEMV_FUSE -> the 3-launch chain below.
         // ctr[nb] lives at scratch[k + 8n .. +512) (alloc extended +512,
         // pre-zeroed at load); nky==1 uses no counter -> unbounded nb ok.
         { static int no_f = -1; if (no_f < 0) { const char* e = getenv("INKWELL_NO_SGEMV_FUSE"); no_f = e ? atoi(e) : 0; }
           if (!no_f && (n % 16) == 0 && (nky == 1 || nb <= 512)) {
-            inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
-                x, (const uint16_t*)suh, scratch /* xh */, (int)k);
             dim3 gsz((unsigned)nb, (unsigned)nky, 1);
             inkwell_exl3_gemv_sf<<<gsz, 256, 0, (cudaStream_t)stream>>>(
                 (const uint32_t*)trel, scratch /* xh */, (const uint16_t*)svh,
                 y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk, ink_pw16_mask());
             return;
           } }
-        inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
-            x, (const uint16_t*)suh, scratch /* xh */, (int)k);
         if (nky > 1) cudaMemsetAsync(scratch + k, 0, (size_t)nky * n * 4, (cudaStream_t)stream);
         dim3 gsz((unsigned)nb, (unsigned)nky, 1);
         inkwell_exl3_gemv_s<<<gsz, 256, 0, (cudaStream_t)stream>>>(
@@ -2617,8 +2647,6 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
             scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
         return;
       } }
-    inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
-        x, (const uint16_t*)suh, scratch /* xh */, (int)k);
     const int nb = (tn + 3) / 4;
     // aim for ~256 blocks: split K when tn is small
     int nky = 1;
@@ -2633,6 +2661,15 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
         (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk); }
     inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
         scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
+}
+
+extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const void* svh,
+                                     const float* x, float* y,
+                                     long long k, long long n, long long ka, long long halfk,
+                                     float* scratch, void* stream) {
+    inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+        x, (const uint16_t*)suh, scratch /* xh */, (int)k);
+    exl3_gemv_tail(trel, svh, y, k, n, ka, halfk, scratch, stream);
 }
 
 __global__ void inkwell_exl3_dbg_dec(const uint32_t* __restrict__ trel,
@@ -4449,6 +4486,7 @@ extern "C" void ink_launch_clip_l2(const float* x, const float* w, float* y,
 // them as parallel branches (same trick as the MoE D-stage overlap).
 static cudaStream_t mz_ss[8] = {};
 static cudaEvent_t mz_ev[9] = {};
+static cudaEvent_t mz_gev[8] = {};
 extern "C" void ink_launch_exl3_gemv_mz(
     const void* const* trel, const void* const* suh, const void* const* svh,
     const float* const* x, float* y, long long ystride,
@@ -4458,10 +4496,47 @@ extern "C" void ink_launch_exl3_gemv_mz(
         for (int i = 0; i < 8; ++i) {
             cudaStreamCreateWithFlags(&mz_ss[i], cudaStreamNonBlocking);
             cudaEventCreateWithFlags(&mz_ev[i], cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&mz_gev[i], cudaEventDisableTiming);
         }
         cudaEventCreateWithFlags(&mz_ev[8], cudaEventDisableTiming);
     }
     cudaStream_t st = (cudaStream_t)stream;
+    { static int hm = -1; if (hm < 0) { const char* e = getenv("INKWELL_HADMERGE"); hm = (e && atoi(e) && !getenv("INKWELL_NO_HADMERGE")) ? 1 : 0; }
+      if (hm && nz > 1) {
+          // group zs by identical (x, k); the group leader's stream runs one
+          // merged had_in covering all members before their gemv tails.
+          int glead[8], zgrp[8], ng = 0;
+          for (int z = 0; z < nz; ++z) {
+              int g = -1;
+              for (int gg = 0; gg < ng; ++gg)
+                  if (x[glead[gg]] == x[z] && k[glead[gg]] == k[z]) g = gg;
+              if (g < 0) { glead[ng] = z; g = ng++; }
+              zgrp[z] = g;
+          }
+          cudaEventRecord(mz_ev[8], st);
+          for (int g = 0; g < ng; ++g) {
+              HadNArgs a; a.n = 0; a.k = (int)k[glead[g]];
+              for (int z = 0; z < nz; ++z) if (zgrp[z] == g) {
+                  a.x[a.n] = x[z];
+                  a.suh[a.n] = (const uint16_t*)suh[z];
+                  a.xh[a.n] = scr[z];
+                  ++a.n;
+              }
+              const int lz = glead[g];
+              cudaStreamWaitEvent(mz_ss[lz], mz_ev[8], 0);
+              inkwell_exl3_had_in_n<<<dim3((unsigned)(a.k / 128), (unsigned)a.n), 128, 512, mz_ss[lz]>>>(a);
+              cudaEventRecord(mz_gev[g], mz_ss[lz]);
+          }
+          for (int z = 0; z < nz; ++z) {
+              if (z != glead[zgrp[z]])
+                  cudaStreamWaitEvent(mz_ss[z], mz_gev[zgrp[z]], 0);
+              exl3_gemv_tail(trel[z], svh[z], y + (size_t)z * ystride,
+                  k[z], n[z], ka[z], halfk[z], scr[z], mz_ss[z]);
+              cudaEventRecord(mz_ev[z], mz_ss[z]);
+              cudaStreamWaitEvent(st, mz_ev[z], 0);
+          }
+          return;
+      } }
     cudaEventRecord(mz_ev[8], st);
     for (int z = 0; z < nz; ++z) {
         cudaStreamWaitEvent(mz_ss[z], mz_ev[8], 0);
