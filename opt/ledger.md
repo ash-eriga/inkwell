@@ -1142,3 +1142,50 @@ this single A/B covers both "before" and "after" states. PW16_KMASK unchanged.
   scheduling bound; the real gap is the ~160us avg launch cost itself being
   issue-bound (sgemv inner loop instr/weight), addressed by the pw16 core --
   which needs a cleaner A/B on an idle machine to clear 12/16.
+## host-latency pass (step_id, commit 700aecd)
+
+nsys (`--trace=cuda,osrt,nvtx --cuda-graph-trace=node`, baseline best env, /tmp/inkwell_host_base):
+per-token GPU idle on the critical path, steady state:
+
+| gap | us/tok | cause |
+|-----|--------|-------|
+| logits DtoH (800KB) -> next rms_norm | ~895-1159 | host argmax + top5 + 3x unbuffered eprintln + Vec allocs + 10x synced t::set input uploads + embd dequant + upload + graph-key hash + ~6 chunk launches (runner.rs step_cached, main.rs gen loop) |
+| last graph node -> logits DtoH | ~53-266 | sched_synchronize wake + Vec alloc + t::get issue |
+| inside-token small HtoD chains | ~10-14 x several | per-tensor cudaMemcpyAsync+sync on cudaStreamPerThread |
+
+Fixes shipped in step_id fast path:
+- `inkwell_argmax` kernel (kernels.cu): IEEE totalOrder key map + last-max
+  tiebreak = host `max_by(total_cmp)` exactly; reads the `out` tensor in
+  place, writes {idx,key}, 4B DtoH. Killswitch INKWELL_NO_GARGMAX.
+- `ink_sched_compute_async` shim -> `ggml_backend_sched_graph_compute_async`:
+  launches splits/chunked cudaGraphExecs without the final all-backend sync;
+  host blocks on a cudaEvent recorded after the 4B argmax readback.
+  Killswitch INKWELL_NO_ASYNCSTEP (per-tensor synced uploads + blocking
+  sched compute, still uses device argmax).
+- inputs packed into a pinned mirror of in_buf -> ONE async HtoD covering
+  ids/pos/kv_idx/rel_pos/masks/sink_zero (was ~9 synced t::set); embd row
+  dequant into pinned stage -> one async HtoD (was dequant + synced set).
+  in_pin is double-buffered by pos parity so the next step's pos-dep
+  marshal overlaps the running graph (premarshal after launch, pre-sync).
+- per-token eprintln!/top5/argmax-scan behind INKWELL_STEPDBG (off by
+  default); stepdbg mode keeps the exact old per-token output.
+- argmax + readback queued on the ggml stream right after the replay, so
+  the GPU-side tail is ~35us instead of ~50-270us.
+
+A/B: see below (ctl = NO_GARGMAX+NO_ASYNCSTEP+STEPDBG, cand = default).
+
+A/B results (16 neighbour pairs, ctl = NO_GARGMAX+NO_ASYNCSTEP+STEPDBG,
+cand = default step_id path; batch 2 ran under host load from sibling
+agents, so absolute times drift up but pair ordering holds):
+
+ctl  : 46.09 44.49 45.44 45.58 45.52 45.74 45.51 45.95
+       47.02 49.35 45.95 48.84 46.54 50.48 51.06 52.15  ms/tok
+cand : 44.95 45.26 44.65 44.50 44.87 44.90 44.18 44.85
+       46.54 49.00 44.38 49.69 44.64 49.38 47.76 50.87  ms/tok
+median ctl 46.02, cand 44.93 (-1.09 ms/tok, ~-2.4%)
+pair wins: 14/16 (>=12 required)  md5: 5cbe8e06 on all 32 runs
+verdict: ACCEPTED (commit 700aecd)
+
+Remaining boundary budget after this fix (est): event wake + ids write +
+embd dequant (~20us) + 2x HtoD issue + prefetch + graph-key hash + ~6
+chunk launches + argmax tail ~35us = ~0.15-0.25ms/tok, down from ~1.0-1.4.
