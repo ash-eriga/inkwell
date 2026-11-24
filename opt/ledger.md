@@ -1265,3 +1265,54 @@ warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
 - 32K is not budgeted. Decode attention fails above 12,096 tokens (all scores in shared memory, 48 KiB/block on sm_61; probe `opt/kbench/attn_ctx`: n_kv 12,160 → `invalid argument`). Below that it costs 0.18 / 0.72 / 2.75 ms per visit at 1K / 4K / 8K: ~13 ms/tok at 4K and ~29 ms/tok at 8K, vs 0.93 ms in the short-prompt bench.
 - F16 KV at 32K adds +1,008 MiB, so caches go 940 → 0 MiB under the 5,120 cap (replay: 336.8 MiB/tok of misses, +25 to +45 ms); the loader does not enforce the cap. Trims (lazy `Exl3Blk`, `dev_buf` slack, `gf_cat` copy) give back ~282 MiB of caches → ~168 MiB/tok.
 - Seven lossy steps lack a no-regression gate vs 0.0475 / 94.66%; drafter labels are dumped before the shipped quant is final; H200 Window 1 estimate 6–17 h vs the spec's 6.2–9.75 h; Canary 2C cannot run the spec's ~80 GB recipe on an L4.
+
+## 2026-11-24 — device-resident EXL3 MoE descriptor tables accepted
+
+- H1 implementation: each layer's immutable `descs_g/u/d` tables (128 × 32 B)
+  now default to `DevBuf` device memory instead of pinned host zero-copy.
+  `INKWELL_NO_DEVDESC=1` restores the old host-mapped allocation. All MoE
+  single-token, cached, ntok, staging/ccopy and prefetch call sites receive the
+  device pointer. The exl3-v2 host eligibility scan was moved to load time
+  (`v2_descs_ok`) because the launchers can no longer dereference descriptor
+  memory on the host; resolve never consumed descriptors. No dense,
+  router/controller, expert-blob load, or resolve-kernel changes.
+- Build: `cargo build --release` warnings 63 (master budget ≤64).
+- Correctness: generated-text md5 `5cbe8e06` on smoke, both nsys runs, and all
+  32 A/B runs. Peak process VRAM 5052–5064 MiB, below the 5120 MiB cap
+  (+288 KiB nominal descriptor VRAM, below 1 MiB measurement granularity).
+- nsys 2024.5.1, `--trace=cuda --cuda-graph-trace=node`, BEST env, 64 decode
+  tokens, totals/64:
+
+| kernel | ctl pinned ms/tok | cand device ms/tok | diff |
+|---|---:|---:|---:|
+| `inkwell_exl3_gemv_moe_s` | 18.314 | 15.893 | −2.421 |
+| `inkwell_exl3_had_in_moe` | 1.146 | 0.512 | −0.634 |
+| `inkwell_exl3_had_out_moe` | 0.787 | 0.341 | −0.446 |
+| target total | 20.247 | 16.746 | **−3.501** |
+
+  Launches unchanged: gemv/had_in 7752 (121.12/tok), had_out 6528 (102/tok).
+  Profiled decode spans: ctl 3.103184214s, cand 2.59693755s.
+
+- A/B: 16 interleaved neighbour pairs in run order ctl,cand,cand,ctl ×8,
+  one flock, ctl = `INKWELL_NO_DEVDESC=1`:
+
+| rep | ctl1 | cand1 | cand2 | ctl2 |
+|---:|---:|---:|---:|---:|
+| 1 | 40.92 | 37.81 | 39.66 | 41.42 |
+| 2 | 42.62 | 38.01 | 38.38 | 43.75 |
+| 3 | 42.32 | 41.46 | 38.29 | 42.42 |
+| 4 | 41.50 | 39.76 | 38.42 | 44.45 |
+| 5 | 42.53 | 37.99 | 37.75 | 41.63 |
+| 6 | 40.34 | 38.43 | 37.28 | 42.94 |
+| 7 | 41.98 | 36.87 | 37.56 | 41.64 |
+| 8 | 41.03 | 37.95 | 38.98 | 41.25 |
+
+  ctl median **41.81** ms/tok; cand median **38.15** ms/tok;
+  candidate **−3.66 ms/tok (−8.8%)**. Pair wins **16/16** (bar ≥12/16).
+  md5 `5cbe8e06` on every run. Verdict: **ACCEPTED**.
+
+  **Brain re-validation on master (3fa931c base, 2026-11-24):** 16 pairs,
+  ctl median 41.54, dd median 38.28, **−3.25 ms/tok, 15/16** pairs (one dd run
+  exited with no output; 6 follow-up runs with full logs all passed with md5
+  `5cbe8e06`; the same empty-exit happened once on the startup branch, which
+  lacks this change, so it is not attributed to devdesc). ACCEPTED.
