@@ -879,14 +879,30 @@ impl Runner {
         let bf16_ok = |name: &str| bf16w && (name.contains(".controllers.")
             || name.ends_with("mlp.gate.weight") || name.ends_with("attn.attn_sink_proj.weight")
             || name.ends_with("sconv.weight_proj"));
-        let mut dev_bytes = 160usize << 20;
+        // The old loader reserved 160 MiB of slack. Measured occupancy after
+        // the gain/forget dedup is within a few MiB of the exact tensor sum;
+        // keep 8 MiB for alignment/derived tensors. INKWELL_NO_DEVBUF_TRIM=1
+        // restores the old reserve.
+        let devbuf_trim = std::env::var_os("INKWELL_NO_DEVBUF_TRIM").is_none();
+        let dev_headroom: usize = if devbuf_trim {
+            std::env::var("INKWELL_DEVBUF_HEADROOM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+        } else { 160 } << 20;
+        let count_dup_gfcat = devbuf_trim
+            && std::env::var_os("INKWELL_NO_GFCAT_TRIM").is_some()
+            && std::env::var_os("INKWELL_NOCTRLCAT").is_none();
+        let mut dev_bytes = dev_headroom;
         for (n, t) in &repo.tensors {
             let (name, ti) = (n.as_str(), &t.1);
             if name.contains(".experts.") || name.contains(".trellis") || name.contains(".suh")
                 || name.contains(".svh") || name.contains(".mul1") || name == "model.llm.embed.weight"
                 || name.contains("visual") { continue; }
             let w = if bf16_ok(name) && ti.dtype == "BF16" { 2 } else { 4 };
-            dev_bytes += (ti.elems() * w) as usize + 256;
+            let bytes = (ti.elems() * w) as usize;
+            dev_bytes += bytes + 256;
+            if count_dup_gfcat && name.contains(".controllers.")
+                && (name.ends_with("gain_weight") || name.ends_with("forget_weight")) {
+                dev_bytes += bytes;
+            }
         }
         let dev_buf = rt.buf(buft_dev, dev_bytes);
         let cpu_buf = rt.buf(buft_cpu, 2304 * 4 + 256);
@@ -1264,6 +1280,10 @@ impl Runner {
             l.proj0_off = [-1; 3];
             layers.push(l);
         }
+        assert!(off_dev <= dev_bytes, "dev_buf overflow: use={off_dev} alloc={dev_bytes}");
+        eprintln!("dev_buf: use={:.1}MiB alloc={:.1}MiB slack={:.1}MiB",
+            off_dev as f64 / 1048576.0, dev_bytes as f64 / 1048576.0,
+            (dev_bytes - off_dev) as f64 / 1048576.0);
         eprintln!("load_st: dev={}MiB exl3_w={} pinned={}MiB", dev_bytes >> 20, exl3_w.len(),
             pinned_bytes >> 20);
         let exl3_blk: Vec<Box<Exl3Blk>> = exl3_w.iter().map(|e| {
