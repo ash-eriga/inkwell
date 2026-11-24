@@ -34,6 +34,22 @@ extern "C" {
     fn cudaDeviceSynchronize() -> i32;
 }
 
+#[link(name = "nvidia-ml")]
+extern "C" {
+    fn nvmlInit_v2() -> i32;
+    fn nvmlDeviceGetHandleByIndex_v2(index: u32, device: *mut *mut c_void) -> i32;
+    fn nvmlDeviceGetComputeRunningProcesses_v2(device: *mut c_void, count: *mut u32, infos: *mut NvmlProcessInfo) -> i32;
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct NvmlProcessInfo {
+    pid: u32,
+    used_gpu_memory: u64,
+    gpu_instance_id: u32,
+    compute_instance_id: u32,
+}
+
 extern "C" {
     fn ink_launch_dequant_iq2_xxs(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
     fn ink_launch_dequant_iq1_s(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
@@ -650,6 +666,29 @@ pub fn mem_info() -> (usize, usize) {
     let mut t = 0usize;
     assert_eq!(unsafe { cudaMemGetInfo(&raw mut f, &raw mut t) }, 0, "cudaMemGetInfo");
     (f, t)
+}
+
+/// This process's device memory according to NVML, or `None` when the driver
+/// query is unavailable. Unlike `cudaMemGetInfo`, this excludes the desktop
+/// and every other compute process.
+#[must_use]
+pub fn process_memory_bytes() -> Option<usize> {
+    static DEV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let dev = *DEV.get_or_init(|| {
+        if unsafe { nvmlInit_v2() } != 0 { return 0; }
+        let mut d = std::ptr::null_mut();
+        if unsafe { nvmlDeviceGetHandleByIndex_v2(0, &raw mut d) } != 0 { 0 } else { d as usize }
+    });
+    if dev == 0 { return None; }
+    let mut infos = [NvmlProcessInfo::default(); 64];
+    let mut count = infos.len() as u32;
+    if unsafe { nvmlDeviceGetComputeRunningProcesses_v2(dev as *mut c_void, &raw mut count, infos.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let pid = std::process::id();
+    infos.iter().take(count.min(infos.len() as u32) as usize)
+        .find(|p| p.pid == pid)
+        .map(|p| p.used_gpu_memory as usize)
 }
 
 /// Async HtoD copy on stream 0 (ordered with kernels).

@@ -533,6 +533,19 @@ fn st_densew_parts(repo: &inkwell_st::StRepo, name: &str, bf16w: bool) -> (i32, 
     ((if keep_bf16 { BF16 } else { F32 }), dims, bytes)
 }
 
+/// Process device-memory estimate. NVML is exact; the fallback uses the
+/// cudaMemGetInfo baseline captured just after context creation plus a
+/// conservative fixed estimate for the context/ggml runtime itself.
+fn process_vram_bytes(baseline_free: usize) -> (usize, &'static str) {
+    if let Some(b) = inkwell_cuda::process_memory_bytes() {
+        return (b, "nvml");
+    }
+    let base: usize = std::env::var("INKWELL_VRAM_BASELINE_MB").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(300) << 20;
+    let (free_now, _) = inkwell_cuda::mem_info();
+    (base + baseline_free.saturating_sub(free_now), "meminfo-baseline")
+}
+
 impl Runner {
     /// Load the model: tensors → device buffer (dense) / cpu buffer (experts).
     ///
@@ -858,6 +871,7 @@ impl Runner {
     #[expect(clippy::too_many_lines)]
     pub fn load_st(repo: &inkwell_st::StRepo, cfg: &InklingConfig, max_ctx: i64) -> Self {
         let rt = Rt::cuda();
+        let (vram_baseline_free, _) = inkwell_cuda::mem_info();
         let cpu = Ptr(unsafe { inkwell_ggml::ink_backend_cpu(4) });
         let cuda = unsafe { inkwell_ggml::ink_backend_cuda(0) };
         let buft_dev = rt.device_buft();
@@ -1358,6 +1372,61 @@ impl Runner {
             static CACHEL_MB: [usize; 24] = [
                 56, 56, 56, 48, 56, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 156, 156, 48, 44, 48, 52, 48, 52];
+            // Greedy marginal-value tables regenerated with
+            // opt/tools/kslot_alloc.py on the 68-token routing trace.
+            static T0: [usize; 24] = [0; 24];
+            static T192: [usize; 24] = [
+                0, 4, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                56, 12, 24, 24, 24, 20, 12, 8];
+            static T256: [usize; 24] = [
+                0, 4, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                72, 48, 24, 24, 24, 28, 12, 12];
+            static T300: [usize; 24] = [
+                0, 8, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                72, 88, 24, 24, 24, 28, 12, 12];
+            static T384: [usize; 24] = [
+                0, 8, 0, 8, 8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                72, 88, 24, 24, 28, 40, 32, 40];
+            static T600: [usize; 24] = [
+                8, 48, 40, 8, 32, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                108, 120, 32, 36, 32, 40, 44, 40];
+            static T940: [usize; 24] = [
+                72, 68, 56, 40, 68, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                136, 120, 52, 36, 52, 52, 48, 64];
+            static T1200: [usize; 24] = [
+                100, 80, 68, 80, 84, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                156, 164, 52, 48, 64, 68, 64, 76];
+            static T1400: [usize; 24] = [
+                104, 100, 84, 100, 108, 108, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                176, 164, 68, 80, 80, 72, 68, 80];
+
+            let vramcap = std::env::var_os("INKWELL_NO_VRAMCAP").is_none();
+            let budgeted = std::env::var_os("INKWELL_NO_CACHE_BUDGET").is_none();
+            let target_mib: usize = std::env::var("INKWELL_VRAM_CAP_MB").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(5080);
+            let reserve_mib: usize = std::env::var("INKWELL_RUNTIME_RESERVE_MB").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(96);
+            let (pre_cache_used, vram_src) = process_vram_bytes(vram_baseline_free);
+            let target_bytes = target_mib << 20;
+            let reserve_bytes = reserve_mib << 20;
+            let budget_mib = target_bytes
+                .saturating_sub(pre_cache_used)
+                .saturating_sub(reserve_bytes) >> 20;
+            let (table_mib, table): (usize, &[usize; 24]) = if vramcap && budgeted {
+                let tables: [(usize, &'static [usize; 24]); 8] = [
+                    (192, &T192), (256, &T256), (300, &T300), (384, &T384),
+                    (600, &T600), (940, &T940), (1200, &T1200), (1392, &T1400),
+                ];
+                let mut chosen: (usize, &'static [usize; 24]) = (0, &T0);
+                for (total, candidate) in tables {
+                    if total <= budget_mib { chosen = (total, candidate); }
+                }
+                chosen
+            } else {
+                (940, &CACHEL_MB)
+            };
+            eprintln!("vramcap: target={target_mib}MiB reserve={reserve_mib}MiB used_pre_cache={}MiB budget={budget_mib}MiB table={table_mib}MiB source={vram_src} enabled={vramcap}",
+                pre_cache_used >> 20);
             let cachel = std::env::var_os("INKWELL_NO_CACHEL").is_none();
             let over = std::env::var("INKWELL_CACHE_MB_L").unwrap_or_default();
             let per_l = |il: i32| -> Option<usize> {
@@ -1369,15 +1438,28 @@ impl Runner {
                         }
                     }
                 }
-                CACHEL_MB.get(il as usize).copied().filter(|&m| m > 0)
+                table.get(il as usize).copied()
             };
+            let mut cache_allocated = 0usize;
             for (i, a) in moe_args_exl3.iter_mut().enumerate() {
                 if a.on_dev || a.max_slot == 0 { continue; }
                 let cbytes = per_l(a.layer).map_or(ck * 3 * a.max_slot, |mb| mb << 20);
+                if cbytes == 0 { continue; }
                 let (f, _) = inkwell_cuda::mem_info();
-                let margin: usize = std::env::var("INKWELL_CACHE_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
-                if f <= cbytes + (margin << 20) { continue; }
+                if vramcap {
+                    let (used_now, _) = process_vram_bytes(vram_baseline_free);
+                    if used_now.saturating_add(cbytes).saturating_add(reserve_bytes) > target_bytes {
+                        eprintln!("vramcap: skip L{} cache={}MiB used={}MiB budget_left={}MiB",
+                            a.layer, cbytes >> 20, used_now >> 20,
+                            target_bytes.saturating_sub(used_now).saturating_sub(reserve_bytes) >> 20);
+                        continue;
+                    }
+                } else {
+                    let margin: usize = std::env::var("INKWELL_CACHE_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+                    if f <= cbytes + (margin << 20) { continue; }
+                }
                 let Some(buf) = inkwell_cuda::DevBuf::try_new_bytes(cbytes) else { continue };
+                cache_allocated += cbytes;
                 // kslot: same byte budget as ck uniform max-size slots, but as
                 // one granule arena with a device-side free list — slots are
                 // packed to each expert's real blob, so ~1.4x more experts stay
@@ -1449,6 +1531,11 @@ impl Runner {
                 }
                 eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED free={}MiB",
                     a.max_slot, cbytes as f64 / 1e6, f >> 20);
+            }
+            if vramcap {
+                let (post_cache_used, _) = process_vram_bytes(vram_baseline_free);
+                eprintln!("vramcap: cache_allocated={}MiB used_post_cache={}MiB target={target_mib}MiB reserve={reserve_mib}MiB",
+                    cache_allocated >> 20, post_cache_used >> 20);
             }
         }
         Self {
