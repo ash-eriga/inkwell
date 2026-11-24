@@ -1235,3 +1235,15 @@ Fast-forwarded master to `t3/host-latency-token-critical-path` (61ab1dc + ledger
 
 warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
 +9 KiB static scratch only (no new allocations); commits 3171b17, 7743082.
+
+## 2026-11-24 — fused inkwell_mix + had_in merge accepted on master
+
+- `inkwell_mix_fused`: one 256-thread block per (2304/256 column block, query column). Each warp preloads its 72-value
+  slices into registers, computes rms and the dot product per row in the old op order, thread 0 runs the softmax
+  sequentially, then each thread accumulates its column in row order. md5-identical. Killswitches `INKWELL_NO_MIXMB`,
+  `INKWELL_NO_HADMERGE`.
+- nsys (node trace, 68 steps): inkwell_mix 2.66 → 1.17 ms/tok; had_in 1.18 → 0.56 ms/tok (−2.1 ms/tok kernel time).
+- A/B history (ctl = `INKWELL_NO_MIXMB=1 INKWELL_NO_HADMERGE=1`, 16 pairs each):
+  - on 3f60c55 (before the host pass): −1.26 ms, 11/16 — under the bar;
+  - on d8c64ee (host pass in): ctl 43.12, mx 42.11, **−1.02 ms, 15/16**, md5 5cbe8e06 on all 32 runs — ACCEPTED.
+- The host pass cut per-token jitter (ctl spread 42–49 vs 43–51 before), which is what let the kernel gain show.
