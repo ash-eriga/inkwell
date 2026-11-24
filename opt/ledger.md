@@ -1246,4 +1246,4 @@ warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
 - A/B history (ctl = `INKWELL_NO_MIXMB=1 INKWELL_NO_HADMERGE=1`, 16 pairs each):
   - on 3f60c55 (before the host pass): −1.26 ms, 11/16 — under the bar;
   - on d8c64ee (host pass in): ctl 43.12, mx 42.11, **−1.02 ms, 15/16**, md5 5cbe8e06 on all 32 runs — ACCEPTED.
-- The host pass cut per-token jitter (ctl spread 42–49 vs 43–51 before), which is what let the kernel gain show.
+- Control spread was 42.1–48.8 ms here vs 42.2–51.1 in the previous run; whether the host pass lowered the noise is not shown.
