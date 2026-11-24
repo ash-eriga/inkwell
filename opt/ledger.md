@@ -755,4 +755,18 @@ runner.rs `control()`: two custom ops replace 9 launches/site:
 Launch delta: ctrl -7x96=-672; relbias -3x48=-144; total ~-816 launches.
 Killswitches: INKWELL_NO_CTRLFUSE=1, INKWELL_NO_RELGATHER=1 (independent).
 
-A/B: TBD
+### A/B — on master 41d0798 (+gcache), BEST env, 8 pairs ctl,cand,cand,ctl (one flock)
+
+ctl = INKWELL_NO_CTRLFUSE=1 INKWELL_NO_RELGATHER=1; cand = both fused.
+
+| pair | ctl a | cand a | cand b | ctl b |
+| 1 | 52.06 | 54.39 | 49.09 | 52.08 |
+| 2 | 56.93 | 61.51 | 48.97 | 52.21 |
+| 3 | 50.60 | 48.32 | 50.51 | 50.86 |
+| 4 | 51.47 | 47.11 | 47.11 | 50.25 |
+| median | 52.06 | | | |
+cand median 49.09 (-5.7%); adjacent-pair wins 6/8
+(W: c2b, c3a, c3b, c4a, c4b — L: c1a 54.39>52.06, c2a 61.51 outlier).
+md5 5cbe8e06f2d8d82feb7f2ca287a7bc59 all runs. **ACCEPTED** (commit
+1f8c66a). Note: measured on post-gcache master where per-launch bubble
+is smaller (~3.4ms union idle) — gain is mostly launch-count-driven.
