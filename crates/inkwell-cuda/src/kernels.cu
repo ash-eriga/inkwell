@@ -3565,12 +3565,15 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
 
     unsigned long long claimed = 0, missmask = 0;
     int nhits = 0, nbank = 0, nreal = 0;
+    // Count increments are commutative and all complete before the first
+    // victim scan, so issue them across the warp instead of serially on lane 0.
+    for (int s = lane; s < nslots; s += 32)
+        atomicAdd(cnt + st_ids[s] + key_base, 1);
     // pass 1: tag/bank hits. tag is read-only here, so each selection's
     // first-match search is one ballot round per 32 slots — the lowest set
     // lane reproduces the serial loop's break-on-first-match.
     for (int s = 0; s < nslots; ++s) {
         const int e = st_ids[s] + key_base;
-        if (lane == 0) atomicAdd(cnt + e, 1);
         int v = -1;
         for (int c = 0; c < kmax && v < 0; c += 32) {
             const int j = c + lane;
