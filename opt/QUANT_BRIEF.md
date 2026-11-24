@@ -137,20 +137,37 @@ A reviewer re-derived the master spec's full 128K VRAM budget from the safetenso
 
 ## 7. A light drafter for speculative decoding (later)
 
-Inkwell plans speculative decoding with a small drafter later. The drafter's precision never reaches the output, because the verifier checks every drafted token against the full model's argmax. A lossy drafter only lowers the acceptance rate, so int8 weights and activations are allowed in it.
+Inkwell plans speculative decoding with a small drafter later. The drafter's precision never reaches the output, because the verifier checks every drafted token against the full model's argmax. A lossy drafter only lowers the acceptance rate, so int8 and int4 weights are allowed in it.
 
-- **Time budget.** One draft round of 2–3 tokens must cost ~1–3 ms on the 1060.
-  - Serial decode takes 46.8 ms/token.
-  - Verifying 3 rows costs an estimated 1.8–2.0 serial steps and emits ~2.1 tokens, which leaves little time for the drafter.
-  - Today's drafter, the checkpoint's 3-layer DSpark head in EXL3, takes 45–50 ms per round (measured).
-- **Drafts per round: 2–3.** With today's drafter, the first draft is accepted 75% of the time and each later one ~18%, so more drafts add little.
-- **Format the kernel expects (preliminary):**
-  - int8 weights, symmetric, with one scale per output row. Pascal has dp4a (int8×int8) and dp2a (int16×int8).
-  - Matrix dimensions that are multiples of 128.
-  - A reduced-vocabulary head over V′ tokens, plus a table of V′ uint32 ids into the full 200,058-token vocabulary.
-  - The drafter may read the target's hidden states. Today's head takes 4 taps of 2,304 floats per token.
-- **VRAM.** In today's layout, every drafter MiB comes out of the expert caches. The 128K plan has no room for a drafter (§6, condition 5). A 32K-token int8 head at hidden size 2,304 alone takes 72 MiB, so report the drafter's bytes.
-- An Inkwell agent is benchmarking the best drafter shape for this GPU. This section will get exact limits from that work.
+**Acceptance decides the gain, not drafter speed.** Inkwell's kernels already run a draft round in 0.24 ms (1 draft) to 0.68 ms (3 drafts), measured. Modeled speed against today's 46.8 ms/token serial, with p1 = P(first draft accepted) and q = P(each later draft accepted):
+
+| p1 | q | best k | ms/token | vs serial |
+|---|---|---|---|---|
+| 0.50 | 0.18 | 1 | 46.8 | +0% |
+| 0.75 | 0.18 | 1 | 40.1 | +17% |
+| 0.75 | 0.46 | 1 | 40.1 | +17% |
+| 0.82 | 0.65 | 1–2 | 38.5 | +21% |
+| 0.90 | 0.80 | 2–3 | 34.3–34.7 | +35–37% |
+
+- The model assumes a batched verifier that Inkwell has not built yet. Verifying 2 rows costs ~1.5× a serial step, because the rows route to different experts (mean union 12.9 experts per layer instead of 8).
+- Today's checkpoint drafter (DSpark) has p1 ≈ 0.50–0.75 and q ≈ 0.18–0.46, depending on the prompt and the measurement.
+- **Train for p1 first.** With one draft per round, every +0.1 of p1 is worth ~+6–7% speed. A higher q pays only once p1 is above ~0.8.
+
+**Recommended shape (measured kernel cost, 29.9 MiB):** EAGLE-style, conditioned on the target's hidden states.
+- Input: 4 target taps of 2,304 floats (today's taps are layers 5, 23, 41 and 48), softmax-mixed, normalized and projected 2304 → D.
+- Body: 1 transformer layer, D = 1024, FF = 2816 (SwiGLU), 16 query heads and 4 KV heads of 64, sliding window 128.
+- Head: V′ = 32,768 tokens, tied with the input embedding.
+- A 2-layer body costs +0.1 ms per draft and 40.7 MiB, if acceptance needs it.
+
+**Format the kernel expects (measured):**
+- Every linear matrix is row-major [N_out, K_in], with K_in and N_out multiples of 128.
+- Body weights: symmetric int8 per output row, `*.weight` I8 [N_out, K_in] in [−127, 127] plus `*.scale` F32 [N_out] = max|W_row| / 127.
+- Head: int4 with one F16 scale per group of 128 inputs (`lm_head.weight_i4` U8 [V′, D/2], `lm_head.scale` F16 [V′, D/128]), or int8 per row like the body. **Do not use int4 with one scale per row:** first-draft agreement with the fp drafter fell to 58–67%, against 100% for group-128.
+- Vocabulary: `vocab_ids` U32 [V′] maps head rows to target ids, and `inv_vocab_ids` I32 [200,058] maps back (−1 when out of set). Pin the 256 byte tokens and EOS (200006), then rank by corpus frequency. V′ = 32K covers 94.8% of the tokens the target actually generates; 16K covers 86.7%.
+- Norms and biases: F32.
+- The full tensor list and nibble packing are in `opt/kbench/drafter/REPORT.md` §7 of the Inkwell repo.
+
+**VRAM.** In today's layout, every drafter MiB comes out of the expert caches. The 128K plan has no room for a drafter (§6, condition 5).
 
 ## 8. What to send back
 
