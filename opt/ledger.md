@@ -985,3 +985,11 @@ misses 13046 cum unchanged. Launches/tok: -192 vs unfused ctrl chain
 (2 fused ops/site replacing 4). Serial sanity path: 48.30 base ->
 47.62 (bf16) -> 46.38 (+gf) -> 46.22 (+rms2down).
 Commits: 2178e4b (BF16 storage), a25ff40 (gf_apply), 282ef33 (rms2down).
+
+### Brain re-validation on master: BF16 ctrl/router + gf_apply + rms2down — ACCEPTED
+
+- Rebased 2178e4b..4c791b8 onto 7e047e6 (pw16 opt-in included). Review: BF16 src0 goes through ggml-cuda mmvf with the same F32 accumulation order; both fusions copy the mmvf reduce tree. Killswitches INKWELL_NO_BF16CTRL / INKWELL_NO_GFAPPLY / INKWELL_NO_RMSDOWN.
+- A/B with the pw16 env (MAX_CTX=512, CACHE_K=20, MOE_V2, NKY=2, graphs), ctl,bf,bf,ctl ×8, ctl = all three killswitches:
+  - ctl median 48.09 ms/tok, bf median 46.58 ms/tok, **−1.51 ms (−3.1%)**;
+  - bf wins **14/16** neighbouring pairs; md5 5cbe8e06 on all 32 runs; warnings 62.
+- VRAM peak 5010 → 4934 MiB (child measurement). The 76 MiB freed are not yet spent on caches (CACHE_K pins the arena).
