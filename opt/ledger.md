@@ -649,3 +649,18 @@ Boundary hole 3.94 -> **0.83 ms median** (min 0.70; one 10.0 outlier = the
 n_kv 64->128 rebuild step). Residual = logits DtoH ~0.25 + input sets ~0.1
 + embd ~0.02 + prefetch issues ~0.05 + split compute + ~6 chunk launches.
 Per-token union idle 12.4 -> ~3.4 ms/tok median under nsys.
+
+### Brain re-validation on master: step-graph cache (INKWELL_NO_GCACHE) — ACCEPTED
+
+- Fast-forwarded 69fcf8f onto be7ec88.
+- Review:
+  - only `step` and `step_block` use the sched; `step_block` drops the cache and calls sched_reset first;
+  - `feat_ud` userdata is cleared only in `step_block`;
+  - `pos_k`/`pos_val` is dead code: the KV write uses the `kv_idx` tensor, which is uploaded every step;
+  - tau is computed in-graph from `pos_t`.
+  So nothing that depends on `pos` is baked into the reused graph.
+- A/B with BEST env + graphs, ctl,gc,gc,ctl ×4:
+  - ctl median 57.98 ms/tok (7 valid runs);
+  - gc median 51.29 ms/tok (49.89–56.34);
+  - **−11.5%**; gc wins 8/8 neighbouring pairs; md5 5cbe8e06 on every valid run; warnings 62.
+- One ctl run FAILed with no output. At that moment `nvidia-smi` showed another agent's inkwell holding 3770 MiB, probably a job run outside the flock. 3 ctl re-runs passed (57.6/56.6/56.4 ms).
