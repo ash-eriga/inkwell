@@ -203,10 +203,10 @@ Modeled speed against the 46.8 ms/token serial speed of the time (the runtime is
 No pretraining.
 
 1. **Keep the width at D = 2304**, so DSpark's weights still fit. Cut 3 layers to 1 and prune the FF from 9216 to 4608.
-2. **Draft 1 token per round (k = 1).** Keep 1 mask row instead of 7; the GRU recurrence then matters little.
+2. **Draft 1 token per round (k = 1).** Keep 1 mask row instead of 7, and drop the GRU recurrence: at k = 1, q does not count, and the finetune re-learns the layer input.
 3. **Head:** 32K rows taken from the target's own unembed, int4 with group-128 scales (§8.3).
 4. **Body:** int8 with one scale per output row (§8.3).
-5. **Finetune data:** run the target in prefill mode (teacher forcing) over text. Record the 4 taps and the target's argmax at every position, and train the drafter to predict that argmax.
+5. **Finetune data:** run the target in prefill mode (teacher forcing) over text. Record the 4 taps and the target's argmax at every position, and train the drafter to predict that argmax. Take the taps and argmax labels from the exact quantized model Inkwell will ship, not from the BF16 source: the verifier accepts a draft only if it matches the quantized model's argmax. A new quant means new labels and a short re-finetune.
 6. **Metric:** p1 on held-out text, before and after the finetune. Below ~0.6 the drafter does not pay.
 
 Measured kernel cost of this shape: 0.55 ms per round and 81.6 MiB; modeled gain at p1 = 0.75 is ~+11%. A drafter trained from scratch at D = 1024 would cost 0.24 ms and 29.9 MiB (~+13%); it is the fallback if surgery cannot reach the p1 target.
