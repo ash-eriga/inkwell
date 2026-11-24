@@ -22,7 +22,7 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 - **Current quant:** "SAGE REXL3 2.26 bpw", a mixed-precision EXL3 quant.
   - Size: 8.00 GiB. Experts take 6.130 GiB (2.153 bpw on average, including suh/svh). Loop-layer experts take 3.441 GiB (2.42 bpw including suh/svh). The dense trellis takes 0.488 GiB and the unembed 221.3 MiB.
   - Quality: mean KLD 0.0475, top-1 agreement 94.66%.
-- **Current speed:** 47.7 ms/token (~21 tok/s) at short context, on a desktop with apps running.
+- **Current speed:** 46.8 ms/token (~21.4 tok/s) at short context, on a desktop with apps running.
 
 ## 3. How the runtime uses the quant
 
@@ -135,10 +135,28 @@ A reviewer re-derived the master spec's full 128K VRAM budget from the safetenso
 - **KV reference:** Q4 KV costs 8,704 B/token over the 8 full-attention passes. At 128K, reading the KV costs an estimated 5–10 ms per token on the 1060.
 - **Full derivation:** §2.5 of `opt/REVIEW_ARCH.md` in the Inkwell repo.
 
-## 7. What to send back
+## 7. A light drafter for speculative decoding (later)
+
+Inkwell plans speculative decoding with a small drafter later. The drafter's precision never reaches the output, because the verifier checks every drafted token against the full model's argmax. A lossy drafter only lowers the acceptance rate, so int8 weights and activations are allowed in it.
+
+- **Time budget.** One draft round of 2–3 tokens must cost ~1–3 ms on the 1060.
+  - Serial decode takes 46.8 ms/token.
+  - Verifying 3 rows costs an estimated 1.8–2.0 serial steps and emits ~2.1 tokens, which leaves little time for the drafter.
+  - Today's drafter, the checkpoint's 3-layer DSpark head in EXL3, takes 45–50 ms per round (measured).
+- **Drafts per round: 2–3.** With today's drafter, the first draft is accepted 75% of the time and each later one ~18%, so more drafts add little.
+- **Format the kernel expects (preliminary):**
+  - int8 weights, symmetric, with one scale per output row. Pascal has dp4a (int8×int8) and dp2a (int16×int8).
+  - Matrix dimensions that are multiples of 128.
+  - A reduced-vocabulary head over V′ tokens, plus a table of V′ uint32 ids into the full 200,058-token vocabulary.
+  - The drafter may read the target's hidden states. Today's head takes 4 taps of 2,304 floats per token.
+- **VRAM.** In today's layout, every drafter MiB comes out of the expert caches. The 128K plan has no room for a drafter (§6, condition 5). A 32K-token int8 head at hidden size 2,304 alone takes 72 MiB, so report the drafter's bytes.
+- An Inkwell agent is benchmarking the best drafter shape for this GPU. This section will get exact limits from that work.
+
+## 8. What to send back
 
 1. **A per-tensor table:** name, K and bytes. Include the per-layer totals for experts, split into loop and non-loop layers.
 2. **Quality:** mean KLD and top-1 agreement against the source checkpoint (float64 logits, full vocabulary), plus the same figures for the current 2.26 bpw quant measured with your harness.
 3. **The total file size** and the bytes of the 12 loop layers' experts, including suh/svh.
+4. **If you build a drafter:** its tensor shapes, dtypes and bytes, the vocabulary id table, and its acceptance rate against the target if you measured one.
 
 Inkwell will measure speed with its own A/B protocol: ≥8 interleaved pairs, generated-text checks, and the resident budget set through `INKWELL_DEV_EXPERT_MB`.
