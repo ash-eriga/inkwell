@@ -3674,9 +3674,9 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
             if (bj < 0) break;
             const int tv = st_tag[bj];
             for (int p = 0; p < 3; ++p) {
+                flhi = max(flhi, nfl + 1);
                 nfl = ks_free_w(st_flb, st_fln, nfl,
                                 st_sg[bj * 3 + p], gexp[tv * 3 + p]);
-                flhi = max(flhi, nfl);
             }
             if (lane == 0) st_tag[bj] = -1;
             __syncwarp();
@@ -3685,9 +3685,9 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
         if (v < 0 || ng < 3 || force_direct) {
             while (ng > 0) {
                 --ng;
+                flhi = max(flhi, nfl + 1);
                 nfl = ks_free_w(st_flb, st_fln, nfl, got[ng],
                                 gexp[st_ids[s] * 3 + ng]);
-                flhi = max(flhi, nfl);
             }
             if (lane == (s & 31)) map[s] = EXL3_DIRECT;
             continue;
