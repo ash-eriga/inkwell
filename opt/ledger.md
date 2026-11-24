@@ -266,3 +266,5 @@ native low-bit MMA.
 - Cache coverage: ALL 12 moe layers CACHED K=20 — no stage_p in serial path.
 - PLATEAU CONFIRMED at ~91-93ms (~10.8 TPS): moe_cb ~54ms + mz ~19ms +
   exl3_cb ~12ms are all bound by the same per-weight bit-window extract.
+- ctrl gain+forget weight concat at load (1 GEMV + slices): golden, ~neutral —
+  3x15us mmqs saved were already in noise. Kept (killswitch INKWELL_NOCTRLCAT).

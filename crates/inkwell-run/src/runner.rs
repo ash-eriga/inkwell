@@ -47,6 +47,8 @@ struct L {
     /// EXL3 MoE binding index (REXL3 only)
     moe_exl3: Option<usize>,
     msg_query: Option<Ptr>, ctrl_down: [Option<Ptr>; 4], ctrl_gain: [Option<Ptr>; 4], ctrl_forget: [Option<Ptr>; 4],
+    /// concat of same-type {ctrl_gain, ctrl_forget} (shared input) -> 1 GEMV + slices
+    ctrl_gf_cat: [Option<Ptr>; 4], ctrl_gf_off: [[i64; 2]; 4],
 }
 
 /// Everything the decode step needs.
@@ -854,6 +856,27 @@ impl Runner {
                     l.ctrl_forget[ci] = Some(dense!(&lp(il, &format!("controllers.{hn}.forget_weight"))));
                 }
             }
+            // concat same-type {ctrl_gain, ctrl_forget} -> one GEMV on shared input
+            for ci in 0..4 {
+                let (Some(gw), Some(fw)) = (l.ctrl_gain[ci], l.ctrl_forget[ci]) else { continue };
+                let (tg, tf) = unsafe { (inkwell_ggml::ink_tensor_type(gw.0), inkwell_ggml::ink_tensor_type(fw.0)) };
+                if tg != tf || std::env::var("INKWELL_NOCTRLCAT").is_ok() { continue }
+                let ng = unsafe { inkwell_ggml::ink_tensor_ne(gw.0, 1) };
+                let cat = t::new(rt.ctx(), tg as i32, &[unsafe { inkwell_ggml::ink_tensor_ne(gw.0, 0) }, ng + unsafe { inkwell_ggml::ink_tensor_ne(fw.0, 1) }]);
+                let o = (off_dev + 127) & !127;
+                dev_buf.assign(cat, o);
+                let mut boff = 0usize;
+                for src in [gw, fw] {
+                    let n = t::nbytes(src);
+                    let mut host = vec![0u8; n];
+                    unsafe { t::get(src, host.as_mut_ptr(), 0, n) };
+                    unsafe { t::set(cat, host.as_ptr(), boff, n) };
+                    boff += n;
+                }
+                l.ctrl_gf_cat[ci] = Some(cat);
+                l.ctrl_gf_off[ci] = [0, ng];
+                off_dev = o + t::nbytes(cat);
+            }
             // ---- experts: VRAM blob + 3 desc tables (pinned host staging) ----
             {
                 let pre = lp(il, "mlp.experts");
@@ -1247,8 +1270,16 @@ impl Runner {
         let c = self.cur_ctx;
         let gate = t::concat(c, t::rms_norm(c, cur, 1e-6), t::rms_norm(c, msg, 1e-6), 0);
         let gate = t::mmq(c, l.ctrl_down[ctrl].expect("ctrl_down"), gate);
-        let gain = t::tanh(c, t::mmq(c, l.ctrl_gain[ctrl].expect("ctrl_gain"), gate));
-        let forget = t::tanh(c, t::mmq(c, l.ctrl_forget[ctrl].expect("ctrl_forget"), gate));
+        let (gain, forget);
+        if let Some(cat) = l.ctrl_gf_cat[ctrl] {
+            let g3 = t::mmq(c, cat, gate);
+            let [go, fo] = l.ctrl_gf_off[ctrl];
+            gain = t::tanh(c, t::view1(c, g3, fo - go, go * 4));
+            forget = t::tanh(c, t::view1(c, g3, t::ne(cat, 1) - fo, fo * 4));
+        } else {
+            gain = t::tanh(c, t::mmq(c, l.ctrl_gain[ctrl].expect("ctrl_gain"), gate));
+            forget = t::tanh(c, t::mmq(c, l.ctrl_forget[ctrl].expect("ctrl_forget"), gate));
+        }
         t::add(c, t::sub(c, cur, t::mul(c, forget, cur)), t::mul(c, gain, msg))
     }
 
