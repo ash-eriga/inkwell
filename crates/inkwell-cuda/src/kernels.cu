@@ -3557,7 +3557,11 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
     if (pf)
         for (int s = lane; s < nslots; s += 32) st_ptag[s] = ptag[s];
     int nfl = fl[0];
-    for (int i = lane; i < 2 * KSLOT_FLMAX + 1; i += 32) st_fl[i] = fl[i];
+    int flhi = nfl;
+    for (int i = lane; i < nfl; i += 32) {
+        st_flb[i] = fl[1 + i];
+        st_fln[i] = fl[1 + KSLOT_FLMAX + i];
+    }
     __syncwarp();
 
     unsigned long long claimed = 0, missmask = 0;
@@ -3670,9 +3674,11 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
             }
             if (bj < 0) break;
             const int tv = st_tag[bj];
-            for (int p = 0; p < 3; ++p)
+            for (int p = 0; p < 3; ++p) {
                 nfl = ks_free_w(st_flb, st_fln, nfl,
                                 st_sg[bj * 3 + p], gexp[tv * 3 + p]);
+                flhi = max(flhi, nfl);
+            }
             if (lane == 0) st_tag[bj] = -1;
             __syncwarp();
             if (v < 0) v = bj;
@@ -3682,6 +3688,7 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
                 --ng;
                 nfl = ks_free_w(st_flb, st_fln, nfl, got[ng],
                                 gexp[st_ids[s] * 3 + ng]);
+                flhi = max(flhi, nfl);
             }
             if (lane == (s & 31)) map[s] = EXL3_DIRECT;
             continue;
@@ -3694,9 +3701,13 @@ __global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
         ++nreal;
         __syncwarp();
     }
-    // write state back: whole staged arrays (untouched entries are identical)
+    // write state back. Free-list entries at or beyond flhi were never
+    // touched, so leaving them in place preserves even the serial stale tail.
     for (int j = lane; j < kmax; j += 32) tag[j] = st_tag[j];
-    for (int i = lane; i < 2 * KSLOT_FLMAX + 1; i += 32) fl[i] = st_fl[i];
+    for (int i = lane; i < flhi; i += 32) {
+        fl[1 + i] = st_flb[i];
+        fl[1 + KSLOT_FLMAX + i] = st_fln[i];
+    }
     if (lane == 0) {
         fl[0] = nfl;
         if (hm) { atomicAdd(hm, nhits); atomicAdd(hm + 1, nslots - nhits); }
