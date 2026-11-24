@@ -106,6 +106,12 @@ Today Inkwell keeps 2.907 GiB of experts resident: loop layers first, layers 6�
 
 ### 5.3 For both layouts
 
+- **Prefer K = 2.0 for the bulk of the experts, and keep the number of distinct K values per layer small.** This finding is new; the kernel port is in progress.
+  - Inkwell's newer exact decode kernel is measured +14–16% faster on pure K=2.0 tiles. K=4.0 also gets the cheaper aligned-window path.
+  - On a mix of all 7 K values the gain falls to +3%. One MoE launch covers experts of several K, so it runs at the pace of the slowest K. K ∈ {2.5, 3.0, 3.5, 5.0} have no cheap paired-window path.
+  - Today the loop experts are spread over six K values: K1.5 21%, K2 22%, K2.5 27%, K3 19%, K3.5 8%, K4 3%. The non-loop experts are mostly K2 (61%) and K1.5 (33%).
+  - A 2.25 bpw loop built mostly from K=2.0 tiles, plus a few higher-K tiles where quality needs them, would suit the kernels best. Quality decides the final split.
+
 - **Quality cost (estimate).** Lowering the loop from 2.42 to ~2.2 bpw is expected to cost KLD +12–25% (0.0475 → ~0.053–0.060). This is extrapolated from exllamav3's KLD-vs-bpw slope. The loop layers run 3 times, so their error may weigh more. Measure it.
 - **Keep the 2.26 bpw SAGE quant for cards with 8–12 GB or more.** The low-bpw variant is for 6 GB cards.
 
