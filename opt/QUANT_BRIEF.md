@@ -153,11 +153,16 @@ Inkwell plans speculative decoding with a small drafter later. The drafter's pre
 - Today's checkpoint drafter (DSpark) has p1 ≈ 0.50–0.75 and q ≈ 0.18–0.46, depending on the prompt and the measurement.
 - **Train for p1 first.** With one draft per round, every +0.1 of p1 is worth ~+6–7% speed. A higher q pays only once p1 is above ~0.8.
 
-**Recommended shape (measured kernel cost, 29.9 MiB):** EAGLE-style, conditioned on the target's hidden states.
-- Input: 4 target taps of 2,304 floats (today's drafter reads layer visits 5, 23, 41 and 48 of 48), softmax-mixed, normalized and projected 2304 → D.
-- Body: 1 transformer layer, D = 1024, FF = 2816 (SwiGLU), 16 query heads and 4 KV heads of 64, sliding window 128.
-- Head: V′ = 32,768 tokens, tied with the input embedding.
-- A 2-layer body costs +0.1 ms per draft and 40.7 MiB, if acceptance needs it.
+**Shape: surgery on today's DSpark drafter, then a distillation finetune (owner's plan).** No pretraining.
+- Keep the width at D = 2304, so DSpark's weights still fit. Cut 3 layers to 1 and prune the FF from 9216 to 4608.
+- Draft 1 token per round (k = 1). Keep 1 mask row instead of 7.
+- Head: 32K rows taken from the target's own unembed.
+- Measured kernel cost: 0.55 ms per round, 81.6 MiB. Modeled gain at p1 = 0.75: about +11%.
+- Finetune data: run the target in prefill mode (teacher forcing) over text, record the 4 taps and the target's argmax at every position, and train the drafter to predict that argmax.
+- Report p1 on held-out text before and after the finetune. Below ~0.6 the drafter does not pay.
+- A drafter trained from scratch at D = 1024 would cost 0.24 ms and 29.9 MiB (about +13%). It is the fallback if surgery cannot reach the p1 target.
+
+**Read the drafter study's "100%" figures correctly.** In `REPORT.md` §5, "100% d1" means the quantized drafter picked the same token as the fp32 drafter in 12 of 12 rounds. It is not acceptance by the target. In the same test the target accepted 6 of 12 first drafts (50%).
 
 **Format the kernel expects (measured):**
 - Every linear matrix is row-major [N_out, K_in], with K_in and N_out multiples of 128.
@@ -165,7 +170,7 @@ Inkwell plans speculative decoding with a small drafter later. The drafter's pre
 - Head: int4 with one F16 scale per group of 128 inputs (`lm_head.weight_i4` U8 [V′, D/2], `lm_head.scale` F16 [V′, D/128]), or int8 per row like the body. **Do not use int4 with one scale per row:** first-draft agreement with the fp drafter fell to 58–67%, against 100% for group-128.
 - Vocabulary: `vocab_ids` U32 [V′] maps head rows to target ids, and `inv_vocab_ids` I32 [200,058] maps back (−1 when out of set). Pin the 256 byte tokens and EOS (200006), then rank by corpus frequency. V′ = 32K covers 94.8% of the tokens the target actually generates; 16K covers 86.7%.
 - Norms and biases: F32.
-- The full tensor list and nibble packing are in `opt/kbench/drafter/REPORT.md` §7 of the Inkwell repo.
+- The full tensor list and nibble packing are in the drafter study, `opt/kbench/drafter/REPORT.md` §7, sent with this brief.
 
 **VRAM.** In today's layout, every drafter MiB comes out of the expert caches. The 128K plan has no room for a drafter (§6, condition 5).
 
