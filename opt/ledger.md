@@ -1069,3 +1069,4 @@ Commits: see HEAD. Killswitch `INKWELL_NO_CACHEL=1` (uniform ck sizing);
 - The child's multi-block mix profiled without `--cuda-graph-trace=node` and saw 240 launches instead of 8,160; with node trace it was slower (2.66 → 3.11 ms/tok).
 - Rewrite: one warp per (column, query) with the lane's 72 values preloaded into registers (156 regs, 0 spills) and post loads batched 8 rows at a time; same op order. nsys (node trace, 68 steps): mix 2.75 → 1.45 ms/tok, had_in 1.18 → 0.60 ms/tok. md5 5cbe8e06.
 - 16-pair A/B: ctl 48.38, mx 47.98 (−0.40), 11/16, with runs spread 43–67 ms (4 agents active, zram swapping). Not accepted yet; re-run on a quieter box.
+- Re-run on master 3ad8488 (cache sizing in): ctl 45.37, mx 44.07 (**−1.31 ms**), 11/16 again; one 59.7 ms outlier. Pooled 22/32, under the 24/32 bar. Kept on the branch; re-run when fewer agents share the box.
