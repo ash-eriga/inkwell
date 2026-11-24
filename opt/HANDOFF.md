@@ -628,3 +628,23 @@ verify (~140ms/tok floor — still loses), (c) call spec done mechanically.
   (dependent-chain latency, not instr count — uint4 only bought ~5%).
 - Also unexplained: err=900 flaky crashes ONLY under MNTOK_DBG=6 runs
   (event timing?). Non-dbg runs stable. Watch when instrumenting.
+
+## ★ RESUME AQUI (HEAD pós-696e9b7) — devin 2026-11-23 noite
+
+**Estado**: spec ~4.6-4.7 tok/s vs serial ~88ms/tok (~11.3 TPS). Saída correta.
+HEAD inclui: v2 gemv consertado (funnelshift arg order + xbase do batch),
+INKWELL_MOE_V2=1 liga gemv_moe_n no verify (verify ~420-500ms, era 540-650),
+kd adaptativo implementado (MK_CUM_TH=0.4, pads vtok>kd com anchor).
+
+**Bug v2 resolvido**: `__funnelshift_l(lo,hi,s)` recebe a palavra BAIXA primeiro —
+estava `funnelshift_l(ring[m0], ring[m1])` invertido → `funnelshift_l(ring[m1], ring[m0])`.
+E `batch_full/tail` não passavam `bi*TB*16` de xbase. Denso 0 erros; union MoE = ruído
+fp32 de reordenação (max abs 1.9e-4 em |sum|~65) — bench gate 2e-5 era apertado demais.
+
+**Bloqueio decisivo = emit ~2.5** (aceit P: 47/25/16/9%). Mesmo verify ~300ms + emit 4 → ~80ms/tok.
+Emit baixo é qualidade real do drafter (validado vs oracle + draft.py ref de megakernel-zoo).
+
+**Próximo**: bound real da união — passar nslots=kp*8 pro union_expand (kernel param +
+runner state campo spec_kp antes de step_block). Cap accept loop em n<kp-1 (emit≤kp).
+Padding-anchor atual não evita router adicionar experts pras linhas padronizadas.
+Bench: `bash opt/kbench/build.sh gemv_v2_bench && ./opt/kbench/gemv_v2_bench opt/kbench/ids_block.bin 2`.

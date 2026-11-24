@@ -459,6 +459,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         let t2 = Instant::now();
         while spec_ids.len() < target {
             let tv = Instant::now();
+            inkwell_run::moe::SPEC_NSLOTS.store((kp * 8) as i32, std::sync::atomic::Ordering::Relaxed);
             let vl = r.step_block(&vtok, c);
             let ms = tv.elapsed().as_secs_f64() * 1e3;
             let nv = vl.len() / 8;
@@ -473,7 +474,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
             let mut n = 0;
             let mut emitted: Vec<u32> = Vec::with_capacity(8);
             if std::env::var_os("INKWELL_SPEC_PROB").is_some() {
-                for j in 0..7 {
+                for j in 0..kp - 1 {
                     let d = vtok[j + 1] as usize;
                     let vrow = &vl[j * nv..(j + 1) * nv];
                     let pt = softmax_prob(vrow, d);
@@ -492,9 +493,9 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
                         break;
                     }
                 }
-                if n == 7 { emitted.push(verify[7]); }
+                if n == kp - 1 { emitted.push(verify[kp - 1]); }
             } else {
-                while n < 7 && vtok[n + 1] == verify[n] { n += 1; }
+                while n < kp - 1 && vtok[n + 1] == verify[n] { n += 1; }
                 emitted.extend_from_slice(&verify[..n + 1]);
             }
             let ne = emitted.len();

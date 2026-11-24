@@ -506,6 +506,9 @@ fn vscratch() -> &'static VScratch {
 /// Union-batched MoE callback for the 8-token verify block.
 /// src = [x8 (n_embd×8 f32), ids8 (8×8 i32), w8 (8×8 f32)]; dst = [n_embd, 8].
 #[expect(clippy::cast_ptr_alignment, clippy::too_many_lines, reason = "custom op")]
+/// Verify-length bound for the union expand (kp*8 slots); 64 = full block.
+pub static SPEC_NSLOTS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(64);
+
 unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mut c_void) {
     let a = unsafe { &*ud.cast::<MoeArgsExl3>() };
     let st = staging();
@@ -549,7 +552,8 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
             st.sdescs_g.lock().expect("sg").dev_ptr(),
             st.sdescs_u.lock().expect("su").dev_ptr(),
             st.sdescs_d.lock().expect("sd").dev_ptr(),
-            a.on_dev, key_base);
+            a.on_dev, key_base,
+            SPEC_NSLOTS.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
 

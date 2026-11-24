@@ -2655,6 +2655,7 @@ extern "C" void ink_launch_conv_step(const float* x_in, float* state, int region
 // once for all its consumer tokens (LFM-style weight sharing for MoE).
 __global__ void inkwell_exl3_union_expand(
     const int* __restrict__ ids8,          // [64] token-major: ids8[t*8+j]
+    int nslots,                            // bound on populated slots (kp*8 spec)
     int* __restrict__ uids,                // [64] unique expert ids
     int* __restrict__ pnexp,               // [1]
     int* __restrict__ eids,                // [64] expert id per expanded slot
@@ -2669,7 +2670,7 @@ __global__ void inkwell_exl3_union_expand(
     __shared__ int sh_cnt[128], sh_start[128], sh_uidx[128];
     const int e = threadIdx.x;
     int cnt = 0;
-    for (int s = 0; s < 64; ++s) cnt += (ids8[s] == e);
+    for (int s = 0; s < nslots; ++s) cnt += (ids8[s] == e);
     sh_cnt[e] = cnt;
     __syncthreads();
     if (e == 0) {
@@ -2687,14 +2688,14 @@ __global__ void inkwell_exl3_union_expand(
                 ++nu; off += take; c -= take;
             }
         }
-        for (int i = nu; i <= 64; ++i) estart[i] = 64;
+        for (int i = nu; i <= 64; ++i) estart[i] = off;
         for (int i = nu; i < 64; ++i) { eids[i] = 0; euni[i] = 0; etok[i] = 0; }
         *pnexp = nu;
     }
     __syncthreads();
     if (cnt) {
         int p = sh_start[e];
-        for (int s = 0; s < 64; ++s) {
+        for (int s = 0; s < nslots; ++s) {
             if (ids8[s] == e) {
                 eids[p] = e; euni[p] = sh_uidx[e] + (p - sh_start[e]) / 8; etok[p] = s >> 3; epos[s] = p;
                 ++p;
@@ -2908,17 +2909,18 @@ extern "C" void ink_launch_exl3_moe_ntok(
     int* uids, int* eids, int* euni, int* etok, int* estart, int* epos, int* unexp,
     void* cache, int* tag, int* map, int* miss, int* cnt, int k, int64_t slot_proj,
     void* sdescs_g, void* sdescs_u, void* sdescs_d,
-    int on_dev, void* stream, int key_base) {
+    int on_dev, void* stream, int key_base, int nslots) {
     const cudaStream_t st = (cudaStream_t)stream;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     const bool cached = cache != nullptr;
+    if (nslots <= 0) nslots = 64;
     if (cached) {
-        inkwell_exl3_union_expand<<<1, 128, 0, st>>>(ids8, uids, unexp,
+        inkwell_exl3_union_expand<<<1, 128, 0, st>>>(ids8, nslots, uids, unexp,
             eids, euni, etok, estart, epos, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr);
     } else {
         // uncached/on_dev: write per-expert-id desc tables directly (no staging)
-        inkwell_exl3_union_expand<<<1, 128, 0, st>>>(ids8, uids, unexp,
+        inkwell_exl3_union_expand<<<1, 128, 0, st>>>(ids8, nslots, uids, unexp,
             eids, euni, etok, estart, epos,
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
