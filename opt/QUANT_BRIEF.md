@@ -9,7 +9,7 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 3. **The master spec's 128K plan fits on paper, with 5–25 MiB to spare.** Its expert layout is "loop layers resident, other layers streamed every token" (§6). Under that plan:
    - the loop-layer bpw decides whether the plan fits at all;
    - the non-loop expert bpw sets the PCIe bytes per token (~1.1 ms per 0.1 bpw).
-4. **Keep the experts within one layer at one K, or at as few K values as possible.** Section 3.4 explains why.
+4. **Prefer K = 2.0 for the bulk of the experts, and use as few distinct K values per layer as possible.** The decode kernels are fastest on K=2.0 and slowed by mixed-K launches (§5.3).
 5. **Report quality the same way as the current quant:** mean KLD and top-1 agreement against the source, using float64 logits over the full vocabulary.
 
 ## 2. What Inkwell is
@@ -41,7 +41,7 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 The runtime splits a fixed VRAM budget for experts as follows:
 
 1. **Resident layers.** All 128 experts of the layer stay in VRAM. Layers are chosen by visits per byte, so loop layers come first. Today layers 6–15 are resident, within a budget of 3,121,348,608 B (2.907 GiB). That budget is tuned to the current quant.
-2. **Cached layers.** Every other layer gets an LFU cache of k = 20 expert slots in VRAM. That covers 14 layers today, ~811 MiB in total.
+2. **Cached layers.** Every other layer gets an LFU expert cache in VRAM, sized at 20 of the layer's largest expert. That covers 14 layers today, ~811 MiB in total. Slots are packed by each expert's actual size, so smaller experts fit more of them.
 3. **Misses.** An expert that is neither resident nor cached is copied from pinned host memory over PCIe during the token.
    - Today's miss rate is 18.6%, which is ~83 MiB copied per token.
    - The copies take 9.84 ms of GPU time per token. How much of that delays the token is being measured now.
@@ -56,11 +56,13 @@ The runtime splits a fixed VRAM budget for experts as follows:
 - **k = 28 caches OOM, and k = 24 sits at the edge.**
 - **Pinning all 12 loop layers at today's quant was slower.** It left room for only 6 caches and ran at 62.64 ms/token, against 57.85 ms with the default placement (+8%). The loop layers have to get smaller before pinning them pays off.
 
-### 3.4 Why one K per layer matters (today)
+### 3.4 Cache slots follow expert size
 
-- Each cached layer's slots are all the size of the largest expert in that layer.
-- Over the 14 cached layers, the sum of the per-layer maximum K is 42.5, while the sum of the mean K is 28.3. Mixed K inside a layer therefore wastes ~1/3 of cache VRAM.
-- An Inkwell change that sizes slots per K class is being built now. Until it lands, mixing K within a layer's experts costs speed.
+- Since 2026-11-24, cache slots are allocated by each expert's actual size; before, every slot was the size of the layer's largest expert.
+  - The hit rate rose from 66% to 74% in the same VRAM.
+  - Decode got 2.3% faster.
+- Mixing K inside a layer no longer wastes cache VRAM. It still slows the decode kernels (§5.3).
+- Staging misses still cost ~8.8 ms per token on the critical path (measured by skipping the copies). Every byte cut from non-resident experts helps.
 
 ## 4. Why not an int8-optimized codebook (TQIR-INT8 / CPTC-INT8)
 
@@ -102,7 +104,6 @@ Today Inkwell keeps 2.907 GiB of experts resident: loop layers first, layers 6�
 
 - To fit all 12 loop layers within 2.907 GiB and keep the 14 caches, the loop needs ≈2.0 bpw including suh/svh (≈1.9 bpw trellis). This is an estimate, scaled from 3.441 GiB at 2.42 bpw.
 - At 2.2–2.25 bpw the loop fits, but the extra ~0.2–0.3 GiB comes out of the caches, about 3–5 of them.
-- Use a uniform K per layer for the non-loop experts, so cache slots are not wasted (§3.4).
 
 ### 5.3 For both layouts
 
