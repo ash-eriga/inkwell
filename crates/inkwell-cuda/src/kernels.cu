@@ -3185,7 +3185,7 @@ __global__ void inkwell_had_out_wsum_moe(const uint64_t* __restrict__ descs_d,
 
 static inline bool ink_no_hadvec() {
     static int v = -1;
-    if (v < 0) v = getenv("INKWELL_NO_HADVEC") ? 1 : 0;
+    if (v < 0) v = (getenv("INKWELL_HADVEC") && !getenv("INKWELL_NO_HADVEC")) ? 0 : 1;
     return v != 0;
 }
 
