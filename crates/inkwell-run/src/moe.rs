@@ -275,17 +275,74 @@ pub fn moe_cb_addr() -> usize {
     moe_cb as usize
 }
 
-/// Per-expert EXL3 descriptor tables for one layer visit: pinned u64[128][4]
-/// `{trellis_ptr, suh_ptr, svh_ptr, ka | halfk<<8}` — kernels read the desc
-/// then stream the trellis over PCIe zero-copy.
+/// One EXL3 descriptor table (`u64[128][4]`). Default: device memory, so
+/// resident-layer MoE kernels do not stall on uncached PCIe zero-copy reads;
+/// `INKWELL_NO_DEVDESC=1` restores the old pinned host-mapped table.
+#[derive(Debug)]
+pub enum DescTable {
+    /// Old zero-copy host-mapped table.
+    Pinned(cu::PinnedBuf),
+    /// Device-resident copy of the immutable table.
+    Device(cu::DevBuf),
+}
+
+impl DescTable {
+    /// Build a table from its little-endian byte image.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        if std::env::var_os("INKWELL_NO_DEVDESC").is_some() {
+            let pb = cu::host_alloc_mapped(bytes.len());
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pb.host, bytes.len()) };
+            Self::Pinned(pb)
+        } else {
+            let mut db = cu::DevBuf::new_bytes(bytes.len());
+            db.write_bytes(bytes);
+            Self::Device(db)
+        }
+    }
+
+    /// Device-accessible pointer passed to the MoE kernels.
+    #[must_use]
+    pub fn dev(&self) -> *const c_void {
+        match self {
+            Self::Pinned(pb) => pb.dev.cast_const(),
+            Self::Device(db) => db.dev_ptr().cast_const(),
+        }
+    }
+}
+
+/// True when all expert descriptors satisfy the exl3-v2 kernel's window
+/// layout requirements. Mirrors `exl3v2::{words_of,pairable_ka}`; immutable
+/// at load, so the launchers never dereference descriptor tables on the host.
+#[must_use]
+pub fn exl3_descs_v2_ok(descs: &[u64]) -> bool {
+    fn words_of(ka: u64, halfk: u64) -> u64 {
+        (if halfk != 0 { 256 * ka + 128 } else { 256 * ka }) / 32
+    }
+    fn pairable_ka(ka: u64, halfk: u64) -> bool {
+        3 * ka + halfk + 16 <= 32 && words_of(ka, halfk) % 4 == 0
+    }
+    (0..3).all(|pi| (0..128).all(|e| {
+        let d = descs[pi * 512 + e * 4 + 3];
+        let (ka, halfk) = (d & 0xff, (d >> 8) & 1);
+        words_of(ka, halfk) <= 32 && pairable_ka(ka, halfk)
+    }))
+}
+
+/// Per-expert EXL3 descriptor tables for one layer visit:
+/// `{trellis_ptr, suh_ptr, svh_ptr, ka | halfk<<8}`. The descriptor memory is
+/// device-resident by default; the expert blobs it points to may still be
+/// host-mapped on non-resident layers.
 #[derive(Debug)]
 pub struct MoeArgsExl3 {
     /// gate_proj descriptors
-    pub descs_g: cu::PinnedBuf,
+    pub descs_g: DescTable,
     /// up_proj descriptors
-    pub descs_u: cu::PinnedBuf,
+    pub descs_u: DescTable,
     /// down_proj descriptors
-    pub descs_d: cu::PinnedBuf,
+    pub descs_d: DescTable,
+    /// all experts satisfy the v2 window-layout requirements
+    pub v2_descs_ok: bool,
     /// descriptors already point into device memory — staging is a no-op
     pub on_dev: bool,
     /// per-layer VRAM cache of staged expert blobs (pinned layers only)
@@ -448,7 +505,7 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
             if let Some(pf) = &c.prefetch {
                 cu::memcpy_ids8_async(pf.hist.dev_ptr(), ids_dev.cast());
             }
-            cu::exl3_moe_cached_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
+            cu::exl3_moe_cached_async(a.descs_g.dev(), a.descs_u.dev(), a.descs_d.dev(), ids_dev,
                 x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
                 dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),
                 N_SLOTS as i32,
@@ -459,6 +516,7 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
                 st.sdescs_g.lock().expect("sg").dev_ptr(),
                 st.sdescs_u.lock().expect("su").dev_ptr(),
                 st.sdescs_d.lock().expect("sd").dev_ptr(),
+                a.v2_descs_ok,
                 c.prefetch.as_ref().map_or(std::ptr::null(), |p| p.ptag.dev_ptr().cast()),
                 c.prefetch.as_ref().map_or(std::ptr::null(), |p| p.pready.dev_ptr().cast()),
                 c.prefetch.as_ref().map_or(std::ptr::null_mut(), |p| p.bank.dev_ptr()),
@@ -469,7 +527,7 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
                 c.fl.as_ref().map_or(std::ptr::null_mut(), |b| b.dev_ptr().cast()));
         } else {
             if std::env::var_os("INKWELL_MOE_IDLOG").is_some() { moe_idlog(ids_dev, a.layer); }
-            cu::exl3_moe_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
+            cu::exl3_moe_async(a.descs_g.dev(), a.descs_u.dev(), a.descs_d.dev(), ids_dev,
                 x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
                 dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),
                 N_SLOTS as i32,
@@ -477,7 +535,7 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
                 st.sdescs_g.lock().expect("sg").dev_ptr(),
                 st.sdescs_u.lock().expect("su").dev_ptr(),
                 st.sdescs_d.lock().expect("sd").dev_ptr(),
-                a.on_dev);
+                a.on_dev, a.v2_descs_ok);
         }
     }
 }
@@ -582,7 +640,7 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
             (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0, 0, 0,
              std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut())
         };
-        cu::exl3_moe_ntok_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev,
+        cu::exl3_moe_ntok_async(a.descs_g.dev(), a.descs_u.dev(), a.descs_d.dev(),
             x8, ids8, w8, out8,
             v.xh_e.lock().expect("x").dev_ptr().cast(),
             v.gu_e.lock().expect("g").dev_ptr().cast(),
@@ -602,7 +660,7 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
             st.sdescs_g.lock().expect("sg").dev_ptr(),
             st.sdescs_u.lock().expect("su").dev_ptr(),
             st.sdescs_d.lock().expect("sd").dev_ptr(),
-            a.on_dev, key_base,
+            a.on_dev, a.v2_descs_ok, key_base,
             SPEC_NSLOTS.load(std::sync::atomic::Ordering::Relaxed), hm, gexp, soff, fl);
     }
 }

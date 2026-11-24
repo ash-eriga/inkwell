@@ -1131,15 +1131,16 @@ impl Runner {
                 for d in descs.chunks_exact_mut(4) {
                     d[0] += base; d[1] += base; d[2] += base;
                 }
+                let v2_descs_ok = crate::moe::exl3_descs_v2_ok(&descs);
                 let mk = |pi: usize| {
-                    let pb = inkwell_cuda::host_alloc_mapped(128 * 32);
-                    unsafe { std::ptr::copy_nonoverlapping(descs[pi * 512..].as_ptr().cast::<u8>(), pb.host, 128 * 32) };
-                    pb
+                    crate::moe::DescTable::from_bytes(unsafe {
+                        std::slice::from_raw_parts(descs[pi * 512..].as_ptr().cast::<u8>(), 128 * 32)
+                    })
                 };
                 l.moe_exl3 = Some(moe_args_exl3.len());
                 moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
-                    on_dev, cache: None, max_slot,
+                    v2_descs_ok, on_dev, cache: None, max_slot,
                     layer: moe_args_exl3.len() as i32,
                 }));
             }
@@ -2155,7 +2156,7 @@ impl Runner {
             let Some(pf) = &mut c.prefetch else { continue };
             unsafe {
                 inkwell_cuda::exl3_prefetch2_async(
-                    a.descs_g.dev, a.descs_u.dev, a.descs_d.dev,
+                    a.descs_g.dev(), a.descs_u.dev(), a.descs_d.dev(),
                     pf.hist.dev_ptr().cast(), c.tag.dev_ptr().cast(),
                     pf.bank.dev_ptr(), pf.ptag.dev_ptr().cast(),
                     pf.pready.dev_ptr().cast(), pf.pf_map.dev_ptr().cast(),

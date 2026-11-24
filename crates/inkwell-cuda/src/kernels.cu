@@ -3507,7 +3507,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
                                     float* xh, float* gu, float* hid, float* dn,
                                     const float* w, float* out, int nslots, void* stream,
                                     void* staging, void* sdescs_g, void* sdescs_u, void* sdescs_d,
-                                    int on_dev) {
+                                    int on_dev, int v2_descs_ok) {
     const cudaStream_t st = (cudaStream_t)stream;
     static cudaStream_t st2 = nullptr;
     static cudaEvent_t ev_ids = nullptr, ev_dstg = nullptr;
@@ -3542,18 +3542,9 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     const bool sg = !no_sgemv;                  // stream-decode gemv replaces v1+v2 serial
     static int v2_env = -1;
     if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
-    int v2_ok = !sg && (v2_env > 0) && nky == 1;
-    if (v2_ok) {
-        const void* dd[3] = {descs_g, descs_u, descs_d};
-        for (int pi = 0; pi < 3 && v2_ok; ++pi) {
-            const uint64_t* dt = (const uint64_t*)dd[pi];
-            for (int e = 0; e < 128; ++e) {
-                const int ka = (int)(dt[e * 4 + 3] & 0xff);
-                const int hf = (int)((dt[e * 4 + 3] >> 8) & 1);
-                if (exl3v2::words_of(ka, hf) > 32 || !exl3v2::pairable_ka(ka, hf)) { v2_ok = 0; break; }
-            }
-        }
-    }
+    // Descriptor eligibility is immutable and was scanned on the host at load;
+    // the tables themselves may be device-resident and are never dereferenced here.
+    int v2_ok = !sg && (v2_env > 0) && nky == 1 && v2_descs_ok;
     static int* e8 = nullptr;
     if (v2_ok && !e8) {
         cudaMalloc(&e8, 65 * 4);
@@ -3615,7 +3606,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                     void* cache, void* tag, void* map, void* miss, void* cnt, int k,
                                     int64_t slot_proj,
                                     void* sdescs_g, void* sdescs_u, void* sdescs_d,
-                                    const void* ptag, const void* pready, void* bank, int* pf_hit,
+                                    int v2_descs_ok, const void* ptag, const void* pready, void* bank, int* pf_hit,
                                     int* hm, const int* gexp, uint64_t* soff, int* fl) {
     const cudaStream_t st = (cudaStream_t)stream;
     // INKWELL_SKIP_CCOPY=1 (timing debug): ccopy writes slot metadata but
@@ -3670,18 +3661,9 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const bool sg = !no_sgemv;                  // stream-decode gemv replaces v1+v2 serial
     static int v2_env = -1;
     if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
-    int v2_ok = !sg && (v2_env > 0) && nky == 1;
-    if (v2_ok) {
-        const void* dd[3] = {descs_g, descs_u, descs_d};
-        for (int pi = 0; pi < 3 && v2_ok; ++pi) {
-            const uint64_t* dt = (const uint64_t*)dd[pi];
-            for (int e = 0; e < 128; ++e) {
-                const int ka = (int)(dt[e * 4 + 3] & 0xff);
-                const int hf = (int)((dt[e * 4 + 3] >> 8) & 1);
-                if (exl3v2::words_of(ka, hf) > 32 || !exl3v2::pairable_ka(ka, hf)) { v2_ok = 0; break; }
-            }
-        }
-    }
+    // Descriptor eligibility is immutable and was scanned on the host at load;
+    // the tables themselves may be device-resident and are never dereferenced here.
+    int v2_ok = !sg && (v2_env > 0) && nky == 1 && v2_descs_ok;
     static int* e8 = nullptr;
     if (v2_ok && !e8) {
         cudaMalloc(&e8, 65 * 4);
@@ -4072,7 +4054,7 @@ extern "C" void ink_launch_exl3_moe_ntok(
     int* uids, int* eids, int* euni, int* etok, int* estart, int* epos, int* unexp,
     void* cache, int* tag, int* map, int* miss, int* cnt, int k, int64_t slot_proj,
     void* sdescs_g, void* sdescs_u, void* sdescs_d,
-    int on_dev, void* stream, int key_base, int nslots, int* hm,
+    int on_dev, int v2_descs_ok, void* stream, int key_base, int nslots, int* hm,
     const int* gexp, uint64_t* soff, int* fl) {
     const cudaStream_t st = (cudaStream_t)stream;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
@@ -4104,21 +4086,11 @@ extern "C" void ink_launch_exl3_moe_ntok(
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
     // v2 kernel: ka <= 4 (WM=32) and pairable window layout, all experts.
-    // desc tables are pinned host memory -- scan once per call (~12KB).
     static int v2_env = -1;
     if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
-    int v2_ok = (v2_env > 0) && nky == 1;
-    if (v2_ok) {
-        const void* dd[3] = {descs_g, descs_u, descs_d};
-        for (int pi = 0; pi < 3 && v2_ok; ++pi) {
-            const uint64_t* dt = (const uint64_t*)dd[pi];
-            for (int e = 0; e < 128; ++e) {
-                const int ka = (int)(dt[e * 4 + 3] & 0xff);
-                const int hf = (int)((dt[e * 4 + 3] >> 8) & 1);
-                if (exl3v2::words_of(ka, hf) > 32 || !exl3v2::pairable_ka(ka, hf)) { v2_ok = 0; break; }
-            }
-        }
-    }
+    // Descriptor eligibility is immutable and was scanned on the host at load;
+    // the tables themselves may be device-resident and are never dereferenced here.
+    int v2_ok = (v2_env > 0) && nky == 1 && v2_descs_ok;
 
     const uint64_t* G = (const uint64_t*)sdescs_g;
     const uint64_t* U = (const uint64_t*)sdescs_u;
