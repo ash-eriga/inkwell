@@ -5396,7 +5396,7 @@ extern "C" void ink_launch_rms2down(const float* x0, const float* x1,
         const void* w, int w_is_bf16, float* dst, int n, int nrows,
         float eps, void* stream) {
     static int no_ctrlbatch = -1;
-    if (no_ctrlbatch < 0) no_ctrlbatch = getenv("INKWELL_NO_CTRLBATCH") ? 1 : 0;
+    if (no_ctrlbatch < 0) no_ctrlbatch = (getenv("INKWELL_CTRLBATCH") && !getenv("INKWELL_NO_CTRLBATCH")) ? 0 : 1;
     if (w_is_bf16 && !no_ctrlbatch && n == 2304 && nrows % 4 == 0) {
         InkCtrlRmsPtrs ps{};
         ps.x0[0] = x0;
