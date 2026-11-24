@@ -1189,3 +1189,10 @@ verdict: ACCEPTED (commit 700aecd)
 Remaining boundary budget after this fix (est): event wake + ids write +
 embd dequant (~20us) + 2x HtoD issue + prefetch + graph-key hash + ~6
 chunk launches + argmax tail ~35us = ~0.15-0.25ms/tok, down from ~1.0-1.4.
+
+## 2026-11-24 — host-latency pass (step_id) accepted on master
+
+Brain re-A/B on master 3f60c55 (16 pairs, ctl = `INKWELL_NO_GARGMAX=1 INKWELL_NO_ASYNCSTEP=1 INKWELL_STEPDBG=1`):
+ctl median 45.22, cand 43.16 ms/tok, **−2.06 ms, 12/16** pair wins, md5 5cbe8e06 on all 32 runs.
+Fast-forwarded master to `t3/host-latency-token-critical-path` (61ab1dc + ledger). Killswitches
+`INKWELL_NO_GARGMAX`, `INKWELL_NO_ASYNCSTEP`; per-token prints now behind `INKWELL_STEPDBG`.
