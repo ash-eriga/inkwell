@@ -1,6 +1,6 @@
-# Quantization brief for Inkling-2-Mini on Inkwell (GTX 1060 6 GB)
+# Inkling-2-Mini on Inkwell (GTX 1060 6 GB): quantization and drafter brief
 
-This document is self-contained. It tells the quantization agent what the Inkwell runtime needs from a new quant and what measurements say about bits per weight. Every number comes from a measurement in the Inkwell repo (`opt/ledger.md`, `opt/THEORY.md`, `opt/REVIEW_ARCH.md`) unless it is marked as an estimate.
+This document is self-contained. It tells the quantization agent what the Inkwell runtime needs from a new quant and from a speculative drafter. Every number comes from a measurement in the Inkwell repo unless it is marked as an estimate or modeled.
 
 ## 1. The bottom line
 
@@ -9,8 +9,10 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 3. **The master spec's 128K plan fits on paper, with 5–25 MiB to spare.** Its expert layout is "loop layers resident, other layers streamed every token" (§6). Under that plan:
    - the loop-layer bpw decides whether the plan fits at all;
    - the non-loop expert bpw sets the PCIe bytes per token (~1.1 ms per 0.1 bpw).
-4. **Prefer K = 2.0 for the bulk of the experts, and use as few distinct K values per layer as possible.** The decode kernels are fastest on K=2.0 and slowed by mixed-K launches (§5.3).
+4. **Bytes matter more than the choice of K.** Where quality allows a choice, K 2.0, 3.0 and 4.0 get Inkwell's faster decode core; 1.5, 2.5, 3.5 and 5.0 do not (§5.3). The gain is small.
 5. **Report quality the same way as the current quant:** mean KLD and top-1 agreement against the source, using float64 logits over the full vocabulary.
+6. **For the drafter, acceptance decides the gain, not drafter speed.** Inkwell's drafter kernels already run a round in 0.24–0.68 ms. The first-draft acceptance p1 must reach ~0.75 for a +17% gain; at 0.5 speculation only breaks even (§7).
+7. **Build the drafter by surgery on today's DSpark head plus a distillation finetune, with no pretraining** (§7). Use the file format in §9.
 
 ## 2. What Inkwell is
 
@@ -42,12 +44,11 @@ The runtime splits a fixed VRAM budget for experts as follows:
 
 1. **Resident layers.** All 128 experts of the layer stay in VRAM. Layers are chosen by visits per byte, so loop layers come first. Today layers 6–15 are resident, within a budget of 3,121,348,608 B (2.907 GiB). That budget is tuned to the current quant.
 2. **Cached layers.** Every other layer gets an LFU expert cache in VRAM, sized at 20 of the layer's largest expert. That covers 14 layers today, ~811 MiB in total. Slots are packed by each expert's actual size, so smaller experts fit more of them.
-3. **Misses.** An expert that is neither resident nor cached is copied from pinned host memory over PCIe during the token.
-   - Today's miss rate is 18.6%, which is ~83 MiB copied per token.
-   - The copies take 9.84 ms of GPU time per token. How much of that delays the token is being measured now.
+3. **Misses.** An expert that is neither resident nor cached is copied from pinned host memory over PCIe during the token. The caches hit 73.9% of selections, which leaves ~37.6 misses and ~64 MiB copied per token.
 
 ### 3.3 Measured VRAM limits
 
+- **The process cap is 5,120 MiB.** The owner keeps the display reserve as a hard safety margin. The best config peaks at 5,010 MiB.
 - **Free VRAM after load:** 150–435 MiB.
 - **OOM thresholds observed** (re-checked against the logs):
   - a crash in `cudaGraphInstantiate` with ~96 MiB free;
@@ -61,7 +62,7 @@ The runtime splits a fixed VRAM budget for experts as follows:
 - Since 2026-11-24, cache slots are allocated by each expert's actual size; before, every slot was the size of the layer's largest expert.
   - The hit rate rose from 66% to 74% in the same VRAM.
   - Decode got 2.3% faster.
-- Mixing K inside a layer no longer wastes cache VRAM. It still slows the decode kernels (§5.3).
+- Mixing K inside a layer no longer wastes cache VRAM.
 - Staging misses still cost ~8.8 ms per token on the critical path (measured by skipping the copies). Every byte cut from non-resident experts helps.
 
 ## 4. Why not an int8-optimized codebook (TQIR-INT8 / CPTC-INT8)
@@ -107,11 +108,16 @@ Today Inkwell keeps 2.907 GiB of experts resident: loop layers first, layers 6�
 
 ### 5.3 For both layouts
 
-- **Prefer K = 2.0 for the bulk of the experts, and keep the number of distinct K values per layer small.** This finding is new; the kernel port is in progress.
-  - Inkwell's newer exact decode kernel is measured +14–16% faster on pure K=2.0 tiles. K=4.0 also gets the cheaper aligned-window path.
-  - On a mix of all 7 K values the gain falls to +3%. One MoE launch covers experts of several K, so it runs at the pace of the slowest K. K ∈ {2.5, 3.0, 3.5, 5.0} have no cheap paired-window path.
-  - Today the loop experts are spread over six K values: K1.5 21%, K2 22%, K2.5 27%, K3 19%, K3.5 8%, K4 3%. The non-loop experts are mostly K2 (61%) and K1.5 (33%).
-  - A 2.25 bpw loop built mostly from K=2.0 tiles, plus a few higher-K tiles where quality needs them, would suit the kernels best. Quality decides the final split.
+- **K choice and kernel speed (measured).** Inkwell's newer exact decode core, measured inside the real MoE kernel against the old core:
+
+  | K | 1.5 | 2.0 | 2.5 | 3.0 | 3.5 | 4.0 | 5.0 |
+  |---|---|---|---|---|---|---|---|
+  | kernel time change | slower | −6 to −8% | 0 to −5% | −4 to −8% | slower | −7 to −9% | slower |
+  | uses the new core | no | yes | yes | yes | no | yes | no |
+
+  - Over a whole token at today's K mix, the new core saves ~1.07 ms of kernel time (nsys). It is in Inkwell but still off by default, pending a cleaner A/B.
+  - Today the loop experts spread over K1.5 21%, K2 22%, K2.5 27%, K3 19%, K3.5 8%, K4 3%. The non-loop experts are mostly K2 (61%) and K1.5 (33%).
+  - VRAM and PCIe bytes outweigh this. Choose K for quality and size first; when two choices tie, take K 2.0, 3.0 or 4.0.
 
 - **Quality cost (estimate).** Lowering the loop from 2.42 to ~2.2 bpw is expected to cost KLD +12–25% (0.0475 → ~0.053–0.060). This is extrapolated from exllamav3's KLD-vs-bpw slope. The loop layers run 3 times, so their error may weigh more. Measure it.
 - **Keep the 2.26 bpw SAGE quant for cards with 8–12 GB or more.** The low-bpw variant is for 6 GB cards.
@@ -135,13 +141,15 @@ A reviewer re-derived the master spec's full 128K VRAM budget from the safetenso
 - **KV reference:** Q4 KV costs 8,704 B/token over the 8 full-attention passes. At 128K, reading the KV costs an estimated 5–10 ms per token on the 1060.
 - **Full derivation:** §2.5 of `opt/REVIEW_ARCH.md` in the Inkwell repo.
 
-## 7. A light drafter for speculative decoding (later)
+## 7. Drafter: acceptance and plan
 
-Inkwell plans speculative decoding with a small drafter later. The drafter's precision never reaches the output, because the verifier checks every drafted token against the full model's argmax. A lossy drafter only lowers the acceptance rate, so int8 and int4 weights are allowed in it.
+Inkwell plans speculative decoding with a small drafter. The drafter's precision never reaches the output, because the verifier checks every drafted token against the full model's argmax. A lossy drafter only lowers the acceptance rate, so int8 and int4 weights are allowed in it.
 
-**Acceptance decides the gain, not drafter speed.** Inkwell's kernels already run a draft round in 0.24 ms (1 draft) to 0.68 ms (3 drafts), measured. Modeled speed against today's 46.8 ms/token serial, with p1 = P(first draft accepted) and q = P(each later draft accepted):
+### 7.1 Acceptance decides the gain
 
-| p1 | q | best k | ms/token | vs serial |
+Modeled speed against today's 46.8 ms/token serial, with p1 = P(first draft accepted) and q = P(each later draft accepted). Draft rounds take 0.24 ms (1 draft) to 0.68 ms (3 drafts), measured.
+
+| p1 | q | best k (drafts per round) | ms/token | vs serial |
 |---|---|---|---|---|
 | 0.50 | 0.18 | 1 | 46.8 | +0% |
 | 0.75 | 0.18 | 1 | 40.1 | +17% |
@@ -149,36 +157,92 @@ Inkwell plans speculative decoding with a small drafter later. The drafter's pre
 | 0.82 | 0.65 | 1–2 | 38.5 | +21% |
 | 0.90 | 0.80 | 2–3 | 34.3–34.7 | +35–37% |
 
-- The model assumes a batched verifier that Inkwell has not built yet. Verifying 2 rows costs ~1.5× a serial step, because the rows route to different experts (mean union 12.9 experts per layer instead of 8).
-- Today's checkpoint drafter (DSpark) has p1 ≈ 0.50–0.75 and q ≈ 0.18–0.46, depending on the prompt and the measurement.
+- The model assumes a batched verifier that Inkwell has not built yet. Verifying 2 rows costs ~1.5× a serial step, because the rows route to different experts: the mean union is 12.9 experts per layer instead of 8 (measured from real routing). With 3 rows it is 16.6, so a third row rarely pays.
+- Today's checkpoint drafter (DSpark) measured p1 ≈ 0.50–0.75 and q ≈ 0.18–0.46, depending on the prompt and the sample.
 - **Train for p1 first.** With one draft per round, every +0.1 of p1 is worth ~+6–7% speed. A higher q pays only once p1 is above ~0.8.
 
-**Shape: surgery on today's DSpark drafter, then a distillation finetune (owner's plan).** No pretraining.
-- Keep the width at D = 2304, so DSpark's weights still fit. Cut 3 layers to 1 and prune the FF from 9216 to 4608.
-- Draft 1 token per round (k = 1). Keep 1 mask row instead of 7.
-- Head: 32K rows taken from the target's own unembed.
-- Measured kernel cost: 0.55 ms per round, 81.6 MiB. Modeled gain at p1 = 0.75: about +11%.
-- Finetune data: run the target in prefill mode (teacher forcing) over text, record the 4 taps and the target's argmax at every position, and train the drafter to predict that argmax.
-- Report p1 on held-out text before and after the finetune. Below ~0.6 the drafter does not pay.
-- A drafter trained from scratch at D = 1024 would cost 0.24 ms and 29.9 MiB (about +13%). It is the fallback if surgery cannot reach the p1 target.
+### 7.2 Plan: surgery on DSpark, then a distillation finetune
 
-**Read the drafter study's "100%" figures correctly.** In `REPORT.md` §5, "100% d1" means the quantized drafter picked the same token as the fp32 drafter in 12 of 12 rounds. It is not acceptance by the target. In the same test the target accepted 6 of 12 first drafts (50%).
+No pretraining.
 
-**Format the kernel expects (measured):**
-- Every linear matrix is row-major [N_out, K_in], with K_in and N_out multiples of 128.
-- Body weights: symmetric int8 per output row, `*.weight` I8 [N_out, K_in] in [−127, 127] plus `*.scale` F32 [N_out] = max|W_row| / 127.
-- Head: int4 with one F16 scale per group of 128 inputs (`lm_head.weight_i4` U8 [V′, D/2], `lm_head.scale` F16 [V′, D/128]), or int8 per row like the body. **Do not use int4 with one scale per row:** first-draft agreement with the fp drafter fell to 58–67%, against 100% for group-128.
-- Vocabulary: `vocab_ids` U32 [V′] maps head rows to target ids, and `inv_vocab_ids` I32 [200,058] maps back (−1 when out of set). Pin the 256 byte tokens and EOS (200006), then rank by corpus frequency. V′ = 32K covers 94.8% of the tokens the target actually generates; 16K covers 86.7%.
-- Norms and biases: F32.
-- The full tensor list and nibble packing are in the drafter study, `opt/kbench/drafter/REPORT.md` §7, sent with this brief.
+1. **Keep the width at D = 2304**, so DSpark's weights still fit. Cut 3 layers to 1 and prune the FF from 9216 to 4608.
+2. **Draft 1 token per round (k = 1).** Keep 1 mask row instead of 7; the GRU recurrence then matters little.
+3. **Head:** 32K rows taken from the target's own unembed, int4 with group-128 scales (§8.3).
+4. **Body:** int8 with one scale per output row (§8.3).
+5. **Finetune data:** run the target in prefill mode (teacher forcing) over text. Record the 4 taps and the target's argmax at every position, and train the drafter to predict that argmax.
+6. **Metric:** p1 on held-out text, before and after the finetune. Below ~0.6 the drafter does not pay.
 
-**VRAM.** In today's layout, every drafter MiB comes out of the expert caches. The 128K plan has no room for a drafter (§6, condition 5).
+Measured kernel cost of this shape: 0.55 ms per round and 81.6 MiB; modeled gain at p1 = 0.75 is ~+11%. A drafter trained from scratch at D = 1024 would cost 0.24 ms and 29.9 MiB (~+13%); it is the fallback if surgery cannot reach the p1 target.
 
-## 8. What to send back
+**VRAM.** In today's layout, every drafter MiB comes out of the expert caches; the model above charges for it. The 128K plan has no room for a drafter (§6, condition 5).
+
+## 8. Drafter: measured results
+
+All kernel times are measured on the GTX 1060, inside one CUDA graph with no host sync. End-to-end speeds are modeled.
+
+### 8.1 Head options
+
+| Head | Extra VRAM | Time, 1 row |
+|---|---|---|
+| Target's resident EXL3 unembed, full 200,058 vocab | 0 MiB | 1.76 ms |
+| int8, V′ = 32K, D = 2304 | 72.2 MiB | 0.43 ms |
+| **int4 group-128, V′ = 32K, D = 2304** | **37.2 MiB** | **0.24 ms** |
+| int8, V′ = 16K, D = 2304 | 36.1 MiB | 0.22 ms |
+| int4 group-128, V′ = 32K, D = 1024 | 16.6 MiB | 0.11 ms |
+
+The heads fuse GEMV, argmax and the id remap in one launch and reach 160–176 GB/s, 78–86% of DRAM peak.
+
+### 8.2 Vocabulary coverage
+
+Coverage = the share of the target's real greedy tokens (640 tokens over 5 prompts: prose, Python, Rust, technical, factual) inside the top-V′ set. The ranking came from a separate 4.12M-token corpus with no overlap with the prompts.
+
+| V′ | Frequency-ranked | Naive ids 0..V′−1 |
+|---|---|---|
+| 8K | 77.8% | 32.2% |
+| 16K | 86.7% | 32.2% |
+| **32K** | **94.8%** | 33.1% |
+| 64K | 95.9% | 35.6% |
+
+- **A frequency-ranked id table is required.** Low ids hold CJK tokens, while common English words with a leading space sit at ids 149,860–199,999 (" the" = 149876).
+- **V′ = 32K is the knee:** +8.1 points over 16K, and only +1.1 more at 64K for twice the VRAM.
+- Rank by frequency in your distillation corpus. Pin the 256 byte tokens and EOS (200006) first.
+
+### 8.3 Quantization cost on today's DSpark (acceptance proxy)
+
+Agreement = how often the quantized DSpark picks the same token as the fp32 DSpark, on real taps. **It is not acceptance by the target.** In the same test the target accepted 6 of 12 first drafts (50%). The sample is small: 12 rounds.
+
+| Quantization (whole drafter, V′ = 32K) | 1st draft | drafts 1–3 | drafts 1–7 |
+|---|---|---|---|
+| int8 weights + int16 activations (dp2a) | 12/12 | 36/36 | 84/84 |
+| int8 weights + int8 activations (dp4a) | 12/12 | 36/36 | 80/84 |
+| int4 group-128 weights everywhere | 11/12 | 29/36 | 51/84 |
+| int4 one scale per row | 7/12 | 23/36 | 36/84 |
+
+- Keep the body int8 per row: it matched the fp32 drafter on every draft 1–3.
+- int4 group-128 is fine in the head alone (12/12 and 34/36 when only the head is int4) but costs agreement when applied to the whole body.
+- **Do not use int4 with one scale per row.**
+
+## 9. Drafter: file format the Inkwell kernels expect
+
+File `drafter.safetensors`:
+
+- **Matrices:** row-major [N_out, K_in] (K_in contiguous). K_in and N_out are multiples of 128.
+- **Body linears:** `*.weight` I8 [N_out, K_in], values in [−127, 127], plus `*.scale` F32 [N_out] = max |W_row| / 127, so W ≈ weight × scale[row]. The same format serves int8 and int16 activations.
+- **Head, int4 group-128:** `lm_head.weight_i4` U8 [V′, D/2] and `lm_head.scale` F16 [V′, D/128] = max |W_group| / 7.
+  - Each little-endian uint32 holds 8 consecutive weights q[0..7] in [−7, 7], stored as nibbles u = q + 8.
+  - The low nibbles (`p & 0x0F0F0F0F`) hold u0–u3 (columns k..k+3). The high nibbles (`(p >> 4) & 0x0F0F0F0F`) hold u4–u7 (columns k+4..k+7).
+  - Alternative: `lm_head.weight` I8 [V′, D] with `lm_head.scale` F32 [V′], like the body.
+- **Vocabulary:** `vocab_ids` U32 [V′] maps head row → target token id; `inv_vocab_ids` I32 [200058] maps target id → head row, −1 when out of set.
+- **Taps:** `tap.fuse_weight` F32 [4] (softmax weights over the 4 tapped visits), `tap.norm.weight` F32 [2304], `tap.proj.{weight,scale}` I8 [D, 2304] + F32 [D] (omit the projection when D = 2304 and it is the identity).
+- **Per layer l:** `layers.{l}.in_norm.weight` F32 [D]; `layers.{l}.attn.qkv_proj.{weight,scale}` (fused Q/K/V); `layers.{l}.attn.q_norm.weight` and `k_norm.weight` F32 [head_dim]; `layers.{l}.attn.o_proj.{weight,scale}`; `layers.{l}.post_norm.weight` F32 [D]; `layers.{l}.mlp.gate_up_proj.{weight,scale}` (fused gate/up); `layers.{l}.mlp.down_proj.{weight,scale}`.
+- **Final:** `final_norm.weight` F32 [D], then the head. An untied input embedding, if used, is `embed.{weight,scale}` I8 [V′, D] + F32 [V′].
+- **Norms and biases:** F32 (BF16 is widened at load).
+
+## 10. What to send back
 
 1. **A per-tensor table:** name, K and bytes. Include the per-layer totals for experts, split into loop and non-loop layers.
 2. **Quality:** mean KLD and top-1 agreement against the source checkpoint (float64 logits, full vocabulary), plus the same figures for the current 2.26 bpw quant measured with your harness.
 3. **The total file size** and the bytes of the 12 loop layers' experts, including suh/svh.
-4. **If you build a drafter:** its tensor shapes, dtypes and bytes, the vocabulary id table, and its acceptance rate against the target if you measured one.
+4. **If you build a drafter:** a `drafter.safetensors` in the §9 format, its dims (D, layers, FF, heads, V′), and p1 and q on held-out text against the target, before and after the finetune.
 
 Inkwell will measure speed with its own A/B protocol: ≥8 interleaved pairs, generated-text checks, and the resident budget set through `INKWELL_DEV_EXPERT_MB`.
