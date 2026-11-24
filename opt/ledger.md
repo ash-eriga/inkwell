@@ -774,3 +774,16 @@ OPCNT after (fusions on): ADD 88 MUL 218 CONCAT 164 RMS_NORM 202
 UNARY 49 CUSTOM 937 SUB 0 CONT 0 GET_ROWS 0 -> kernel-launching
 nodes/token 2830 -> 2114 (-716, -25%). CONT/GET_ROWS/SUB fully
 eliminated from the per-token graph.
+
+### Brain re-validation on master: glue fusions (ctrl-cluster + rel-bias gather) — ACCEPTED
+
+- Cherry-picked 1f8c66a, bdbf4be and f1dc491 onto e8ed4bb.
+- Review fixes, made by the brain:
+  - The fused `control()` path assumed gain = g3[0..n) and forget = g3[fo..fo+n) without checking it. It now runs only if `go == 0 && fo == n && ne(cat,1) - fo == n` and falls back to the unfused chain otherwise.
+  - `Box::leak` of the forget offset on every graph build was replaced by carrying `ng` in the userdata pointer value.
+  - The fusion stayed active after the guard (gain unchanged, below).
+- A/B with BEST env + graphs, ctl,gf,gf,ctl ×4 (ctl = `INKWELL_NO_CTRLFUSE=1 INKWELL_NO_RELGATHER=1`):
+  - ctl median 51.28 ms/tok (49.76–52.52);
+  - gf median 47.74 ms/tok (47.05–52.16);
+  - **−6.9%**; gf wins 8/8 neighbouring pairs; md5 5cbe8e06 on all 16 runs; warnings 62.
+- Master decode is now ~47.7 ms/tok (~21 tok/s).

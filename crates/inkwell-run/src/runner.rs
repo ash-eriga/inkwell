@@ -260,9 +260,9 @@ unsafe extern "C" fn mix_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud
 
 /// `ggml_custom_op_t`: loop-controller tail —
 /// y = (cur - tanh(g3[ng+i])*cur) + tanh(g3[i])*msg. srcs = [g3, cur, msg];
-/// userdata = `&i32` forget offset (ng).
+/// userdata = forget offset ng, carried as the pointer value.
 unsafe extern "C" fn ctrl_apply_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
-    let ng = unsafe { *(ud as *const i32) };
+    let ng = ud as usize as i32;
     unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
     let s = |i: i32| unsafe {
         inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
@@ -1411,11 +1411,13 @@ impl Runner {
         if let Some(cat) = l.ctrl_gf_cat[ctrl] {
             let g3 = t::mmq(c, cat, gate);
             let [go, fo] = l.ctrl_gf_off[ctrl];
-            if fuse && n % 4 == 0 && n / 4 <= 1024 {
-                let ud: &'static i32 = Box::leak(Box::new(fo as i32));
+            // fused kernel reads gain = g3[0..n), forget = g3[fo..fo+n):
+            // only valid for that exact layout. ng travels in the userdata
+            // pointer value (no per-build allocation).
+            if fuse && n % 4 == 0 && n / 4 <= 1024 && go == 0 && fo == n && t::ne(cat, 1) - fo == n {
                 let mut args = [g3.0, cur.0, msg.0];
                 return Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n, 1, 1, 1], &mut args,
-                    ctrl_apply_cb as *const () as usize, (ud as *const i32).cast_mut().cast()) });
+                    ctrl_apply_cb as *const () as usize, fo as usize as *mut std::ffi::c_void) });
             }
             gain = t::tanh(c, t::view1(c, g3, fo - go, go * 4));
             forget = t::tanh(c, t::view1(c, g3, t::ne(cat, 1) - fo, fo * 4));
