@@ -125,9 +125,37 @@ Today Inkwell keeps 2.907 GiB of experts resident: loop layers first, layers 6�
 ### 5.4 Optional: dense weights as group-wise INT4 (needs your quality check)
 
 This applies only to the dense, non-expert weights: attention (645.81M params, 278.7 MiB today at ~3.6 bpw) and the unembed (461M params, 221 MiB at K=4). The experts stay EXL3.
-- **Why:** the dense EXL3 GEMVs are decode-bound. They take ~10.4 ms/token, while their bandwidth floor is ~3.7 ms. A group-wise INT4 format with float activations unpacks in ~3 instructions per weight against ~7–8 for the trellis, so it should run near the bandwidth floor at similar bytes. Modeled saving: 4–5 ms/token for ~+90 MiB VRAM. Inkwell is measuring the kernel now.
+- **Measured kernel speed (2026-11-24, `opt/kbench/w4dense/REPORT.md` in the Inkwell repo):**
+
+  | Format | bpw | ms/token, dense chain | vs EXL3 today | VRAM Δ |
+  |---|---|---|---|---|
+  | EXL3 today | ~3.79 | ~10.24 | — | 0 |
+  | INT4 g128 symmetric | 4.125 | 6.98 | −3.26 ms | +43 MiB |
+  | INT4 g128 asymmetric | 4.25 | 7.09 | −3.18 ms | +60 MiB |
+  | INT4 g64 symmetric | 4.25 | 7.24 | −3.19 ms | +60 MiB |
+  | INT5 g128 | 5.125–5.25 | 8.12 | −2.20 ms | +175 MiB |
+  | INT6 g128 | 6.125–6.25 | 9.28–9.52 | −1.0 ms | +307 MiB |
+
+  Activations stay F32. INT4 runs within 5% of the minimum instruction count per weight on Pascal, and the whole step is bandwidth-bound. INT5/INT6 cost too much VRAM to use everywhere; use them only on single tensors that need them.
 - **The open question is quality.** Group-wise INT4 at ~4.1–4.25 bpw is not obviously as good as an EXL3 trellis at ~3.6 bpw.
-- **Ask:** quantize the dense weights with GPTQ (or AWQ), INT4 with one F16 scale per 128 inputs (also g64, and INT5/INT6 for the most sensitive tensors if INT4 loses), with the experts unchanged. Report mean KLD and top-1 against the source, next to the all-EXL3 quant measured with the same harness. Inkwell adopts it only if KLD and top-1 are equal or better. Inkwell will send the exact tensor packing.
+- **Ask:** quantize the dense weights with GPTQ (or AWQ), with the experts unchanged. Try in order: INT4 g128 symmetric, then g128 asymmetric and g64 symmetric, then INT5/INT6 on the most sensitive tensors only. Report mean KLD and top-1 against the source, next to the all-EXL3 quant measured with the same harness (today 0.0475 and 94.66%). Inkwell adopts it only if KLD and top-1 are equal or better.
+- **File format:**
+  - Store each matrix row-major `[N_out, K_in]`, with no Hadamard tensors. Inkwell re-tiles it at load.
+  - Tensors per projection (the 6 attention projections per layer and `lm_head`):
+    - `{prefix}.qweight`: U8 `[N_out, K_in/2]`.
+    - `{prefix}.qweight_hi1`: U8 `[N_out, K_in/8]`, W5 only.
+    - `{prefix}.qweight_hi2`: U8 `[N_out, K_in/4]`, W6 only.
+    - `{prefix}.scales`: F16 `[N_out, K_in/G]` for symmetric, `[N_out, K_in/G, 2]` = {scale, min} for asymmetric.
+  - Header metadata `quant_type`, one of `w4_g128_sym`, `w4_g128_asym`, `w4_g64_sym`, `w4_g64_asym`, `w5_g128_sym`, `w5_g128_asym`, `w6_g128_sym`.
+  - Groups run along K_in. With `u` unsigned in [0, 2^b − 1]:
+    - symmetric: `w = scale · (u − 2^(b−1))`;
+    - asymmetric: `w = scale · u + min`.
+  - Nibble packing, for every 8 weights `u[0..7]` of a row: byte `b` (0–3) holds `u[b]` in its low nibble and `u[4+b]` in its high nibble. In NumPy, for `u` shaped `[N, K/8, 8]`:
+    ```python
+    lo4 = u & 0x0F
+    qweight = (lo4[..., 0:4] | (lo4[..., 4:8] << 4)).astype(np.uint8).reshape(N, K // 2)
+    ```
+  - The W5/W6 upper-bit planes are specified in §6.3 of the report.
 
 ## 6. Context length: 128K re-check (done)
 
