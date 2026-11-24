@@ -631,6 +631,10 @@ pub fn mem_info() -> (usize, usize) {
 pub unsafe fn memcpy_d2h_sync(dst: *mut c_void, src: *const c_void, bytes: usize) {
     assert_eq!(cudaMemcpy(dst, src, bytes, 2), 0, "memcpy_d2h_sync");
 }
+/// Async device→host copy on the current stream; caller must sync before reading.
+pub unsafe fn memcpy_d2h_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
+    assert_eq!(cudaMemcpyAsync(dst, src, bytes, 2, stream()), 0, "memcpy_d2h_async");
+}
 
 pub unsafe fn memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
     let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, stream()) };

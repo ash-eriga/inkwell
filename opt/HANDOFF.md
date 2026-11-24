@@ -678,3 +678,12 @@ Bench: `bash opt/kbench/build.sh gemv_v2_bench && ./opt/kbench/gemv_v2_bench opt
   draft ~55ms tem 7 syncs d2h (argmax readback por iteração do markov head —
   batchar ou manter argmax no device economiza ~15ms).
 - Comandos idênticos; INKWELL_MOE_V2=1 já é default nas medições de spec.
+
+## DP4A plan (serial focus — user directive)
+
+- bs_f32 range real = ±487 (medido em rexl3-00001) → peso NÃO cabe int8.
+- Esquema correto: x int8/grupo-16 (q8_1) + 4 plane-bytes de p=w16*0x83DCD12D
+  como peso int8 → dp4a([x,x,x,x], p) = x*w exato. ~3.75 instr/peso vs ~6.
+- Implementar tile_row_dp4a em gemv_moe_n (v2, bench valida vs v1), xh quantizado
+  p/ xq(int8)+xqs por had_out_moe ou kernel separado; serial via INKWELL_MOE_V2.
+- dz async já commitado; spec ~5.2 tok/s é teto do drafter — foco é serial ~127ms.

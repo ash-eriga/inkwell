@@ -493,7 +493,7 @@ impl Mtp {
                 out[i] = prev;
                 if self.dz.len() < NB { self.dz.resize(NB, Vec::new()); }
                 self.dz[i].resize(VOCAB, 0.0);
-                inkwell_cuda::memcpy_d2h_sync(self.dz[i].as_mut_ptr().cast(),
+                inkwell_cuda::memcpy_d2h_async(self.dz[i].as_mut_ptr().cast(),
                     self.d(&self.z).cast(), VOCAB * 4);
                 if i == 1 && std::env::var_os("INKWELL_MTP_BASE").is_some() {
                     // diagnostic: argmax of unembed(hid_1) alone (no markov/ho)
@@ -507,6 +507,7 @@ impl Mtp {
                     eprintln!("dbg i=1: markov={} base={}", prev, u32::from_ne_bytes(t2));
                 }
             }
+            inkwell_cuda::DevBuf::sync();
             // adaptive draft length (reference): kd = leading drafts whose
             // confidence cumprod stays >= theta; verify gets kp = kd+1 rows.
             let theta: f64 = std::env::var("MK_CUM_TH").ok()
