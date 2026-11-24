@@ -723,8 +723,11 @@ impl Runner {
             let sv = repo.tensor(&format!("{base}.svh")).unwrap();
             let mut svh = inkwell_cuda::DevBuf::new_bytes(sv.nbytes() as usize);
             svh.write_bytes(repo.data(&format!("{base}.svh")).unwrap());
-            Box::new(Exl3W { trel, suh, svh, ka, halfk, k, n,
-                scratch: inkwell_cuda::DevBuf::new(k + 8 * n) })
+            // fused sgemv uses scratch[k + 8n .. +512) as atomic strip
+            // counters: must start zeroed (kernel self-resets per launch).
+            let scratch = inkwell_cuda::DevBuf::new(k + 8 * n + 512);
+            scratch.zero();
+            Box::new(Exl3W { trel, suh, svh, ka, halfk, k, n, scratch })
         }
 
         // ---- globals ----

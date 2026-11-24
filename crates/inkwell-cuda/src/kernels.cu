@@ -1993,6 +1993,114 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_s(
     }
 }
 
+// Fused variant of the inkwell_exl3_gemv_s chain: had_in stays a separate
+// launch (xh is shared across the mz set), but the gemv absorbs memset +
+// had_out: partials go to t[y*n + col] as before and the LAST block for
+// strip bx (atomic ticket on ctr[bx], pre-zeroed, self-resetting) sums the
+// nky partials in the same ascending-z order as inkwell_exl3_had_out, then
+// runs the same 128-butterfly + svh multiply into y. Bit-identical output.
+// (Folding had_in too was tried first: ~24x redundant chunk transforms on
+// the nky==1 unembed made it a net loss.)
+__global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf(
+                                       const uint32_t* __restrict__ trel,
+                                       const float* __restrict__ xh,
+                                       const uint16_t* __restrict__ svh,
+                                       float* __restrict__ y,
+                                       float* __restrict__ t,
+                                       int* __restrict__ ctr,
+                                       int tk, int tn, int ka, int halfk) {
+    const int n = tn * 16;
+    const int tkc = (tk + gridDim.y - 1) / gridDim.y;
+    const int tk_lo = blockIdx.y * tkc;
+    const int tk_hi = min(tk_lo + tkc, tk);
+    __shared__ __align__(16) float xs[SGEMV_DENSE_MAXK];
+    __shared__ float red[8];
+    __shared__ unsigned int ticket;
+    __shared__ float strip[128];
+    const int e_lo = tk_lo * 16, e_hi = tk_hi * 16;
+    // prologue: stage this block's k-range of x and its Sigma_x (as gemv_s)
+    float sxl = 0.f;
+    for (int e = e_lo + threadIdx.x; e < e_hi; e += 256) {
+        const float v = xh[e];
+        sxl += v;
+        xs[e] = v;
+    }
+#pragma unroll
+    for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sxl;
+    __syncthreads();
+    float sx = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sx += red[i];
+    const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
+    float a0 = 0.f, a1 = 0.f;
+    if (tk_hi > tk_lo && tn_i < tn) {
+        switch (ka * 2 + halfk) {
+            case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 6:  sgemv_run<3, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 7:  sgemv_run<3, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 8:  sgemv_run<4, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 10: sgemv_run<5, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            default: __trap();
+        }
+    }
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+    const int lane = threadIdx.x & 31;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    const float off = KOFF * sx;
+    if (gridDim.y == 1) {
+        // single-k-block: strip lives in smem only; zero first so columns
+        // >= n contribute 0 to the butterfly exactly like had_out's v=0.
+        if (threadIdx.x < 128) strip[threadIdx.x] = 0.f;
+        __syncthreads();
+        if (tn_i < tn && (lane & 3) == 0) {
+            strip[(threadIdx.x >> 5) * 16 + (lane >> 2)]     = fmaf(KINV, a0, off);
+            strip[(threadIdx.x >> 5) * 16 + (lane >> 2) + 8] = fmaf(KINV, a1, off);
+        }
+        __syncthreads();
+    } else {
+        if (tn_i < tn && (lane & 3) == 0) {
+            float* dst = &t[(size_t)blockIdx.y * n + tn_i * 16 + (lane >> 2)];
+            dst[0] = fmaf(KINV, a0, off); dst[8] = fmaf(KINV, a1, off);
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) ticket = atomicAdd(&ctr[blockIdx.x], 1u);
+        __syncthreads();
+        if (ticket != gridDim.y - 1) return;   // not last: done
+        __threadfence();
+        if (threadIdx.x == 0) ctr[blockIdx.x] = 0;   // self-reset for next launch
+        const int c = blockIdx.x * 128 + threadIdx.x;
+        if (threadIdx.x < 128) {
+            float v = 0.f;
+            if (c < n) for (int z = 0; z < (int)gridDim.y; ++z) v += t[(size_t)z * n + c];
+            strip[threadIdx.x] = v;
+        }
+        __syncthreads();
+    }
+    // shared epilogue: strip[128] = partial sums -> H128 * svh -> y (had_out
+    // clone). Only the last block per strip (or every block when nky==1)
+    // reaches this; barriers stay uniform across all 256 threads.
+    {
+        const int c = blockIdx.x * 128 + threadIdx.x;
+        const bool live = threadIdx.x < 128;
+        for (int s = 1; s < 128; s <<= 1) {
+            const float u = !live ? 0.f
+                          : (threadIdx.x & s) ? strip[threadIdx.x - s] - strip[threadIdx.x]
+                                              : strip[threadIdx.x] + strip[threadIdx.x + s];
+            __syncthreads();
+            if (live) strip[threadIdx.x] = u;
+            __syncthreads();
+        }
+        if (live && c < n) y[c] = strip[threadIdx.x] * 0.08838834764831845f
+                                * __half2float(__ushort_as_half(svh[c]));
+    }
+}
+
 // Batched-token GEMV (spec-decode verify): one weight stream feeds NTOK=8
 // activation sets. t layout: [nky][ntok][n]; xh: [ntok][tk*16].
 __global__ void inkwell_exl3_gemv_dp4a_ntok(const uint32_t* __restrict__ trel,
@@ -2183,14 +2291,28 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
                                      long long k, long long n, long long ka, long long halfk,
                                      float* scratch, void* stream) {
     const int tk = (int)(k / 16), tn = (int)(n / 16);
-    inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
-        x, (const uint16_t*)suh, scratch /* xh */, (int)k);
     { static int no_s = -1; if (no_s < 0) { const char* e = getenv("INKWELL_NO_SGEMV_DENSE"); no_s = e ? atoi(e) : 0; }
       if (!no_s && k <= SGEMV_DENSE_MAXK) {
         const int nb = (tn + 7) / 8;
         int nky = 1;
         { static int tgt = -1; if (tgt < 0) { const char* e = getenv("INKWELL_SGEMV_DENSE_TGT"); tgt = e ? atoi(e) : 32; }
           while (nb * nky < tgt && nky < 8 && nky * 2 <= tk) nky *= 2; }
+        // fused path: had_in + gemv_sf (which absorbs memset + had_out).
+        // killswitch INKWELL_NO_SGEMV_FUSE -> the 4-launch chain below.
+        // ctr[nb] lives at scratch[k + 8n .. +512) (alloc extended +512,
+        // pre-zeroed at load); nky==1 uses no counter -> unbounded nb ok.
+        { static int no_f = -1; if (no_f < 0) { const char* e = getenv("INKWELL_NO_SGEMV_FUSE"); no_f = e ? atoi(e) : 0; }
+          if (!no_f && (n % 16) == 0 && (nky == 1 || nb <= 512)) {
+            inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+                x, (const uint16_t*)suh, scratch /* xh */, (int)k);
+            dim3 gsz((unsigned)nb, (unsigned)nky, 1);
+            inkwell_exl3_gemv_sf<<<gsz, 256, 0, (cudaStream_t)stream>>>(
+                (const uint32_t*)trel, scratch /* xh */, (const uint16_t*)svh,
+                y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk);
+            return;
+          } }
+        inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+            x, (const uint16_t*)suh, scratch /* xh */, (int)k);
         if (nky > 1) cudaMemsetAsync(scratch + k, 0, (size_t)nky * n * 4, (cudaStream_t)stream);
         dim3 gsz((unsigned)nb, (unsigned)nky, 1);
         inkwell_exl3_gemv_s<<<gsz, 256, 0, (cudaStream_t)stream>>>(
@@ -2199,6 +2321,8 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
             scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
         return;
       } }
+    inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
+        x, (const uint16_t*)suh, scratch /* xh */, (int)k);
     const int nb = (tn + 3) / 4;
     // aim for ~256 blocks: split K when tn is small
     int nky = 1;
