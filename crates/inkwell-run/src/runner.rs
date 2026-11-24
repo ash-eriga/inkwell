@@ -26,6 +26,7 @@ use std::collections::HashMap;
 const F32: i32 = 0;
 const F16: i32 = 1;
 const I32: i32 = 26;
+const BF16: i32 = 30;
 
 /// per-layer weight handles resolved by name
 #[derive(Debug, Default)]
@@ -739,14 +740,21 @@ impl Runner {
         let tp = |name: &str| repo.tensor(name).unwrap_or_else(|| panic!("missing {name}"));
         let dtp = |name: &str| repo.data(name).unwrap_or_else(|| panic!("missing data {name}"));
 
-        // ---- device byte budget: all dense F32 + headroom ----
+        // ---- device byte budget: dense F32 (mul_mat weights BF16) + headroom ----
+        // INKWELL_NO_BF16CTRL=1 restores F32 storage for the mul_mat-consumed
+        // weights (controllers, router gate, sinks, conv projections).
+        let bf16w = std::env::var_os("INKWELL_NO_BF16CTRL").is_none();
+        let bf16_ok = |name: &str| bf16w && (name.contains(".controllers.")
+            || name.ends_with("mlp.gate.weight") || name.ends_with("attn.attn_sink_proj.weight")
+            || name.ends_with("sconv.weight_proj"));
         let mut dev_bytes = 160usize << 20;
         for (n, t) in &repo.tensors {
             let (name, ti) = (n.as_str(), &t.1);
             if name.contains(".experts.") || name.contains(".trellis") || name.contains(".suh")
                 || name.contains(".svh") || name.contains(".mul1") || name == "model.llm.embed.weight"
                 || name.contains("visual") { continue; }
-            dev_bytes += (ti.elems() * 4) as usize + 256;
+            let w = if bf16_ok(name) && ti.dtype == "BF16" { 2 } else { 4 };
+            dev_bytes += (ti.elems() * w) as usize + 256;
         }
         let dev_buf = rt.buf(buft_dev, dev_bytes);
         let cpu_buf = rt.buf(buft_cpu, 2304 * 4 + 256);
@@ -764,6 +772,28 @@ impl Runner {
                 let bytes = if ti.dtype == "BF16" { bf16_to_f32(dtp($name)) }
                     else { assert_eq!(ti.dtype, "F32"); dtp($name).to_vec() };
                 let ten = t::new(rt.ctx(), F32, &dims);
+                let o = (off_dev + 127) & !127;
+                dev_buf.assign(ten, o);
+                unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                off_dev = o + t::nbytes(ten);
+                ten
+            }};
+        }
+
+        /// upload a mul_mat weight: keep the file's BF16 bytes when enabled
+        /// (ggml-cuda mmvf reads BF16 src0 with identical F32 accumulation
+        /// order on sm_61); widen to F32 otherwise.
+        macro_rules! densew {
+            ($name:expr) => {{
+                let ti = tp($name);
+                let mut dims: Vec<i64> = ti.shape.iter().rev().map(|&d| d as i64).collect();
+                dims.retain(|&d| d != 1);
+                let (ty, bytes) = if bf16_ok($name) && ti.dtype == "BF16" {
+                    (BF16, dtp($name).to_vec())
+                } else if ti.dtype == "BF16" {
+                    (F32, bf16_to_f32(dtp($name)))
+                } else { assert_eq!(ti.dtype, "F32"); (F32, dtp($name).to_vec()) };
+                let ten = t::new(rt.ctx(), ty, &dims);
                 let o = (off_dev + 127) & !127;
                 dev_buf.assign(ten, o);
                 unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
@@ -910,7 +940,7 @@ impl Runner {
                 }),
                 attn_rel_clip: Some(dense!(&lp(il, "attn.rel_l2_clip.scale"))),
                 attn_q_clip: Some(dense!(&lp(il, "attn.q_l2_clip.scale"))),
-                attn_sink_proj: Some(dense!(&lp(il, "attn.attn_sink_proj.weight"))),
+                attn_sink_proj: Some(densew!(&lp(il, "attn.attn_sink_proj.weight"))),
                 attn_k_conv: if conv(il) {
                     // HF static_w is [4,1024] [tap,ch] — ggml [4,1024] col-major wants taps contiguous per ch -> transpose
                     let bytes = bf16_to_f32_t(dtp(&lp(il, "attn.k_sconv.static_w")), &[4, 1024]);
@@ -930,12 +960,12 @@ impl Runner {
                     off_dev = o + t::nbytes(ten);
                     Some(ten)
                 } else { Some(dense!(&lp(il, "attn.v_sconv.weight"))) },
-                attn_k_conv_proj: conv(il).then(|| dense!(&lp(il, "attn.k_sconv.weight_proj"))),
-                attn_v_conv_proj: conv(il).then(|| dense!(&lp(il, "attn.v_sconv.weight_proj"))),
+                attn_k_conv_proj: conv(il).then(|| densew!(&lp(il, "attn.k_sconv.weight_proj"))),
+                attn_v_conv_proj: conv(il).then(|| densew!(&lp(il, "attn.v_sconv.weight_proj"))),
                 attn_post_conv: Some(dense!(&lp(il, "attn_sconv.weight"))),
                 ffn_post_conv: Some(dense!(&lp(il, "mlp_sconv.weight"))),
                 ffn_norm: Some(dense!(&lp(il, "mlp_norm.weight"))),
-                ffn_gate_inp: Some(dense!(&lp(il, "mlp.gate.weight"))),
+                ffn_gate_inp: Some(densew!(&lp(il, "mlp.gate.weight"))),
                 ffn_exp_probs_b: Some(dense!(&lp(il, "mlp.gate.bias"))),
                 attn_res_query: (il >= 1).then(|| {
                     let q = tp(&format!("model.llm.attn_res.attn_queries.{}", il - 1));
@@ -976,9 +1006,9 @@ impl Runner {
             if il >= 6 && il < 18 {
                 for (ci, cn) in CTRL_NAMES.iter().enumerate() {
                     let hn = match *cn { "q" => "attn", "ffn" => "mlp", x => x };
-                    l.ctrl_down[ci] = Some(dense!(&lp(il, &format!("controllers.{hn}.down_weight"))));
-                    l.ctrl_gain[ci] = Some(dense!(&lp(il, &format!("controllers.{hn}.gain_weight"))));
-                    l.ctrl_forget[ci] = Some(dense!(&lp(il, &format!("controllers.{hn}.forget_weight"))));
+                    l.ctrl_down[ci] = Some(densew!(&lp(il, &format!("controllers.{hn}.down_weight"))));
+                    l.ctrl_gain[ci] = Some(densew!(&lp(il, &format!("controllers.{hn}.gain_weight"))));
+                    l.ctrl_forget[ci] = Some(densew!(&lp(il, &format!("controllers.{hn}.forget_weight"))));
                 }
             }
             // concat same-type {ctrl_gain, ctrl_forget} -> one GEMV on shared input
