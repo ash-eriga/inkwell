@@ -3065,6 +3065,130 @@ __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
     }
 }
 
+// Vectorized/fused MoE Hadamard chain (bit-identical operation order).
+__global__ void inkwell_exl3_had_in_moe_vec(const uint64_t* __restrict__ descs,
+        const uint64_t* __restrict__ descs2, const int* __restrict__ ids,
+        const float* __restrict__ x, float* __restrict__ xh, float* __restrict__ xh2,
+        int xh2s, int k, const int* __restrict__ missf, int skipmode) {
+    const int slot = blockIdx.y;
+    if (skipmode && ((missf[slot] != 0) == (skipmode == 1))) return;
+    const uint64_t* dd = blockIdx.z ? descs2 : descs;
+    float* xho = blockIdx.z ? xh2 + (size_t)slot * xh2s : xh + (size_t)slot * k;
+    const uint16_t* suh = (const uint16_t*)(uintptr_t)dd[ids[slot] * 4 + 1];
+    const size_t xoff = descs2 ? 0 : (size_t)slot * k;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int wpb = blockDim.x >> 5;
+    const int base = (blockIdx.x * wpb + wid) * 128;
+    if (base >= k) return;
+    const int e0 = base + lane * 4;
+    const float4 xv = *(const float4*)(x + xoff + e0);
+    const uint2 sv = *(const uint2*)(suh + e0);
+    float v[4];
+    v[0] = xv.x * __half2float(__ushort_as_half((uint16_t)(sv.x & 0xffffu)));
+    v[1] = xv.y * __half2float(__ushort_as_half((uint16_t)(sv.x >> 16)));
+    v[2] = xv.z * __half2float(__ushort_as_half((uint16_t)(sv.y & 0xffffu)));
+    v[3] = xv.w * __half2float(__ushort_as_half((uint16_t)(sv.y >> 16)));
+    had128_warp(v, lane * 4);
+    *(float4*)(xho + e0) = make_float4(
+        v[0] * 0.08838834764831845f,
+        v[1] * 0.08838834764831845f,
+        v[2] * 0.08838834764831845f,
+        v[3] * 0.08838834764831845f);
+}
+
+__global__ void inkwell_exl3_had_out_moe_vec(const uint64_t* __restrict__ descs,
+        const uint64_t* __restrict__ descs2, const int* __restrict__ ids,
+        const float* __restrict__ t, float* __restrict__ y, int n, int stride, int off,
+        int tslot, int tzoff) {
+    const int slot = blockIdx.y;
+    const uint64_t* dd = blockIdx.z ? descs2 : descs;
+    const uint16_t* svh = (const uint16_t*)(uintptr_t)dd[ids[slot] * 4 + 2];
+    off += blockIdx.z * n;
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int wpb = blockDim.x >> 5;
+    const int base = (blockIdx.x * wpb + wid) * 128;
+    if (base >= n) return;
+    const int e0 = base + lane * 4;
+    const float4 tv = *(const float4*)(t + (size_t)slot * tslot + (size_t)blockIdx.z * tzoff + e0);
+    float v[4] = {tv.x, tv.y, tv.z, tv.w};
+    had128_warp(v, lane * 4);
+    const uint2 sv = *(const uint2*)(svh + e0);
+    *(float4*)(y + (size_t)slot * stride + off + e0) = make_float4(
+        v[0] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.x & 0xffffu))),
+        v[1] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.x >> 16))),
+        v[2] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.y & 0xffffu))),
+        v[3] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.y >> 16))));
+}
+
+// Fused situ_pair + had_in(Down), ncols = 1152 and no per-expert scale.
+__global__ void inkwell_situ_had_in_moe(const float* __restrict__ gu,
+        const uint64_t* __restrict__ descs_d, const int* __restrict__ ids,
+        float* __restrict__ xh, float situ_beta, float situ_lin_beta, int ncols) {
+    const int slot = blockIdx.y;
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int base = (blockIdx.x * 3 + wid) * 128;
+    const int e0 = base + lane * 4;
+    const float4 gv = *(const float4*)(gu + (size_t)slot * 2 * ncols + e0);
+    const float4 uv = *(const float4*)(gu + (size_t)slot * 2 * ncols + ncols + e0);
+    const uint16_t* suh = (const uint16_t*)(uintptr_t)descs_d[ids[slot] * 4 + 1];
+    const uint2 sv = *(const uint2*)(suh + e0);
+    const float gf[4] = {gv.x, gv.y, gv.z, gv.w};
+    const float uf[4] = {uv.x, uv.y, uv.z, uv.w};
+    const uint16_t sh[4] = {
+        (uint16_t)(sv.x & 0xffffu), (uint16_t)(sv.x >> 16),
+        (uint16_t)(sv.y & 0xffffu), (uint16_t)(sv.y >> 16)
+    };
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float a = (situ_beta * tanhf(gf[i] / situ_beta)) / (1.0f + expf(-gf[i]));
+        const float b = situ_lin_beta * tanhf(uf[i] / situ_lin_beta);
+        const float h = a * b;
+        v[i] = h * __half2float(__ushort_as_half(sh[i]));
+    }
+    had128_warp(v, lane * 4);
+    *(float4*)(xh + (size_t)slot * ncols + e0) = make_float4(
+        v[0] * 0.08838834764831845f,
+        v[1] * 0.08838834764831845f,
+        v[2] * 0.08838834764831845f,
+        v[3] * 0.08838834764831845f);
+}
+
+// Fused had_out(Down) + weighted sum over the fixed eight selected experts.
+__global__ void inkwell_had_out_wsum_moe(const uint64_t* __restrict__ descs_d,
+        const int* __restrict__ ids, const float* __restrict__ dn,
+        const float* __restrict__ w, float* __restrict__ out, int n) {
+    __shared__ float sm[8][128];
+    const int slot = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int base = blockIdx.x * 128;
+    const int e0 = lane * 4;
+    const uint16_t* svh = (const uint16_t*)(uintptr_t)descs_d[ids[slot] * 4 + 2];
+    const float4 dv = *(const float4*)(dn + (size_t)slot * n + base + e0);
+    float v[4] = {dv.x, dv.y, dv.z, dv.w};
+    had128_warp(v, e0);
+    const uint2 sv = *(const uint2*)(svh + base + e0);
+    sm[slot][e0 + 0] = v[0] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.x & 0xffffu)));
+    sm[slot][e0 + 1] = v[1] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.x >> 16)));
+    sm[slot][e0 + 2] = v[2] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.y & 0xffffu)));
+    sm[slot][e0 + 3] = v[3] * 0.08838834764831845f * __half2float(__ushort_as_half((uint16_t)(sv.y >> 16)));
+    __syncthreads();
+    if (threadIdx.x < 128) {
+        const int c = threadIdx.x;
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 8; ++s) acc += w[s] * sm[s][c];
+        out[base + c] = acc;
+    }
+}
+
+static inline bool ink_no_hadvec() {
+    static int v = -1;
+    if (v < 0) v = getenv("INKWELL_NO_HADVEC") ? 1 : 0;
+    return v != 0;
+}
+
 // Stage selected experts pinned-host → VRAM staging (coalesced uint4 copies,
 // latency hidden by occupancy). Rewrites staged desc tables (indexed by
 // ids[slot]) to point at staging; downstream kernels unchanged.
@@ -3530,9 +3654,11 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     const uint64_t* U = on_dev ? (const uint64_t*)descs_u : (const uint64_t*)sdescs_u;
     const uint64_t* D = on_dev ? (const uint64_t*)descs_d : (const uint64_t*)sdescs_d;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
+    const bool hadvec = !ink_no_hadvec() && nslots == 8;
     // gate + up fused: blockIdx.z selects the descriptor set
-    dim3 gin((KG + 511) / 512, nslots, 2);
-    inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG, nullptr, 0, nullptr, nullptr);
+    dim3 gin(hadvec ? (KG + 255) / 256 : (KG + 511) / 512, nslots, 2);
+    if (hadvec) inkwell_exl3_had_in_moe_vec<<<gin, 64, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG, nullptr, 0);
+    else inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG, nullptr, 0, nullptr, nullptr);
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
     int nky_s = 1;
@@ -3573,12 +3699,18 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                                  (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky, nullptr, 0);
     }
-    dim3 gout((NG + 511) / 512, nslots, 2);
-    inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
-    inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
-    dim3 din((KD + 511) / 512, nslots);
-    if (!on_dev) cudaStreamWaitEvent(st, ev_dstg, 0);
-    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
+    dim3 gout(hadvec ? (NG + 383) / 384 : (NG + 511) / 512, nslots, 2);
+    if (hadvec) {
+        inkwell_exl3_had_out_moe_vec<<<gout, 96, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
+        if (!on_dev) cudaStreamWaitEvent(st, ev_dstg, 0);
+        inkwell_situ_had_in_moe<<<dim3(3, nslots), 96, 0, st>>>(gu, D, ids, xh, 4.f, 25.f, NG);
+    } else {
+        inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
+        inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
+        dim3 din((KD + 511) / 512, nslots);
+        if (!on_dev) cudaStreamWaitEvent(st, ev_dstg, 0);
+        inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
+    }
     if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8, xqs8, KD);
     if (sg) {
@@ -3593,9 +3725,13 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
                                                  dn, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
     }
-    dim3 dout((ND + 511) / 512, nslots, 1);
-    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
-    inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
+    if (hadvec) {
+        inkwell_had_out_wsum_moe<<<dim3(ND / 128), 256, 0, st>>>(D, ids, dn, w, out, ND);
+    } else {
+        dim3 dout((ND + 511) / 512, nslots, 1);
+        inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
+        inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
+    }
 }
 
 // Cached variant: resolve -> copy misses -> same downstream chain.
@@ -3652,6 +3788,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const uint64_t* U = (const uint64_t*)sdescs_u;
     const uint64_t* D = (const uint64_t*)sdescs_d;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
+    const bool hadvec = !ink_no_hadvec() && nslots == 8;
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
     int nky_s = 1;
@@ -3681,8 +3818,10 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     // gate+up fused in one launch: blockIdx.z selects the descriptor set.
     // Hit slots run BEFORE ev_join so their gemv overlaps the bulk copy of
     // the missed experts on the side stream; miss slots run right after.
-    dim3 gin((KG + 511) / 512, nslots, 2);
-    inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
+    dim3 gin(hadvec ? (KG + 255) / 256 : (KG + 511) / 512, nslots, 2);
+    if (hadvec) inkwell_exl3_had_in_moe_vec<<<gin, 64, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
+                                                (const int*)miss, 1);
+    else inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 1, nullptr, nullptr);
     if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     // GU stays fp32
@@ -3701,7 +3840,9 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                                  (const int*)miss, 1);
     }
     cudaStreamWaitEvent(st, ev_join, 0);
-    inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
+    if (hadvec) inkwell_exl3_had_in_moe_vec<<<gin, 64, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
+                                                (const int*)miss, 2);
+    else inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 2, nullptr, nullptr);
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
@@ -3717,11 +3858,16 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                                  (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky,
                                                  (const int*)miss, 2);
     }
-    dim3 gout((NG + 511) / 512, nslots, 2);
-    inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
-    inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
-    dim3 din((KD + 511) / 512, nslots);
-    inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
+    dim3 gout(hadvec ? (NG + 383) / 384 : (NG + 511) / 512, nslots, 2);
+    if (hadvec) {
+        inkwell_exl3_had_out_moe_vec<<<gout, 96, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
+        inkwell_situ_had_in_moe<<<dim3(3, nslots), 96, 0, st>>>(gu, D, ids, xh, 4.f, 25.f, NG);
+    } else {
+        inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
+        inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
+        dim3 din((KD + 511) / 512, nslots);
+        inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
+    }
     if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8c, xqs8c, KD);
     if (sg) {
@@ -3736,9 +3882,13 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
                                                  dn, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
     }
-    dim3 dout((ND + 511) / 512, nslots, 1);
-    inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
-    inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
+    if (hadvec) {
+        inkwell_had_out_wsum_moe<<<dim3(ND / 128), 256, 0, st>>>(D, ids, dn, w, out, ND);
+    } else {
+        dim3 dout((ND + 511) / 512, nslots, 1);
+        inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
+        inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
+    }
 }
 
 extern "C" void ink_launch_exl3_stage(const void* descs_g, const void* descs_u,
