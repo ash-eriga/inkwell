@@ -2503,19 +2503,47 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG, nullptr, 0, nullptr, nullptr);
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+    static int v2_env = -1;
+    if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
+    int v2_ok = (v2_env > 0) && nky == 1;
+    if (v2_ok) {
+        const void* dd[3] = {descs_g, descs_u, descs_d};
+        for (int pi = 0; pi < 3 && v2_ok; ++pi) {
+            const uint64_t* dt = (const uint64_t*)dd[pi];
+            for (int e = 0; e < 128; ++e) {
+                const int ka = (int)(dt[e * 4 + 3] & 0xff);
+                const int hf = (int)((dt[e * 4 + 3] >> 8) & 1);
+                if (exl3v2::words_of(ka, hf) > 32 || !exl3v2::pairable_ka(ka, hf)) { v2_ok = 0; break; }
+            }
+        }
+    }
+    static int* e8 = nullptr;
+    if (v2_ok && !e8) {
+        cudaMalloc(&e8, 65 * 4);
+        int h[65]; for (int i = 0; i < 65; ++i) h[i] = i;
+        cudaMemcpy(e8, h, 260, cudaMemcpyHostToDevice);
+    }
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
-    dim3 gg(NG / 64, nslots, 2 * nky);
-    inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky, nullptr, 0);
+    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
+        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr);
+    else {
+        dim3 gg(NG / 64, nslots, 2 * nky);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                                 (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky, nullptr, 0);
+    }
     dim3 gout((NG + 511) / 512, nslots, 2);
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
-    dim3 gd(ND / 64, nslots, nky);
-    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                             dn, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
+    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
+        nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr);
+    else {
+        dim3 gd(ND / 64, nslots, nky);
+        inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
+                                                 dn, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
+    }
     dim3 dout((ND + 511) / 512, nslots, 1);
     inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);
@@ -2565,6 +2593,26 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+    static int v2_env = -1;
+    if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
+    int v2_ok = (v2_env > 0) && nky == 1;
+    if (v2_ok) {
+        const void* dd[3] = {descs_g, descs_u, descs_d};
+        for (int pi = 0; pi < 3 && v2_ok; ++pi) {
+            const uint64_t* dt = (const uint64_t*)dd[pi];
+            for (int e = 0; e < 128; ++e) {
+                const int ka = (int)(dt[e * 4 + 3] & 0xff);
+                const int hf = (int)((dt[e * 4 + 3] >> 8) & 1);
+                if (exl3v2::words_of(ka, hf) > 32 || !exl3v2::pairable_ka(ka, hf)) { v2_ok = 0; break; }
+            }
+        }
+    }
+    static int* e8 = nullptr;
+    if (v2_ok && !e8) {
+        cudaMalloc(&e8, 65 * 4);
+        int h[65]; for (int i = 0; i < 65; ++i) h[i] = i;
+        cudaMemcpy(e8, h, 260, cudaMemcpyHostToDevice);
+    }
     // gate+up fused in one launch: blockIdx.z selects the descriptor set.
     // Hit slots run BEFORE ev_join so their gemv overlaps the bulk copy of
     // the missed experts on the side stream; miss slots run right after.
@@ -2572,25 +2620,38 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 1, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
-    dim3 gg(NG / 64, nslots, 2 * nky);
-    inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky,
-                                             (const int*)miss, 1);
+    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
+        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1);
+    else {
+        dim3 gg(NG / 64, nslots, 2 * nky);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                                 (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky,
+                                                 (const int*)miss, 1);
+    }
     cudaStreamWaitEvent(st, ev_join, 0);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 2, nullptr, nullptr);
-    inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                             (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky,
-                                             (const int*)miss, 2);
+    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
+        (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2);
+    else {
+        dim3 gg(NG / 64, nslots, 2 * nky);
+        inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                                 (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky,
+                                                 (const int*)miss, 2);
+    }
     dim3 gout((NG + 511) / 512, nslots, 2);
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
-    dim3 gd(ND / 64, nslots, nky);
-    inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                             dn, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
+    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
+        nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr);
+    else {
+        dim3 gd(ND / 64, nslots, nky);
+        inkwell_exl3_gemv_moe<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
+                                                 dn, ND, 0, KD / 16, ND / 16, KD, ND, nky, nullptr, 0);
+    }
     dim3 dout((ND + 511) / 512, nslots, 1);
     inkwell_exl3_had_out_moe<<<dout, 128, 0, st>>>(D, nullptr, ids, dn, xh /*reuse xh as y*/, ND, ND, 0, ND, 0);
     inkwell_expert_wsum<<<(unsigned)((ND + 255) / 256), 256, 0, st>>>(xh, w, nullptr, out, ND, nslots);

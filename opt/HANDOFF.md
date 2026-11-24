@@ -648,3 +648,18 @@ Emit baixo é qualidade real do drafter (validado vs oracle + draft.py ref de me
 runner state campo spec_kp antes de step_block). Cap accept loop em n<kp-1 (emit≤kp).
 Padding-anchor atual não evita router adicionar experts pras linhas padronizadas.
 Bench: `bash opt/kbench/build.sh gemv_v2_bench && ./opt/kbench/gemv_v2_bench opt/kbench/ids_block.bin 2`.
+
+## Update (d6f182a+) — kd adaptativo + union bound commitados
+
+- `MK_CUM_TH` (default 0.4; **0.05 melhor**) gates kp=kd+1 verify rows; `SPEC_NSLOTS`
+  bounda union_expand aos primeiros kp*8 slots; emit capado em kp-1.
+- Números: verify ~331ms@kp pequeno (era ~430); spec **~5.2 tok/s** (era 4.6).
+- INKWELL_SPEC_PROB rejeitado (3.8 tok/s, texto degrade).
+- **mtp do Inkling tem hidden_out [2304,256]+bias — fold no espaço HIDDEN, não
+  vocab como o draft.py do megakernel-zoo (que é deepseek-v4)**. Nossa matemática
+  (u2 = hid + ho(latent) + ho_b → unembed) está CORRETA — emit ~2.5 é qualidade
+  real deste drafter; o 4.34 da ref era outro modelo.
+- **Teto honesto do spec com este draft: ~6-7 tok/s < serial 11.3** — precisaria
+  emit ≥3.5+ E verify ≤300. O draft treinado é o gargalo, não o verify.
+- Ideia pra serial: aplicar o v2 gemv_moe_n no caminho seriado (MoE 45→~31ms
+  se 1.45x se mantiver p/ 1 token) → ~12 TPS.
