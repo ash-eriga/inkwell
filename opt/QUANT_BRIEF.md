@@ -6,7 +6,9 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 
 1. **Keep the EXL3 mul1 trellis.** Do not move to an int8-constrained codebook (TQIR-INT8, CPTC-INT8), int4, int8 or fp16. Section 4 gives the reasons.
 2. **On the GTX 1060, a lower bpw does not make the GEMV kernels faster per weight.** They are limited by instruction issue, not memory bandwidth. Bits per weight change speed only through which experts fit in VRAM and how many bytes cross PCIe per token.
-3. **The loop layers (6–17) are where bytes matter most.** They run 3 times per token. Today their experts take 3.441 GiB, and that does not fit in VRAM alongside the caches the runtime needs.
+3. **The master spec's 128K plan fits on paper, with 5–25 MiB to spare.** Its expert layout is "loop layers resident, other layers streamed every token" (§6). Under that plan:
+   - the loop-layer bpw decides whether the plan fits at all;
+   - the non-loop expert bpw sets the PCIe bytes per token (~1.1 ms per 0.1 bpw).
 4. **Keep the experts within one layer at one K, or at as few K values as possible.** Section 3.4 explains why.
 5. **Report quality the same way as the current quant:** mean KLD and top-1 agreement against the source, using float64 logits over the full vocabulary.
 
@@ -47,7 +49,10 @@ The runtime splits a fixed VRAM budget for experts as follows:
 ### 3.3 Measured VRAM limits
 
 - **Free VRAM after load:** 150–435 MiB.
-- **OOM thresholds observed:** 126 MiB free (graph instantiate), 153 MiB free, and a failed 16 MiB graph allocation. Plan for at least ~200 MiB of headroom.
+- **OOM thresholds observed** (re-checked against the logs):
+  - a crash in `cudaGraphInstantiate` with ~96 MiB free;
+  - a failed 16 MiB allocation with ~44 MiB free.
+  Runs passed with ~209 MiB free. Today's runtime needs that free space for compute buffers and graph instantiation.
 - **k = 28 caches OOM, and k = 24 sits at the edge.**
 - **Pinning all 12 loop layers at today's quant was slower.** It left room for only 6 caches and ran at 62.64 ms/token, against 57.85 ms with the default placement (+8%). The loop layers have to get smaller before pinning them pays off.
 
@@ -70,25 +75,58 @@ The runtime splits a fixed VRAM budget for experts as follows:
 
 ## 5. What a new quant should aim for
 
-Ranked by expected speed impact on the 6 GB card:
+There are two expert layouts, and they reward different bpw choices.
 
-1. **Shrink the loop-layer experts (layers 6–17).** Each byte there is read 3 times per token, so this matters most.
-   - To fit within today's resident budget (2.907 GiB) with all 14 caches intact, the 12 loop layers need ≈2.0 bpw including suh/svh. That is ≈1.9 bpw of trellis, an estimate scaled from 3.441 GiB at 2.42 bpw.
-   - At 2.2 bpw the loop takes ~3.13 GiB (estimate). All 12 loop layers then fit, but the extra ~0.22 GiB comes out of the caches, about 3–4 of them.
-   - Expected gain for a 2.2 bpw loop fit: −3 to −5 ms/token (estimate).
-   - Expected quality cost: KLD +12–25%, from 0.0475 to ~0.053–0.060. This is extrapolated from exllamav3's KLD-vs-bpw slope, and the loop layers may weigh more because they run 3 times. It must be measured.
-2. **Use a uniform K per layer for the non-loop experts**, so cache slots are not wasted (§3.4).
-3. **Leave the dense trellis, attention and unembed alone.** Moving attention to int4/int5 g32 would save an estimated 1–2.5 ms on the 1060, but it costs +70–150 MiB of VRAM and loses on RTX.
-4. **Keep the 2.26 bpw SAGE quant for cards with 8–12 GB or more.** The low-bpw variant is for 6 GB cards.
+### 5.1 The master spec's 128K plan (Recipe A-Strict)
 
-## 6. Context length (pending verification)
+The 12 loop layers stay resident in VRAM. The experts of the 12 non-loop layers (L0–5, L18–23) are copied over PCIe on every token. There are no expert caches. Its quant targets, with sizes re-derived from the safetensors headers:
 
-- The master spec plans 128K context on 6 GB with Q4/K4V2 KV and states 932.85 MiB for the KV and attention state at 128K.
-- A reviewer is now re-checking the spec's full VRAM budget at 128K against measured sizes. Treat the 128K fit as unverified until that check is back. This section will be updated with the result.
-- Reference figures:
-  - Q4 KV costs 8,704 B/token for the 8 full-attention passes, or 9,792 B/token with the draft layer.
-  - Fixed sliding-window and convolution state is ~0.17 GiB.
-  - Reading the KV at 128K adds an estimated ≥4 ms/token on the 1060.
+| Component | Spec target | Spec MiB | Today (SAGE 2.26) | Change needed |
+|---|---|---|---|---|
+| Loop experts L6–17 (12,230.59M params) | 2.25 bpw | 3,280.5 | 3,523.6 at 2.42 bpw | −243 MiB |
+| Attention, 24 layers (645.81M params) | 4–5 bpw | 362.0 | 278.7 at 3.63 bpw | +83 MiB |
+| lm_head (460.93M params) | NariQ 3.5 bpw | 192.4 | 221.3, EXL3 trellis | −29 MiB; see note below |
+| Message gates, routers, convs/norms | BF16 | 73.6 | 148 as F32 on device | runtime change, not quant |
+
+- **Every MiB in the loop matters.** The plan's total is 5,095–5,115 MiB against a 5,120 MiB cap, a margin of 5–25 MiB. It holds only if the runtime overhead stays at 200 MiB or less. Today's runtime takes 387–518 MiB, so Inkwell has runtime work to do too.
+- **Non-loop expert bpw sets the PCIe cost.** These layers stream 764.4M params per token, 207.0 MB at today's bpw. At ccopy's 8.6 GB/s that takes 24.1 ms per token; at copy-engine DMA's 12.4–12.6 GB/s (measured) it takes 16.6 ms.
+  - Each 0.1 bpw on those experts is ~9.6 MB per token, ~1.1 ms per token with ccopy (estimate).
+  - Quality there trades directly against speed. Measure KLD per step of bpw.
+- **lm_head format.** Inkwell has no NariQ kernel; it decodes only EXL3 mul1. Either ship the head as EXL3 mul1 at about the same bpw, or tell the Inkwell owner so a kernel can be planned. NariQ saves 28.9 MiB over today's head.
+- **KV.** The plan uses K4V2 KV (864 MiB at 128K). Inkwell has no K4V2 kernel yet, and its quality is not measured.
+- **Expected decode speed at 128K under this plan** (reviewer estimate): 12–13 tok/s with today's kernels. After the planned kernel work it reaches 15–20 tok/s, and 23–31 tok/s only if all PCIe traffic is hidden.
+
+### 5.2 Today's Inkwell layout (short context, expert caches)
+
+Today Inkwell keeps 2.907 GiB of experts resident: loop layers first, layers 6–15. Every other layer gets an LFU cache of 20 slots. For a quant aimed at this layout:
+
+- To fit all 12 loop layers within 2.907 GiB and keep the 14 caches, the loop needs ≈2.0 bpw including suh/svh (≈1.9 bpw trellis). This is an estimate, scaled from 3.441 GiB at 2.42 bpw.
+- At 2.2–2.25 bpw the loop fits, but the extra ~0.2–0.3 GiB comes out of the caches, about 3–5 of them.
+- Use a uniform K per layer for the non-loop experts, so cache slots are not wasted (§3.4).
+
+### 5.3 For both layouts
+
+- **Quality cost (estimate).** Lowering the loop from 2.42 to ~2.2 bpw is expected to cost KLD +12–25% (0.0475 → ~0.053–0.060). This is extrapolated from exllamav3's KLD-vs-bpw slope. The loop layers run 3 times, so their error may weigh more. Measure it.
+- **Keep the 2.26 bpw SAGE quant for cards with 8–12 GB or more.** The low-bpw variant is for 6 GB cards.
+
+## 6. Context length: 128K re-check (done)
+
+A reviewer re-derived the master spec's full 128K VRAM budget from the safetensors headers, the model config and measured probes.
+
+- **Verdict:** 128K fits under the spec's 5,120 MiB cap with 5–25 MiB to spare. Against the card's physical limit (6,057 MiB visible to CUDA, minus the desktop's 494–512 MiB) the margin is 430–468 MiB.
+- **Conditions:**
+  1. The runtime fits in 200 MiB, allocated from one pool at load. The bare CUDA context is 65 MiB.
+  2. The three requants in §5.1 ship.
+  3. K4V2 KV kernels exist and pass a KLD check.
+  4. The 123.6 MiB batch-verify scratch is removed.
+  5. MTP is off, or the spec's reduced MTP recipe (−60.75 MiB) applies.
+  6. The desktop stays under 937 MiB.
+- **Corrections to the spec:**
+  - The display reserve is 937 MiB, not 1,024: the driver reserves 87 MiB.
+  - The conv ring takes 3.66 MiB, not 3.10.
+  - Two lines are missing: the single-row GEMV scratch (15.7 MiB) and per-tensor allocation overhead (~100 MiB unless pooled). In total the missing lines add a net +15.3 MiB.
+- **KV reference:** Q4 KV costs 8,704 B/token over the 8 full-attention passes. At 128K, reading the KV costs an estimated 5–10 ms per token on the 1060.
+- **Full derivation:** §2.5 of `opt/REVIEW_ARCH.md` in the Inkwell repo.
 
 ## 7. What to send back
 
