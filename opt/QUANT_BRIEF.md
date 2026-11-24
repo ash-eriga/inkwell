@@ -154,7 +154,7 @@ Inkwell plans speculative decoding with a small drafter later. The drafter's pre
 - **Train for p1 first.** With one draft per round, every +0.1 of p1 is worth ~+6–7% speed. A higher q pays only once p1 is above ~0.8.
 
 **Recommended shape (measured kernel cost, 29.9 MiB):** EAGLE-style, conditioned on the target's hidden states.
-- Input: 4 target taps of 2,304 floats (today's taps are layers 5, 23, 41 and 48), softmax-mixed, normalized and projected 2304 → D.
+- Input: 4 target taps of 2,304 floats (today's drafter reads layer visits 5, 23, 41 and 48 of 48), softmax-mixed, normalized and projected 2304 → D.
 - Body: 1 transformer layer, D = 1024, FF = 2816 (SwiGLU), 16 query heads and 4 KV heads of 64, sliding window 128.
 - Head: V′ = 32,768 tokens, tied with the input embedding.
 - A 2-layer body costs +0.1 ms per draft and 40.7 MiB, if acceptance needs it.
