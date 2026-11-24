@@ -787,3 +787,17 @@ eliminated from the per-token graph.
   - gf median 47.74 ms/tok (47.05–52.16);
   - **−6.9%**; gf wins 8/8 neighbouring pairs; md5 5cbe8e06 on all 16 runs; warnings 62.
 - Master decode is now ~47.7 ms/tok (~21 tok/s).
+
+## 2026-11-24 — EXL3 decode math Round 2 (real weights, SASS + silicon microbench, `opt/kbench/exl3_math2/`)
+
+Explored 4 directions (`opt/kbench/exl3_math2/{test_cpu.cpp,sass_kernels.cu,count_sass.py,bench.cu,REPORT.md}`), keeping exact shipped 8-tiles/block grid parallelism (144/144 blocks), `<= 40` regs (0 spills), and 6 blocks/SM (fixing `41d0798`'s `-42%` regression from 48 regs + 4× grid shrink):
+
+- **Lossless ~3 instr/w at batch-1 is PROVABLY UNREACHABLE on `sm_61`:** Real weights across all 7 $K$ (65,664 tiles = 16.81M weights) have $H_1(B)=7.999$ b/byte (`zratio=1.0004`, $H(\text{bs})=9.04\text{–}9.25$ b/w) -> incompressible; only 0%-bloat bijections exist. Exact FP32 batch-1 lower bound is `>= 5.63–6.19` instr/w (hand-assembled 2-XMAD SASS) / `>= 6.63–7.19` (stock `ptxas 12.6`, 3-XMAD impossible to lower to 2 via PTX). Achieved: `6.875` (`M=32-Strided C0c`) and `7.219` (`M=16-Paired C0c`).
+- **Key silicon discoveries (interleaved min-of-31 vs shipped `inkwell_exl3_gemv_moe_s` under `flock`):**
+  - **2-way (`M=16`) / 4-way (`M=32`) in-block `tk`-split** preserves 8 tiles/blk and `<= 40` regs (`0` spills), flipping `41d0798`'s `-42%` into real gains on `K=2.0` (`40.7%` of SAGE MoE):
+    - **`M=16-Paired C0c` (exact I2F, L1-rot, 39 regs):** `321.1` vs `280.8 Gw/s` (**`1.14–1.16×`**), `7.6e-7` err.
+    - **`M=32-Strided C4` (NEW 0%-bloat Strided-Crumb bijection for `K=2.0` + replicated 16-entry `SHFL` + `ISCADD` = 0 XMADs in loop + `XMAD.S16`, 40 regs):** **`355.9` vs `280.3 Gw/s` (`1.27×`)**, `3.9e-5` err (`180×` below 1 EXL3 quant step; exact `M=32-Strided C0c` ties `M=16` at `319.3 Gw/s`, `1.14×`). Verified 0/0 fails across all 10,368 real `K=2.0` tiles (2.65M weights).
+    - **`I2F` (`C0c`) beats Magic `FADD32I` (`C1c`) by +12% on silicon** (`321.1` vs `286.9 Gw/s` despite identical 7.2 instr/w) because `I2F` offloads 1.0 op/w from the saturated ALU pipe onto Pascal's idle SFU/CVT pipe. `C3b` folded per-tile loses (`0.98×`); 64KB/128KB `LDG` LUTs collapse to `17.0–17.4 Gw/s` (`0.06×`).
+  - **Full SAGE All-7-K Mix (interleaved vs shipped `~260 Gw/s`):** gains shrink to **`1.03×` exact** (`M=16-Paired C0c` `266.1 Gw/s` / `Hybrid C0c` `267.6 Gw/s`, `5.4e-7`) and **`1.05×` sub-step** (`M=16-Paired C4 blk=16` `274.7 Gw/s` / `Hybrid C4` `274.0 Gw/s`, `2.0e-5`, 0 spills) because heterogeneous-K MoE launches are bounded by non-`K=2.0` wave tail blocks (where 0 `(D, D+16)` pairs exist for `K ∈ {2.5, 3.0, 3.5, 5.0}`). Expected serial MoE e2e upside is only `~0.6–1.0 ms/tok` (`~1–2%`).
+  - **Approx Pareto cliff vs EXL3 quant step (`KINV=0.006767`, `rms_rel≈7.0e-3`):** `C0c` (`0.0001×` step) and `C4` (`0.002–0.007×` step) are safe; all cheaper approximations (`C6 dp4a-8` `0.6–1.8×`, `A-BS8` `1.1–23×`, `A-2BYTE` `148×`) jump to/past 1 full quant step; `C3a` fails Dist B (`1.09×` step).
+  - **Multi-token batching `B=1..4` (`M=16-Batch C0c`, exact FP32, 40 regs, 0 spills, `2–8.2 KB` smem):** becomes MORE compute-bound per loaded weight (`Rd_Gw/s`: `288 -> 244 -> 203 -> 184`), while effective throughput crosses the `722 G MAC/s` (`<= 3.0` instr/w/tok) barrier at **`B=4`**: `B=2` **`487.9 G MAC/s` (`1.68×`)**, `B=3` **`608.2` (`2.11×`)**, **`B=4` `734.0 G MAC/s` (`2.53×`, `2.828` instr/w/tok, `6.3e-7`)** (`B=4 C4`: `734–741 G MAC/s`, `2.453` instr/w/tok).
