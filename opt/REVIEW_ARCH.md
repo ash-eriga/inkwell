@@ -4,18 +4,19 @@ Date 2026-11-24. Base commit be7ec88 (56.43 ms/tok median, BEST env, graphs on).
 Inputs: the master spec v2.2 / runbook v1.4 (`/tmp/inkling2-mini-spec.txt`), `opt/PLAN.md`, `opt/THEORY.md`,
 `opt/ledger.md`, `opt/kbench/exl3_math/REPORT.md`, `crates/inkwell-run/src/runner.rs`,
 `crates/inkwell-cuda/src/kernels.cu`, and the safetensors headers of the SAGE-REXL3 2.26 bpw quant.
-No GPU runs were made for this review.
+§2.5 also uses the placement-sweep load logs (`/tmp/place_runs/*.log`), nvidia-smi, and two GPU probes run under the shared GPU lock: bare CUDA 12.6 context size, and pinned HtoD copy bandwidth.
 
 ## Verdict
 
 1. Keep the core: EXL3/SAGE trellis weights, the Rust host, custom stream-decode GEMVs, CUDA graphs, device-side routing with SM-driven staging, and per-layer expert caches.
-2. The spec's speed model is wrong on both sides. It sizes PCIe as if no cache existed (207 MB/tok vs 83 MiB measured). It budgets nothing for GEMV compute (36 ms/tok of kernel time measured) or for launches, glue and the host (~17 ms).
+2. The spec's speed model counts only PCIe. Its 128K plan keeps no expert cache, so it stages 207 MB/tok (today's caches stage 83 MiB). It budgets nothing for GEMV compute (36 ms/tok of kernel time measured), for launches, glue and the host (~17 ms), or for attention over 128K of KV (5–10 ms est.).
 3. Its kernel ceiling for mul1 (~510 Gw/s) is above the proven ALU-only bound (≤492 Gw/s). The measured rate is 211–234 Gw/s.
 4. Its "single largest lever" is pinning all loop layers. Pinning by visits/byte measured −1.4%. Forcing all 12 loop layers resident at today's quant measured +8% (62.64 ms).
-5. Its per-expert DMA staging needs host-known expert ids. That breaks graph capture, and graphs are worth 7.7 ms; the faster DMA would save ~3 ms.
+5. Its per-expert DMA staging measured 12.4–12.6 GB/s here against ccopy's 8.6 GB/s: −3 ms at today's 83 MiB, −7.5 ms at the plan's 207 MB. It needs host-known expert ids, so it costs either the single captured graph (worth 7.7 ms) or a split into 12 graph segments (cost unmeasured).
 6. The time goes to three places: launches, glue and the host (~17–20 ms); GEMV issue (9.47 instructions/weight); PCIe staging (≤9.8 ms).
-7. Fixing them in that order reaches ~28–34 ms/tok (~30–36 tok/s) on the GTX 1060 with no format change. A requant and a codebook fork are optional extras, each gated on quality.
+7. Fixing them in that order reaches ~28–34 ms/tok (~30–36 tok/s) on the GTX 1060 at short context with today's caches, with no format change. A requant and a codebook fork are optional extras, each gated on quality.
 8. On RTX 30–50 the same weight file stays the best choice. int4, int8 and fp16 transcodes multiply bytes by 2–7× on cards that are bandwidth-bound. Glue fusion is the top lever there too.
+9. 128K fits the 6 GB card under the spec's plan, which has no expert caches: 5,095–5,115 MiB against the 5,120 MiB cap (+5 to +25 MiB), and +430 to +468 MiB under the physical ceiling at today's desktop use. It needs a runtime of ≤200 MiB (today's ggml runtime takes 387–518), three requants, and K4V2 kernels. Estimated decode at 128K full context: 56–68 ms/tok after the plan below, 49–61 with DMA staging, 40–53 with a prefetch hiding half the PCIe (§2.5).
 
 ## 0. Where the time goes today
 
@@ -113,11 +114,12 @@ The physical floor is 1,867 MiB of VRAM traffic per token at 217 GB/s, which is 
 ### 2.3 The staging design: the spec's plan loses the graph win, and today's slots waste capacity (≤9.8 ms/tok at stake)
 
 **Spec plan.** Double-buffered per-expert `cuMemcpyHtoDAsync` at 12–13 GB/s into 20 MiB of staging (spec line 294). It conflicts with graph capture:
-- A copy-engine memcpy needs its source address on the host at launch time, so the host must learn each layer's expert ids. That means up to 48 device→host syncs per token and no single captured graph.
-- Graphs are worth 7.7 ms (§1).
-- The DMA rate gain is worth ~3 ms: 83 MiB at 8.6 GB/s is 10.1 ms; at 12.5 GB/s it is 7.0 ms.
+- A copy-engine memcpy needs its source address on the host at launch time, so the host must learn each layer's expert ids. That takes one device→host sync per streamed visit: 12 per token in the spec's plan, up to 48 with caches on every layer. The single captured graph becomes segments.
+- Graphs are worth 7.7 ms (§1). Whether 12 segments keep most of that is unmeasured.
+- Pinned HtoD by copy engine measured 12.39, 12.50 and 12.56 GB/s for 2, 20 and 256 MiB copies on this machine (probe for this review). ccopy runs at 8.6 GB/s.
+- The DMA rate gain at today's 83 MiB: 10.1 → 7.0 ms, −3 ms. At the spec's 207 MB: 24.1 → 16.6 ms, −7.5 ms.
 
-**Spec traffic.** It assumes no cache, so 12 non-loop layers × 8 experts stream every token, 764.4M params or 207 MB (spec line 294). The measured traffic is lower:
+**Spec traffic.** The plan keeps no cache, so 12 non-loop layers × 8 experts stream every token, 764.4M params or 207 MB (spec line 294). Today's caches make the measured traffic lower:
 - With k=20 LFU caches the miss rate is 18.6%, which stages ~83 MiB/token (`opt/THEORY.md:80-87`).
 - The ccopy kernel measures 9.84 ms/tok.
 - How much of that sits on the critical path is not measured. Routing for visit L depends on visit L's attention, so most of the copy waits on the chain router → ccopy → GEMV. Only the `skipmode` hit/miss split hides part of it.
@@ -140,28 +142,81 @@ The mechanism:
 
 The lever exists only after a requant (§4 step 7). Even then it is worth 3–5 ms, not the largest item.
 
-### 2.5 The VRAM ledger has no safety margin, and several of its savings are not VRAM
+### 2.5 128K context fits on paper, with zero expert caches; the runtime line is the unproven one
 
-**Headroom.**
-- The spec plans 20.65–66.10 MiB of headroom (spec lines 301-302).
-- The ledger shows runtime OOMs at 126 MiB free (graph instantiate, `opt/ledger.md:70`), at 153 MiB free, and on a 16 MiB graph allocation (`opt/ledger.md:430-434`). The spec's margins would OOM.
+The spec's 128K plan (Recipe A-Strict, spec lines 294-302) keeps the 12 loop layers resident and streams every expert of the 12 non-loop layers on every token. It has no LFU expert cache. Under that plan, 128K does not displace today's caches; the plan never had them. The arithmetic of every weight and KV line checks out against the headers and the model config, to within 0.6 MiB. The process fits the 5,120 MiB cap with 5–25 MiB to spare if the runtime line (spec line 296) holds at 180–200 MiB. Today's ggml runtime takes 387–518 MiB for that line.
 
-**Display reserve.** The spec reserves 1,024 MiB for the display and caps the process at 5,120 MiB.
-- Today's runs leave 150–435 MiB free after load.
-- Enforcing the cap removes (1,024 − display use now − free now) MiB from caches. One k=20 cache costs 50–80 MB.
+**Budget at 128K, line by line.** MiB unless marked. "Today" means the SAGE-REXL3 2.26 bpw quant and the current loader.
 
-**Context length.**
-- At 128K, the spec's K4V2 KV and attention state take 932.85 MiB (spec line 299). Today's 14 caches total ~811 MiB.
-- Each 1K tokens of full-attention context costs 6.75 MiB at K4V2. Today's F16 layout costs 32 MiB: 8 full-attention visits × 8 KV heads × 128 × 2 × 2 B.
-- At 128K the KV also adds ≥4 ms/tok of reads (864 MiB at 217 GB/s).
-- The bench (one prompt, 64 tokens, ctx 512) never exercises this cost.
+| # | component (spec line) | spec | verified | status |
+|---|---|---|---|---|
+| 1 | Display reserve (295) | 1,024 (cap 5,120 of 6,144) | nvidia-smi: 6,144 total, 87 driver-reserved, so CUDA sees 6,057 and the cap leaves 937 for the desktop. Desktop measured 494–512 (Hyprland, quickshell, 2 Electron GPU processes) | Wrong: the reserve is 937, not 1,024. It holds 425–443 of slack at today's desktop use |
+| 2 | Context + prefill scratch (296) | 180–200 | Bare CUDA 12.6 context: 65 (probe). Today's ggml runtime: 291–309 at init, plus 96–209 that must stay free for compute buffers and graph instantiate (OOM at ~96, runs at ~209; evidence below), so 387–518. 128K prefill scratch: unmeasured | Unverifiable. The spec says "verified via Phase 0", but Phase 0 is pending (spec line 428) and the repo has no such record |
+| 3 | Attention, 24 layers (135, 142, 149, 237) | 362.0 | Headers: 644.09M trellis + 1.72M FP16 = 645.81M (spec 645.90M). 201.8 + 97.1 + 80.7 = 379.6 MB = 362.0. Today: 278.7 at 3.63 bpw | Confirmed. Needs a requant to 4–5 bpw (+83 vs today) |
+| 4 | lm_head, NariQ 3.5 bpw (156, 237) | 192.4 | 460.93M × 3.5/8 = 201.7 MB = 192.4. Today: 221.3 trellis | Arithmetic confirmed. The NariQ format is unverifiable (§2.2) |
+| 5 | Message gates, routers, convs/norms (184, 205, 212) | 73.6 | Headers: 28.31M + 7.08M BF16, 1.60M FP32 → 54.0 + 13.5 + 6.1. Today: stored as F32, 148 | Confirmed. Needs BF16 storage (−74 vs today, §3.5) |
+| 6 | GPU scales, LUTs, headers (219) | 38.0 | Today's suh/svh for the same tensors: 31.9 (loop experts 30.38, attention 1.17, head 0.39) | Plausible. The planned formats' metadata is unspecified |
+| | **Fixed weights (297)** | **666.0** | 362.0 + 192.4 + 73.6 + 38.0 = 666.0 | Confirmed |
+| 7 | Loop core L6–17 at 2.25 bpw (107, 298) | 3,280.5 | 12,230.59M × 2.25/8 = 3,439.9 MB = 3,280.5. Today: 3,523.6 at 2.42 bpw | Confirmed. Needs a requant (−243 vs today) |
+| 8 | K4V2 KV + attention state (299) | 932.85 | Global: 8 visits × 131,072 × 864 B = 864.00 (K 512 + V 256 + scales 96 B per head set). SWA: 40 × 1,024 × 864 B = 33.75. Sinks/local: 48 × 64 × 4 KiB = 12.00. rel_bias: 48 × 1,024 × 16 × 4 B = 3.00. Prefill ring: 512 × 8 × 4 KiB = 16.00 (spec 17.00). Conv ring: 48 × 3 × 6,656 × 4 B = 3.66 (spec 3.10) | Total 933.4. Conv ring wrong by +0.56. No K4V2 kernel exists, and its quality is unmeasured |
+| 9 | Cold DMA staging (300) | 20.0 | 2 buffers × 4 experts × 2.49 MB (an L20–23 expert at 2.5 bpw) = 19.0 | Confirmed |
+| 10 | LFU expert caches | none | 0. The non-loop layers stream 764.4M params, 207.0 MB/token: L0–5 95.6 + L18–19 31.9 + L20–23 79.6 MB | Confirmed. The footprint table's "hot experts cached in VRAM" (lines 117, 124, 131) has no VRAM line, so the plan contradicts itself there |
+| 11 | Serial GEMV scratch | missing | 15.7 (`exl3_of` scratch, 145 matrices). Today's loader also allocates 123.6 of 8-row `Exl3Blk` scratch, used only by batched verify | Missing line |
+| 12 | Allocation overhead | missing | Per-layer free deltas in the k=20 load log exceed header bytes by 1.8–7.1 per layer, ~100 over 24 layers (likely cudaMalloc granularity) | Missing. One pooled allocation removes it |
+| | **Process total (301)** | **5,079.35–5,099.35** | Rows 2–11 with the spec's runtime: 5,094.6–5,114.6 | The spec's own sum is right. Rows 8, 9 and 11 add a net 15.3 |
 
-**Recipe B.** The 12 loop layers at 2.5 bpw take 3,822.1 MB (3,645 MiB), +364.5 MiB over Recipe A. Added to the 5,079–5,099 MiB Recipe A total, that reaches ~5,445 MiB, over the 5,120 MiB cap.
+**OOM evidence on today's path** (ctx 512):
+- `DEV_EXPERT_MB=3227 margin=800` died in `cudaGraphInstantiate` with ~96 MiB free after load. The log shows 153 MiB before the last 60 MiB cache (`/tmp/place_runs/sweep_b3227_m800.log:46`). The ledger records that pre-allocation figure as "153 MiB left" (`opt/ledger.md:434`).
+- `DEV_LAYERS=6-17 margin=600` failed a 16 MiB allocation with ~44 MiB free (`opt/ledger.md:430`).
+- Runs passed with ~209 MiB free (k=24) and ~378 MiB free (k=20 default).
+- The 126 MiB OOM (`opt/ledger.md:70-71`) has no log to check.
+
+**Fit.** The physical ceiling is 6,057 − desktop = 5,545–5,563 MiB at today's desktop use.
+
+| runtime assumption | process total | vs 5,120 cap | vs physical ceiling |
+|---|---|---|---|
+| spec runtime 180–200, pooled allocations | 5,095–5,115 | **+5 to +25** | +430 to +468 |
+| spec runtime, per-tensor cudaMalloc (+100) | 5,195–5,215 | −75 to −95 | +330 to +368 |
+| today's ggml runtime 387–518, batch scratch dropped, pooled | 5,302–5,433 | −182 to −313 | +112 to +261 |
+| today's ggml runtime, batch scratch kept, per-tensor cudaMalloc | 5,525–5,656 | over | −111 to +38 |
+
+128K fits on the GTX 1060 6 GB under the spec's plan, with +5 to +25 MiB under the cap and +430 to +468 MiB under the physical ceiling. It fits only if all of these hold:
+1. The whole runtime fits in 200 MiB: context, module load, compute buffers, graph exec and the 128K prefill scratch. The bare context is 65 MiB, so 135 MiB is left for the rest. Today's ggml runtime needs 387–518 MiB.
+2. All allocations come from one pool, sized at load. A 5–25 MiB margin leaves no room for lazy allocation; today's path already OOMs with ~96 MiB free.
+3. The three requants ship: loop core 2.42 → 2.25 bpw, attention 3.63 → 4–5 bpw, head to a 3.5 bpw format. Ctrl and routers are stored as BF16.
+4. K4V2 kernels exist and pass the KLD gate (§4 step 0c). The spec plans cache-aware QAD for this; nothing is measured.
+5. The 123.6 MiB batch scratch goes, so speculative verify needs its own budget.
+6. MTP stays off, or Recipe A-MTP's −60.75 MiB core applies (spec line 302).
+7. The desktop stays under 937 MiB. It uses 494–512 MiB today.
+
+**Decode at 128K full context under the plan.**
+- Bytes per token: VRAM weights 1,919 MB (loop experts 645, attention 780, head 202, ctrl and router 85, staged experts 207) plus KV 941 MB (864 MiB global, 33.75 MiB SWA). At 217 GB/s that is a 13.2 ms floor.
+- Attention over 128K: 24 heads × 131,072 × 128 × 2 × 8 visits = 6.44 G MAC/token. The FMA floor is 2.9–3.4 ms and the KV-read floor 4.3 ms. Estimate 5–10 ms with K4V2 dequant (spec line 368: 7–10).
+- Staging 207.0 MB: 24.1 ms by ccopy (8.6 GB/s), 16.6 ms by copy-engine DMA (12.4–12.6 GB/s measured on this machine). No cache hit is left to overlap with. Per-expert pipelining can hide the staged experts' own GEMVs (~11% of GEMV bytes, 2–3 ms); the rows below do not subtract that.
+
+| state | GEMV | glue, launches, host | attention | staging | ms/tok | tok/s |
+|---|---|---|---|---|---|---|
+| today's kernels, plan's memory | today's 56.43 ms minus 9.84 ms ccopy, minus 0.93 ms attention (~46–51) | in GEMV column | 5–10 | 24.1 | ~75–85 | 12–13 |
+| after §4 steps 1–3 and 6, ccopy | 21–25 | 6–9 | 5–10 | 24.1 | 56–68 | 15–18 |
+| same, DMA with 12 graph segments | 21–25 | 6–9 (+ segment cost, unmeasured) | 5–10 | 16.6 | 49–61 | 16–20 |
+| plus a pre-gate prefetch hiding half the PCIe | 21–25 | 6–9 | 5–10 | 8.3 | 40–53 | 19–25 |
+| all PCIe hidden | 21–25 | 6–9 | 5–10 | 0 | 32–44 | 23–31 |
+
+The spec's 22–29 tok/s (spec line 2, 34–45 ms) needs the last row: every staged byte hidden, plus the full kernel and glue plan. Its own speed model (spec line 305) counts only the 16–17 ms of PCIe.
+
+**Using the slack the reserve does not need.**
+- The plan leaves 430–468 MiB unused under the physical ceiling at today's desktop use. After a 100 MiB safety margin, that is 13–15 cache slots per non-loop layer.
+- At a 25–45% miss rate, staging falls from 207 MB to ~50–95 MB, about −9 to −12 ms with DMA. The miss rate is an assumption: the measured 18.6% at k=20 is for loop layers 12–16, which repeat 3× per token (`opt/THEORY.md:79-81`). The old-kernel sweep put k=12 within 6 ms of k=20 (`opt/ledger.md:192`).
+- This spends the display reserve, so the owner decides (§5 question 3).
+
+**Recipe B.** The 12 loop layers at 2.5 bpw take 3,822.1 MB (3,645.0 MiB), +364.5 MiB over Recipe A. The total reaches 5,459–5,479 MiB: over the cap, but under the physical ceiling by 66–104 MiB if the runtime holds at 200 MiB.
 
 **Savings that are not VRAM.**
-- The spec claims 4-bit embeddings, a 5/6-bit vision tower and a NariQ lm_head together "reclaim 1.27 GB" for the loop core.
+- The spec claims that 4-bit embeddings, a 5/6-bit vision tower and a NariQ lm_head together reclaim 1.27–1.39 GB (spec line 92).
 - In the spec's own placement, embeddings live in RAM and vision streams only during image prefill. Neither is in VRAM during decode.
-- Today's unembed is already a 221 MiB trellis, so NariQ's ~202 MB head saves ~19 MiB of VRAM.
+- Today's unembed is already a 221.3 MiB trellis, so NariQ's 192.4 MiB head saves 28.9 MiB of VRAM.
+
+**Shorter context.** Each 1K tokens of global KV costs 6.75 MiB at K4V2, about 3 expert slots (2.8–3.6 at 2.0–2.5 bpw). Today's F16 layout costs 32 MiB per 1K: 8 visits × 8 KV heads × 128 × 2 × 2 B. The bench (one prompt, 64 tokens, ctx 512) never exercises this cost.
 
 ### 2.6 The speculative-decoding projection does not survive the measured acceptance and expert union
 
@@ -280,12 +335,13 @@ Expected time per token on cards that hold all experts:
 
 - **Attention:** keep the trellis.
   - Attention GEMVs run ~7–9 ms of wall time, after mz stream overlap.
+  - Today's attention trellis averages 3.63 bpw (278.7 MiB for 644.09M params). The spec's 4–5 bpw plan costs +83 MiB.
   - Moving them to int4/int5 g32 saves an estimated 1–2.5 ms on the 1060, for +70–150 MiB of VRAM (25–50 cache slots).
   - It loses on RTX (2× the bytes).
 - **Ctrl and router: store them as BF16, not F32.**
   - `load_st` widens them with `bf16_to_f32` (`runner.rs:331`, `runner.rs:696-708`): 148 MiB on device (ctrl 108, router 27, misc 12.6).
   - BF16 frees ~74 MiB, about one more k=20 cache, and halves their read bytes. The BF16→F32 widen is a 16-bit shift.
-- **Unembed:** keep the 221 MiB trellis. NariQ would save ~19 MiB.
+- **Unembed:** keep the 221.3 MiB trellis. NariQ's 192.4 MiB head would save 28.9 MiB.
 
 ## 4. Ordered plan
 
@@ -314,11 +370,12 @@ Every A/B below uses the existing protocol: ≥8 interleaved pairs in both order
 
 ## 5. Open questions for the owner
 
-1. **Context target on 6 GB.**
-   - Every 1K tokens of full-attention KV costs 6.75 MiB at K4V2 (32 MiB at F16), roughly 2 (or 10) cache slots.
-   - 128K at K4V2 (864 MiB) displaces all of today's 14 caches (~811 MiB) and adds ≥4 ms/tok of KV reads.
+1. **Context target on 6 GB.** The spec's 128K plan fits with zero expert caches and full non-loop streaming (§2.5). Which one?
+   - 128K under the 5,120 MiB cap: 207 MB/tok staged, est. 49–61 ms/tok after the plan with DMA staging and 12 graph segments.
+   - 128K plus non-loop caches in the 430–468 MiB the desktop leaves unused today: est. a further −9 to −12 ms, paid for with the display reserve (question 3).
+   - A shorter context with caches: each 1K tokens of K4V2 global KV (6.75 MiB) buys ~3 expert slots. This review's plan reaches 28–34 ms/tok at short context with today's quant and caches.
 2. **Gate for approximate kernels.** Keep md5 identity, or accept a KLD threshold? If a threshold, what number? Steps 3, 6 and 8 need the answer.
-3. **Display reserve.** Is the spec's 1,024 MiB display reserve and 5,120 MiB cap a hard requirement? Measure the display's current use; each 50–80 MB given up is one k=20 cache.
+3. **Display reserve.** Is the 5,120 MiB cap a hard requirement? CUDA sees 6,057 MiB (87 MiB driver-reserved), so the cap leaves 937 MiB to the desktop. The desktop used 494–512 MiB, measured idle on 2026-11-24. After a 100 MiB safety margin, the 425–443 MiB in between holds 13–15 non-loop slots per layer at 128K, or 4–7 of today's k=20 caches at short context.
 4. **2.2 bpw loop-fit variant.** Ship it for 6 GB cards at an estimated +12–25% KLD, and keep the 2.26 bpw SAGE quant for ≥ 8–12 GB cards? What KLD is acceptable?
 5. **Codebook fork.** Is ending exllamav3 compatibility acceptable for a Pascal-only win of ~3.5 ms?
 6. **Lossy runtime knobs.** Are top-k 8→6 or expert skipping by routing weight in scope?
@@ -334,3 +391,4 @@ Every A/B below uses the existing protocol: ≥8 interleaved pairs in both order
 - exllamav3 `doc/qb_kld.png` (github.com/turboderp-org/exllamav3): KLD vs bpw for EXL3, GGUF and NVFP4.
 - NVIDIA GA102 (Ampere) and AD102 (Ada) architecture whitepapers: INT32 on 64 of 128 FP32 lanes per SM. Blackwell: unified INT32/FP32 cores.
 - Spec: `/tmp/inkling2-mini-spec.txt`, the master spec v2.2 / runbook v1.4 (line numbers cited inline).
+- §2.5 measurements (2026-11-24): load logs `/tmp/place_runs/k20b.log`, `k24b.log`, `sweep_b3227_m800.log`, `sweep_loops_m600.log`; `nvidia-smi` memory and per-process use; a `cudaFree(0)` probe (6,057 MiB total, 5,480 MiB free with the desktop at 512 MiB, so the context takes 65 MiB); a pinned `cudaMemcpyAsync` HtoD probe (2/20/256 MiB). Probe sources are in `/tmp/review_arch_scripts/ctx/`.
