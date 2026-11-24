@@ -219,6 +219,17 @@ struct ClipL2Args { thr: f32, has_w: i32 }
 
 /// `ggml_custom_op_t`: `y = (x*w) * min(1, thr/(||x*w||_2 + eps))` per column.
 /// src[0] = x `[d, h]`; src[1] = scale (only when `has_w`). dst = x-shaped.
+struct RouterArgs { wscale: f32, wfloor: f32 }
+
+unsafe extern "C" fn router_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*(ud as *const RouterArgs) };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let logits = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 0)) as *const f32 };
+    let bias = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 1)) as *const f32 };
+    unsafe { inkwell_cuda::router_async(logits.cast(), bias.cast(),
+        inkwell_ggml::ink_tensor_data(dst).cast(), 8, 128, a.wscale, a.wfloor) };
+}
+
 unsafe extern "C" fn clip_l2_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
     let a = unsafe { &*ud.cast::<ClipL2Args>() };
     unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
@@ -1400,16 +1411,29 @@ impl Runner {
 
         // MoE — sigmoid gating + bias select, fused gate_up, SITU
         let logits = t::mmq(c, l.ffn_gate_inp.expect("g"), fcur); // [128, 1]
-        let probs = t::sigmoid(c, logits);
-        let sel = t::add(c, probs, l.ffn_exp_probs_b.expect("pb"));
-        let ids = t::argsort_top_k(c, sel, 8); // [8, ntok]
-        let probs3 = t::reshape3(c, probs, 1, 128, 1); // [1, n_expert, ntok]
-        let mut weights = t::get_rows(c, probs3, ids); // [1, 8, ntok]
-        let weights2 = t::reshape2(c, weights, 8, 1);
-        let wsum = t::clamp(c, t::sum_rows(c, weights2), 6.103515625e-5, f32::INFINITY);
-        weights = t::reshape3(c, t::div(c, weights2, wsum), 1, 8, 1);
-        weights = t::scale(c, weights, self.cfg.expert_weights_scale);
-        let weights3 = weights;
+        let (ids, weights3);
+        if std::env::var_os("INKWELL_NO_ROUTERFUSE").is_none() {
+            // fused: sigmoid+bias+top8+normalize in one kernel; dst[0..8]=w, dst[8..16]=ids bits
+            let pb = l.ffn_exp_probs_b.expect("pb");
+            let mut rargs = [logits.0, pb.0];
+            let ud = Box::leak(Box::new(RouterArgs {
+                wscale: self.cfg.expert_weights_scale, wfloor: 6.103515625e-5 }));
+            let r_out = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [16, 1, 1, 1], &mut rargs,
+                router_cb as usize, (ud as *mut RouterArgs).cast()) });
+            ids = t::view1(c, r_out, 8, 32);
+            weights3 = t::reshape3(c, t::view1(c, r_out, 8, 0), 1, 8, 1);
+        } else {
+            let probs = t::sigmoid(c, logits);
+            let sel = t::add(c, probs, l.ffn_exp_probs_b.expect("pb"));
+            ids = t::argsort_top_k(c, sel, 8); // [8, ntok]
+            let probs3 = t::reshape3(c, probs, 1, 128, 1); // [1, n_expert, ntok]
+            let mut weights = t::get_rows(c, probs3, ids); // [1, 8, ntok]
+            let weights2 = t::reshape2(c, weights, 8, 1);
+            let wsum = t::clamp(c, t::sum_rows(c, weights2), 6.103515625e-5, f32::INFINITY);
+            weights = t::reshape3(c, t::div(c, weights2, wsum), 1, 8, 1);
+            weights = t::scale(c, weights, self.cfg.expert_weights_scale);
+            weights3 = weights;
+        }
 
         // custom op: 8 expert GEMVs on GPU over zero-copy pinned weights +
         // fused SITU + per-expert scales + weighted sum — all in one callback

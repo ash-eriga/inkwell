@@ -3500,3 +3500,44 @@ extern "C" void ink_launch_exl3_gemv_mz(
         cudaStreamWaitEvent(st, mz_ev[z], 0);
     }
 }
+
+// ===================== fused router: sigmoid+bias+top-k+normalize =====================
+// out[0..8) = normalized*scale weights of the selected experts;
+// out[8..16) = selected expert ids as i32 bit patterns (read as f32 tensor).
+__global__ void inkwell_router(const float* __restrict__ logits,
+                               const float* __restrict__ bias,
+                               float* __restrict__ out, int k, int n_exp,
+                               float wscale, float wfloor) {
+    __shared__ float s_sel[256];
+    __shared__ float s_prb[256];
+    __shared__ int s_ids[64];
+    const int t = threadIdx.x;
+    const float l = (t < n_exp) ? logits[t] : -INFINITY;
+    const float p = 1.f / (1.f + __expf(-l));
+    if (t < n_exp) { s_prb[t] = p; s_sel[t] = p + bias[t]; }
+    __syncthreads();
+    // top-k by serial argmax rounds (thread 0) — 128-256 elems, ~2us
+    if (t == 0) {
+        float wsum = 0.f;
+        for (int j = 0; j < k; ++j) {
+            int bi = -1; float bv = -INFINITY;
+            for (int e = 0; e < n_exp; ++e)
+                if (s_sel[e] > bv) { bv = s_sel[e]; bi = e; }
+            s_ids[j] = bi;
+            s_sel[bi] = -INFINITY;
+            wsum += s_prb[bi];
+        }
+        if (wsum < wfloor) wsum = wfloor;
+        const float inv = wscale / wsum;
+        for (int j = 0; j < k; ++j) {
+            out[j] = s_prb[s_ids[j]] * inv;
+            out[k + j] = __int_as_float(s_ids[j]);
+        }
+    }
+}
+
+extern "C" void ink_launch_router(const void* logits, const void* bias, void* out,
+                                  int k, int n_exp, float wscale, float wfloor, void* stream) {
+    inkwell_router<<<1, 256, 0, (cudaStream_t)stream>>>(
+        (const float*)logits, (const float*)bias, (float*)out, k, n_exp, wscale, wfloor);
+}
