@@ -1259,3 +1259,9 @@ warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
 - **Optional FLAGGED REORDERED win:** `M3a` `sink_relbias_fused` (BF16 `rel_bias_pad`, `max_abs=4.77e-7` vs cuBLAS K=16): `9.15 → 3.10 µs` (**−0.29 ms/tok** bench / **~−0.55 ms** nsys, **−512 KiB VRAM**).
 - **Total strict BIT-EXACT savings: ~−4.6 to −5.25 ms/tok** (projected decode ~37.8–38.4 ms/tok); with `M3a`: ~−5.1 to −5.8 ms/tok (~37.2–37.8 ms/tok).
 
+## 2026-11-24 — Review of master spec v3.0 (`opt/REVIEW_SPEC_v3.md`)
+
+- Format and contracts match QUANT_BRIEF; most runtime numbers check out. Wrong: "smaller non-loop experts" (v3 makes them +436 MiB, est. misses 53.6 → ~59–100 MiB/tok), Option B "13.7 MiB smaller" (+44 MiB vs today), the −1.07 ms pw16 gain (not accepted), Drafter B "fits 128K".
+- 32K is not budgeted. Decode attention fails above 12,096 tokens (all scores in shared memory, 48 KiB/block on sm_61; probe `opt/kbench/attn_ctx`: n_kv 12,160 → `invalid argument`). Below that it costs 0.18 / 0.72 / 2.75 ms per visit at 1K / 4K / 8K: ~13 ms/tok at 4K and ~29 ms/tok at 8K, vs 0.93 ms in the short-prompt bench.
+- F16 KV at 32K adds +1,008 MiB, so caches go 940 → 0 MiB under the 5,120 cap (replay: 336.8 MiB/tok of misses, +25 to +45 ms); the loader does not enforce the cap. Trims (lazy `Exl3Blk`, `dev_buf` slack, `gf_cat` copy) give back ~282 MiB of caches → ~168 MiB/tok.
+- Seven lossy steps lack a no-regression gate vs 0.0475 / 94.66%; drafter labels are dumped before the shipped quant is final; H200 Window 1 estimate 6–17 h vs the spec's 6.2–9.75 h; Canary 2C cannot run the spec's ~80 GB recipe on an L4.
