@@ -2,6 +2,8 @@
 
 This is a math problem that can be worked on a CPU alone. The deliverable is a theorem with a Lean 4 proof, a CPU reference implementation with an exhaustive test, and an operation count. The Inkwell team ports and measures the result on the GPU.
 
+**Context.** This is about decompressing neural-network weights, not security. The function below is the public "mul1" codebook of the EXL3 quantization format (exllamav3, open source). It turns a 16-bit code into one weight of a language model. There is no key, no secret and no cryptographic system: every input is known, and the goal is only to evaluate the same function with fewer GPU instructions.
+
 ## 1. Why it matters
 Decoding one token of Inkling-2-Mini on a GTX 1060 takes ~38–41 ms. The largest single kernel, the MoE expert GEMV (~16 ms per token in nsys), is dot products whose weights are stored compressed as an EXL3 trellis.
 - ~3.06 billion weights are decoded per token: 48 layer visits × 8 experts × 3 matrices × 2304 × 1152, plus the dense layers.
@@ -69,7 +71,7 @@ Find an algorithm that computes, for one tile, either
 with **provably the same result** as the reference and **fewer GPU instructions per weight** than ~5.63 under the cost model of §3.
 
 Directions, none of them known to work:
-- exploit the recurrence of §4 to replace the 3-XMAD multiply;
+- use the recurrence of §4 to replace the 3-XMAD multiply;
 - compute bytesum of the product without forming the full product (carry structure);
 - split w into parts with small tables (≤ 4 KiB);
 - bucket by s, so that Σ_k v(s_k) x_k = Σ_s v(s) · (Σ_{k : s_k = s} x_k), when that is cheaper;
