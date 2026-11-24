@@ -68,6 +68,8 @@ extern "C" {
     fn ink_launch_draft_bf16row(w: *const c_void, idx: i32, ldw: i32, o: *mut f32, s: *mut c_void);
     fn ink_launch_draft_argmax(z: *const f32, n: i32, cap: f32, o: *mut i32, s: *mut c_void);
     fn ink_launch_conv_step(x_in: *const f32, state: *mut f32, region_off: i32, w: *const f32, dyn_p: *const f32, ch: i32, n_heads: i32, scale: f32, out: *mut f32, snap: *mut f32, stream: *mut c_void);
+    fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
+    fn ink_launch_exl3_gemv_mz(trel: *const *const c_void, suh: *const *const c_void, svh: *const *const c_void, x: *const *const f32, y: *mut f32, ystride: i64, scr: *const *mut f32, k: *const i64, n: *const i64, ka: *const i64, halfk: *const i64, nz: i32, stream: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_s_moe(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
@@ -757,6 +759,24 @@ pub unsafe fn exl3_gemv_ntok_async(trel: *const c_void, suh: *const c_void, svh:
 pub unsafe fn conv_step_async(x_in: *const f32, state: *mut f32, region_off: i32,
     w: *const f32, dyn_p: *const f32, ch: i32, n_heads: i32, scale: f32, out: *mut f32, snap: *mut f32) {
     unsafe { ink_launch_conv_step(x_in, state, region_off, w, dyn_p, ch, n_heads, scale, out, snap, stream()) };
+}
+/// Fused L2 clip: y = (x*w) * min(1, thr/(||(x*w)|| + eps)) per column of x `[d, h]`.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+pub unsafe fn clip_l2_async(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32) {
+    unsafe { ink_launch_clip_l2(x, w, y, d, h, thr, stream()) };
+}
+/// Multi-projection EXL3 gemv: `nz` independent projections on parallel side streams.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn exl3_gemv_mz_async(trel: &[*const c_void], suh: &[*const c_void], svh: &[*const c_void],
+    x: &[*const f32], y: *mut f32, ystride: i64, scr: &[*mut f32],
+    k: &[i64], n: &[i64], ka: &[i64], halfk: &[i64]) {
+    unsafe { ink_launch_exl3_gemv_mz(trel.as_ptr(), suh.as_ptr(), svh.as_ptr(), x.as_ptr(),
+        y, ystride, scr.as_ptr().cast(), k.as_ptr(), n.as_ptr(), ka.as_ptr(), halfk.as_ptr(), trel.len() as i32, stream()) };
 }
 
 pub unsafe fn exl3_moe_async(dg: *const c_void, du: *const c_void, dd: *const c_void,

@@ -3441,3 +3441,62 @@ extern "C" void ink_launch_draft_bf16row(const void* w, int idx, int ldw, float*
 extern "C" void ink_launch_draft_argmax(const float* z, int n, float cap, int* o, void* s) {
     inkwell_draft_argmax<<<1, 256, 0, (cudaStream_t)s>>>(z, n, cap, o);
 }
+
+// fused L2 clip: y = (x*w) * min(1, thr/(||(x*w)||_2 + eps)) per column.
+// x: [d, h] contiguous; w optional same layout; one block per column.
+__global__ void inkwell_clip_l2(const float* __restrict__ x, const float* __restrict__ w,
+                                float* __restrict__ y, int d, float thr) {
+    const int h = blockIdx.x;
+    const int i = threadIdx.x;
+    __shared__ float red[8];
+    __shared__ float fshr;
+    float c = 0.f;
+    if (i < d) {
+        c = x[(size_t)h * d + i];
+        if (w) c *= w[(size_t)h * d + i];
+    }
+    float v = c * c;
+    for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    if ((i & 31) == 0) red[i >> 5] = v;
+    __syncthreads();
+    if (i == 0) {
+        float n = red[0];
+        for (int j = 1; j < (256 >> 5); ++j) n += red[j];
+        fshr = fminf(1.f, thr / (sqrtf(n) + 1e-6f));
+    }
+    __syncthreads();
+    if (i < d) y[(size_t)h * d + i] = c * fshr;
+}
+
+extern "C" void ink_launch_clip_l2(const float* x, const float* w, float* y,
+                                   int d, int h, float thr, void* stream) {
+    inkwell_clip_l2<<<h, 256, 0, (cudaStream_t)stream>>>(x, w, y, d, thr);
+}
+
+// multi-projection EXL3 gemv: nz independent (trel,suh,svh,x,y,scratch,k,n)
+// projections issued on per-z side streams so the cuda-graph capture records
+// them as parallel branches (same trick as the MoE D-stage overlap).
+static cudaStream_t mz_ss[8] = {};
+static cudaEvent_t mz_ev[9] = {};
+extern "C" void ink_launch_exl3_gemv_mz(
+    const void* const* trel, const void* const* suh, const void* const* svh,
+    const float* const* x, float* y, long long ystride,
+    float* const* scr, const long long* k, const long long* n,
+    const long long* ka, const long long* halfk, int nz, void* stream) {
+    if (!mz_ss[0]) {
+        for (int i = 0; i < 8; ++i) {
+            cudaStreamCreateWithFlags(&mz_ss[i], cudaStreamNonBlocking);
+            cudaEventCreateWithFlags(&mz_ev[i], cudaEventDisableTiming);
+        }
+        cudaEventCreateWithFlags(&mz_ev[8], cudaEventDisableTiming);
+    }
+    cudaStream_t st = (cudaStream_t)stream;
+    cudaEventRecord(mz_ev[8], st);
+    for (int z = 0; z < nz; ++z) {
+        cudaStreamWaitEvent(mz_ss[z], mz_ev[8], 0);
+        ink_launch_exl3_gemv(trel[z], suh[z], svh[z], x[z], y + (size_t)z * ystride,
+            k[z], n[z], ka[z], halfk[z], scr[z], mz_ss[z]);
+        cudaEventRecord(mz_ev[z], mz_ss[z]);
+        cudaStreamWaitEvent(st, mz_ev[z], 0);
+    }
+}

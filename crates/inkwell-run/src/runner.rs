@@ -214,6 +214,63 @@ struct ConvStepArgs {
 
 /// `ggml_custom_op_t`: fused conv shift + ssm_conv + taps + residual + scale.
 /// src[0]=x_in [ch], src[1]=w [4,ch], src[2]=dyn [4,nh] (optional).
+/// userdata for the fused per-column L2 clip (`clip()`).
+struct ClipL2Args { thr: f32, has_w: i32 }
+
+/// `ggml_custom_op_t`: `y = (x*w) * min(1, thr/(||x*w||_2 + eps))` per column.
+/// src[0] = x `[d, h]`; src[1] = scale (only when `has_w`). dst = x-shaped.
+unsafe extern "C" fn clip_l2_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<ClipL2Args>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let x = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 0)) as *const f32 };
+    let w = if a.has_w != 0 {
+        unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 1)) as *const f32 }
+    } else { std::ptr::null() };
+    let y = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
+    let d = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let h = (unsafe { inkwell_ggml::ink_tensor_ne(dst, 1) } * unsafe { inkwell_ggml::ink_tensor_ne(dst, 2) }) as i32;
+    unsafe { inkwell_cuda::clip_l2_async(x, w, y, d, h, a.thr) };
+}
+
+/// userdata for the multi-projection EXL3 gemv (wq/gate/rel/wk/wv on parallel streams).
+struct Exl3MzArgs { ws: [*const Exl3W; 6], xidx: [i32; 6], nz: i32 }
+
+/// `ggml_custom_op_t`: `nz` EXL3 projections on parallel side streams.
+/// src[i] = the i-th distinct input tensor; per-proj input picked via `xidx`.
+/// dst `[n_max, nz]` — proj z's output lives in column z (`dst + z*n_max`).
+unsafe extern "C" fn exl3_mz_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<Exl3MzArgs>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let y = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
+    let nz = a.nz as usize;
+    let mut trel = [std::ptr::null::<std::ffi::c_void>(); 8];
+    let mut suh = [std::ptr::null::<std::ffi::c_void>(); 8];
+    let mut svh = [std::ptr::null::<std::ffi::c_void>(); 8];
+    let mut x = [std::ptr::null::<f32>(); 8];
+    let mut scr = [std::ptr::null_mut::<f32>(); 8];
+    let mut kk = [0i64; 8];
+    let mut nn = [0i64; 8];
+    let mut ka = [0i64; 8];
+    let mut hk = [0i64; 8];
+    for z in 0..nz {
+        let w = unsafe { &*a.ws[z] };
+        trel[z] = w.trel.dev_ptr();
+        suh[z] = w.suh.dev_ptr();
+        svh[z] = w.svh.dev_ptr();
+        x[z] = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, a.xidx[z])) as *const f32 };
+        scr[z] = w.scratch.dev_ptr().cast();
+        kk[z] = w.k as i64;
+        nn[z] = w.n as i64;
+        ka[z] = w.ka as i64;
+        hk[z] = w.halfk as i64;
+    }
+    let n_max = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) };
+    unsafe {
+        inkwell_cuda::exl3_gemv_mz_async(&trel[..nz], &suh[..nz], &svh[..nz], &x[..nz],
+            y, n_max, &scr[..nz], &kk[..nz], &nn[..nz], &ka[..nz], &hk[..nz])
+    };
+}
+
 unsafe extern "C" fn conv_step_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
     let a = unsafe { &*ud.cast::<ConvStepArgs>() };
     unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
@@ -1004,6 +1061,15 @@ impl Runner {
 
     fn clip(&self, x: Ptr, scale: Option<Ptr>, thr: f32) -> Ptr {
         let c = self.cur_ctx;
+        if std::env::var_os("INKWELL_NO_CLIPFUSE").is_none() {
+            let a: &'static ClipL2Args = Box::leak(Box::new(ClipL2Args {
+                thr, has_w: scale.is_some() as i32 }));
+            let mut args = vec![x.0];
+            if let Some(s) = scale { args.push(s.0); }
+            let (d, h, nt) = (t::ne(x, 0), t::ne(x, 1), t::ne(x, 2));
+            return Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [d, h, nt, 1], &mut args,
+                clip_l2_cb as usize, (a as *const ClipL2Args).cast_mut().cast()) });
+        }
         let mut cur = x;
         if let Some(s) = scale { cur = t::mul(c, cur, s); }
         let norm = t::scale_bias(c, t::sqrt(c, t::sum_rows(c, t::sqr(c, cur))), 1.0, 1e-6);
@@ -1196,30 +1262,62 @@ impl Runner {
             inputs[2] = self.norm(inputs[2], l.attn_v_inp_norm.expect("v_inp"));
         }
 
-        // projections: concat {q,gate,rel} when types allowed it at load
-        let (q, gate_lin, r_pre) = if let Some(cat) = l.proj0_cat {
-            let out = t::mmq(c, cat, inputs[0]);
-            // ggml_view_1d offset is in BYTES in this fork — out is F32 (row idx * 4)
-            let slice = |off: i64, n: i64, key: &'static str, w: Option<Ptr>| {
-                if off >= 0 { t::view1(c, out, n, off * 4) } else { self.proj(c, l, key, w, inputs[0]) }
-            };
+        // projections: on all-EXL3 layers fuse the 5 independent projections
+        // (wq/gate/rel on inputs[0..2]) into one multi-stream custom op —
+        // each ~100us gemv runs as a parallel branch of the captured graph.
+        let mz_keys: [&'static str; 5] = ["wq", "gate", "rel", "wk", "wv"];
+        let mz_ok = std::env::var_os("INKWELL_NO_MZ").is_none()
+            && mz_keys.iter().all(|k| l.exl3.contains_key(*k));
+        let (q, gate_lin, r_pre, wk_p, wv_p) = if mz_ok {
+            let mut ws = [std::ptr::null::<Exl3W>(); 6];
+            let mut n_max = 0i64;
+            for (z, k) in mz_keys.iter().enumerate() {
+                let e: &Exl3W = &*self.exl3_w[l.exl3[k]];
+                ws[z] = e;
+                n_max = n_max.max(e.n as i64);
+            }
+            let a: &'static mut Exl3MzArgs = Box::leak(Box::new(Exl3MzArgs {
+                ws, xidx: [0, 0, 0, 1, 2, 0], nz: 5 }));
+            let mut args = [inputs[0].0, inputs[1].0, inputs[2].0];
+            let out = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32,
+                [n_max, 5, 1, 1], &mut args,
+                exl3_mz_cb as usize, (a as *mut Exl3MzArgs).cast()) });
+            let n = |k: &'static str| self.exl3_w[l.exl3[k]].n as i64;
             (
-                slice(l.proj0_off[0], 3072, "wq", l.wq),
-                slice(l.proj0_off[1], 3072, "gate", l.wqkv_gate),
-                slice(l.proj0_off[2], 384, "rel", l.attn_rel),
+                t::view1(c, out, n("wq"), 0),
+                t::view1(c, out, n("gate"), n_max * 4),
+                t::view1(c, out, n("rel"), 2 * n_max * 4),
+                t::view1(c, out, n("wk"), 3 * n_max * 4),
+                t::view1(c, out, n("wv"), 4 * n_max * 4),
             )
         } else {
-            (
-                self.proj(c, l, "wq", l.wq, inputs[0]),
-                self.proj(c, l, "gate", l.wqkv_gate, inputs[0]),
-                self.proj(c, l, "rel", l.attn_rel, inputs[0]),
-            )
+            let (q, gate_lin, r_pre) = if let Some(cat) = l.proj0_cat {
+                let out = t::mmq(c, cat, inputs[0]);
+                // ggml_view_1d offset is in BYTES in this fork — out is F32 (row idx * 4)
+                let slice = |off: i64, n: i64, key: &'static str, w: Option<Ptr>| {
+                    if off >= 0 { t::view1(c, out, n, off * 4) } else { self.proj(c, l, key, w, inputs[0]) }
+                };
+                (
+                    slice(l.proj0_off[0], 3072, "wq", l.wq),
+                    slice(l.proj0_off[1], 3072, "gate", l.wqkv_gate),
+                    slice(l.proj0_off[2], 384, "rel", l.attn_rel),
+                )
+            } else {
+                (
+                    self.proj(c, l, "wq", l.wq, inputs[0]),
+                    self.proj(c, l, "gate", l.wqkv_gate, inputs[0]),
+                    self.proj(c, l, "rel", l.attn_rel, inputs[0]),
+                )
+            };
+            (q, gate_lin, r_pre,
+                self.proj(c, l, "wk", l.wk, inputs[1]),
+                self.proj(c, l, "wv", l.wv, inputs[2]))
         };
         let k_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_k_conv_proj.expect("kcp"), inputs[1])) };
         let v_dyn = if is_swa { None } else { Some(t::mmq(c, l.attn_v_conv_proj.expect("vcp"), inputs[2])) };
-        let k = self.convolve(self.proj(c, l, "wk", l.wk, inputs[1]), l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores, std::ptr::null_mut());
+        let k = self.convolve(wk_p, l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores, std::ptr::null_mut());
         let gqa = (hd * hkv) as i64;
-        let v = self.convolve(self.proj(c, l, "wv", l.wv, inputs[2]), l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores, std::ptr::null_mut());
+        let v = self.convolve(wv_p, l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores, std::ptr::null_mut());
         let r = r_pre;
         if il == 0 {
             self.dump("rel_raw", r); self.dump("inputs0", inputs[0]);
