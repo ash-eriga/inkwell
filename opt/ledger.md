@@ -339,3 +339,60 @@ Generated text byte-identical (md5 5cbe8e06...) in ALL 6 runs — no token flips
 
 VERDICT: **ACCEPT** — gold passes on all geometries/skipmodes, e2e -16.4% ms/tok,
 byte-identical output, warning-neutral (60 `warning:` lines before = after).
+
+## 2026-11-24 — sgemv dense (stream-decode single-token gemv)
+
+Ported the `inkwell_exl3_gemv_moe_s` design to the DENSE single-token GEMV.
+New kernel `inkwell_exl3_gemv_s` (kernels.cu, right after `inkwell_exl3_gemv_dp4a`;
+reuses `sgemv_run<KA,H>`/`sgemv_win`/`sgemv_mul16` via forward decls): 256 thr =
+8 warps = 8 tile columns, lane t owns 8 consecutive ring windows at compile-time
+offsets, 3 __ldg trellis words per tile, no smem ring, no __syncthreads in the
+loop, x staged in `xs[3072]` smem (12 KB — covers wo k=3072) + chunk-local Σx in
+the prologue, out = KINV*acc + KOFF*Σx.
+- grid (ceil(tn/8), nky); block y owns chunk [y*tkc, min(y*tkc+tkc,tk)) and
+  plain-stores its PARTIAL to t[y*tn*16+col] (empty chunks write 0);
+  inkwell_exl3_had_out sums the nky partials. ntok/MoE/v2 paths untouched.
+- `ink_launch_exl3_gemv`: killswitch `INKWELL_NO_SGEMV_DENSE=1` (static, once)
+  -> exact old path incl. INKWELL_EXL3_X8. New path default for k <= 3072
+  (guards vs bigger-k tensors). Own split-K env `INKWELL_SGEMV_DENSE_TGT`
+  (blocks target, default 32; nky <= 8 and nky*2 <= tk). Covers the mz 5-proj
+  set (via ink_launch_exl3_gemv_mz), wo_ud and the unembed lm_head.
+- scratch k+8*n floats already allows nky up to 8 (runner.rs:727).
+
+### Gold on REAL dense weights (opt/kbench/sgemv_dense_gold.cu +
+### sgemv_dense_dump.py; all of wq_du, gate_attn, wr_du, wk_dv, wv_dv, wo_ud
+### + full-size unembed; K in {3,3.5,5,4}; relerr = max|new-ref|/max|ref|)
+| shape | K | old dp4a us | best new | relerr (all nky) |
+| wq_du 2304->3072    | 3   | 110.2 | nky=2 42.0 us | <=2.2e-06 PASS |
+| gate_attn 2304->3072| 3   | 112.4 | nky=2 41.6 us | <=1.2e-06 PASS |
+| wr_du 2304->384     | 5   |  19.5 | nky=8 11.9 us | <=2.2e-06 PASS |
+| wk_dv 2304->1024    | 3.5 |  42.0 | nky=4 20.3 us | <=1.3e-06 PASS |
+| wv_dv 2304->1024    | 3.5 |  41.0 | nky=4 20.2 us | <=3.2e-06 PASS |
+| wo_ud 3072->2304    | 3.5 | 105.1 | nky=8 42.6 us | <=2.1e-06 PASS |
+| unembed 2304->201088| 4   | 5830  | nky=1 1881 us | <=1.8e-06 PASS |
+empty-chunk run (wr_du nky=145>tk=144): 3.5e-07 PASS — tail blocks store 0.
+
+### INKWELL_SGEMV_DENSE_TGT sweep (est = 48*(wq+gate+wr+wk+wv+wo) + unembed)
+| tgt | nky (gate wk wo wq wr wv unemb) | est us/tok-gemv |
+| 1   | 1 1 1 1 1 1 1 | 12059 |
+| 24  | 1 4 2 1 8 4 1 | 11242 |
+| **32** | **2 4 2 2 8 4 1** | **10570 (picked default)** |
+| 48  | 2 8 4 2 8 8 1 | 10825 |
+| 64+ | ...->8s | >=11104 |
+old path est: 26469 us/tok-gemv -> -60%.
+concurrent mz (5 streams, wall): old 263.7 us | new tgt=24 89.1 / tgt=32 93.2 /
+tgt=48 95.8 / tgt=64 99.8 / tgt>=128 ~109.6 us — ~2.8x.
+
+### e2e A/B (BEST env, alternating C/A/C/A/C/A/C/A; ms/tok = decode-8-tok s*1000/64)
+| run | control (NO_SGEMV_DENSE=1) | candidate (tgt=32 default) |
+| 1 | 4.5689s = 71.39 | 3.6763s = 57.44 |
+| 2 | 4.5873s = 71.68 | 3.8036s = 59.43 |
+| 3 | 4.5278s = 70.75 | 3.7313s = 58.30 |
+| 4 | 4.4977s = 70.28 | 3.6577s = 57.15 |
+| median | 4.5484s = **71.07 ms/tok** | 3.7038s = **57.87 ms/tok** (-18.6%) |
+
+Generated text byte-identical (md5 5cbe8e06f2d8d82feb7f2ca287a7bc59) in ALL 8
+runs — no token flips. Warning count unchanged (60 `warning:` lines before/after).
+
+VERDICT: **ACCEPT** — candidate median faster (-18.6%), gold passes every K/nky
+incl. empty chunks, byte-identical output, killswitch default OFF = new kernel.

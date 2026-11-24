@@ -1927,6 +1927,72 @@ __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
     if (live && rp == 0) t[blockIdx.y * (tn * 16) + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
 }
 
+// stream-decode helpers shared with the MoE kernel (defined near inkwell_exl3_gemv_moe_s)
+__device__ __forceinline__ uint32_t sgemv_mul16(uint32_t w);
+template <int D> __device__ __forceinline__ uint32_t sgemv_win(uint32_t hi, uint32_t lo);
+template <int KA, int H>
+__device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
+                                          int tk_lo, int tk_hi, const float* __restrict__ xs,
+                                          float& a0, float& a1);
+
+// "stream-decode" dense single-token gemv (same design as inkwell_exl3_gemv_moe_s):
+// one warp per 16-wide tile column, 256 threads = 8 warps = 8 tile columns;
+// lane t owns 8 consecutive ring windows at compile-time offsets, 3 __ldg words
+// per tile, no smem ring, no __syncthreads in the loop; Σx over the block's
+// k-range precomputed in the prologue; out = KINV*acc + KOFF*Σx.
+// grid (ceil(tn/8), nky): block y owns tk chunk [y*tkc, min(y*tkc+tkc, tk)) and
+// writes its PARTIAL to t[y*(tn*16) + col] with a plain store (empty chunks
+// write 0); inkwell_exl3_had_out sums the nky partials.
+#define SGEMV_DENSE_MAXK 3072
+__global__ void __launch_bounds__(256) inkwell_exl3_gemv_s(
+                                       const uint32_t* __restrict__ trel,
+                                       const float* __restrict__ xh,
+                                       float* __restrict__ t,
+                                       int tk, int tn, int ka, int halfk) {
+    const int tkc = (tk + gridDim.y - 1) / gridDim.y;
+    const int tk_lo = blockIdx.y * tkc;
+    const int tk_hi = min(tk_lo + tkc, tk);
+    __shared__ __align__(16) float xs[SGEMV_DENSE_MAXK];
+    __shared__ float red[8];
+    // prologue: stage this block's k-range of x and its Σx
+    float sxl = 0.f;
+    for (int e = tk_lo * 16 + threadIdx.x; e < tk_hi * 16; e += 256) {
+        const float v = xh[e];
+        sxl += v;
+        xs[e] = v;
+    }
+#pragma unroll
+    for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sxl;
+    __syncthreads();
+    float sx = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sx += red[i];
+    const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (tn_i >= tn) return;
+    float a0 = 0.f, a1 = 0.f;
+    switch (ka * 2 + halfk) {
+        case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 6:  sgemv_run<3, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 7:  sgemv_run<3, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 8:  sgemv_run<4, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 10: sgemv_run<5, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        default: __trap();
+    }
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+    const int lane = threadIdx.x & 31;
+    if ((lane & 3) == 0) {
+        const float KINV = __half2float(__ushort_as_half(0x1eee));
+        const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+        const float off = KOFF * sx;   // chunk-local Σx belongs to every column once
+        float* dst = &t[(size_t)blockIdx.y * (tn * 16) + tn_i * 16 + (lane >> 2)];
+        dst[0] = fmaf(KINV, a0, off); dst[8] = fmaf(KINV, a1, off);
+    }
+}
+
 // Batched-token GEMV (spec-decode verify): one weight stream feeds NTOK=8
 // activation sets. t layout: [nky][ntok][n]; xh: [ntok][tk*16].
 __global__ void inkwell_exl3_gemv_dp4a_ntok(const uint32_t* __restrict__ trel,
@@ -2119,6 +2185,20 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
     const int tk = (int)(k / 16), tn = (int)(n / 16);
     inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
         x, (const uint16_t*)suh, scratch /* xh */, (int)k);
+    { static int no_s = -1; if (no_s < 0) { const char* e = getenv("INKWELL_NO_SGEMV_DENSE"); no_s = e ? atoi(e) : 0; }
+      if (!no_s && k <= SGEMV_DENSE_MAXK) {
+        const int nb = (tn + 7) / 8;
+        int nky = 1;
+        { static int tgt = -1; if (tgt < 0) { const char* e = getenv("INKWELL_SGEMV_DENSE_TGT"); tgt = e ? atoi(e) : 32; }
+          while (nb * nky < tgt && nky < 8 && nky * 2 <= tk) nky *= 2; }
+        if (nky > 1) cudaMemsetAsync(scratch + k, 0, (size_t)nky * n * 4, (cudaStream_t)stream);
+        dim3 gsz((unsigned)nb, (unsigned)nky, 1);
+        inkwell_exl3_gemv_s<<<gsz, 256, 0, (cudaStream_t)stream>>>(
+            (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
+        inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
+            scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
+        return;
+      } }
     const int nb = (tn + 3) / 4;
     // aim for ~256 blocks: split K when tn is small
     int nky = 1;
