@@ -73,6 +73,9 @@ extern "C" {
     fn ink_launch_draft_bf16row(w: *const c_void, idx: i32, ldw: i32, o: *mut f32, s: *mut c_void);
     fn ink_launch_draft_argmax(z: *const f32, n: i32, cap: f32, o: *mut i32, s: *mut c_void);
     fn ink_launch_conv_step(x_in: *const f32, state: *mut f32, region_off: i32, w: *const f32, dyn_p: *const f32, ch: i32, n_heads: i32, scale: f32, out: *mut f32, snap: *mut f32, stream: *mut c_void);
+    fn ink_launch_ctrl_apply(g3: *const f32, cur: *const f32, msg: *const f32, y: *mut f32, n: i32, ng: i32, stream: *mut c_void);
+    fn ink_launch_rms2cat(x0: *const f32, x1: *const f32, y: *mut f32, n: i32, eps: f32, stream: *mut c_void);
+    fn ink_launch_relbias_gather(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, y: *mut f32, nkv: i32, nh: i32, ext: i32, stream: *mut c_void);
     fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_exl3_gemv_mz(trel: *const *const c_void, suh: *const *const c_void, svh: *const *const c_void, x: *const *const f32, y: *mut f32, ystride: i64, scr: *const *mut f32, k: *const i64, n: *const i64, ka: *const i64, halfk: *const i64, nz: i32, stream: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
@@ -771,6 +774,29 @@ pub unsafe fn conv_step_async(x_in: *const f32, state: *mut f32, region_off: i32
 /// Raw device pointers; launched on the ggml cuda stream.
 pub unsafe fn clip_l2_async(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32) {
     unsafe { ink_launch_clip_l2(x, w, y, d, h, thr, stream()) };
+}
+/// Loop-controller tail: y = (cur - tanh(g3[ng+i])*cur) + tanh(g3[i])*msg.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+pub unsafe fn ctrl_apply_async(g3: *const f32, cur: *const f32, msg: *const f32,
+    y: *mut f32, n: i32, ng: i32) {
+    unsafe { ink_launch_ctrl_apply(g3, cur, msg, y, n, ng, stream()) };
+}
+/// concat(rms_norm(x0), rms_norm(x1)) — ggml-order-identical reduction.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+pub unsafe fn rms2cat_async(x0: *const f32, x1: *const f32, y: *mut f32, n: i32, eps: f32) {
+    unsafe { ink_launch_rms2cat(x0, x1, y, n, eps, stream()) };
+}
+/// rel-bias gather + sink subtract: y[j + h*nkv] = mm[rp[j] + h*ext] - sinks[h].
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+pub unsafe fn relbias_gather_async(mm: *const f32, sinks: *const f32, rel_pos: *const c_void,
+    y: *mut f32, nkv: i32, nh: i32, ext: i32) {
+    unsafe { ink_launch_relbias_gather(mm, sinks, rel_pos, y, nkv, nh, ext, stream()) };
 }
 /// Multi-projection EXL3 gemv: `nz` independent projections on parallel side streams.
 ///

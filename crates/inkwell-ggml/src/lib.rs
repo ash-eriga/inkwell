@@ -101,6 +101,7 @@ extern "C" {
     pub fn ink_alloc_graph(galloc: *mut c_void, g: *mut c_void) -> bool;
     pub fn ink_compute(backend: *mut c_void, g: *mut c_void) -> c_int;
     pub fn ink_graph_op_counts(g: *mut c_void);
+    pub fn ink_graph_dump(g: *mut c_void);
     pub fn ink_is_contiguous(t: *const c_void) -> c_int;
     pub fn ink_backend_free(b: *mut c_void);
     pub fn ink_tensor_nbytes(t: *mut c_void) -> usize;

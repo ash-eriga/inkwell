@@ -713,3 +713,46 @@ cross-lane pair sharing via shfl) to keep warp count up.
 VERDICT: **REJECTED** — code reverted (kernels.cu, sgemv_var.cu). Kept
 plan_pw.cpp (the verified extraction planner: emits + validates the per-K op
 lists; reuse for any future paired-window attempt).
+
+## 2026-11-24 — glue fusions round 2 (ctrl cluster + rel-bias gather)
+
+### Per-token ggml op map (INKWELL_GRAPHDUMP, pos=0, 4599 nodes)
+
+OPCNT (node counts/token; views/reshape/permute are free, no kernel):
+ADD=184 SUB=144 MUL=410 CONCAT=260 RMS_NORM=394 MUL_MAT=352 SCALE=5
+CPY=1 CONT=96 RESHAPE=606 VIEW=823 PERMUTE=240 GET_ROWS=48 SET_ROWS=96
+CLAMP=1 UNARY=241 CUSTOM=697 LOG=1 -> ~2900 kernel-launching nodes/token.
+
+Per-visit node skeleton (REXL3 path, all attn projs EXL3):
+- norm() = RMS_NORM+MUL -> backend already fuses (rms_norm_mul_f32). The 394
+  rms_norm launches already include the weight muls; ~166 MUL nodes are
+  likewise already elided, as are the 48 UNARY(sigmoid)+MUL gate muls
+  (unary_mul fusion). Remaining real launches below.
+- control() x4/msg-visit (24 msg-visits): RMS_NORM, RMS_NORM, CONCAT[4608],
+  MUL_MAT down [4608->64], MUL_MAT gf_cat [64->4608], 2x VIEW, 2x
+  UNARY(tanh), MUL, SUB, MUL, ADD = 11 launches per site, 44/visit, 1056/tok.
+- per visit: sinks MUL_MAT [2304->24], rel_bias MUL_MAT [16,1025]x[16,24]
+  (sgemm), SUB+CONT+GET_ROWS+CONT rel-gather (4), set_rows x2, mix CONCATs,
+  residual ADD x~1.75, misc.
+- generic mul_mat (352): 96 ctrl_down + 96 gf_cat + 48 sinks + 48 gate_inp
+  [2304->128] + 48 rel_bias sgemm + 16 conv_proj. F32 weights ~2.4MB/ctrl
+  pair; ~300MB weight reads/tok total.
+- CUSTOM 697: mz(48)+conv k/v/post/ffn(4x48=192... ~11-12/visit)+clip x3+
+  attn+router+moe+mix x2-3+exl3 out.
+
+### Attempt C1 — ctrl-cluster fusion + rel-bias gather (exact-math)
+
+runner.rs `control()`: two custom ops replace 9 launches/site:
+- `rms2cat` (inkwell_rms2cat): 2 blocks x 1024 thr, replicates ggml
+  rms_norm_f32 vec path (vpt=1, float4, same block_reduce<SUM> tree,
+  __fdiv_rn) -> [rms(cur); rms(msg)] in 1 launch (-2/site).
+- `ctrl_apply` (inkwell_ctrl_apply): y = (cur - tanh(g3[ng+i])*cur) +
+  tanh(g3[i])*msg with __f*_rn intrinsics to block fmad contraction ->
+  same op order as tanh+mul+sub+mul+add (-5/site).
+- `relbias_gather` (inkwell_relbias_gather): kq_b[j+h*nkv] =
+  mm[rel_pos[j]+h*ext] - sinks[h]; replaces SUB+permute/CONT+GET_ROWS+
+  permute/CONT (-3/visit).
+Launch delta: ctrl -7x96=-672; relbias -3x48=-144; total ~-816 launches.
+Killswitches: INKWELL_NO_CTRLFUSE=1, INKWELL_NO_RELGATHER=1 (independent).
+
+A/B: TBD

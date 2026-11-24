@@ -183,6 +183,15 @@ extern "C" void ink_graph_op_counts(ggml_cgraph* g) {
     for (int i = 0; i < GGML_OP_COUNT; i++)
         if (cnt[i]) fprintf(stderr, "OPCNT %s = %d\n", ggml_op_name((enum ggml_op)i), cnt[i]);
 }
+extern "C" void ink_graph_dump(ggml_cgraph* g) {
+    for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
+        const ggml_tensor* t = ggml_graph_node(g, i);
+        fprintf(stderr, "NODE %d %s ty=%d ne=[%ld,%ld,%ld,%ld] nsrc=", i,
+            ggml_op_name(t->op), (int)t->type, (long)t->ne[0], (long)t->ne[1], (long)t->ne[2], (long)t->ne[3]);
+        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) fprintf(stderr, "%ld ", (long)t->src[s]->ne[0]);
+        fprintf(stderr, " name=%s\n", t->name);
+    }
+}
 extern "C" int ink_is_contiguous(const ggml_tensor* t) { return ggml_is_contiguous(t) ? 1 : 0; }
 extern "C" int64_t ink_tensor_ne(ggml_tensor* t, int i) { return t->ne[i]; }
 extern "C" int64_t ink_tensor_nb(ggml_tensor* t, int i) { return t->nb[i]; }

@@ -4089,3 +4089,76 @@ extern "C" void ink_launch_mix(const void* st, const void* q, void* out,
         (const float*)st, (const float*)q, (float*)out, embd, rows, qcols, scale);
 }
 
+
+// ---- loop-controller glue fusions (graph-rewrite path in runner.rs) ----
+
+// y = (cur - forget*cur) + gain*msg with gain = tanh(g3[0..n]),
+// forget = tanh(g3[ng..ng+n]). Replaces tanh x2 + mul/sub/mul/add.
+// __f*_rn intrinsics keep the same op order as the unfused chain
+// (--use_fast_math could otherwise contract into fma).
+__global__ void inkwell_ctrl_apply(const float* __restrict__ g3,
+        const float* __restrict__ cur, const float* __restrict__ msg,
+        float* __restrict__ y, int n, int ng) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float gn = tanhf(g3[i]);
+    const float fg = tanhf(g3[ng + i]);
+    const float t = __fsub_rn(cur[i], __fmul_rn(fg, cur[i]));
+    y[i] = __fadd_rn(t, __fmul_rn(gn, msg[i]));
+}
+extern "C" void ink_launch_ctrl_apply(const float* g3, const float* cur,
+        const float* msg, float* y, int n, int ng, void* stream) {
+    inkwell_ctrl_apply<<<(n + 255) / 256, 256, 0, (cudaStream_t)stream>>>(
+        g3, cur, msg, y, n, ng);
+}
+
+// concat(rms_norm(x0), rms_norm(x1)) in one launch: block bx normalizes
+// input bx into y + bx*n. Mirrors ggml rms_norm_f32 (vec path, 1024 thr,
+// vpt=1) including the block_reduce<SUM> tree so sums match bit-exactly.
+__global__ void __launch_bounds__(1024) inkwell_rms2cat(
+        const float* __restrict__ x0, const float* __restrict__ x1,
+        float* __restrict__ y, int n, float eps) {
+    __shared__ float s_sum[32];
+    const float* x = blockIdx.x ? x1 : x0;
+    float* dst = y + (size_t)blockIdx.x * n;
+    const int tid = threadIdx.x;
+    const int n4 = n / 4;
+    float4 xs = make_float4(0.f, 0.f, 0.f, 0.f);
+    float tmp = 0.f;
+    if (tid < n4) {
+        xs = ((const float4*)x)[tid];
+        tmp += xs.x * xs.x + xs.y * xs.y + xs.z * xs.z + xs.w * xs.w;
+    }
+    for (int m = 16; m; m >>= 1) tmp += __shfl_xor_sync(0xffffffffu, tmp, m);
+    const int wid = tid >> 5, lane = tid & 31;
+    if (lane == 0) s_sum[wid] = tmp;
+    __syncthreads();
+    tmp = (lane < (int)(blockDim.x >> 5)) ? s_sum[lane] : 0.f;
+    for (int m = 16; m; m >>= 1) tmp += __shfl_xor_sync(0xffffffffu, tmp, m);
+    const float scale = rsqrtf(__fdiv_rn(tmp, (float)n) + eps);
+    if (tid < n4) {
+        ((float4*)dst)[tid] = make_float4(scale * xs.x, scale * xs.y,
+                                          scale * xs.z, scale * xs.w);
+    }
+}
+extern "C" void ink_launch_rms2cat(const float* x0, const float* x1,
+        float* y, int n, float eps, void* stream) {
+    inkwell_rms2cat<<<2, 1024, 0, (cudaStream_t)stream>>>(x0, x1, y, n, eps);
+}
+
+// rel-bias gather: y[j + h*nkv] = mm[rel_pos[j] + h*ext] - sinks[h].
+// Replaces sub + permute/cont + get_rows + permute/cont.
+__global__ void inkwell_relbias_gather(const float* __restrict__ mm,
+        const float* __restrict__ sinks, const int* __restrict__ rel_pos,
+        float* __restrict__ y, int nkv, int nh, int ext) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nkv * nh) return;
+    const int h = i / nkv, j = i - h * nkv;
+    y[i] = __fsub_rn(mm[(size_t)rel_pos[j] + (size_t)h * ext], sinks[h]);
+}
+extern "C" void ink_launch_relbias_gather(const float* mm, const float* sinks,
+        const void* rel_pos, float* y, int nkv, int nh, int ext, void* stream) {
+    const int t = nkv * nh;
+    inkwell_relbias_gather<<<(t + 255) / 256, 256, 0, (cudaStream_t)stream>>>(
+        mm, sinks, (const int*)rel_pos, y, nkv, nh, ext);
+}

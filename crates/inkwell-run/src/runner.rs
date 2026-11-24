@@ -258,6 +258,54 @@ unsafe extern "C" fn mix_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud
         inkwell_ggml::ink_tensor_data(dst).cast(), a.embd, a.rows, a.qcols, a.scale) };
 }
 
+/// `ggml_custom_op_t`: loop-controller tail —
+/// y = (cur - tanh(g3[ng+i])*cur) + tanh(g3[i])*msg. srcs = [g3, cur, msg];
+/// userdata = `&i32` forget offset (ng).
+unsafe extern "C" fn ctrl_apply_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let ng = unsafe { *(ud as *const i32) };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let n = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    unsafe {
+        inkwell_cuda::ctrl_apply_async(s(0), s(1), s(2),
+            inkwell_ggml::ink_tensor_data(dst).cast(), n, ng)
+    };
+}
+
+/// `ggml_custom_op_t`: concat(rms_norm(x0), rms_norm(x1)) in one launch.
+/// srcs = [x0, x1]; dst [2n] with x0 in [0..n).
+unsafe extern "C" fn rms2cat_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let n = (unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } / 2) as i32;
+    unsafe {
+        inkwell_cuda::rms2cat_async(s(0), s(1),
+            inkwell_ggml::ink_tensor_data(dst).cast(), n, 1e-6)
+    };
+}
+
+/// `ggml_custom_op_t`: kq_b[j + h*nkv] = table[rel_pos[j] + h*ext] - sinks[h].
+/// srcs = [table mm [ext, nh], sinks [nh], rel_pos i32 [nkv]].
+unsafe extern "C" fn relbias_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let mm = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i))
+    };
+    let nkv = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let nh = unsafe { inkwell_ggml::ink_tensor_ne(mm, 1) } as i32;
+    let ext = unsafe { inkwell_ggml::ink_tensor_ne(mm, 0) } as i32;
+    unsafe {
+        inkwell_cuda::relbias_gather_async(inkwell_ggml::ink_tensor_data(mm).cast(),
+            s(1).cast(), s(2).cast(), inkwell_ggml::ink_tensor_data(dst).cast(),
+            nkv, nh, ext)
+    };
+}
+
 unsafe extern "C" fn clip_l2_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
     let a = unsafe { &*ud.cast::<ClipL2Args>() };
     unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
@@ -1346,12 +1394,29 @@ impl Runner {
     /// loop control gate: (1-forget)*cur + gain*msg
     fn control(&self, cur: Ptr, msg: Ptr, l: &L, ctrl: usize) -> Ptr {
         let c = self.cur_ctx;
-        let gate = t::concat(c, t::rms_norm(c, cur, 1e-6), t::rms_norm(c, msg, 1e-6), 0);
+        // glue fusion (INKWELL_NO_CTRLFUSE=1 restores the unfused chain):
+        // rms2cat packs the two rms_norms + concat into one kernel, and
+        // ctrl_apply does tanh x2 + the (1-forget)*cur + gain*msg tail.
+        let fuse = std::env::var_os("INKWELL_NO_CTRLFUSE").is_none();
+        let n = t::ne(cur, 0);
+        let gate = if fuse && n % 4 == 0 && n / 4 <= 1024 {
+            let mut args = [cur.0, msg.0];
+            Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [2 * n, 1, 1, 1], &mut args,
+                rms2cat_cb as *const () as usize, std::ptr::null_mut()) })
+        } else {
+            t::concat(c, t::rms_norm(c, cur, 1e-6), t::rms_norm(c, msg, 1e-6), 0)
+        };
         let gate = t::mmq(c, l.ctrl_down[ctrl].expect("ctrl_down"), gate);
         let (gain, forget);
         if let Some(cat) = l.ctrl_gf_cat[ctrl] {
             let g3 = t::mmq(c, cat, gate);
             let [go, fo] = l.ctrl_gf_off[ctrl];
+            if fuse && n % 4 == 0 && n / 4 <= 1024 {
+                let ud: &'static i32 = Box::leak(Box::new(fo as i32));
+                let mut args = [g3.0, cur.0, msg.0];
+                return Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n, 1, 1, 1], &mut args,
+                    ctrl_apply_cb as *const () as usize, (ud as *const i32).cast_mut().cast()) });
+            }
             gain = t::tanh(c, t::view1(c, g3, fo - go, go * 4));
             forget = t::tanh(c, t::view1(c, g3, t::ne(cat, 1) - fo, fo * 4));
         } else {
@@ -1504,12 +1569,20 @@ impl Runner {
         // rel bias (upstream): table = mm(pad(rel_bias), r) - sinks; gather by distance
         let sinks = t::mmq(c, l.attn_sink_proj.expect("sink"), inputs[0]); // [nh, 1]
         let table = t::mmq(c, l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias"), r); // [ext+1, nh, 1]
-        let table = t::sub(c, table, t::reshape3(c, sinks, 1, nh, 1));
-        let table = t::cont(c, t::permute(c, table, 1, 0, 2, 3)); // [nh, ext+1, 1]
         let rel_pos = if is_swa { step.rel_pos_swa } else { step.rel_pos_full };
-        let kq_b = t::get_rows(c, table, rel_pos); // [nh, n_kv, 1]
-        // permute(2,0,1,3): src dim i goes to dst dim arg_i -> [n_kv, 1, nh, 1]
-        let kq_b = t::cont(c, t::permute(c, t::reshape4(c, kq_b, nh, n_kv, 1, 1), 2, 0, 1, 3));
+        // fused gather+sub (INKWELL_NO_RELGATHER=1 restores the chain):
+        // kq_b[j,0,h] = table[rel_pos[j], h] - sinks[h] in one kernel.
+        let kq_b = if std::env::var_os("INKWELL_NO_RELGATHER").is_none() {
+            let mut args = [table.0, sinks.0, rel_pos.0];
+            Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                relbias_cb as *const () as usize, std::ptr::null_mut()) })
+        } else {
+            let table = t::sub(c, table, t::reshape3(c, sinks, 1, nh, 1));
+            let table = t::cont(c, t::permute(c, table, 1, 0, 2, 3)); // [nh, ext+1, 1]
+            let kq_b = t::get_rows(c, table, rel_pos); // [nh, n_kv, 1]
+            // permute(2,0,1,3): src dim i goes to dst dim arg_i -> [n_kv, 1, nh, 1]
+            t::cont(c, t::permute(c, t::reshape4(c, kq_b, nh, n_kv, 1, 1), 2, 0, 1, 3))
+        };
         if il == 0 { self.dump("table-0", table); self.dump("kqb-0", kq_b); }
 
         // Fused decode attention (replaces kq GEMV + softmax + V GEMV chain)
@@ -1793,6 +1866,9 @@ impl Runner {
         }
         if std::env::var_os("INKWELL_OPCNT").is_some() {
             unsafe { inkwell_ggml::ink_graph_op_counts(g.0) };
+        }
+        if std::env::var_os("INKWELL_GRAPHDUMP").is_some() && pos == 0 {
+            unsafe { inkwell_ggml::ink_graph_dump(g.0) };
         }
         // issue this token's expert prefetch on the side stream: predicted
         // ids are hist[] from the last token (already drained). Overlaps the
