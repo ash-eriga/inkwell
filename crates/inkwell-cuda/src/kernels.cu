@@ -3294,7 +3294,6 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         ++cnt[e];
         int v = -1;
         for (int j = 0; j < k; ++j) if (tag[j] == e) { v = j; break; }
-        int m = 0;
         if (v < 0 && pf) {
             for (int p2 = 0; p2 < nslots; ++p2)
                 if (ptag[p2] == e) { v = EXL3_PF_BASE + p2; if (pf_hit) atomicAdd(pf_hit, 1); break; }
