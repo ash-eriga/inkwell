@@ -3079,7 +3079,7 @@ impl Runner {
 }
 /// `ggml_custom_op_t` for fused decode attention: src[0]=K view, src[1]=V view,
 /// src[2]=q3 [hd,1,nh], src[3]=bias [n_kv,1,nh], src[4]=mask [n_kv+1]; dst=[hd*nh].
-pub fn attn_cb_addr() -> usize { attn_cb as usize }
+pub fn attn_cb_addr() -> usize { attn_cb as *const () as usize }
 
 unsafe extern "C" fn attn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
     unsafe {
@@ -3115,7 +3115,7 @@ unsafe extern "C" fn attn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _
 /// `ggml_custom_op_t` for dense quantized GEMVs (Q8_0 → dp4a i8 path).
 /// src[0] = weight (quantized, device), src[1] = x (f32, device), dst = y.
 #[expect(clippy::cast_ptr_alignment)]
-pub fn dense_cb_addr() -> usize { dense_cb as usize }
+pub fn dense_cb_addr() -> usize { dense_cb as *const () as usize }
 
 unsafe extern "C" fn dense_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
     unsafe {

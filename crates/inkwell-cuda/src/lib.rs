@@ -13,7 +13,7 @@ extern "C" {
         embd: i32, rows: i32, qcols: i32, scale: f32, stream: *mut std::ffi::c_void);
     pub fn ink_launch_router(logits: *const std::ffi::c_void, bias: *const std::ffi::c_void,
         out: *mut std::ffi::c_void, k: i32, n_exp: i32, wscale: f32, wfloor: f32, stream: *mut std::ffi::c_void);
-    pub fn ink_launch_gate_router(w: *const std::ffi::c_void, x: *const f32, bias: *const std::ffi::c_void,
+    fn ink_launch_gate_router(w: *const std::ffi::c_void, x: *const f32, bias: *const std::ffi::c_void,
         out: *mut std::ffi::c_void, nrows: i32, ncols2: i32, k: i32, wscale: f32, wfloor: f32, stream: *mut std::ffi::c_void);
 
     fn cudaMalloc(p: *mut *mut c_void, bytes: usize) -> i32;
