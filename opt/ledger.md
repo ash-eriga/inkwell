@@ -1247,3 +1247,15 @@ warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
   - on 3f60c55 (before the host pass): −1.26 ms, 11/16 — under the bar;
   - on d8c64ee (host pass in): ctl 43.12, mx 42.11, **−1.02 ms, 15/16**, md5 5cbe8e06 on all 32 runs — ACCEPTED.
 - Control spread was 42.1–48.8 ms here vs 42.2–51.1 in the previous run; whether the host pass lowered the noise is not shown.
+### `mul_mat_vec_f` & MoE Hadamard kernel study (`opt/kbench/mmvf_had/REPORT.md`, sm_61) — READY FOR IMPLEMENTATION
+
+- Attribution (`/tmp/nsys_mix_on.sqlite` vs `/tmp/nsys_pw16_ctl.sqlite`, 50 steady-state steps): BF16 controller fusions already cut `mul_mat_vec_f` from `3.357` → `0.668 ms/tok` (112 launches: 48× `mlp.gate` `0.396`, 48× `attn_sink_proj` `0.209`, 16× `k/v_sconv` `0.063`), paired with `inkwell_router` (`0.837`), `rms2down` (`1.030`), `gf_apply` (`0.701`), `sgemm` relbias (`0.464`), and MoE `had_in`/`had_out` (`1.845 ms/tok`, 69% on `on_dev` layers).
+- **Headline finding (`H1`, BIT-EXACT, −3.5 to −4.20 ms/tok, +120 KiB VRAM):** `runner.rs:1129–1139` allocates `descs_g/u/d` in `host_alloc_mapped` (PCIe zero-copy) even when `on_dev == true` (10 loop layers = 30 visits/tok), stalling 480 CTAs/visit on uncached PCIe reads. Real EXL3 microbench (`H0` PINNED `422.73 µs` → `H1` VRAM `282.61 µs`, `−140.1 µs/visit` = **−4.20 ms/tok**: −1.31 ms Hadamard + −1.62 ms GU + −1.43 ms DN); corroborated within 4% by `nsys` (`ON_DEV` DN `131.03` vs `CACHED` `85.35 µs` = −45.68 µs vs bench −47.74 µs).
+- **Additional BIT-EXACT wins (`bit_diffs=0`):**
+  - `M1b-4` fused `mlp.gate + router_par_128` (`gate_router_fused_exact<4>`): `20.70 → 11.12 µs` (**−0.46 ms/tok** bench / **~−0.55 ms** nsys; matches reordered LDG.128 `11.14 µs`).
+  - `M2b-4` + `M2a-4` 0-smem `rms2down_nosmem_mr<4>` (18.7 KiB → 640 B smem) + 3× batched attn controller triads: **−0.33 ms/tok** (up to ~−0.40 ms with by-value struct args).
+  - `H3e` clean 6-kernel MoE chain (shipped 40-reg `gemv_moe_s` untouched + `had_in_moe_vec` + `had_out_moe_vec` + `situ_had_in_moe` + `had_out_wsum_moe`): `282.61 → 277.71 µs` (**−0.235 ms/tok**). Fusing `had_in/out` *into* `gemv_moe_s` (`H2`/`H3a`) regressed **+18–20 µs/visit** (16 B stack spill + 2 extra barriers) — rejected.
+  - `M4-1` batched `k/v_sconv`: **−0.014 ms/tok**.
+- **Optional FLAGGED REORDERED win:** `M3a` `sink_relbias_fused` (BF16 `rel_bias_pad`, `max_abs=4.77e-7` vs cuBLAS K=16): `9.15 → 3.10 µs` (**−0.29 ms/tok** bench / **~−0.55 ms** nsys, **−512 KiB VRAM**).
+- **Total strict BIT-EXACT savings: ~−4.6 to −5.25 ms/tok** (projected decode ~37.8–38.4 ms/tok); with `M3a`: ~−5.1 to −5.8 ms/tok (~37.2–37.8 ms/tok).
+
