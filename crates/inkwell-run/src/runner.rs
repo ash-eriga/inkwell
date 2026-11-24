@@ -109,6 +109,21 @@ pub struct Runner {
     swa: i64,
     visits: Vec<(usize /*layer*/, usize /*slot*/)>,
     n_full: usize,
+    /// built step graph kept alive across tokens while padded n_kv shapes are
+    /// stable (rebuild on each 64-token boundary). `None` after `step_block`.
+    step_gcache: Option<StepCache>,
+}
+
+/// Live objects of a built step graph: the cgraph + its input tensors (via
+/// `step`). Device addresses never change (inputs sit in `in_buf`,
+/// intermediates in the sched's allocated splits, which are not reset while
+/// this is alive).
+#[derive(Copy, Clone, Debug)]
+struct StepCache {
+    step: Step,
+    graph: Ptr,
+    /// final tensor read back for logits (`cur` at graph end)
+    out: Ptr,
 }
 
 /// tensor dims (ne0..) of a gguf tensor
@@ -649,7 +664,7 @@ impl Runner {
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits,
-            n_full,
+            n_full, step_gcache: None,
         }
     }
 
@@ -1100,6 +1115,7 @@ impl Runner {
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits, n_full,
+            step_gcache: None,
         }
     }
 }
@@ -1597,6 +1613,7 @@ fn step_pos_key(s: &Step, is_swa: bool, swa: i64) -> i64 {
 /// tau scale tensor (built per step in `step()`)
 fn step_tau(s: &Step) -> Ptr { s.tau }
 
+#[derive(Copy, Clone, Debug)]
 struct Step {
     ids: Ptr,
     kv_idx_full: Ptr,
@@ -1620,6 +1637,31 @@ impl Runner {
     /// On graph/alloc/compute failure.
     pub fn step(&mut self, id: u32, pos: i64) -> Vec<f32> {
         let tb0 = std::time::Instant::now();
+        // per-visit max n_kv this step, padded to a multiple of 64 so tensor
+        // shapes stay constant across steps (CUDA-graph replayable). The
+        // -inf softmax masks cover the padding columns.
+        let n_kv_full_raw = pos + 1;
+        let n_kv_swa_raw = (pos + 1).min(self.swa);
+        let n_kv_full = ((n_kv_full_raw + 63) & !63).min(self.max_ctx);
+        let n_kv_swa = ((n_kv_swa_raw + 63) & !63).min(self.swa);
+
+        // Reuse the built ggml graph + sched splits + instantiated CUDA graph
+        // while the shape signature is unchanged: only input data varies.
+        // Killswitch: INKWELL_NO_GCACHE=1 forces the per-step rebuild.
+        let caching = std::env::var_os("INKWELL_NO_GCACHE").is_none();
+        if caching {
+            if let Some(gc) = self.step_gcache.take() {
+                if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
+                    let logits = self.step_cached(id, pos, &gc);
+                    self.step_gcache = Some(gc);
+                    return logits;
+                }
+            }
+        }
+
+        // drop the live split before ctx_reset frees the tensor objects it
+        // references (is_alloc survives across steps when caching is on)
+        unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
         // persistent ctx + reset: tensor addresses repeat every token so the
         // CUDA graph cache key (nodes[0]) matches and capture can warm up
         if self.cur_ctx.0.is_null() {
@@ -1633,15 +1675,6 @@ impl Runner {
         let n_embd = self.cfg.n_embd as i64;
         let (hd, nh, hkv) = (128i64, 24i64, 8i64);
         let n_rep = nh / hkv;
-        let extent = (self.cfg.rel_extent + 1) as i64;
-
-        // per-visit max n_kv this step, padded to a multiple of 64 so tensor
-        // shapes stay constant across steps (CUDA-graph replayable). The
-        // -inf softmax masks cover the padding columns.
-        let n_kv_full_raw = pos + 1;
-        let n_kv_swa_raw = (pos + 1).min(self.swa);
-        let n_kv_full = ((n_kv_full_raw + 63) & !63).min(self.max_ctx);
-        let n_kv_swa = ((n_kv_swa_raw + 63) & !63).min(self.swa);
 
         // --- inputs ---
         let ids = t::new(c, I32, &[1]);
@@ -1667,32 +1700,6 @@ impl Runner {
             buf.assign(x, off);
             o = off + t::nbytes(x);
         }
-        unsafe {
-            t::set(ids, [id as i32].as_ptr().cast(), 0, 4);
-            t::set(pos_t, [pos as i32].as_ptr().cast(), 0, 4);
-            t::set(kv_idx_full, [pos as i32].as_ptr().cast(), 0, 4);
-            t::set(kv_idx_swa, [(pos.min(self.swa - 1)) as i32].as_ptr().cast(), 0, 4);
-            // rel_pos[j] = distance (pos - key_pos) clamped to extent; slot j of
-            // the SWA window holds position pos-(n_kv-1-j). Padded slots get a
-            // harmless index — their logits are masked to -inf before softmax.
-            let rp = |nk: i64, raw: i64| -> Vec<i32> {
-                (0..nk).map(|j| if j < raw { (raw - 1 - j).min(self.cfg.rel_extent as i64) as i32 } else { 0 }).collect()
-            };
-            let rp_f = rp(n_kv_full, n_kv_full_raw);
-            let rp_s = rp(n_kv_swa, n_kv_swa_raw);
-            t::set(rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
-            t::set(rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
-            // -inf on padded columns (plus a 0 for the appended sink column)
-            let mk = |nk: i64, raw: i64| -> Vec<f32> {
-                (0..=nk).map(|j| if j < raw || j == nk { 0.0 } else { f32::NEG_INFINITY }).collect()
-            };
-            let mk_f = mk(n_kv_full, n_kv_full_raw);
-            let mk_s = mk(n_kv_swa, n_kv_swa_raw);
-            t::set(mask_full, mk_f.as_ptr().cast(), 0, mk_f.len() * 4);
-            t::set(mask_swa, mk_s.as_ptr().cast(), 0, mk_s.len() * 4);
-            let z = vec![0f32; (hkv * n_rep) as usize];
-            t::set(sink_zero, z.as_ptr().cast(), 0, z.len() * 4);
-        }
         // keep buf alive for the graph
         std::mem::forget(buf);
 
@@ -1704,23 +1711,10 @@ impl Runner {
 
         let step = Step { ids, kv_idx_full, kv_idx_swa, pos: pos_t, rel_pos_full, rel_pos_swa, sink_zero, tau, pos_val: pos,
                           mask_full, mask_swa, n_kv_full_pad: n_kv_full, n_kv_swa_pad: n_kv_swa };
+        self.upload_step_inputs(&step, id, pos);
 
         // embed: dequantize the row host-side (embd stays quantized, ~230 MiB not 1.85 GiB)
-        {
-            let (src, ty, stride) = self.embd_src;
-            let mut row = vec![0f32; 2304];
-            if ty == -2 {
-                // bf16 rows (safetensors path)
-                let s = unsafe { src.add(id as usize * stride) } as *const u16;
-                for (i, r) in row.iter_mut().enumerate() {
-                    *r = f32::from_bits(u32::from(unsafe { *s.add(i) }) << 16);
-                }
-            } else {
-                let rc = unsafe { inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row.as_mut_ptr(), 2304) };
-                assert_eq!(rc, 0, "dequant embd row");
-            }
-            unsafe { t::set(self.embd_row, row.as_ptr().cast(), 0, 2304 * 4) };
-        }
+        self.upload_embd_row(id);
         let mut cur = self.embd_row;
         let _ = ids;
         self.dump("embd_raw", cur);
@@ -1803,6 +1797,98 @@ impl Runner {
         // issue this token's expert prefetch on the side stream: predicted
         // ids are hist[] from the last token (already drained). Overlaps the
         // graph build + early compute below.
+        self.issue_moe_prefetch(pos);
+        let prof = std::env::var_os("INKWELL_PROF").is_some();
+        if prof { eprintln!("PROF build={:.1}ms", tb0.elapsed().as_secs_f64()*1e3); }
+        let t0 = std::time::Instant::now();
+        unsafe {
+            assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
+            self.dump_all();
+        }
+        if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        let logits = self.read_logits(cur, prof);
+        // (unpadded vocab is a contiguous prefix slice of the padded logits)
+        if caching {
+            // keep ctx + cgraph + sched split + instantiated CUDA graph alive
+            self.step_gcache = Some(StepCache { step, graph: g, out: cur });
+        } else {
+            // release the cached split plan so the next step's graph gets re-allocated
+            unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
+        }
+        logits
+    }
+
+    /// Cache-hit step: same cgraph, same sched splits, same instantiated CUDA
+    /// graph — refresh input data and replay. Bit-identical to a rebuild:
+    /// every graph node, kernel argument and device address is unchanged.
+    fn step_cached(&mut self, id: u32, pos: i64, gc: &StepCache) -> Vec<f32> {
+        let tb0 = std::time::Instant::now();
+        self.upload_step_inputs(&gc.step, id, pos);
+        self.upload_embd_row(id);
+        self.issue_moe_prefetch(pos);
+        let prof = std::env::var_os("INKWELL_PROF").is_some();
+        if prof { eprintln!("PROF build={:.1}ms", tb0.elapsed().as_secs_f64()*1e3); }
+        let t0 = std::time::Instant::now();
+        unsafe {
+            assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, gc.graph.0), 0, "sched compute");
+            self.dump_all();
+        }
+        if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        self.read_logits(gc.out, prof)
+    }
+
+    /// Upload this step's input values into already buffer-assigned tensors.
+    fn upload_step_inputs(&self, s: &Step, id: u32, pos: i64) {
+        unsafe {
+            t::set(s.ids, [id as i32].as_ptr().cast(), 0, 4);
+            t::set(s.pos, [pos as i32].as_ptr().cast(), 0, 4);
+            t::set(s.kv_idx_full, [pos as i32].as_ptr().cast(), 0, 4);
+            t::set(s.kv_idx_swa, [(pos.min(self.swa - 1)) as i32].as_ptr().cast(), 0, 4);
+            // rel_pos[j] = distance (pos - key_pos) clamped to extent; slot j of
+            // the SWA window holds position pos-(n_kv-1-j). Padded slots get a
+            // harmless index — their logits are masked to -inf before softmax.
+            let n_kv_full_raw = pos + 1;
+            let n_kv_swa_raw = (pos + 1).min(self.swa);
+            let rp = |nk: i64, raw: i64| -> Vec<i32> {
+                (0..nk).map(|j| if j < raw { (raw - 1 - j).min(self.cfg.rel_extent as i64) as i32 } else { 0 }).collect()
+            };
+            let rp_f = rp(s.n_kv_full_pad, n_kv_full_raw);
+            let rp_s = rp(s.n_kv_swa_pad, n_kv_swa_raw);
+            t::set(s.rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
+            t::set(s.rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
+            // -inf on padded columns (plus a 0 for the appended sink column)
+            let mk = |nk: i64, raw: i64| -> Vec<f32> {
+                (0..=nk).map(|j| if j < raw || j == nk { 0.0 } else { f32::NEG_INFINITY }).collect()
+            };
+            let mk_f = mk(s.n_kv_full_pad, n_kv_full_raw);
+            let mk_s = mk(s.n_kv_swa_pad, n_kv_swa_raw);
+            t::set(s.mask_full, mk_f.as_ptr().cast(), 0, mk_f.len() * 4);
+            t::set(s.mask_swa, mk_s.as_ptr().cast(), 0, mk_s.len() * 4);
+            let z = vec![0f32; (t::ne(s.sink_zero, 2) * t::ne(s.sink_zero, 3)) as usize];
+            t::set(s.sink_zero, z.as_ptr().cast(), 0, z.len() * 4);
+        }
+    }
+
+    /// Host-dequantize embd row `id` and upload it (embd stays quantized,
+    /// ~230 MiB not 1.85 GiB).
+    fn upload_embd_row(&self, id: u32) {
+        let (src, ty, stride) = self.embd_src;
+        let mut row = vec![0f32; 2304];
+        if ty == -2 {
+            // bf16 rows (safetensors path)
+            let s = unsafe { src.add(id as usize * stride) } as *const u16;
+            for (i, r) in row.iter_mut().enumerate() {
+                *r = f32::from_bits(u32::from(unsafe { *s.add(i) }) << 16);
+            }
+        } else {
+            let rc = unsafe { inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row.as_mut_ptr(), 2304) };
+            assert_eq!(rc, 0, "dequant embd row");
+        }
+        unsafe { t::set(self.embd_row, row.as_ptr().cast(), 0, 2304 * 4) };
+    }
+
+    /// Issue this token's expert prefetch on the side stream.
+    fn issue_moe_prefetch(&mut self, pos: i64) {
         for a in &mut self.moe_args_exl3 {
             let Some(c) = &mut a.cache else { continue };
             let Some(pf) = &mut c.prefetch else { continue };
@@ -1822,19 +1908,16 @@ impl Runner {
                 eprintln!("PFSTAT L{} hits={} misses={}", a.layer, hits, misses);
             }
         }
-        let prof = std::env::var_os("INKWELL_PROF").is_some();
-        if prof { eprintln!("PROF build={:.1}ms", tb0.elapsed().as_secs_f64()*1e3); }
-        let t0 = std::time::Instant::now();
-        unsafe {
-            assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, g.0), 0, "sched compute");
-            self.dump_all();
-        }
-        if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
+    }
+
+    /// Read back the [vocab_unpadded] logits from graph output tensor `out`
+    /// (or run the own-head IQ4_XS lm_head when the model has no EXL3 head).
+    fn read_logits(&mut self, out: Ptr, prof: bool) -> Vec<f32> {
         let tl0 = std::time::Instant::now();
         let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
         if let Some((w, x_dev, y_dev)) = self.out_head.as_mut() {
             let mut normed = vec![0f32; self.cfg.n_embd as usize];
-            unsafe { t::get(cur, normed.as_mut_ptr().cast(), 0, normed.len() * 4) };
+            unsafe { t::get(out, normed.as_mut_ptr().cast(), 0, normed.len() * 4) };
             x_dev.write(&normed);
             unsafe {
                 inkwell_cuda::mmvq_iq4_xs_moe(
@@ -1844,11 +1927,8 @@ impl Runner {
             let all = y_dev.read();
             logits.copy_from_slice(&all[..self.cfg.vocab_unpadded as usize]);
         } else {
-            unsafe { t::get(cur, logits.as_mut_ptr().cast(), 0, logits.len() * 4) };
+            unsafe { t::get(out, logits.as_mut_ptr().cast(), 0, logits.len() * 4) };
         }
-        // (unpadded vocab is a contiguous prefix slice of the padded logits)
-        // release the cached split plan so the next step's graph gets re-allocated
-        unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
         if prof { eprintln!("PROF logits={:.1}ms", tl0.elapsed().as_secs_f64()*1e3); }
         logits
     }
@@ -2143,6 +2223,9 @@ impl Runner {
                 self.conv_snap.push(inkwell_cuda::DevBuf::new_bytes(n * NT * 4));
             }
         }
+        // invalidates any cached step graph: ctx_reset frees its tensors
+        self.step_gcache = None;
+        unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
         if self.cur_ctx.0.is_null() {
             self.cur_ctx = Ptr(unsafe { inkwell_ggml::ink_ctx_new() });
         } else {

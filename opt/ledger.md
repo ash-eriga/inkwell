@@ -595,3 +595,57 @@ warnings 60 before = after. VERDICT: **ACCEPT**.
   - sf median 56.43 ms/tok (55.19–59.79);
   - **−2.9%**; sf beats its neighbouring ctl in 7/8 pairs;
   - md5 5cbe8e06 on all 16 runs; warnings 64 = baseline.
+
+## 2026-11-24 — token-boundary hole: step-graph reuse (GCACHE) — ACCEPTED
+
+### Diagnosis — the ~3.94 ms GPU-idle hole per token (nsys, graphs on)
+
+Hole = GPU idle from the 9216 B embd-row HtoD to the first rms_norm of the
+next replay = pure host turnaround. PROF timers (host) + nsys:
+
+| piece | ms/tok | where |
+|---|---|---|
+| logits DtoH 800 KB (200058 f32) | ~0.30 | `PROF logits`, before hole |
+| argmax + top5 + eprintln | ~0.55 | `poststep`, before hole |
+| ctx_reset + input tensors/sets + embd dequant | ~0.20 | pre-marker |
+| **ggml graph build** (48 visits, build_forward) | ~1.1 | `PROF build` tail, in-hole |
+| **sched host work**: split_graph + gallocr alloc + cuda-graph key hash + node_props build+memcmp (~3.4k nodes x ~1 KB) + chunk launches | ~2.7 | inside `PROF compute`, in-hole |
+| **boundary hole total (nsys)** | **~3.94** | contiguous idle |
+
+### Change — reuse the built ggml graph + sched splits + cudaGraphExec
+
+`step()` gains `step_gcache`: while the padded n_kv signature is unchanged
+(rebuild only on each 64-token boundary), the per-token step skips
+ctx_reset, tensor/op creation, build_forward, `sched_reset`, split_graph,
+gallocr alloc and the per-node node_props compare entirely. Inputs are
+re-`t::set` in place (same device addresses), embd row re-uploaded, then
+`ink_sched_compute` hits `is_alloc` -> compute_splits -> cgraph->uid match
+-> pure cudaGraphLaunch. Bit-identical: same nodes, same kernel args, same
+addresses — only input values change. `step_block` drops the cache +
+sched_reset first (its ctx_reset frees the tensors). `cargo warnings` 24
+before = after; kernels.cu untouched (4091 lines).
+
+Killswitch: **INKWELL_NO_GCACHE=1** -> old per-step rebuild + sched_reset.
+
+### A/B — BEST env + graphs, 16 runs ctl,cand,cand,ctl x4 (one flock)
+
+| run | ctl (NO_GCACHE=1) | cand |
+| 1 | 56.94 | 49.66 |
+| 2 | 58.77 | 54.83 |
+| 3 | 64.12 | 52.12 |
+| 4 | 60.86 | 52.18 |
+| 5 | 58.01 | 55.46 |
+| 6 | 63.30 | 57.84 |
+| 7 | 61.20 | 52.08 |
+| 8 | 56.81 | 51.27 |
+| median | **59.82** | **52.15** (-12.8%) |
+
+Candidate beats its neighbouring control in **8/8 pairs**; generated text
+md5 `5cbe8e06f2d8d82feb7f2ca287a7bc59` on all 16 runs.
+
+### nsys re-check (same method, last-16 windows)
+
+Boundary hole 3.94 -> **0.83 ms median** (min 0.70; one 10.0 outlier = the
+n_kv 64->128 rebuild step). Residual = logits DtoH ~0.25 + input sets ~0.1
++ embd ~0.02 + prefetch issues ~0.05 + split compute + ~6 chunk launches.
+Per-token union idle 12.4 -> ~3.4 ms/tok median under nsys.
