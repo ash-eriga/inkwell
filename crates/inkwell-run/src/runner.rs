@@ -292,6 +292,23 @@ unsafe extern "C" fn gf_apply_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i3
     };
 }
 
+/// `ggml_custom_op_t`: fused rms2cat + ctrl_down GEMV.
+/// srcs = [x0, x1, weight]; dst [nrows] where nrows = weight->ne[1].
+unsafe extern "C" fn rms2down_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let w = unsafe { inkwell_ggml::ink_tensor_src(dst, 2) };
+    let n = (unsafe { inkwell_ggml::ink_tensor_ne(w, 0) } / 2) as i32;
+    let nrows = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let is_bf16 = i32::from(unsafe { inkwell_ggml::ink_tensor_type(w) } == BF16);
+    unsafe {
+        inkwell_cuda::rms2down_async(s(0), s(1), inkwell_ggml::ink_tensor_data(w),
+            is_bf16, inkwell_ggml::ink_tensor_data(dst).cast(), n, nrows, 1e-6)
+    };
+}
+
 /// `ggml_custom_op_t`: concat(rms_norm(x0), rms_norm(x1)) in one launch.
 /// srcs = [x0, x1]; dst [2n] with x0 in [0..n).
 unsafe extern "C" fn rms2cat_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
@@ -1512,14 +1529,23 @@ impl Runner {
         // ctrl_apply does tanh x2 + the (1-forget)*cur + gain*msg tail.
         let fuse = std::env::var_os("INKWELL_NO_CTRLFUSE").is_none();
         let n = t::ne(cur, 0);
-        let gate = if fuse && n % 4 == 0 && n / 4 <= 1024 {
-            let mut args = [cur.0, msg.0];
-            Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [2 * n, 1, 1, 1], &mut args,
-                rms2cat_cb as *const () as usize, std::ptr::null_mut()) })
+        let dn = l.ctrl_down[ctrl].expect("ctrl_down");
+        // rms2down fuses rms2cat + the down GEMV (INKWELL_NO_RMSDOWN=1
+        // restores the pair). Bit-identical to it.
+        let gate = if fuse && n == 2304 && std::env::var_os("INKWELL_NO_RMSDOWN").is_none() {
+            let mut args = [cur.0, msg.0, dn.0];
+            Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [t::ne(dn, 1), 1, 1, 1], &mut args,
+                rms2down_cb as *const () as usize, std::ptr::null_mut()) })
         } else {
-            t::concat(c, t::rms_norm(c, cur, 1e-6), t::rms_norm(c, msg, 1e-6), 0)
+            let gate = if fuse && n % 4 == 0 && n / 4 <= 1024 {
+                let mut args = [cur.0, msg.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [2 * n, 1, 1, 1], &mut args,
+                    rms2cat_cb as *const () as usize, std::ptr::null_mut()) })
+            } else {
+                t::concat(c, t::rms_norm(c, cur, 1e-6), t::rms_norm(c, msg, 1e-6), 0)
+            };
+            t::mmq(c, dn, gate)
         };
-        let gate = t::mmq(c, l.ctrl_down[ctrl].expect("ctrl_down"), gate);
         let (gain, forget);
         if let Some(cat) = l.ctrl_gf_cat[ctrl] {
             let [go, fo] = l.ctrl_gf_off[ctrl];

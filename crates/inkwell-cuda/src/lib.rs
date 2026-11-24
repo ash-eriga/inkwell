@@ -76,6 +76,7 @@ extern "C" {
     fn ink_launch_ctrl_apply(g3: *const f32, cur: *const f32, msg: *const f32, y: *mut f32, n: i32, ng: i32, stream: *mut c_void);
     fn ink_launch_rms2cat(x0: *const f32, x1: *const f32, y: *mut f32, n: i32, eps: f32, stream: *mut c_void);
     fn ink_launch_gf_apply(x: *const c_void, x_is_bf16: i32, y: *const f32, cur: *const f32, msg: *const f32, dst: *mut f32, n: i32, fo: i32, stream: *mut c_void);
+    fn ink_launch_rms2down(x0: *const f32, x1: *const f32, w: *const c_void, w_is_bf16: i32, dst: *mut f32, n: i32, nrows: i32, eps: f32, stream: *mut c_void);
     fn ink_launch_relbias_gather(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, y: *mut f32, nkv: i32, nh: i32, ext: i32, stream: *mut c_void);
     fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_exl3_gemv_mz(trel: *const *const c_void, suh: *const *const c_void, svh: *const *const c_void, x: *const *const f32, y: *mut f32, ystride: i64, scr: *const *mut f32, k: *const i64, n: *const i64, ka: *const i64, halfk: *const i64, nz: i32, stream: *mut c_void);
@@ -799,6 +800,16 @@ pub unsafe fn rms2cat_async(x0: *const f32, x1: *const f32, y: *mut f32, n: i32,
 pub unsafe fn gf_apply_async(x: *const c_void, x_is_bf16: i32, gate: *const f32,
     cur: *const f32, msg: *const f32, y: *mut f32, n: i32, fo: i32) {
     unsafe { ink_launch_gf_apply(x, x_is_bf16, gate, cur, msg, y, n, fo, stream()) };
+}
+/// Fused rms2cat + ctrl_down GEMV: dst[r] = dot(row r, [rms(x0);rms(x1)]).
+/// Bit-identical to rms2cat + mmvf (same emulated reduce and dot order).
+///
+/// # Safety
+/// `w` is the `[2n, nrows]` weight tensor (f32 or bf16 per `w_is_bf16`).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rms2down_async(x0: *const f32, x1: *const f32, w: *const c_void,
+    w_is_bf16: i32, dst: *mut f32, n: i32, nrows: i32, eps: f32) {
+    unsafe { ink_launch_rms2down(x0, x1, w, w_is_bf16, dst, n, nrows, eps, stream()) };
 }
 /// rel-bias gather + sink subtract: y[j + h*nkv] = mm[rp[j] + h*ext] - sinks[h].
 ///

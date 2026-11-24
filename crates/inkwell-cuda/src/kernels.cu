@@ -4681,3 +4681,79 @@ extern "C" void ink_launch_gf_apply(const void* x, int x_is_bf16,
         inkwell_gf_apply<float><<<g, 256, 0, (cudaStream_t)stream>>>(
             (const float*)x, y, cur, msg, dst, n, fo);
 }
+
+// ---- rms2cat + ctrl_down GEMV fusion (INKWELL_NO_RMSDOWN=1 disables) ----
+// Per output row: recompute concat(rms_norm(x0), rms_norm(x1)) in smem with
+// the exact 1024-thread association of inkwell_rms2cat emulated on 256
+// threads (real thread tid owns virtual tids {tid, tid+256, tid+512}; real
+// warp r covers virtual warps {r, r+8, r+16}), then run the mmvf-256 dot
+// (256 thr, tid-strided pairs, shfl_xor 16..1 + 32-entry cross-warp buffer).
+// Bit-identical to the unfused inkwell_rms2cat + mmvf chain.
+template <typename T>
+__global__ void inkwell_rms2down(const float* __restrict__ x0,
+        const float* __restrict__ x1, const T* __restrict__ w,
+        float* __restrict__ dst, int n, float eps) {
+    __shared__ float sg[4608];     // gate: [rms(x0) ; rms(x1)]
+    __shared__ float s_sum[32];
+    __shared__ float s_buf[32];
+    const int tid = threadIdx.x, lane = tid & 31, w_ = tid >> 5;
+    const int n4 = n / 4;
+    if (tid >= 24 && tid < 32) s_sum[tid] = 0.f;  // virtual warps 24..31
+    for (int bx = 0; bx < 2; ++bx) {
+        const float* x = bx ? x1 : x0;
+        // virtual-tid partials, same float4 -> thread map as the 1024-thr kernel
+        float p[3]; float4 q[3];
+        for (int k = 0; k < 3; ++k) {
+            const int vt = tid + k * 256;
+            q[k] = vt < n4 ? ((const float4*)x)[vt] : make_float4(0,0,0,0);
+            p[k] = q[k].x*q[k].x + q[k].y*q[k].y + q[k].z*q[k].z + q[k].w*q[k].w;
+        }
+        __syncthreads();
+        // real warp w covers virtual warps {w, w+8, w+16}
+        for (int k = 0; k < 3; ++k) {
+            float v = (tid + k * 256 < n4) ? p[k] : 0.f;
+            for (int m = 16; m; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0) s_sum[w_ + 8 * k] = v;
+        }
+        __syncthreads();
+        float t = s_sum[lane];
+        for (int m = 16; m; m >>= 1) t += __shfl_xor_sync(0xffffffffu, t, m);
+        const float scale = rsqrtf(__fdiv_rn(t, (float)n) + eps);
+        for (int k = 0; k < 3; ++k) {
+            const int vt = tid + k * 256;
+            if (vt < n4) ((float4*)(sg + bx * n))[vt] =
+                make_float4(scale * q[k].x, scale * q[k].y, scale * q[k].z, scale * q[k].w);
+        }
+        __syncthreads();
+    }
+    if (tid >= 8 && tid < 32) s_buf[tid] = 0.f;  // mmvf buf_iw is zero-filled
+    __syncthreads();
+    // mmvf-identical dot: this block's row, 2304 pairs, tid-strided
+    const T* row = w + (size_t)blockIdx.x * (2 * n);
+    const float2* gy = (const float2*)sg;
+    float s = 0.f;
+    for (int c = tid; c < n; c += 256) {
+        const float2 tw = gf_wload(row, c);
+        const float2 tg = gy[c];
+        s += tw.x * tg.x;
+        s += tw.y * tg.y;
+    }
+    for (int m = 16; m; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    s_buf[w_] = s;
+    __syncthreads();
+    if (w_ == 0) {
+        s = s_buf[lane];
+        for (int m = 16; m; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+        if (lane == 0) dst[blockIdx.x] = s;
+    }
+}
+extern "C" void ink_launch_rms2down(const float* x0, const float* x1,
+        const void* w, int w_is_bf16, float* dst, int n, int nrows,
+        float eps, void* stream) {
+    if (w_is_bf16)
+        inkwell_rms2down<__nv_bfloat16><<<(unsigned)nrows, 256, 0, (cudaStream_t)stream>>>(
+            x0, x1, (const __nv_bfloat16*)w, dst, n, eps);
+    else
+        inkwell_rms2down<float><<<(unsigned)nrows, 256, 0, (cudaStream_t)stream>>>(
+            x0, x1, (const float*)w, dst, n, eps);
+}
