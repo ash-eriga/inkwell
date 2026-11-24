@@ -177,11 +177,13 @@ __device__ __forceinline__ void tile_row_d4(const uint32_t* __restrict__ ring, c
     const int gidx = roff >> 4;
 #pragma unroll
     for (int tt = 0; tt < NC; ++tt) {
-        const uint32_t xp = xq[tt][roff >> 2];   // pack index g*4+m, base already +m
-        int isum = __dp4a((int)__byte_perm(xp, 0, 0x0000), (int)p0, 0);
-        isum = __dp4a((int)__byte_perm(xp, 0, 0x1111), (int)p1, isum);
-        isum = __dp4a((int)__byte_perm(xp, 0, 0x2222), (int)p2, isum);
-        isum = __dp4a((int)__byte_perm(xp, 0, 0x3333), (int)p3, isum);
+        const uint4 xp4 = ((const uint4*)xq[tt])[roff >> 2 & ~3u];   // uint4 idx = g*4 (xqb has +m)
+        // dp4a.s32.u32: signed int8 splat x UNSIGNED plane bytes (exact weight bytesum)
+        int isum = 0;
+        asm volatile("dp4a.s32.u32 %0, %1, %2, %3;" : "+r"(isum) : "r"(xp4.x), "r"(p0), "r"(0));
+        asm volatile("dp4a.s32.u32 %0, %1, %2, %3;" : "+r"(isum) : "r"(xp4.y), "r"(p1), "r"(isum));
+        asm volatile("dp4a.s32.u32 %0, %1, %2, %3;" : "+r"(isum) : "r"(xp4.z), "r"(p2), "r"(isum));
+        asm volatile("dp4a.s32.u32 %0, %1, %2, %3;" : "+r"(isum) : "r"(xp4.w), "r"(p3), "r"(isum));
         s[tt] = fmaf((float)isum, xqs[tt][gidx], s[tt]);
     }
 }
@@ -368,12 +370,12 @@ __global__ void __launch_bounds__(256) gemv_moe_n(const uint64_t* __restrict__ d
 #pragma unroll
         for (int tt = 0; tt < NC; ++tt) { s[tt] = 0.f; xb[tt] = xg + (size_t)tt * xstride + 2 * m; }
         if (xqu) {
-            // xq row = tk u32 (one per 16-group), m already selects the lane's pack
-            const uint32_t* xqrow = xqu + (size_t)sx0 * tk * 4 + m;
+            // xq = uint4 splats at [slot*tk*4 + g*4 + m]; base +m picks lane pack
+            const uint32_t* xqrow = xqu + (size_t)sx0 * tk * 16 + m * 4;
             const float* xqsrow = xqsu + (size_t)sx0 * tk;
 #pragma unroll
             for (int tt = 0; tt < NC; ++tt) {
-                xqb[tt] = xqrow + (size_t)tt * tk * 4;   // 4 packs per group per lane? see quant layout
+                xqb[tt] = xqrow + (size_t)tt * tk * 16;
                 xqsb[tt] = xqsrow + (size_t)tt * tk;
             }
         }

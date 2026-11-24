@@ -172,3 +172,13 @@ Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8
 - dp4a JA esta maximo: dentro do bs_f32 (mul+dp4a) do decode trellis.
 - Conclusao: MAC int no EXL3 exige re-quant de peso p/ int8 (EAR, vetado).
 - d2a (tile_row_d2 + quant_x_i16 + env INKWELL_MOE_D2A) REVERTIDO — saida garbage.
+
+## 2026-11-23 — MoE DP4A (dp4a.s32.u32) — REJEITADO p/ serial
+- Implementado o fix do rebuttal: x int8/grupo (amax/127) pré-splattado em uint4 por `inkwell_exl3_quant_x_i8p`, `tile_row_d4` com asm `dp4a.s32.u32` (x signed × plane-bytes unsigned). Verificado exato no device.
+- Bug real encontrado: `asm` SEM `volatile` era reordenado/elidido pelo ptxas → saída garbage. Com `volatile` a math fica exata (err real por gidx medido).
+- CUIDADO: `atomicMax((unsigned*)errbuf, (unsigned)(err*64))` interpretado como float SEMPRE imprime ~0 — o dump "err=0" anterior nunca verificou nada. Correto é `__float_as_uint(err)`.
+- RESULTADO A/B (control-candidate-control, nslots=8 serial):
+  - GU (gate+up) d4: quebra saída — erro ~30-100 por janela = ruído de quantização int8 do x (~5-10%). Inerente à abordagem nesse caminho (hadamard output tem outliers). REJEITADO.
+  - Down d4: golden e exato, mas ~200ms/step vs ~181ms controle = ~10% MAIS LENTO (launch do quant + round-trip xq não compensam na 1060). REJEITADO.
+- Estado: código d4 fica atrás de INKWELL_MOE_D4A (default off); GU quants removidos. gemv_moe_n aceita xq/xq2/xqs/xqs2.
+- Próximo (rebuttal): occupancy/ILP fusion, fuse hadamard, CUDA graph do bloco, expert prefetch.

@@ -2499,15 +2499,18 @@ __global__ void inkwell_exl3_quant_x_i8p(const float* __restrict__ x,
     for (int o = 8; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffu, am, o, 16));
     const float sc = am > 0.f ? am / 127.f : 1.f;
     const int qi = __float2int_rn(v / sc);
-    // lane m gathers elements {2m, 2m+1, 2m+8, 2m+9}
+    // lane m stores 4 PRE-SPLATTED packs for elements {2m, 2m+1, 2m+8, 2m+9}
     if (lane < 4) {
+        uint4* dst = (uint4*)xq + (size_t)slot * (n >> 4) * 4 + g * 4 + lane;
         int a = __shfl_sync(0xffffu, qi, 2 * lane, 16);
         int b = __shfl_sync(0xffffu, qi, 2 * lane + 1, 16);
         int c = __shfl_sync(0xffffu, qi, 2 * lane + 8, 16);
         int d = __shfl_sync(0xffffu, qi, 2 * lane + 9, 16);
-        xq[(size_t)slot * (n >> 4) * 4 + g * 4 + lane] =
-            (uint32_t)(a & 0xff) | ((uint32_t)(b & 0xff) << 8) |
-            ((uint32_t)(c & 0xff) << 16) | ((uint32_t)(d & 0xff) << 24);
+        const uint32_t sa = __byte_perm((uint32_t)a, 0, 0x0000u);
+        const uint32_t sb = __byte_perm((uint32_t)b, 0, 0x0000u);
+        const uint32_t sc_ = __byte_perm((uint32_t)c, 0, 0x0000u);
+        const uint32_t sd = __byte_perm((uint32_t)d, 0, 0x0000u);
+        *dst = make_uint4(sa, sb, sc_, sd);
     }
     if (lane == 0) xqs[slot * (n >> 4) + g] = sc;
 }
@@ -2561,13 +2564,10 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         cudaMalloc(&xq8, 64 * 2304); cudaMalloc(&xqs8, 64 * 144 * 4);
         cudaMalloc(&xq8b, 64 * 2304); cudaMalloc(&xqs8b, 64 * 144 * 4);
     }
-    if (d4) {
-        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>(xh, xq8, xqs8, KG);
-        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>((const float*)gu, xq8b, xqs8b, KG);
-    }
+    // GU stays fp32 (int8-x loses ~10%/window here) -> no GU quants
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, nullptr, 0,
-        d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, d4 ? xq8b : nullptr, d4 ? xqs8b : nullptr);
+        nullptr, nullptr, nullptr, nullptr);   // GU stays fp32: int8-x loses ~10%/window
     else {
         dim3 gg(NG / 64, nslots, 2 * nky);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
@@ -2671,13 +2671,10 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 1, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
-    if (d4) {
-        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>(xh, xq8c, xqs8c, KG);
-        inkwell_exl3_quant_x_i8p<<<dim3(nslots, KG / 16), 16, 0, st>>>((const float*)gu, xq8d, xqs8d, KG);
-    }
+    // GU stays fp32
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1,
-        d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, d4 ? xq8d : nullptr, d4 ? xqs8d : nullptr);
+        nullptr, nullptr, nullptr, nullptr);
     else {
         dim3 gg(NG / 64, nslots, 2 * nky);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
@@ -2689,7 +2686,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                                 (const int*)miss, 2, nullptr, nullptr);
     if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2,
-        d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, d4 ? xq8d : nullptr, d4 ? xqs8d : nullptr);
+        nullptr, nullptr, nullptr, nullptr);
     else {
         dim3 gg(NG / 64, nslots, 2 * nky);
         inkwell_exl3_gemv_moe<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
