@@ -1415,3 +1415,39 @@ default serial step already uses cached `OnceLock` switches, packed pinned input
 upload, async sched compute, device argmax with a 4 B readback, double-buffered
 premarshal, and no default per-token logits `Vec` readback. Remaining `env` or
 small-copy costs are in the GPU shadow or far below the A/B noise floor.
+## 2026-11-24 — mmvf_had production port: router accepted, ctrl/H3e opt-in
+
+Implementation branch `t3/port-mmvf-had-kernels`, rebased on bb8d77e. Commits: e06023c router fusion, cff25d3 controller batching, 426b888 H3e, 7087a15 KV batching, 840c7a9 warning cleanup, 8154204 ctrl opt-in, 7011b1d H3e opt-in.
+
+Kernel-level exactness against the shipped kernels on real inputs (`/tmp/portverify.log`): all `PORT` checks `bit_diffs=0` — `inkwell_router_par_128` ids 8/8/w 0/8, `inkwell_gate_router<4>` ids 8/8/w 0/8, `inkwell_rms2down_mr<4,1>`, all three `inkwell_ctrl_triad` branches, both `inkwell_kv_sconv<1>` outputs, and the full H3e runtime chain end-to-end. md5 `5cbe8e06` in every completed production A/B run.
+
+### M1b-4 fused gate+router — ACCEPTED, default-on (`INKWELL_NO_ROUTERFUSE` vetoes)
+
+16 interleaved pairs ordered ctl,cand,cand,ctl. ctl 46.997 ms/tok median (43.88–51.38), cand 44.6425 (43.11–47.75), **−2.355 ms/tok, 14/16 pair wins**. md5 `5cbe8e06` on all 32 runs. The non-BF16 fallback uses the bit-exact parallel router.
+
+### M2 controller batching/fast rms2down — REJECTED, opt-in `INKWELL_CTRLBATCH=1` (`INKWELL_NO_CTRLBATCH` vetoes)
+
+Stopped after five positional pairs because the candidate lost all five and could no longer reach 12/16. ctl median 40.703 ms/tok (39.10–43.15, n=5), cand 45.6235 (43.18–47.79, n=6), **0/5 pair wins**; md5 `5cbe8e06` throughout. The kernels are bit-exact and faster in the isolated study, but the production graph regressed.
+
+### H3e MoE Hadamard chain — REJECTED, opt-in `INKWELL_HADVEC=1` (`INKWELL_NO_HADVEC` vetoes)
+
+16 interleaved pairs. ctl 40.673 ms/tok median, cand 40.491, **−0.182 ms/tok but only 9/16 pair wins**, below the 12/16 bar. md5 `5cbe8e06` on all 32 runs. The late runs in both arms shifted upward together (external machine noise), but the pair-win count is decisive.
+
+### M4 KV projection batching — kept, md5-checked
+
+`inkwell_kv_sconv_batched<1>` is bit-exact in the port verifier and was enabled throughout the production runs above (all md5 `5cbe8e06`). `INKWELL_NO_KVBATCH` vetoes it.
+
+### nsys before/after (`--cuda-graph-trace=node`, 64 decode steps)
+
+Before (all four vetoes): relevant kernel time — `mul_mat_vec_f` 0.780, `rms2down` 1.166, `gf_apply` 0.792, `had_in_moe` 1.252, `had_out_moe` 0.841, `situ_pair` 0.148, `expert_wsum` 0.144 ms/tok. After (router+KV+H3e enabled; ctrl off): `gate_router_fused<4>` 0.815, remaining `mul_mat_vec_f` 0.252, `kv_sconv_batched` 0.054, `had_in_moe_vec` 0.843, `had_out_moe_vec` 0.315, `situ_had_in_moe` 0.357 ms/tok; `had_out_wsum` was present but below the simple regex table print cutoff. Total kernel time in these two profiles was 56.239 → 53.660 ms/tok (nsys-run attribution, not an A/B acceptance measurement).
+
+Build: `cargo build --release` rc=0, warnings **62** (master budget ≤64), `kernels.cu` **5504** lines.
+
+### Brain re-validation on master (1218f58 crates + docs, 2026-11-24): mmvf_had port — ACCEPTED
+
+- ctl = master-equivalent binary; cand = branch default (router fusion on, kv sconv batching on;
+  ctrl batching and H3e stay opt-in). BEST env, 8 × (ctl,cand,cand,ctl), one flock.
+- ctl median **37.87**, cand **37.54** ms/tok → **−0.33 ms/tok**, **12/16** pairs. md5 `5cbe8e06` on all 32 runs.
+- The child's −2.36 ms (router fusion) was measured before devdesc landed; most of it does not
+  survive on the current master. Meets the bar (median faster, ≥12/16, md5). ACCEPTED.
+- Killswitches: INKWELL_NO_ROUTERFUSE, INKWELL_NO_KVBATCH.
