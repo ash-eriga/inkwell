@@ -930,3 +930,13 @@ Full study (`opt/kbench/drafter/REPORT.md`) answering cost model, head/body desi
   - Full 3L + Markov + `32K` head: **`Int8 + Int16 X (dp2a)` = `84/84 (100.0%)`**, **`Int8 + Int8 X (dp4a)` = `36/36 (100.0%)` on d1..3 / `80/84 (95.2%)` on d1..7**, zero loss in real target `emit`.
   - Head-only `Int4-g128 + Int8 X (32K)` = **`12/12 (100%)` d1 / `34/36 (94.4%)` d1..3** (zero loss in target `emit`), whereas **per-row `Int4` collapses to `67%` head-only / `58%` full on d1** (disqualified).
 - **Recommended design:** **`EAGLE-1-Med`** (`1L, D=1024, FF=2816, 16q/4kv hd=64, SWA-128`, 4-tap fuse, symmetric per-row `int8` `dp4a` body) + **tied `V'=32,768` `int4-g128` nibble-unpack head** (`29.9 MiB` VRAM; measured CUDA-graph round **`0.24 / 0.46 / 0.68 ms`** for `k=1/2/3`; modeled **`24.14 tok/s` (+13.0%)** at `k=1` under current acceptance and **`25.08 tok/s` (+17.4%)** with trained EAGLE acceptance). Requires compact ragged `B=2..3` verifier in Inkwell.
+
+### Brain re-validation on master: pw16 (M=16-Paired C0c core) — NOT ACCEPTED, kept opt-in
+
+- Cherry-picked 95b1b50 onto 952e1ff. Review: the reduce scratch reuses `xs` only after a `__syncthreads`; every thread reaches `pw16_reduce`; nky=2 atomics add two terms onto zero, so the result is order-independent; per-block K dispatch keeps mixed-K launches correct.
+- nsys, one run each (68 steps, graphs on): total kernel 3791.7 → 3718.9 ms; `gemv_moe_s` 1267.5 → 1230.3 (−0.55 ms/tok), `gemv_sf` 922.5 → 890.1 (−0.48 ms/tok). Kernel gain ≈ **−1.07 ms/tok (−1.9%)**.
+- E2E A/B, BEST env, ctl = `INKWELL_NO_PW16=1`, ctl,pw,pw,ctl:
+  - batch 1 (8 pairs): ctl 46.45, pw 46.39 ms/tok, 5/8;
+  - batch 2 (8 pairs, pre-registered: accept if 16-pair total ≥12/16 and median faster): ctl 49.64, pw 49.37, 6/8;
+  - total **11/16**, median 47.97 → 47.04. md5 5cbe8e06 on all 32 runs. Other agents were building concurrently (batch 2 is ~3 ms slower overall).
+- Verdict: below the bar. Code stays on master **default off**, opt-in with `INKWELL_PW16=1`. Re-test on an idle machine; the expected effect (~1 ms) is close to the pair noise.

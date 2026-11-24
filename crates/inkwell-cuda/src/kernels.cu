@@ -2159,10 +2159,10 @@ __device__ __forceinline__ void pw16_reduce(int part, int t_in_blk, int sub, boo
 #ifndef PW16_KMASK
 #define PW16_KMASK ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 8))   // K=2.0/2.5/3.0/4.0 (per-K kbench)
 #endif
-// killswitch INKWELL_NO_PW16=1 -> mask 0 (shipped core for every K)
+// opt-in INKWELL_PW16=1 (default off: 16-pair A/B 11/16, below the 12/16 bar)
 static inline int ink_pw16_mask() {
     static int m = -1;
-    if (m < 0) m = getenv("INKWELL_NO_PW16") ? 0 : PW16_KMASK;
+    if (m < 0) m = (getenv("INKWELL_PW16") && !getenv("INKWELL_NO_PW16")) ? PW16_KMASK : 0;   // default OFF until E2E A/B passes
     return m;
 }
 
