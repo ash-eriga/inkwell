@@ -663,3 +663,18 @@ Bench: `bash opt/kbench/build.sh gemv_v2_bench && ./opt/kbench/gemv_v2_bench opt
   emit ≥3.5+ E verify ≤300. O draft treinado é o gargalo, não o verify.
 - Ideia pra serial: aplicar o v2 gemv_moe_n no caminho seriado (MoE 45→~31ms
   se 1.45x se mantiver p/ 1 token) → ~12 TPS.
+
+## Estado c874e34 — spec ~5.2 tok/s, teto estrutural do drafter
+
+- **VEREDITO MATEMÁTICO**: emit ~2.5 real do drafter (mtp inkling = hidden_out
+  H-space, implementação correta, validada vs oracle). Round mín ~390ms →
+  spec teto ~5.2-5.5 tok/s < serial ~127ms/tok (~7.9 TPS). Spec não vence sem
+  drafter melhor OU verify ≤220ms com emit ≥2.5.
+- v2 no serial = neutro (1 consumidor/entry, batching não se aplica) — gated.
+- **Próximos (verify fixed-cost ~200ms não-MoE)**: had grids bound a nslots
+  (já está: union ≤ kp*8 — grids ainda 64, boundar ajuda kp baixo); gaps ~85ms
+  = ~500 launches ~170μs cada → o fix real é CUDA graph do step_block inteiro
+  (captura uma vez, replay por round — buffers fixos, inputs via memcpy);
+  draft ~55ms tem 7 syncs d2h (argmax readback por iteração do markov head —
+  batchar ou manter argmax no device economiza ~15ms).
+- Comandos idênticos; INKWELL_MOE_V2=1 já é default nas medições de spec.

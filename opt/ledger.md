@@ -151,3 +151,15 @@ Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8
 - Piso com dieta de instruções (~7 instr/peso decode + 1,25/consumidor, 3,7 IPC): por bloco
   MoE-VRAM ≈ 33 ms (hoje 113), denso ntok-8 ≈ 25 ms (47), unembed ≈ 6 (11), MoE-pinned
   ≈ 104 ms (PCIe; hoje 254). GEMVs 425 → ~168 ms.
+
+## spec: kd adaptativo + union bound + serial v2 gate (devin, HEAD c58d46e+)
+
+- MK_CUM_TH sweep: 0.05 → emit 2.72/5.1tok/s; 0.4 → 2.33/5.2; 0.15 → 2.04/4.3.
+- SPEC_NSLOTS bounds union_expand a kp*8 → verify ~331ms@kp baixo (era ~430).
+- INKWELL_SPEC_PROB rejeitado: 3.8 tok/s, texto piora.
+- mtp.safetensors: hidden_out[2304,256]+bias (fold em HIDDEN, não vocab) —
+  nossa matemática da markov head está correta; draft.py do megakernel-zoo é
+  de deepseek-v4 (fold_w vocab), não comparável.
+- v2 no serial: ~128ms vs ~127ms controle — neutro (1 consumidor/entry).
+- **VEREDITO**: spec teto ~5.2-5.5 tok/s; emit ~2.5 real do drafter; spec não
+  vence serial (~127ms/tok aqui). Bloqueio = qualidade do drafter, não verify.
