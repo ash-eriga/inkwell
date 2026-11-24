@@ -2277,6 +2277,41 @@ __global__ void inkwell_exl3_moe_stage(const uint64_t* __restrict__ descs_g,
     }
 }
 
+// Single-projection variant of moe_stage: one block per slot copies proj `proj`'s
+// blob (trellis+suh+svh) from host-mapped descs into staging and fixes sdescs.
+__global__ void inkwell_exl3_moe_stage_p(const uint64_t* __restrict__ descs,
+                                       const int* __restrict__ ids,
+                                       uint8_t* __restrict__ staging,
+                                       uint64_t* __restrict__ sdescs,
+                                       int proj) {
+    const int slot = blockIdx.x;
+    const uint64_t* d = descs + ids[slot] * 4;
+    const int ka = (int)(d[3] & 0xff);
+    const int halfk = (int)((d[3] >> 8) & 1);
+    const int trel_b = 10368 * r_bits_words(ka, halfk) * 4;
+    uint8_t* dst = staging + (size_t)(slot * 3 + proj) * EXL3_STAGE_PROJ;
+    const int suh_b = (proj == 2 ? 2304 : 4608);
+    const int svh_b = (proj == 2 ? 4608 : 2304);
+    const uint4* s0 = (const uint4*)(uintptr_t)d[0];
+    const uint4* s1 = (const uint4*)(uintptr_t)d[1];
+    const uint4* s2 = (const uint4*)(uintptr_t)d[2];
+    const int n0 = trel_b / 16, n1 = suh_b / 16, n2 = svh_b / 16;
+    uint4* t0 = (uint4*)dst;
+    uint4* t1 = (uint4*)(dst + trel_b);
+    uint4* t2 = (uint4*)(dst + trel_b + suh_b);
+    const int t = threadIdx.x;
+    for (int i = t; i < n0; i += blockDim.x) t0[i] = s0[i];
+    for (int i = t; i < n1; i += blockDim.x) t1[i] = s1[i];
+    for (int i = t; i < n2; i += blockDim.x) t2[i] = s2[i];
+    if (t == 0) {
+        uint64_t* o = sdescs + ids[slot] * 4;
+        o[0] = (uint64_t)(uintptr_t)dst;
+        o[1] = (uint64_t)(uintptr_t)(dst + trel_b);
+        o[2] = (uint64_t)(uintptr_t)(dst + trel_b + suh_b);
+        o[3] = d[3];
+    }
+}
+
 // Per-layer VRAM expert cache: resolve ids -> K slots, copy only misses.
 // tag[v] = expert id (-1 empty); map[s] = slot chosen for ids[s];
 // miss[s] = 1 when a copy is required. rr = per-layer victim counter.
@@ -2522,10 +2557,22 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
                                     void* staging, void* sdescs_g, void* sdescs_u, void* sdescs_d,
                                     int on_dev) {
     const cudaStream_t st = (cudaStream_t)stream;
+    static cudaStream_t st2 = nullptr;
+    static cudaEvent_t ev_ids = nullptr, ev_dstg = nullptr;
     if (!on_dev) {
-        inkwell_exl3_moe_stage<<<nslots * 3, 256, 0, st>>>(
-            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
-            ids, (uint8_t*)staging, (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d);
+        if (!st2) { cudaStreamCreateWithFlags(&st2, cudaStreamNonBlocking);
+                    cudaEventCreateWithFlags(&ev_ids, cudaEventDisableTiming);
+                    cudaEventCreateWithFlags(&ev_dstg, cudaEventDisableTiming); }
+        // D staging runs on st2 in parallel with the GU compute below.
+        cudaEventRecord(ev_ids, st);
+        cudaStreamWaitEvent(st2, ev_ids, 0);
+        inkwell_exl3_moe_stage_p<<<nslots, 256, 0, st2>>>(
+            (const uint64_t*)descs_d, ids, (uint8_t*)staging, (uint64_t*)sdescs_d, 2);
+        cudaEventRecord(ev_dstg, st2);
+        inkwell_exl3_moe_stage_p<<<nslots, 256, 0, st>>>(
+            (const uint64_t*)descs_g, ids, (uint8_t*)staging, (uint64_t*)sdescs_g, 0);
+        inkwell_exl3_moe_stage_p<<<nslots, 256, 0, st>>>(
+            (const uint64_t*)descs_u, ids, (uint8_t*)staging, (uint64_t*)sdescs_u, 1);
     }
     const uint64_t* G = on_dev ? (const uint64_t*)descs_g : (const uint64_t*)sdescs_g;
     const uint64_t* U = on_dev ? (const uint64_t*)descs_u : (const uint64_t*)sdescs_u;
@@ -2577,6 +2624,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     inkwell_exl3_had_out_moe<<<gout, 128, 0, st>>>(G, U, ids, dn, gu, NG, 2 * NG, 0, ND, NG);
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
+    if (!on_dev) cudaStreamWaitEvent(st, ev_dstg, 0);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
     if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8, xqs8, KD);

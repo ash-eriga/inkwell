@@ -182,3 +182,13 @@ Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8
   - Down d4: golden e exato, mas ~200ms/step vs ~181ms controle = ~10% MAIS LENTO (launch do quant + round-trip xq não compensam na 1060). REJEITADO.
 - Estado: código d4 fica atrás de INKWELL_MOE_D4A (default off); GU quants removidos. gemv_moe_n aceita xq/xq2/xqs/xqs2.
 - Próximo (rebuttal): occupancy/ILP fusion, fuse hadamard, CUDA graph do bloco, expert prefetch.
+
+## 2026-11-24 — Serial plateau analysis + D-stage overlap
+- Breakdown @K=16: step ~117ms = non-MoE ~53ms (ggml CUDA-graph ativo) + MoE ~64ms.
+- MoE ≈ PCIe-bound: ~48 visits × ~20MB staged ≈ 960MB/tok; ~15GB/s efetivo ≈ saturação gen3.
+- dp4a MoE: REJEITADO (ver entry anterior).
+- INKWELL_MOE_PREFETCH: REJEITADO — só existe p/ camadas CACHED; pinned não têm. K16+PF OOM; K12+PF ~121ms (pior que K16).
+- D-stage overlap (novo): stage D em st2 ∥ compute GU — efeito ~1-2ms (PCIe compartilhada, streams não somam banda). MANTIDO (grátis, golden).
+- Cache K sweep: K=4 ~181ms, K=12 ~121ms, K=16 ~117ms, K=20 ~115ms (ctx512+margin10), K=24+ OOM.
+- BEST serial env: GGML_PASCAL_GRAPHS=1 INKWELL_MAX_CTX=512 INKWELL_CACHE_MARGIN_MB=10 INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_V2=1 → ~115ms/tok ≈ 8.7 TPS.
+- PLATEAU: VRAM (6GB) capa o cache; bytes PCIe/tok é o piso. Próximos levers rankeados: (1) mais VRAM p/ cache — precisa liberar ~50MiB/camada (dev_buf/KV/head) (2) occupancy/ILP do gemv_moe_n — mas serial já é byte-bound, upside pequeno (3) CUDA-graph da cadeia MoE — ~300 launches, ~2-3ms upside.
