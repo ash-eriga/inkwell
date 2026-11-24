@@ -4,6 +4,18 @@ This continues `opt/MATH_CHALLENGE.md`. Step 1 proved the arithmetic. Step 2 tur
 
 **Context.** This is still about decompressing neural-network weights with the public EXL3 "mul1" codebook. The rewrite edits the SASS that NVIDIA's compiler produced from our own kernel source (`crates/inkwell-cuda/src/kernels.cu`), to remove redundant instructions. The integer results stay bit-identical, so model quality cannot change.
 
+**No GPU and no NVIDIA driver are needed on your side.**
+- Install only the CUDA 12.6 compiler tools, with no driver: `conda install -c nvidia cuda-nvcc=12.6 cuda-cuobjdump=12.6 cuda-nvdisasm=12.6 cuda-cudart-dev=12.6`, or the 12.6 runfile with `--silent --toolkit`.
+- You also need a host g++ ≤ 13, because nvcc 12.6 rejects newer versions.
+- `nvcc -cubin`, `cuobjdump -sass`, `nvdisasm`, the assembler, Lean and your checker all run on a CPU.
+- Nothing you deliver may need a GPU to be tested. Your evidence is:
+  - the Lean proofs;
+  - the certificate checker;
+  - the SASS before/after diffs;
+  - optionally, a CPU emulation of the edited regions.
+- The silicon tests in §6.4 run on our GTX 1060 after you hand over.
+- If you cannot install the toolkit, ask, and we send `kernels.cubin`, its SASS and its nvdisasm output. Tracks A and C still work from those files. Track B needs ptxas.
+
 ## 1. Step 1 results, and why they do not ship as they are
 What step 1 proved, and what we keep:
 - `prod2_eq` / `sCand_eq`: (c·w) mod 2^32 = 0xD12D·w + ((0x83DC·w) mod 2^16) << 16 for 16-bit w, which is 2 XMAD.
