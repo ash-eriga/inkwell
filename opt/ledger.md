@@ -1070,3 +1070,13 @@ Commits: see HEAD. Killswitch `INKWELL_NO_CACHEL=1` (uniform ck sizing);
 - Rewrite: one warp per (column, query) with the lane's 72 values preloaded into registers (156 regs, 0 spills) and post loads batched 8 rows at a time; same op order. nsys (node trace, 68 steps): mix 2.75 → 1.45 ms/tok, had_in 1.18 → 0.60 ms/tok. md5 5cbe8e06.
 - 16-pair A/B: ctl 48.38, mx 47.98 (−0.40), 11/16, with runs spread 43–67 ms (4 agents active, zram swapping). Not accepted yet; re-run on a quieter box.
 - Re-run on master 3ad8488 (cache sizing in): ctl 45.37, mx 44.07 (**−1.31 ms**), 11/16 again; one 59.7 ms outlier. Pooled 22/32, under the 24/32 bar. Kept on the branch; re-run when fewer agents share the box.
+
+### Dense W4/W5/W6 group-wise GEMV kernel study (`opt/kbench/w4dense/REPORT.md`, sm_61) — READY FOR QUANT KLD CHECK
+
+- Tuned `N32`-tiled F32-activation W4/W5/W6 kernels (`LDG.128`, opaque-AND `I2F.F32.U8` 0-shift unpack, broadcast smem `x` with 0 bank conflicts, in-block split-K, fused `unembed+argmax`) hit **2.65–2.70 SASS ins/w** for W4 (`3.28–3.33` for W5/W6, 40 regs, 0 spills, 6 blks/SM) and **172.3 GB/s** on `unembed` (96.4% of raw `LDG.128` STREAM 178.8 GB/s; zero-compute 4.125 bpw floor = 5.80 ms/tok).
+- Modeled dense time (`48×attn6 + unembed`, 31 interleaved reps vs shipped EXL3, CPU FP64 verified `fails=0`):
+  - **`W4_g128_sym` (4.125 bpw):** `6.98 ms` vs `8.85 ms` bare `gemv_s` (**1.27×, −1.87 ms**) / `~10.24 ms` shipped `had_in+gemv_sf` (**1.47×, −3.26 ms**; up to −3.3..−5.2 ms at warm SM clocks), **+43.43 MiB** VRAM (+38.07 attn, +5.36 unembed).
+  - **`W4_g128_asym` / `W4_g64_sym` (4.250 bpw):** `7.09 / 7.24 ms` (**1.44–1.45×, −3.18 ms** shipped), **+59.89 MiB** VRAM.
+  - **`W4_g128_dp2a` (int16 x):** `6.71 ms` (−0.27 ms vs F32, 100× worse rel err `4.2e-5` vs `3.8e-7`) → keep exact F32.
+  - **`W5` (`8.12 ms`, +175 MiB) & `W6` (`9.28–9.52 ms`, +307 MiB):** rejected globally (too much VRAM on 6 GB; `W6` slower than bare EXL3).
+- Verdict: not ~2× (capped by 192 GB/s DRAM), but **−3.2 ms/tok for +43–60 MiB** fits inside existing headroom; adopt `W4_g128_sym` or `W4_g128_asym`/`W4_g64_sym` if quantizer meets KLD ≤ 0.0475 and top-1 ≥ 94.66%. Format contract in `opt/kbench/w4dense/REPORT.md` §6.
