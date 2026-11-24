@@ -1625,8 +1625,8 @@ __global__ void inkwell_exl3_had_in(const float* __restrict__ x,
     if (base + t < k) xh[base + t] = sm[t] * 0.08838834764831845f; // 1/sqrt(128)
 }
 
-// merged had_in, opt-in with INKWELL_HADMERGE=1 (INKWELL_NO_HADMERGE vetoes;
-// default stays per-member launches: ~12us/token saved, inside A/B noise).
+// merged had_in, default on (INKWELL_NO_HADMERGE=1 restores per-matrix had_in;
+// nsys graph-node trace: had_in 1.16 -> 0.62 ms/token).
 // Member z applies the identical 128-point butterfly to its own x with its
 // own suh into its own xh; only the launch count changes.
 struct HadNArgs { const float* x[8]; const uint16_t* suh[8]; float* xh[8]; int n; int k; };
@@ -2555,7 +2555,7 @@ extern "C" void ink_launch_exl3_gemv_ntok(const void* trel, const void* suh, con
                                           float* scratch, void* stream) {
     const int NTOK = 8;
     const int tk = (int)(k / 16), tn = (int)(n / 16);
-    { static int hm = -1; if (hm < 0) { const char* e = getenv("INKWELL_HADMERGE"); hm = (e && atoi(e) && !getenv("INKWELL_NO_HADMERGE")) ? 1 : 0; }
+    { static int hm = -1; if (hm < 0) { hm = getenv("INKWELL_NO_HADMERGE") ? 0 : 1; }
       if (hm) {
           HadNArgs a; a.n = NTOK; a.k = (int)k;
           for (int tt = 0; tt < NTOK; ++tt) {
@@ -4501,7 +4501,7 @@ extern "C" void ink_launch_exl3_gemv_mz(
         cudaEventCreateWithFlags(&mz_ev[8], cudaEventDisableTiming);
     }
     cudaStream_t st = (cudaStream_t)stream;
-    { static int hm = -1; if (hm < 0) { const char* e = getenv("INKWELL_HADMERGE"); hm = (e && atoi(e) && !getenv("INKWELL_NO_HADMERGE")) ? 1 : 0; }
+    { static int hm = -1; if (hm < 0) { hm = getenv("INKWELL_NO_HADMERGE") ? 0 : 1; }
       if (hm && nz > 1) {
           // group zs by identical (x, k); the group leader's stream runs one
           // merged had_in covering all members before their gemv tails.
@@ -4630,37 +4630,45 @@ __global__ void inkwell_mix(const float* __restrict__ st,
         out[i] = a;
     }
 }
-// Multi-block mix, opt-in with INKWELL_MIXMB=1 (INKWELL_NO_MIXMB vetoes);
-// default is the single-block kernel above: the ~20us/token kernel saving
-// sat inside A/B noise so it did not qualify as default (see opt/ledger).
-// mix_pre spreads the per-column reductions over blocks (one warp per column;
-// the lane-strided sums and xor-shuffle trees are verbatim). mix_post
-// recomputes the sequential softmax redundantly per block and splits the
-// output elements over all SMs. Scratch is a slot-rotated device array so
-// launches on different streams cannot share it; all math is identical.
+// Multi-block mix (default; INKWELL_NO_MIXMB=1 = single-block kernel above).
+// The single-block kernel is latency-bound: rows is 1..6 in practice, so 1-6
+// warps each walk 72 dependent global loads per pass. mix_pre runs one warp
+// per (column j, query qc) and preloads the lane's 72 column and query values
+// into registers, then runs the SAME lane-strided sums (t = 0..71 in order)
+// and xor-shuffle trees; every (j,qc) warp recomputes rms identically.
+// mix_post recomputes the softmax exactly as before (thread 0, sequential j)
+// and splits the output elements over blocks, with loads batched 8 rows at a
+// time but accumulated in j order. Bit-identical to the single-block kernel.
+#define MIX_NPL 72   // embd / 32 for embd = 2304; other embd use the old kernel
 #define MIX_SCR_STRIDE (64 + 64 * 8)
 __device__ float g_mix_scr[4 * MIX_SCR_STRIDE];
 
-__global__ void inkwell_mix_pre(const float* __restrict__ st,
+__global__ void __launch_bounds__(32) inkwell_mix_pre(const float* __restrict__ st,
                                 const float* __restrict__ q,
-                                int embd, int rows, int qcols, int slot) {
+                                int embd, int qcols, int slot) {
     float* s_rms = g_mix_scr + slot * MIX_SCR_STRIDE;
     float* s_p = s_rms + 64;
-    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
-    for (int j = blockIdx.x * nw + w; j < rows; j += nw * gridDim.x) {
-        const float* col = st + (size_t)j * embd;
-        float ss = 0.f;
-        for (int i = lane; i < embd; i += 32) ss += col[i] * col[i];
-        for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(~0u, ss, m);
-        const float rms = sqrtf(ss / (float)embd + 1e-6f);
-        if (lane == 0) s_rms[j] = rms;
-        for (int qc = 0; qc < qcols; ++qc) {
-            float dp = 0.f;
-            for (int i = lane; i < embd; i += 32) dp += col[i] / rms * q[(size_t)qc * embd + i];
-            for (int m = 16; m; m >>= 1) dp += __shfl_xor_sync(~0u, dp, m);
-            if (lane == 0) s_p[j * 8 + qc] = dp;
-        }
+    const int j = blockIdx.x, qc = blockIdx.y, lane = threadIdx.x;
+    const float* col = st + (size_t)j * embd;
+    float c[MIX_NPL], qq[MIX_NPL];
+#pragma unroll
+    for (int t = 0; t < MIX_NPL; ++t) c[t] = col[lane + 32 * t];
+    if (qc < qcols) {
+#pragma unroll
+        for (int t = 0; t < MIX_NPL; ++t) qq[t] = q[(size_t)qc * embd + lane + 32 * t];
     }
+    float ss = 0.f;
+#pragma unroll
+    for (int t = 0; t < MIX_NPL; ++t) ss += c[t] * c[t];
+    for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(~0u, ss, m);
+    const float rms = sqrtf(ss / (float)embd + 1e-6f);
+    if (qc == 0 && lane == 0) s_rms[j] = rms;
+    if (qc >= qcols) return;
+    float dp = 0.f;
+#pragma unroll
+    for (int t = 0; t < MIX_NPL; ++t) dp += c[t] / rms * qq[t];
+    for (int m = 16; m; m >>= 1) dp += __shfl_xor_sync(~0u, dp, m);
+    if (lane == 0) s_p[j * 8 + qc] = dp;
 }
 
 __global__ void inkwell_mix_post(const float* __restrict__ st,
@@ -4671,38 +4679,46 @@ __global__ void inkwell_mix_post(const float* __restrict__ st,
     const int qc = blockIdx.y;
     const float* g_rms = g_mix_scr + slot * MIX_SCR_STRIDE;
     const float* g_p = g_rms + 64;
-    if (threadIdx.x < rows) s_rms[threadIdx.x] = g_rms[threadIdx.x];
+    if (threadIdx.x < rows) {
+        s_rms[threadIdx.x] = g_rms[threadIdx.x];
+        s_p[threadIdx.x] = g_p[threadIdx.x * 8 + qc];
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
         float mx = -INFINITY;
-        for (int j = 0; j < rows; ++j) { s_p[j] = g_p[j * 8 + qc] * scale; mx = fmaxf(mx, s_p[j]); }
+        for (int j = 0; j < rows; ++j) { s_p[j] *= scale; mx = fmaxf(mx, s_p[j]); }
         float d = 0.f;
         for (int j = 0; j < rows; ++j) { s_p[j] = __expf(s_p[j] - mx); d += s_p[j]; }
         for (int j = 0; j < rows; ++j) s_p[j] /= d;
     }
     __syncthreads();
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < embd; e += (int)(blockDim.x * gridDim.x)) {
-        float a = 0.f;
-        for (int j = 0; j < rows; ++j) a += st[(size_t)j * embd + e] / s_rms[j] * s_p[j];
-        out[(size_t)qc * embd + e] = a;
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= embd) return;
+    float a = 0.f;
+    for (int j0 = 0; j0 < rows; j0 += 8) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = (j0 + u < rows) ? st[(size_t)(j0 + u) * embd + e] : 0.f;
+#pragma unroll
+        for (int u = 0; u < 8; ++u) if (j0 + u < rows) a += v[u] / s_rms[j0 + u] * s_p[j0 + u];
     }
+    out[(size_t)qc * embd + e] = a;
 }
 
 extern "C" void ink_launch_mix(const void* st, const void* q, void* out,
                                int embd, int rows, int qcols, float scale, void* stream) {
-    { static int mb = -1; if (mb < 0) { const char* e = getenv("INKWELL_MIXMB"); mb = (e && atoi(e) && !getenv("INKWELL_NO_MIXMB")) ? 1 : 0; }
-      if (mb) {
-          static unsigned mix_slot = 0;
-          const int slot = (int)(mix_slot++ & 3u);
-          const int g1 = (rows + 1) / 2;
-          inkwell_mix_pre<<<(g1 > 0 ? g1 : 1), 64, 0, (cudaStream_t)stream>>>(
-              (const float*)st, (const float*)q, embd, rows, qcols, slot);
-          if (qcols > 0) {
-              dim3 g2((embd + 255) / 256, qcols);
-              inkwell_mix_post<<<g2, 256, 0, (cudaStream_t)stream>>>(
-                  (const float*)st, (float*)out, embd, rows, scale, slot);
-          }
-          return;
-      } }
+    static int mb = -1;
+    if (mb < 0) mb = getenv("INKWELL_NO_MIXMB") ? 0 : 1;
+    if (mb && embd == 32 * MIX_NPL && rows >= 1 && rows <= 64 && qcols >= 1 && qcols <= 8) {
+        // 4 rotating scratch slots: consecutive mixes never share one
+        static unsigned mix_slot = 0;
+        const int slot = (int)(mix_slot++ & 3u);
+        inkwell_mix_pre<<<dim3(rows, qcols), 32, 0, (cudaStream_t)stream>>>(
+            (const float*)st, (const float*)q, embd, qcols, slot);
+        inkwell_mix_post<<<dim3((embd + 127) / 128, qcols), 128, 0, (cudaStream_t)stream>>>(
+            (const float*)st, (float*)out, embd, rows, scale, slot);
+        return;
+    }
     inkwell_mix<<<1, 256, 0, (cudaStream_t)stream>>>(
         (const float*)st, (const float*)q, (float*)out, embd, rows, qcols, scale);
 }
