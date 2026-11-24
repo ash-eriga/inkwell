@@ -3,3 +3,5 @@ opt/rexl3/exl3-src
 # kbench built binaries (keep sources + ids)
 opt/kbench/probe_*
 opt/kbench/kb_*
+opt/kbench/sgemv_bench
+opt/kbench/sgemv_gold

@@ -2347,6 +2347,125 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
     }
 }
 
+// ---- "stream-decode" MoE gemv (port of kbench sg::gemv_moe_s, MAC=0 f32 exact) ----
+// One warp owns one 16x16 tile column (tn) and walks tk. Lane t owns ring
+// positions 8t..8t+7: 8 CONSECUTIVE windows -> compile-time bit offsets
+// (j*KA + H*((j+1)>>1)). Per tile: 3 __ldg words straight from global, 2 SHF
+// align into a 64-bit register stream, then 1 SHF + XMAD-mul16 + IDP/I2F/FFMA
+// per window. No smem ring, no __syncthreads in the loop; Σx over the block's
+// k-range is precomputed in the prologue. Same affine out as inkwell_exl3_gemv_moe.
+__device__ __forceinline__ uint32_t sgemv_mul16(uint32_t w) {   // (w & 0xffff) * 0x83DCD12D mod 2^32
+    const uint32_t h = w & 0xffffu;
+    return h * 0xD12Du + ((h * 0x83DCu) << 16);
+}
+// window j (16 bits, MSB-first) out of the 64-bit stream hi:lo; offset compile-time
+template <int D> __device__ __forceinline__ uint32_t sgemv_win(uint32_t hi, uint32_t lo) {
+    if constexpr (D <= 16) return hi >> (16 - D);
+    else return __funnelshift_r(lo, hi, 48 - D);
+}
+template <int KA, int H>
+__device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
+                                          int tk_lo, int tk_hi, const float* __restrict__ xs,
+                                          float& a0, float& a1) {
+    constexpr int NW = 8 * KA + 4 * H;
+    const int t = threadIdx.x & 31;
+    const int R = 32 * NW;
+    int B = (H ? (8 * t + 1) * KA + ((8 * t + 1) >> 1) : (8 * t + 1) * KA) - 16;
+    if (B < 0) B += R;
+    const int w0 = B >> 5, o = B & 31;
+    const int w1 = (w0 + 1 == NW) ? 0 : w0 + 1;
+    const int w2 = (w1 + 1 == NW) ? 0 : w1 + 1;
+    const int r0 = 2 * (t & 3);
+    const size_t stride = (size_t)tn * NW;
+    const uint32_t* p = tb + (size_t)tn_i * NW;
+#pragma unroll 4
+    for (int a = tk_lo; a < tk_hi; ++a) {
+        const uint32_t* q = p + (size_t)a * stride;
+        const int kb = a * 16 + r0;
+        const uint32_t W0 = __ldg(q + w0), W1 = __ldg(q + w1), W2 = __ldg(q + w2);
+        const uint32_t hi = __funnelshift_l(W1, W0, o), lo = __funnelshift_l(W2, W1, o);
+        uint32_t pp[8];
+#define SG_D(j) ((j) * KA + H * (((j) + 1) >> 1))
+        pp[0] = sgemv_mul16(sgemv_win<SG_D(0)>(hi, lo)); pp[1] = sgemv_mul16(sgemv_win<SG_D(1)>(hi, lo));
+        pp[2] = sgemv_mul16(sgemv_win<SG_D(2)>(hi, lo)); pp[3] = sgemv_mul16(sgemv_win<SG_D(3)>(hi, lo));
+        pp[4] = sgemv_mul16(sgemv_win<SG_D(4)>(hi, lo)); pp[5] = sgemv_mul16(sgemv_win<SG_D(5)>(hi, lo));
+        pp[6] = sgemv_mul16(sgemv_win<SG_D(6)>(hi, lo)); pp[7] = sgemv_mul16(sgemv_win<SG_D(7)>(hi, lo));
+#undef SG_D
+        const float2 xa = *(const float2*)&xs[kb], xc = *(const float2*)&xs[kb + 8];
+        float f[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) f[j] = (float)(int)__dp4a(pp[j], 0x01010101u, 0u);
+        a0 = fmaf(xa.x, f[0], a0); a0 = fmaf(xa.y, f[1], a0); a0 = fmaf(xc.x, f[2], a0); a0 = fmaf(xc.y, f[3], a0);
+        a1 = fmaf(xa.x, f[4], a1); a1 = fmaf(xa.y, f[5], a1); a1 = fmaf(xc.x, f[6], a1); a1 = fmaf(xc.y, f[7], a1);
+    }
+}
+
+#define SGEMV_MAXK 2304
+// Drop-in for inkwell_exl3_gemv_moe: same params/semantics.
+// grid ((tn+7)/8, nslots, nsel*nky), 256 threads = 8 warps = 8 tn tiles of one slot.
+__global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
+                                      const uint64_t* __restrict__ descs,
+                                      const uint64_t* __restrict__ descs2,
+                                      const int* __restrict__ ids,
+                                      const float* __restrict__ xh,
+                                      const float* __restrict__ xh2, int xh2s,
+                                      float* __restrict__ t, int tslot, int tzoff,
+                                      int tk, int tn, int k, int n, int nky,
+                                      const int* __restrict__ missf, int skipmode) {
+    const int slot = blockIdx.y;
+    // skipmode 1: hits only; 2: misses only; 0: all slots (uniform per block)
+    if (skipmode && ((missf[slot] != 0) == (skipmode == 1))) return;
+    const int nsel = descs2 ? 2 : 1;             // fused gate+up pairs vs single
+    const int ky = blockIdx.z / nsel;            // k-range index
+    const int zsel = blockIdx.z % nsel;
+    const uint64_t* d = (zsel ? descs2 : descs) + ids[slot] * 4;
+    const int tk_lo = (ky * tk) / nky;
+    const int tk_hi = ((ky + 1) * tk) / nky;
+    const float* xg = zsel ? xh2 + (size_t)slot * xh2s : xh + (size_t)slot * k;
+    __shared__ __align__(16) float xs[SGEMV_MAXK];
+    __shared__ float red[8];
+    // prologue: stage this block's k-range of x and its Σx
+    float sxl = 0.f;
+    for (int e = tk_lo * 16 + threadIdx.x; e < tk_hi * 16; e += 256) {
+        const float v = xg[e];
+        sxl += v;
+        xs[e] = v;
+    }
+#pragma unroll
+    for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sxl;
+    __syncthreads();
+    float sx = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sx += red[i];
+    const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (tn_i >= tn) return;
+    const uint32_t* tb = (const uint32_t*)(uintptr_t)d[0];
+    const int ka = (int)(d[3] & 0xff), hk = (int)((d[3] >> 8) & 1);
+    float a0 = 0.f, a1 = 0.f;
+    switch (ka * 2 + hk) {
+        case 3:  sgemv_run<1, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 4:  sgemv_run<2, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 5:  sgemv_run<2, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 6:  sgemv_run<3, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 7:  sgemv_run<3, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 8:  sgemv_run<4, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        case 10: sgemv_run<5, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+        default: __trap();
+    }
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+    const int lane = threadIdx.x & 31;
+    if ((lane & 3) == 0) {
+        const float KINV = __half2float(__ushort_as_half(0x1eee));
+        const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+        const float off = KOFF * sx;   // whole-k-range Σx belongs to every column once
+        float* dst = &t[(size_t)slot * n + zsel * tzoff + tn_i * 16 + (lane >> 2)];
+        const float v0 = fmaf(KINV, a0, off), v1 = fmaf(KINV, a1, off);
+        if (nky > 1) { atomicAdd(dst, v0); atomicAdd(dst + 8, v1); } else { dst[0] = v0; dst[8] = v1; }
+    }
+}
+
 __global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
                                          const uint64_t* __restrict__ descs2,
                                          const int* __restrict__ ids,
@@ -2725,9 +2844,14 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG, nullptr, 0, nullptr, nullptr);
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+    int nky_s = 1;
+    { const char* e = getenv("INKWELL_SGEMV_NKY"); if (e) nky_s = atoi(e); if (nky_s < 1) nky_s = 1; }
+    static int no_sgemv = -1;
+    if (no_sgemv < 0) no_sgemv = getenv("INKWELL_NO_SGEMV") ? atoi(getenv("INKWELL_NO_SGEMV")) : 0;
+    const bool sg = !no_sgemv;                  // stream-decode gemv replaces v1+v2 serial
     static int v2_env = -1;
     if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
-    int v2_ok = (v2_env > 0) && nky == 1;
+    int v2_ok = !sg && (v2_env > 0) && nky == 1;
     if (v2_ok) {
         const void* dd[3] = {descs_g, descs_u, descs_d};
         for (int pi = 0; pi < 3 && v2_ok; ++pi) {
@@ -2745,7 +2869,8 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         int h[65]; for (int i = 0; i < 65; ++i) h[i] = i;
         cudaMemcpy(e8, h, 260, cudaMemcpyHostToDevice);
     }
-    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    const int nky_eff = sg ? nky_s : nky;       // nky of the kernel actually launched
+    if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     static uint32_t* xq8 = nullptr; static float* xqs8 = nullptr;
     static uint32_t* xq8b = nullptr; static float* xqs8b = nullptr;
     const bool d4 = v2_ok && getenv("INKWELL_MOE_D4A");
@@ -2754,7 +2879,11 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
         cudaMalloc(&xq8b, 64 * 2304); cudaMalloc(&xqs8b, 64 * 144 * 4);
     }
     // GU stays fp32 (int8-x loses ~10%/window here) -> no GU quants
-    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
+    if (sg) {
+        dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
+        inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0);
+    } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, nullptr, 0,
         nullptr, nullptr, nullptr, nullptr);   // GU stays fp32: int8-x loses ~10%/window
     else {
@@ -2768,9 +2897,13 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     dim3 din((KD + 511) / 512, nslots);
     if (!on_dev) cudaStreamWaitEvent(st, ev_dstg, 0);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
-    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8, xqs8, KD);
-    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
+    if (sg) {
+        dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
+        inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
+    } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, nullptr, nullptr);
     else {
@@ -2827,9 +2960,14 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     int nky = 1;
     { const char* e = getenv("INKWELL_MOE_NKY"); if (e) nky = atoi(e); if (nky < 1) nky = 1; }
+    int nky_s = 1;
+    { const char* e = getenv("INKWELL_SGEMV_NKY"); if (e) nky_s = atoi(e); if (nky_s < 1) nky_s = 1; }
+    static int no_sgemv = -1;
+    if (no_sgemv < 0) no_sgemv = getenv("INKWELL_NO_SGEMV") ? atoi(getenv("INKWELL_NO_SGEMV")) : 0;
+    const bool sg = !no_sgemv;                  // stream-decode gemv replaces v1+v2 serial
     static int v2_env = -1;
     if (v2_env < 0) v2_env = getenv("INKWELL_MOE_V2") ? atoi(getenv("INKWELL_MOE_V2")) : 0;
-    int v2_ok = (v2_env > 0) && nky == 1;
+    int v2_ok = !sg && (v2_env > 0) && nky == 1;
     if (v2_ok) {
         const void* dd[3] = {descs_g, descs_u, descs_d};
         for (int pi = 0; pi < 3 && v2_ok; ++pi) {
@@ -2854,15 +2992,21 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         cudaMalloc(&xq8c, 64 * 2304); cudaMalloc(&xqs8c, 64 * 144 * 4);
         cudaMalloc(&xq8d, 64 * 2304); cudaMalloc(&xqs8d, 64 * 144 * 4);
     }
+    const int nky_eff = sg ? nky_s : nky;       // nky of the kernel actually launched
     // gate+up fused in one launch: blockIdx.z selects the descriptor set.
     // Hit slots run BEFORE ev_join so their gemv overlaps the bulk copy of
     // the missed experts on the side stream; miss slots run right after.
     dim3 gin((KG + 511) / 512, nslots, 2);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 1, nullptr, nullptr);
-    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     // GU stays fp32
-    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
+    if (sg) {
+        dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
+        inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
+                                                   (const int*)miss, 1);
+    } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1,
         nullptr, nullptr, nullptr, nullptr);
     else {
@@ -2874,7 +3018,12 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     cudaStreamWaitEvent(st, ev_join, 0);
     inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
                                                 (const int*)miss, 2, nullptr, nullptr);
-    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
+    if (sg) {
+        dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
+        inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
+                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
+                                                   (const int*)miss, 2);
+    } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2,
         nullptr, nullptr, nullptr, nullptr);
     else {
@@ -2888,9 +3037,13 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     inkwell_situ_pair<<<(unsigned)((nslots * NG + 255) / 256), 256, 0, st>>>(gu, nullptr, hid, 4.f, 25.f, NG, nslots);
     dim3 din((KD + 511) / 512, nslots);
     inkwell_exl3_had_in_moe<<<din, 128, 0, st>>>(D, nullptr, ids, hid, xh, nullptr, 0, KD, nullptr, 0, nullptr, nullptr);
-    if (nky > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
+    if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8c, xqs8c, KD);
-    if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
+    if (sg) {
+        dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
+        inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
+    } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, nullptr, nullptr);
     else {

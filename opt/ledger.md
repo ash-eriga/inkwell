@@ -268,3 +268,74 @@ native low-bit MMA.
   exl3_cb ~12ms are all bound by the same per-weight bit-window extract.
 - ctrl gain+forget weight concat at load (1 GEMV + slices): golden, ~neutral —
   3x15us mmqs saved were already in noise. Kept (killswitch INKWELL_NOCTRLCAT).
+
+## 2026-11-24 — Plateau re-check: EXL3 is NOT instruction-floor-bound; stream-decode gemv 1.9-2.1x (kbench)
+- SASS of serial `inkwell_exl3_gemv_moe` inner loop: 552 instr / 32 weights = **17.25 instr/weight**.
+  Useful decode+MAC = 8 (SHF, LOP, 3 XMAD, IDP, I2F, FFMA). Overhead: 3 LDS/weight (ring + x),
+  1 FADD/weight (redundant Σx), 29 SYNC + 30 ISETP per batch (runtime `tkn` guard), barriers.
+  Dense `inkwell_exl3_gemv_dp4a`: rolled loop, 4 weights/iter, >=9.5 instr/weight.
+- sm_61 throughput (lane-ops/clk/SM, /tmp/tp probe @1708 MHz nominal): FFMA 100, IDP4A 101, IDP2A 100,
+  XMAD 103, SHF 53, I2F 28. dp4a/dp2a are FULL rate; I2F is 1/4 rate.
+- New kernel `opt/kbench/sgemv_bench.cu` (sg::gemv_moe_s): 1 warp per tn tile, lane t owns 8 CONSECUTIVE
+  ring positions 8t..8t+7 -> window offsets compile-time (j*KA + H*((j+1)>>1)); 3 __ldg words straight
+  from global, 2 SHF align, 1 BFE/SHF per window, no smem ring, no __syncthreads in the loop, Σx precomputed.
+  Templated per (KA,H) in {1.5,2,2.5,3,3.5,4,5}; switch once per warp. CPU ref = exl3_window + tile_perm.
+- Results, 8 slots, real SAGE K mix, all-VRAM (base = serial kernel, nky=2):
+  | stage | base us | f32 exact | dp2a int16-x | dp4a int8-x |
+  | GU 2304->2x1152 | 376 | 201 (1.87x, err 1.7e-6) | 201 (1.87x, 1.0e-4) | 188 (2.0x, 1.9e-2) |
+  | down 1152->2304 | 212 | 103 (2.06x, 1.5e-6) | 107 (1.99x, 1.1e-4) | 99 (2.1x, 2.7e-2) |
+  | x48 visits | 28.2 ms | 14.6 ms | 14.8 ms | 13.8 ms |
+  (f32 best with `#pragma unroll 4` per-tile loop; int variants best with 8-tile unrolled blocks + flush per 128-k.)
+- dp2a core = 5.4 instr/weight (XMAD 2.3, IDP 2, BFE/SHF 0.8) -> issue ceiling ~380 Gw/s; achieved 211 Gw/s
+  -> now latency/occupancy-bound, not issue-bound. int8-x dp4a rejected again (2e-2 err).
+- NOTE: bench MoE gemvs = 28 ms/token but moe_cb_exl3 = ~53 ms -> ~25 ms of moe_cb is NOT gemv
+  (resolve/ccopy misses, had_in/out, swiglu, wsum, memsets). Unmeasured split.
+- Verdict: the plateau was the kernel structure, not EXL3 on Pascal. Next: wire gemv_moe_s (f32 exact) behind
+  a killswitch, gold test vs serial kernel, A/B e2e; then port the same structure to dense/ntok gemvs.
+
+## 2026-11-24 — sgemv (stream-decode MoE gemv) wired into serial
+
+Ported `sg::gemv_moe_s` (MAC=0, f32 exact) from `opt/kbench/sgemv_bench.cu` into
+kernels.cu as `inkwell_exl3_gemv_moe_s` — drop-in signature for
+`inkwell_exl3_gemv_moe`, grid ((tn+7)/8, nslots, nsel*nky_s). Wired into BOTH
+serial launchers (ink_launch_exl3_moe: 1 GU + 1 down; ink_launch_exl3_moe_cached:
+GU-hits, GU-misses, down), replacing old-kernel AND exl3v2::gemv_moe_n branches.
+Killswitch `INKWELL_NO_SGEMV=1` = exact old behaviour; `INKWELL_SGEMV_NKY`
+(default 1) is the new kernel's split-K (`nky_eff` drives the dn memsets).
+d4/quant_x_i8p skipped when sgemv active (v2-only path).
+
+### Gold on REAL weights (opt/kbench/sgemv_gold.cu + sgemv_dump.py;
+### 8 slots covering every K in {1.5,2,2.5,3,3.5,4} for gate, up and down)
+| stage | config | relerr | verdict |
+| GU  2304->2x1152 | old nky=1 | 2.75e-06 | PASS |
+| GU  2304->2x1152 | old nky=2 | 1.64e-06 | PASS |
+| GU  2304->2x1152 | new nky=1 | 2.08e-06 | PASS |
+| GU  2304->2x1152 | new nky=2 | 1.46e-06 | PASS |
+| GU  2304->2x1152 | new skipmode=1 | 2.08e-06 | PASS (skipped untouched) |
+| GU  2304->2x1152 | new skipmode=2 | 1.99e-06 | PASS (skipped untouched) |
+| GU  2304->2x1152 | timing | old(nky=2) 371.6us / new 207.9us | 1.79x |
+| down 1152->2304 | old nky=1 | 1.85e-06 | PASS |
+| down 1152->2304 | old nky=2 | 1.15e-06 | PASS |
+| down 1152->2304 | new nky=1 | 1.82e-06 | PASS |
+| down 1152->2304 | new nky=2 | 1.25e-06 | PASS |
+| down 1152->2304 | new skipmode=1 | 1.19e-06 | PASS (skipped untouched) |
+| down 1152->2304 | new skipmode=2 | 1.82e-06 | PASS (skipped untouched) |
+| down 1152->2304 | timing | old(nky=2) 212.0us / new 114.7us | 1.85x |
+
+### e2e A/B (BEST env, alternating C/A/C/A/C/A; ms/tok = decode-8-tok s*1000/64)
+| run | control (NO_SGEMV=1) | candidate |
+| 1 | 5.5035s = 85.99 | 4.4303s = 69.22 |
+| 2 | 5.5325s = 86.45 | 4.6085s = 72.01 |
+| 3 | 5.5144s = 86.16 | 4.6095s = 72.02 |
+| median | 5.5144s = **86.16 ms/tok** | 4.6085s = **72.01 ms/tok** (-16.4%) |
+
+Generated text byte-identical (md5 5cbe8e06...) in ALL 6 runs — no token flips.
+
+### GGML_OP_PROF (run WITHOUT GGML_PASCAL_GRAPHS — profiler's
+### cudaDeviceSynchronize is illegal during capture)
+- control:   moe_cb_exl3 n=48  median-window 44.35ms (tot 3090.3ms / 68 windows)
+- candidate: moe_cb_exl3 n=48  median-window 28.78ms (tot 2030.6ms / 68 windows)
+- moe_cb -35%; other callbacks (exl3_mz, exl3_cb, mix, attn, conv, clip, router) unchanged.
+
+VERDICT: **ACCEPT** — gold passes on all geometries/skipmodes, e2e -16.4% ms/tok,
+byte-identical output, warning-neutral (60 `warning:` lines before = after).
