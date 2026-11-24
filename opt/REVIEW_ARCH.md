@@ -375,7 +375,7 @@ Every A/B below uses the existing protocol: ≥8 interleaved pairs in both order
    - 128K plus non-loop caches in the 430–468 MiB the desktop leaves unused today: est. a further −9 to −12 ms, paid for with the display reserve (question 3).
    - A shorter context with caches: each 1K tokens of K4V2 global KV (6.75 MiB) buys ~3 expert slots. This review's plan reaches 28–34 ms/tok at short context with today's quant and caches.
 2. **Gate for approximate kernels.** Keep md5 identity, or accept a KLD threshold? If a threshold, what number? Steps 3, 6 and 8 need the answer.
-3. **Display reserve.** Is the 5,120 MiB cap a hard requirement? CUDA sees 6,057 MiB (87 MiB driver-reserved), so the cap leaves 937 MiB to the desktop. The desktop used 494–512 MiB, measured idle on 2026-11-24. After a 100 MiB safety margin, the 425–443 MiB in between holds 13–15 non-loop slots per layer at 128K, or 4–7 of today's k=20 caches at short context.
+3. **Display reserve. DECIDED by the owner (2026-11-24): the 5,120 MiB process cap stays a hard safety margin. Do not spend the display reserve on caches.** Measured: the BEST config peaks at 5,010 MiB per process (nvidia-smi, short context), inside the cap.
 4. **2.2 bpw loop-fit variant.** Ship it for 6 GB cards at an estimated +12–25% KLD, and keep the 2.26 bpw SAGE quant for ≥ 8–12 GB cards? What KLD is acceptable?
 5. **Codebook fork.** Is ending exllamav3 compatibility acceptable for a Pascal-only win of ~3.5 ms?
 6. **Lossy runtime knobs.** Are top-k 8→6 or expert skipping by routing weight in scope?
