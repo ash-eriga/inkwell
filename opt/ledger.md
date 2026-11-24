@@ -839,3 +839,30 @@ is on the critical path (side-stream bulk copy does NOT hide it). md5
 - Notable: L0/L20/L21 are nearly single-class (123-127 experts share one size
   class + 1-5 outliers) — per-class pools behave almost exactly like today's
   LFU there, just with right-sized slots.
+
+## kslot: variable-size expert slots via device free-list (commit b8c0995)
+
+Design (final): each cached layer's buffer = one arena of 6912-B granules
+(= suh+svh; every proj blob is exactly 6*w+1 granules). New resolve kernel
+`inkwell_exl3_kslot_resolve` keeps today's GLOBAL LFU but slots are variable:
+per miss it first-fits 3 extents from a sorted free list (sorted insert +
+adjacent merge on free), evicting the least-used unclaimed resident until the
+expert fits; nothing evictable -> EXL3_DIRECT. soff[v*3+p] byte offsets are
+resolve-maintained and read by ccopy (prefetch bank keeps fixed stride).
+Killswitch: `INKWELL_NO_KSLOT=1` restores uniform ck x max_slot.
+
+Rejected first attempt (measured, not committed): per-K-class pools with
+equal-resident-fraction waterfill. md5 correct but L17 misses 484 -> 886 —
+visits skew toward the large classes, so per-class partitioning starved the
+hot pool. Global-LFU + allocator keeps the working-set choice free.
+
+### Results (BEST env, k=20)
+- md5 5cbe8e06 on all 26 validation + A/B runs; free VRAM margin 511 MiB.
+- Selection misses (62 tok, PFSTAT): 3011 -> 2329 (-22.6%); hit 66.3% -> 73.9%.
+  Per layer: L16 377->359, L17 484->465, L22 114->50, L18 118->61, etc.
+  (misses/tok ~48.6 -> ~37.6; staged MiB/tok roughly proportional ~83 -> ~64).
+- E2E A/B, 16 interleaved ctl,cand,cand,ctl pairs (ctl = INKWELL_NO_KSLOT=1):
+  ctl median 50.87 ms/tok, cand median 50.18 (-0.69 ms/tok, -1.4%);
+  pair wins 11/16 (69%). Median faster; pair-win rate just under the 75% bar —
+  the remaining misses are the bigger blobs and part of the copy is hidden by
+  the side stream, so the byte savings translate at ~1/3 of the naive estimate.

@@ -877,7 +877,7 @@ impl Runner {
         let mut pinned_bytes = 0usize;
         let mut expert_dev: Vec<inkwell_cuda::DevBuf> = Vec::new();
         let mut moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>> = Vec::new();
-        let mut moe_esz: Vec<[u32; 128]> = Vec::new();
+        let mut moe_gw: Vec<[u32; 384]> = Vec::new();
         let conv = |il: usize| il % 6 == 5;
         for il in 0..24usize {
             let mut l = L {
@@ -1018,7 +1018,7 @@ impl Runner {
                 let mut descs: Vec<u64> = vec![0; 3 * 128 * 4];
                 let mut off = 0usize;
                 let mut max_slot = 0usize;
-                let mut esz = [0u32; 128];
+                let mut gxp = [0u32; 384];
                 for e in 0..128usize {
                     for (pi, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
                         let base = format!("{pre}.{e}.{proj}");
@@ -1034,11 +1034,11 @@ impl Runner {
                         // per-layer cache slot = max expert blob (trellis+suh+svh)
                         let w = (k16 / 16) * 8 + usize::from(k16 % 16 != 0) * 4;
                         let blob = 10368 * w * 4 + 6912;
-                        esz[e] = esz[e].max(blob as u32);
+                        gxp[e * 3 + pi] = (blob / 6912) as u32; // = 6*w + 1 granules
                         max_slot = max_slot.max(blob);
                     }
                 }
-                moe_esz.push(esz);
+                moe_gw.push(gxp);
                 let (f_free, _) = inkwell_cuda::mem_info();
                 eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
                 let dev_margin: usize = std::env::var("INKWELL_DEV_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
@@ -1133,6 +1133,7 @@ impl Runner {
         // CUDA-graph capture + desktop fluctuation still need room.
         let ck: usize = std::env::var("INKWELL_EXL3_CACHE_K")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+        let kslot = std::env::var_os("INKWELL_NO_KSLOT").is_none();
         if ck >= 8 {
             for (i, a) in moe_args_exl3.iter_mut().enumerate() {
                 if a.on_dev || a.max_slot == 0 { continue; }
@@ -1141,19 +1142,63 @@ impl Runner {
                 let margin: usize = std::env::var("INKWELL_CACHE_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
                 if f <= cbytes + (margin << 20) { continue; }
                 let Some(buf) = inkwell_cuda::DevBuf::try_new_bytes(cbytes) else { continue };
-                let tag = inkwell_cuda::DevBuf::new_bytes(ck * 4);
-                tag.write_bytes_async(&vec![0xFFu8; ck * 4]);
+                // kslot: same byte budget as ck uniform max-size slots, but as
+                // one granule arena with a device-side free list — slots are
+                // packed to each expert's real blob, so ~1.4x more experts stay
+                // resident under the same global-LFU policy. soff[v*3+p] is the
+                // (slot,proj) byte offset maintained by the resolve kernel;
+                // gexp = per-(e,proj) granule counts; fl = free-extent list.
+                // INKWELL_NO_KSLOT=1 = today's uniform ck x max_slot.
+                let mut k_tot = ck;
+                let mut gexp = None;
+                let mut soff = None;
+                let mut flb = None;
+                if kslot {
+                    let gxp = &moe_gw[i];
+                    let arena = cbytes / 6912;
+                    // max residents = arena / smallest 3-proj expert footprint
+                    let gmin3 = (0..128)
+                        .map(|e| (gxp[3 * e] + gxp[3 * e + 1] + gxp[3 * e + 2]) as usize)
+                        .min().unwrap_or(1).max(1);
+                    let kmax = (arena / gmin3).clamp(1, 64); // claimed mask is u64
+                    let gd = inkwell_cuda::DevBuf::new_bytes(384 * 4);
+                    gd.write_bytes_async(unsafe {
+                        std::slice::from_raw_parts(gxp.as_ptr().cast::<u8>(), 384 * 4)
+                    });
+                    let sd = inkwell_cuda::DevBuf::new_bytes(3 * kmax * 8);
+                    sd.write_bytes_async(&vec![0u8; 3 * kmax * 8]);
+                    let mut fl_h = vec![0i32; 513];
+                    fl_h[0] = 1;
+                    fl_h[257] = arena as i32; // one free extent [0, arena)
+                    let fd = inkwell_cuda::DevBuf::new_bytes(513 * 4);
+                    fd.write_bytes_async(unsafe {
+                        std::slice::from_raw_parts(fl_h.as_ptr().cast::<u8>(), 513 * 4)
+                    });
+                    k_tot = kmax;
+                    gexp = Some(gd);
+                    soff = Some(sd);
+                    flb = Some(fd);
+                    eprintln!("kslot L{}: arena={} gran kmax={} (cap {}/{}MiB)",
+                        a.layer, arena, kmax,
+                        arena * 6912 / 1048576, cbytes / 1048576);
+                }
+                let tag = inkwell_cuda::DevBuf::new_bytes(k_tot * 4);
+                tag.write_bytes_async(&vec![0xFFu8; k_tot * 4]);
                 let cnt = inkwell_cuda::DevBuf::new_bytes(128 * 4);
                 cnt.write_bytes_async(&[0u8; 128 * 4]);
                 a.cache = Some(crate::moe::Exl3Cache {
-                    buf, tag, cnt, k: ck as i32, slot: a.max_slot,
+                    buf, tag, cnt, k: k_tot as i32, slot: a.max_slot,
                     hm: crate::moe::new_hm(),
+                    gexp, soff, fl: flb,
                     prefetch: std::env::var_os("INKWELL_MOE_PREFETCH").is_some()
                         .then(|| crate::moe::Exl3Prefetch::new(a.max_slot)).flatten(),
                 });
                 if std::env::var_os("INKWELL_KSIZES").is_some() {
-                    let esz = &moe_esz[i];
-                    let mut sizes: Vec<u32> = esz.iter().copied().collect();
+                    let gxp = &moe_gw[i];
+                    let esz: Vec<u32> = (0..128)
+                        .map(|e| 6912 * gxp[3 * e..3 * e + 3].iter().max().copied().unwrap_or(0))
+                        .collect();
+                    let mut sizes: Vec<u32> = esz.clone();
                     sizes.sort_unstable();
                     sizes.dedup();
                     let dist: Vec<String> = sizes.iter()

@@ -2841,6 +2841,115 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
     }
 }
 
+// kslot resolve (INKWELL_NO_KSLOT unset): same global-LFU eviction as the
+// uniform cache, but slots are variable-size — the cache buffer is one arena
+// of KSLOT_GRAN-byte granules and each expert's proj blob packs tightly
+// (gexp[e*3+p] = 6*w_ep+1 granules, exact fit). A slot is 3 extents + a tag
+// entry; soff[v*3+p] (bytes) is maintained here and read by ccopy.
+// fl = free-extent list: fl[0]=n, then (base,len) i32 pairs sorted by base.
+#define KSLOT_GRAN 6912
+#define KSLOT_FLMAX 256  // > 3*64 max extents + 1
+__global__ void inkwell_exl3_kslot_resolve(const int* __restrict__ ids,
+        int* __restrict__ tag, uint64_t* __restrict__ soff,
+        int* __restrict__ map, int* __restrict__ miss,
+        int* __restrict__ cnt, int nslots, int kmax,
+        const int* __restrict__ gexp, int* __restrict__ fl,
+        const int* __restrict__ ptag, const int* __restrict__ pready,
+        int* __restrict__ pf_hit, const int* __restrict__ pnexp,
+        int key_base, int force_direct, int* __restrict__ hm) {
+    if (threadIdx.x != 0) return;
+    if (pnexp) nslots = *pnexp;
+    const int pf = pready ? *pready : 0;
+    unsigned long long claimed = 0;
+    // pass 1: hits (and prefetch-bank hits)
+    for (int s = 0; s < nslots; ++s) {
+        const int e = ids[s] + key_base;
+        ++cnt[e];
+        int v = -1;
+        for (int j = 0; j < kmax; ++j) if (tag[j] == e) { v = j; break; }
+        if (v < 0 && pf) {
+            for (int p2 = 0; p2 < nslots; ++p2)
+                if (ptag[p2] == e) { v = EXL3_PF_BASE + p2; if (pf_hit) atomicAdd(pf_hit, 1); break; }
+        }
+        if (v >= 0) {
+            miss[s] = 0;
+            map[s] = v;
+            if (v < kmax) claimed |= 1ULL << v;
+            if (hm) ++hm[0];
+        } else {
+            miss[s] = 1;
+            map[s] = -1;
+            if (hm) ++hm[1];
+        }
+    }
+    // helpers (single thread): first-fit alloc / sorted insert+merge free
+    int nfl = fl[0];
+    int* fb = fl + 1;      // bases
+    int* fn = fl + 1 + KSLOT_FLMAX; // lens
+#define KS_FIT(need, out) { out = -1; \
+    for (int q = 0; q < nfl; ++q) if (fn[q] >= (need)) { out = q; break; } }
+#define KS_ALLOC(idx, need, base) { base = fb[idx]; fb[idx] += (need); fn[idx] -= (need); \
+    if (fn[idx] == 0) { for (int q = idx; q + 1 < nfl; ++q) { fb[q] = fb[q+1]; fn[q] = fn[q+1]; } --nfl; } }
+#define KS_FREE(base, len) { \
+    int q = 0; while (q < nfl && fb[q] < (base)) ++q; \
+    for (int r = nfl; r > q; --r) { fb[r] = fb[r-1]; fn[r] = fn[r-1]; } \
+    fb[q] = (base); fn[q] = (len); ++nfl; \
+    if (q > 0 && fb[q-1] + fn[q-1] == fb[q]) { fn[q-1] += fn[q]; \
+        for (int r = q; r + 1 < nfl; ++r) { fb[r] = fb[r+1]; fn[r] = fn[r+1]; } --nfl; --q; } \
+    if (q + 1 < nfl && fb[q] + fn[q] == fb[q+1]) { fn[q] += fn[q+1]; \
+        for (int r = q + 1; r + 1 < nfl; ++r) { fb[r] = fb[r+1]; fn[r] = fn[r+1]; } --nfl; } }
+    // pass 2: per miss, find a free slot + 3 extents; evict global-least-used
+    // unclaimed residents until they fit; DIRECT if nothing left to evict.
+    for (int s = 0; s < nslots; ++s) {
+        if (!miss[s]) continue;
+        const int e = ids[s] + key_base;
+        int v = -1;
+        for (int j = 0; j < kmax; ++j) if (tag[j] < 0) { v = j; break; }
+        int got[3];
+        int ng = 0;
+        for (;;) {
+            while (v >= 0 && ng < 3) {
+                const int need = gexp[ids[s] * 3 + ng];
+                int fi; KS_FIT(need, fi);
+                if (fi < 0) break;
+                KS_ALLOC(fi, need, got[ng]);
+                ++ng;
+            }
+            if (v >= 0 && ng == 3) break;
+            // evict least-used unclaimed resident
+            int best = -1, bestc = 0x7fffffff;
+            for (int j = 0; j < kmax; ++j) {
+                if (claimed & (1ULL << j)) continue;
+                const int t2 = tag[j];
+                if (t2 < 0) continue;
+                const int c = cnt[t2];
+                if (c < bestc) { bestc = c; best = j; }
+            }
+            if (best < 0) break;
+            const int tv = tag[best];
+            for (int p = 0; p < 3; ++p) {
+                KS_FREE((int)(soff[best * 3 + p] / KSLOT_GRAN), gexp[tv * 3 + p]);
+            }
+            tag[best] = -1;
+            if (v < 0) v = best;
+        }
+        if (v < 0 || ng < 3 || force_direct) {
+            while (ng > 0) { --ng; KS_FREE(got[ng], gexp[ids[s] * 3 + ng]); }
+            map[s] = EXL3_DIRECT;
+            continue;
+        }
+        claimed |= 1ULL << v;
+        tag[v] = e;
+        for (int p = 0; p < 3; ++p) soff[v * 3 + p] = (uint64_t)got[p] * KSLOT_GRAN;
+        map[s] = v;
+        if (pf_hit) atomicAdd(pf_hit + 1, 1);
+    }
+    fl[0] = nfl;
+#undef KS_FIT
+#undef KS_ALLOC
+#undef KS_FREE
+}
+
 // Copy missing experts into their cache slots and (always) point the staged
 // desc tables at the slots. cache layout: (v*3+proj) * EXL3_STAGE_PROJ.
 __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
@@ -2855,7 +2964,8 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
                                        uint64_t* __restrict__ sdescs_g,
                                        uint64_t* __restrict__ sdescs_u,
                                        uint64_t* __restrict__ sdescs_d,
-                                       int mode, const int* __restrict__ pnexp) {
+                                       int mode, const int* __restrict__ pnexp,
+                                       const uint64_t* __restrict__ soff) {
     const int slot = blockIdx.x / 3;
     if (pnexp && slot >= *pnexp) return;
     const int proj = blockIdx.x % 3;
@@ -2882,8 +2992,13 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
         return;
     }
     uint8_t* cbase = cache;
-    if (mslot >= EXL3_PF_BASE) { cbase = bank; mslot -= EXL3_PF_BASE; }
-    uint8_t* dst = cbase + (size_t)(mslot * 3 + proj) * (size_t)slot_proj;
+    const bool bank_slot = mslot >= EXL3_PF_BASE;
+    if (bank_slot) { cbase = bank; mslot -= EXL3_PF_BASE; }
+    // soff (kslot): per-(slot,proj) byte offsets for size-class slots; the
+    // prefetch bank keeps the uniform stride.
+    uint8_t* dst = (!bank_slot && soff)
+        ? cbase + soff[mslot * 3 + proj]
+        : cbase + (size_t)(mslot * 3 + proj) * (size_t)slot_proj;
     if (threadIdx.x == 0 && part == 0) {
         uint64_t* o = sd + ids[slot] * 4;
         o[0] = (uint64_t)(uintptr_t)dst;
@@ -3133,16 +3248,23 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                     int64_t slot_proj,
                                     void* sdescs_g, void* sdescs_u, void* sdescs_d,
                                     const void* ptag, const void* pready, void* bank, int* pf_hit,
-                                    int* hm) {
+                                    int* hm, const int* gexp, uint64_t* soff, int* fl) {
     const cudaStream_t st = (cudaStream_t)stream;
     // INKWELL_SKIP_CCOPY=1 (timing debug): ccopy writes slot metadata but
     // moves no data — bounds how much staging sits on the critical path.
     static int skip_cc = -1;
     if (skip_cc < 0) { const char* e = getenv("INKWELL_SKIP_CCOPY"); skip_cc = e ? atoi(e) : 0; }
-    inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
-        (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
-        (const int*)ptag, (const int*)pready, pf_hit, nullptr, 0,
-        getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+    if (soff) {
+        inkwell_exl3_kslot_resolve<<<1, 32, 0, st>>>(ids,
+            (int*)tag, (uint64_t*)soff, (int*)map, (int*)miss, (int*)cnt, nslots, k,
+            gexp, fl, (const int*)ptag, (const int*)pready, pf_hit, nullptr, 0,
+            getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+    } else {
+        inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
+            (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
+            (const int*)ptag, (const int*)pready, pf_hit, nullptr, 0,
+            getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+    }
     static cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     static cudaStream_t ss = nullptr;
     {
@@ -3157,14 +3279,14 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
             (uint8_t*)bank, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, nullptr);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, nullptr, soff);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
         inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
             (uint8_t*)bank, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, nullptr);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, nullptr, soff);
         cudaEventRecord(ev_join, ss);
     }
     const uint64_t* G = (const uint64_t*)sdescs_g;
@@ -3582,7 +3704,8 @@ extern "C" void ink_launch_exl3_moe_ntok(
     int* uids, int* eids, int* euni, int* etok, int* estart, int* epos, int* unexp,
     void* cache, int* tag, int* map, int* miss, int* cnt, int k, int64_t slot_proj,
     void* sdescs_g, void* sdescs_u, void* sdescs_d,
-    int on_dev, void* stream, int key_base, int nslots, int* hm) {
+    int on_dev, void* stream, int key_base, int nslots, int* hm,
+    const int* gexp, uint64_t* soff, int* fl) {
     const cudaStream_t st = (cudaStream_t)stream;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     const bool cached = cache != nullptr;
@@ -3635,21 +3758,28 @@ extern "C" void ink_launch_exl3_moe_ntok(
     static int skip_cc = -1;
     if (skip_cc < 0) { const char* e = getenv("INKWELL_SKIP_CCOPY"); skip_cc = e ? atoi(e) : 0; }
     if (cached) {
-        inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(uids,
-            tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr, unexp,
-            key_base, getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+        if (soff) {
+            inkwell_exl3_kslot_resolve<<<1, 32, 0, st>>>(uids,
+                tag, (uint64_t*)soff, map, miss, cnt, nexp, k,
+                gexp, fl, nullptr, nullptr, nullptr, unexp,
+                key_base, getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+        } else {
+            inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(uids,
+                tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr, unexp,
+                key_base, getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+        }
         inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 1), 32, 0, st>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
             nullptr, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, unexp);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, unexp, soff);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
         inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 16), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
             nullptr, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, unexp);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, unexp, soff);
         cudaEventRecord(ev_join, ss);
     }
     dim3 gin((KG + 511) / 512, 64, 2);
