@@ -1000,3 +1000,58 @@ Commits: 2178e4b (BF16 storage), a25ff40 (gf_apply), 282ef33 (rms2down).
 - Misses fall ~3.6× (37.6 → ~15/tok at M=12), but the token gets slower: M=12 59.2–62.5 ms, M=8 54.0 ms, vs 46.78 baseline.
 - Cause: PCIe 3.0 bytes are the cost. Claims move ~125 MB/tok against ~86 MB/tok of demand; the 1.24× prediction waste is wire time, and the ~0.7 ms window between issue and join per visit cannot hide 0.5–0.9 ms of copies. A ≥2-visit predictor would be needed, and step 0 found none.
 - Lesson: on this box, fewer bytes over PCIe wins (cache sizing, smaller streamed experts), not earlier bytes.
+## 2026-11-24 — Per-layer expert-cache sizing (worktree t3-cb1d9264)
+
+### Method
+- `INKWELL_IDSEQ=<path>` (moe.rs): stream-ordered `cudaMemcpyAsync` + sync on
+  the compute stream appends `[layer i32][8 i32]` per MoE visit; eager only
+  (cb runs once per capture under CUDA graphs, so trace with graphs off).
+  A default-stream copy raced the router kernel — first trace was garbage.
+  Traces: 68 tok default prompt, 74 tok robot-paint prompt.
+- `opt/tools/kslot_replay.py`: gexp granules from safetensors headers
+  (`w=8*(k16/16)+4*(k16%16!=0)`, blob=6912*(6w+1)); replays the exact
+  `inkwell_exl3_kslot_resolve` policy (first-fit extents, global least-cnt
+  eviction, u64 claimed, kmax<=64). Validated vs `INKWELL_PF_STAT`: per-layer
+  misses within ~2% at ck=20.
+- `opt/tools/kslot_alloc.py`: per-layer miss-byte curve (4 MiB steps) then
+  greedy marginal missMiB/MiB; hand-checked ~10 variants on both traces.
+  Greedy948 (t1 52.7) lost to F964 (51.7); F964 peaked 5076 MiB (4 MiB under
+  cap) so the default table is F-mid trimmed to 940 MiB (V1).
+
+### Table (streamed layers; sim on 68-tok trace)
+| L  | visits | MiB before->after | hit% before->after | missMiB/tok before->after |
+|----|--------|-------------------|--------------------|---------------------------|
+| 0  | 68     | 47 -> 56          | 59.4 -> 66.7       | 6.24 -> 5.11 |
+| 1  | 68     | 47 -> 56          | 65.4 -> 72.2       | 5.31 -> 4.27 |
+| 2  | 68     | 57 -> 56          | 73.9 -> 74.1       | 3.30 -> 3.28 |
+| 3  | 68     | 47 -> 48          | 59.9 -> 59.9       | 5.34 -> 5.34 |
+| 4  | 68     | 57 -> 56          | 68.9 -> 68.6       | 4.05 -> 4.13 |
+| 5  | 68     | 57 -> 64          | 64.3 -> 68.2       | 5.52 -> 4.86 |
+| 16 | 204    | 76 -> 156         | 76.0 -> 92.8       | 17.42 -> 5.02 |
+| 17 | 204    | 76 -> 156         | 68.9 -> 91.7       | 22.81 -> 6.04 |
+| 18 | 68     | 57 -> 48          | 88.4 -> 85.3       | 1.62 -> 2.03 |
+| 19 | 68     | 57 -> 44          | 86.2 -> 83.5       | 1.86 -> 2.25 |
+| 20 | 68     | 47 -> 48          | 82.2 -> 81.8       | 2.75 -> 2.81 |
+| 21 | 68     | 57 -> 52          | 84.9 -> 83.5       | 2.32 -> 2.54 |
+| 22 | 68     | 66 -> 48          | 90.6 -> 84.0       | 1.45 -> 2.47 |
+| 23 | 68     | 57 -> 52          | 83.6 -> 80.3       | 2.52 -> 3.02 |
+Total 812 -> 940 MiB; sim miss bytes 82.6 -> 53.2 MiB/tok (trace1),
+94.1 -> 71.5 (trace2). Maxing L16/L17 at cap while starving small layers
+was WORSE on both traces (61.1/74.6) — the LFU curves flatten.
+
+### Result (real, INKWELL_PF_STAT cumulative ~63 tok)
+misses ~2329 -> ~1745 (-25%); L16 359->112, L17 465->127. ccopy bytes
+scale with miss bytes (~-35 MiB/tok predicted).
+
+### A/B (8 interleaved pairs ctl,cand,cand,ctl; ctl = INKWELL_NO_CACHEL=1)
+ctl:  50.00 46.12 46.36 48.07 49.60 51.82 46.34 51.46 (med 48.84)
+cand: 44.06 41.68 45.38 42.88 41.49 47.19 44.23 44.47 (med 44.15)
+-> **-4.69 ms/tok (-9.6%), wins 8/8.** md5 5cbe8e06 on all 16 runs.
+VRAM peak: ctl 4934-4962, cand 5052 (cap 5080). warnings 62.
+
+### Data only: L15 streamed (not shipped, not A/B'd)
+Streaming L15 frees ~324 MiB of resident experts; re-spent as cache
+(L15=120, L16/17 at ~210 cap) the sim predicts 53.2 -> 50.6 MiB/tok (-5%).
+
+Commits: see HEAD. Killswitch `INKWELL_NO_CACHEL=1` (uniform ck sizing);
+`INKWELL_CACHE_MB_L="0:56,16:156,..."` per-layer override.

@@ -1199,9 +1199,30 @@ impl Runner {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         let kslot = std::env::var_os("INKWELL_NO_KSLOT").is_none();
         if ck >= 8 {
+            // Per-layer arena MiB, measured by replaying the real routing
+            // trace through the kslot policy (opt/ledger.md). Loop layers
+            // L16/L17 hold ~half the miss bytes at uniform sizing.
+            // INKWELL_NO_CACHEL=1 restores uniform ck*3*max_slot;
+            // INKWELL_CACHE_MB_L="16:150,17:200" overrides per layer.
+            static CACHEL_MB: [usize; 24] = [
+                56, 56, 56, 48, 56, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                156, 156, 48, 44, 48, 52, 48, 52];
+            let cachel = std::env::var_os("INKWELL_NO_CACHEL").is_none();
+            let over = std::env::var("INKWELL_CACHE_MB_L").unwrap_or_default();
+            let per_l = |il: i32| -> Option<usize> {
+                if !cachel { return None; }
+                for t in over.split(',') {
+                    if let Some((a, b)) = t.split_once(':') {
+                        if a.trim().parse::<i32>() == Ok(il) {
+                            if let Ok(mb) = b.trim().parse::<usize>() { return Some(mb); }
+                        }
+                    }
+                }
+                CACHEL_MB.get(il as usize).copied().filter(|&m| m > 0)
+            };
             for (i, a) in moe_args_exl3.iter_mut().enumerate() {
                 if a.on_dev || a.max_slot == 0 { continue; }
-                let cbytes = ck * 3 * a.max_slot;
+                let cbytes = per_l(a.layer).map_or(ck * 3 * a.max_slot, |mb| mb << 20);
                 let (f, _) = inkwell_cuda::mem_info();
                 let margin: usize = std::env::var("INKWELL_CACHE_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
                 if f <= cbytes + (margin << 20) { continue; }
@@ -1213,7 +1234,7 @@ impl Runner {
                 // (slot,proj) byte offset maintained by the resolve kernel;
                 // gexp = per-(e,proj) granule counts; fl = free-extent list.
                 // INKWELL_NO_KSLOT=1 = today's uniform ck x max_slot.
-                let mut k_tot = ck;
+                let mut k_tot = cbytes / (3 * a.max_slot); // = ck at uniform sizing
                 let mut gexp = None;
                 let mut soff = None;
                 let mut flb = None;

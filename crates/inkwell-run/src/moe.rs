@@ -300,6 +300,30 @@ pub struct MoeArgsExl3 {
 /// INKWELL_MOE_IDLOG=path is set and the cb runs eagerly (no cuda graphs).
 static MOE_HIST: std::sync::Mutex<Option<Box<[[u64; 128]; 32]>>> = std::sync::Mutex::new(None);
 
+/// Ordered per-visit trace: appends [layer i32][8 i32] to INKWELL_IDSEQ's
+/// file per call. Eager mode only (like moe_idlog): under CUDA graphs the cb
+/// runs once at capture, so take traces with GGML_PASCAL_GRAPHS unset.
+fn moe_idseq(ids_dev: *const i32, layer: i32) {
+    use std::io::Write as _;
+    let path = match std::env::var("INKWELL_IDSEQ") { Ok(v) => v, Err(_) => return };
+    unsafe extern "C" {
+        fn cudaMemcpyAsync(d: *mut c_void, s: *const c_void, n: usize, k: i32, st: *mut c_void) -> i32;
+        fn cudaStreamSynchronize(st: *mut c_void) -> i32;
+    }
+    // async copy on the compute stream + sync: a default-stream copy races the
+    // router kernel that writes ids (stream-ordered dispatch).
+    let st = inkwell_ggml::cuda_stream();
+    let mut h = [0i32; 8];
+    unsafe {
+        cudaMemcpyAsync(h.as_mut_ptr().cast(), ids_dev.cast(), 32, 2, st);
+        cudaStreamSynchronize(st);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(&layer.to_le_bytes());
+        for x in h { let _ = f.write_all(&x.to_le_bytes()); }
+    }
+}
+
 /// Accumulate one visit's ids into MOE_HIST (host side, eager mode only).
 fn moe_idlog(ids_dev: *const i32, layer: i32) {
     use std::io::Write as _;
@@ -417,6 +441,7 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
     let mut hid = st.hid.lock().expect("hid");
     let mut dn = st.dn.lock().expect("dn");
     let mut xh = st.xh.lock().expect("xh");
+    if std::env::var_os("INKWELL_IDSEQ").is_some() { moe_idseq(ids_dev, a.layer); }
     unsafe {
         if let Some(c) = &a.cache {
             if std::env::var_os("INKWELL_MOE_IDLOG").is_some() { moe_idlog(ids_dev, a.layer); }
