@@ -193,7 +193,15 @@ pub struct Exl3Blk {
     n: usize,
     ka: usize,
     halfk: bool,
-    scratch: inkwell_cuda::DevBuf,
+    scratch_len: usize,
+    scratch: std::sync::OnceLock<inkwell_cuda::DevBuf>,
+}
+
+impl Exl3Blk {
+    /// Allocate the 8-row scratch on first use (the serial decode path never uses it).
+    fn ensure_scratch(&self) {
+        self.scratch.get_or_init(|| inkwell_cuda::DevBuf::new(self.scratch_len));
+    }
 }
 
 /// `ggml_custom_op_t`: batched EXL3 GEMV — `dst->src[0]` = x `[k, 8]` f32 device.
@@ -203,9 +211,10 @@ unsafe extern "C" fn exl3_ntok_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i
     let x = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
     let x_dev = unsafe { inkwell_ggml::ink_tensor_data(x) } as *const f32;
     let y = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
+    let scratch = w.scratch.get_or_init(|| inkwell_cuda::DevBuf::new(w.scratch_len));
     unsafe {
         inkwell_cuda::exl3_gemv_ntok_async(w.trel, w.suh, w.svh,
-            x_dev, y, w.k, w.n, w.ka, w.halfk, w.scratch.dev_ptr().cast());
+            x_dev, y, w.k, w.n, w.ka, w.halfk, scratch.dev_ptr().cast());
     }
 }
 
@@ -1213,11 +1222,19 @@ impl Runner {
         }
         eprintln!("load_st: dev={}MiB exl3_w={} pinned={}MiB", dev_bytes >> 20, exl3_w.len(),
             pinned_bytes >> 20);
-        let exl3_blk: Vec<Box<Exl3Blk>> = exl3_w.iter().map(|e| Box::new(Exl3Blk {
-            trel: e.trel.dev_ptr(), suh: e.suh.dev_ptr(), svh: e.svh.dev_ptr(),
-            k: e.k, n: e.n, ka: e.ka, halfk: e.halfk,
-            scratch: inkwell_cuda::DevBuf::new(8 * e.k + 64 * e.n),
-        })).collect();
+        let exl3_blk: Vec<Box<Exl3Blk>> = exl3_w.iter().map(|e| {
+            let b = Box::new(Exl3Blk {
+                trel: e.trel.dev_ptr(), suh: e.suh.dev_ptr(), svh: e.svh.dev_ptr(),
+                k: e.k, n: e.n, ka: e.ka, halfk: e.halfk,
+                scratch_len: 8 * e.k + 64 * e.n,
+                scratch: std::sync::OnceLock::new(),
+            });
+            // INKWELL_NO_LAZY_BLKSCRATCH=1 restores eager allocation at load.
+            if std::env::var_os("INKWELL_NO_LAZY_BLKSCRATCH").is_some() {
+                b.ensure_scratch();
+            }
+            b
+        }).collect();
 
         // visits + KV arenas (same as GGUF path)
         let (start, end, np, nphys) = (6usize, 18usize, 3usize, 24usize);
@@ -2677,6 +2694,7 @@ impl Runner {
         match l.exl3.get(key) {
             Some(&i) => {
                 let e = &*self.exl3_blk[i];
+                e.ensure_scratch();
                 let mut args = [x.0];
                 Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [e.n as i64, NT as i64, 1, 1], &mut args,
                     exl3_ntok_cb_addr(), (e as *const Exl3Blk).cast_mut().cast()) })
@@ -3091,6 +3109,7 @@ impl Runner {
         self.feat_tap(&c, 48, cur);
         let oi = self.output_exl3.expect("output exl3");
         let e = &*self.exl3_blk[oi];
+        e.ensure_scratch();
         let mut args = [cur.0];
         let logits_t = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [e.n as i64, NT as i64, 1, 1], &mut args,
             exl3_ntok_cb_addr(), (e as *const Exl3Blk).cast_mut().cast()) });
