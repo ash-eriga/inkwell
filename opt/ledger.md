@@ -801,3 +801,41 @@ Explored 4 directions (`opt/kbench/exl3_math2/{test_cpu.cpp,sass_kernels.cu,coun
   - **Full SAGE All-7-K Mix (interleaved vs shipped `~260 Gw/s`):** gains shrink to **`1.03×` exact** (`M=16-Paired C0c` `266.1 Gw/s` / `Hybrid C0c` `267.6 Gw/s`, `5.4e-7`) and **`1.05×` sub-step** (`M=16-Paired C4 blk=16` `274.7 Gw/s` / `Hybrid C4` `274.0 Gw/s`, `2.0e-5`, 0 spills) because heterogeneous-K MoE launches are bounded by non-`K=2.0` wave tail blocks (where 0 `(D, D+16)` pairs exist for `K ∈ {2.5, 3.0, 3.5, 5.0}`). Expected serial MoE e2e upside is only `~0.6–1.0 ms/tok` (`~1–2%`).
   - **Approx Pareto cliff vs EXL3 quant step (`KINV=0.006767`, `rms_rel≈7.0e-3`):** `C0c` (`0.0001×` step) and `C4` (`0.002–0.007×` step) are safe; all cheaper approximations (`C6 dp4a-8` `0.6–1.8×`, `A-BS8` `1.1–23×`, `A-2BYTE` `148×`) jump to/past 1 full quant step; `C3a` fails Dist B (`1.09×` step).
   - **Multi-token batching `B=1..4` (`M=16-Batch C0c`, exact FP32, 40 regs, 0 spills, `2–8.2 KB` smem):** becomes MORE compute-bound per loaded weight (`Rd_Gw/s`: `288 -> 244 -> 203 -> 184`), while effective throughput crosses the `722 G MAC/s` (`<= 3.0` instr/w/tok) barrier at **`B=4`**: `B=2` **`487.9 G MAC/s` (`1.68×`)**, `B=3` **`608.2` (`2.11×`)**, **`B=4` `734.0 G MAC/s` (`2.53×`, `2.828` instr/w/tok, `6.3e-7`)** (`B=4 C4`: `734–741 G MAC/s`, `2.453` instr/w/tok).
+
+## 2026-11-24 — kslot step 0: exposed staging + size census (worktree t3-c88bd85d)
+
+Instrumentation (this commit, all env-gated, off by default):
+- `INKWELL_SKIP_CCOPY=1`: ccopy kernels write slot metadata but move no data
+  (mode 3). Timing-only: output garbage, graph shape identical.
+- `hm` i32[2] per-cache selection hit/miss counters in `inkwell_exl3_cache_resolve`;
+  read via `INKWELL_PF_STAT` (now works without prefetch, cumulative per layer).
+- `INKWELL_KSIZES=1`: per-layer expert-blob size census at cache alloc.
+
+### Exposed staging (BEST env, k=20; ms/tok = s*1000/64)
+| ctl | skip_ccopy |
+| 50.53 | 41.71 |
+| 51.92 | 41.25 |
+| 49.87 | 42.38 |
+| median **50.53** | **41.71** |
+Exposed staging = **~8.8 ms/tok** — nearly all of the 9.84 ms ccopy kernel time
+is on the critical path (side-stream bulk copy does NOT hide it). md5
+5cbe8e06 on every ctl run.
+
+### Hit rate at k=20 (62 tok, cumulative PFSTAT)
+- prelude L0-5 (1 visit/tok, 496 sel each): miss ~47-50% (!)
+- loop L16-17 (3 visits/tok, 1488 sel each): miss 25.3% / 32.5%
+- L18-23 (1 visit/tok): miss 23-30%
+- TOTAL 3011/8928 = **33.7% miss ≈ 48.6 misses/tok** (higher than THEORY's
+  18.6% — that measured the old on_dev={0-11} placement; prelude layers
+  have poor k=20 locality).
+
+### Size census (per-proj blob = 10368*w*4+6912 B; class = max over 3 projs)
+- classes are few per layer (2-6); distinct sizes {492,654,816,978,1140,1302} KiB.
+- sum over 14 cached layers: sum(max)=1707.4 MiB vs sum(esz)=1170.3 MiB
+  (ratio 1.46 — matches review's 42.5/28.3 = 1.50).
+- k_eff = ck*max*128/sum(esz) per layer: 24.5-34.6, mean 27.9 (vs k=20).
+- L16/L17 (biggest experts, 3 visits/tok): k_eff only ~24.6 — least gain where
+  traffic is highest. L2/L22: k_eff ~34.
+- Notable: L0/L20/L21 are nearly single-class (123-127 experts share one size
+  class + 1-5 outliers) — per-class pools behave almost exactly like today's
+  LFU there, just with right-sized slots.

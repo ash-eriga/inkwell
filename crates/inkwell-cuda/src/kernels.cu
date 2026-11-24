@@ -2788,9 +2788,10 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         int* __restrict__ cnt, int nslots, int k,
         const int* __restrict__ ptag, const int* __restrict__ pready,
         int* __restrict__ pf_hit, const int* __restrict__ pnexp,
-        int key_base, int force_direct) {
+        int key_base, int force_direct, int* __restrict__ hm) {
     // LFU eviction: cnt[e] counts uses; the least-used resident is evicted.
     // pf_hit[0]=bank hits, pf_hit[1]=real misses (filled via serial ccopy)
+    // hm[0]=selection hits (cache or bank), hm[1]=misses (debug counters)
     if (threadIdx.x != 0) return;
     if (pnexp) nslots = *pnexp;
     const int pf = pready ? *pready : 0;
@@ -2810,9 +2811,11 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
             miss[s] = 0;
             map[s] = v;
             if (v < k) claimed |= 1ULL << v;
+            if (hm) ++hm[0];
         } else {
             miss[s] = 1;
             map[s] = -1;
+            if (hm) ++hm[1];
         }
     }
     // pass 2: evict the least-used unclaimed resident for each miss
@@ -2888,7 +2891,8 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
         o[2] = (uint64_t)(uintptr_t)(dst + trel_b + suh_b);
         o[3] = d[3];
     }
-    if (!miss[slot]) return;
+    // mode 3 (INKWELL_SKIP_CCOPY, timing debug): meta only, no data copy.
+    if (!miss[slot] || mode == 3) return;
     const uint4* s0 = (const uint4*)(uintptr_t)d[0];
     uint4* t0 = (uint4*)dst;
     // mode 1: meta + suh + svh tail (small, main stream — had_in needs suh);
@@ -3128,12 +3132,17 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                     void* cache, void* tag, void* map, void* miss, void* cnt, int k,
                                     int64_t slot_proj,
                                     void* sdescs_g, void* sdescs_u, void* sdescs_d,
-                                    const void* ptag, const void* pready, void* bank, int* pf_hit) {
+                                    const void* ptag, const void* pready, void* bank, int* pf_hit,
+                                    int* hm) {
     const cudaStream_t st = (cudaStream_t)stream;
+    // INKWELL_SKIP_CCOPY=1 (timing debug): ccopy writes slot metadata but
+    // moves no data — bounds how much staging sits on the critical path.
+    static int skip_cc = -1;
+    if (skip_cc < 0) { const char* e = getenv("INKWELL_SKIP_CCOPY"); skip_cc = e ? atoi(e) : 0; }
     inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
         (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
         (const int*)ptag, (const int*)pready, pf_hit, nullptr, 0,
-        getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0);
+        getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
     static cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     static cudaStream_t ss = nullptr;
     {
@@ -3148,14 +3157,14 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
             (uint8_t*)bank, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1, nullptr);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, nullptr);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
         inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
             (uint8_t*)bank, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2, nullptr);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, nullptr);
         cudaEventRecord(ev_join, ss);
     }
     const uint64_t* G = (const uint64_t*)sdescs_g;
@@ -3573,7 +3582,7 @@ extern "C" void ink_launch_exl3_moe_ntok(
     int* uids, int* eids, int* euni, int* etok, int* estart, int* epos, int* unexp,
     void* cache, int* tag, int* map, int* miss, int* cnt, int k, int64_t slot_proj,
     void* sdescs_g, void* sdescs_u, void* sdescs_d,
-    int on_dev, void* stream, int key_base, int nslots) {
+    int on_dev, void* stream, int key_base, int nslots, int* hm) {
     const cudaStream_t st = (cudaStream_t)stream;
     const int KG = 2304, NG = 1152, KD = 1152, ND = 2304;
     const bool cached = cache != nullptr;
@@ -3623,22 +3632,24 @@ extern "C" void ink_launch_exl3_moe_ntok(
     const uint64_t* G = (const uint64_t*)sdescs_g;
     const uint64_t* U = (const uint64_t*)sdescs_u;
     const uint64_t* D = (const uint64_t*)sdescs_d;
+    static int skip_cc = -1;
+    if (skip_cc < 0) { const char* e = getenv("INKWELL_SKIP_CCOPY"); skip_cc = e ? atoi(e) : 0; }
     if (cached) {
         inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(uids,
             tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr, unexp,
-            key_base, getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0);
+            key_base, getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
         inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 1), 32, 0, st>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
             nullptr, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 1, unexp);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, unexp);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
         inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 16), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
             nullptr, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 2, unexp);
+            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, unexp);
         cudaEventRecord(ev_join, ss);
     }
     dim3 gin((KG + 511) / 512, 64, 2);

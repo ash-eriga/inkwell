@@ -339,8 +339,17 @@ pub struct Exl3Cache {
     pub k: i32,
     /// bytes per slot per proj = this layer's max expert blob.
     pub slot: usize,
+    /// selection hit/miss counters (i32[2]) for INKWELL_PF_STAT.
+    pub hm: cu::DevBuf,
     /// predictive prefetch state (side-stream copies of last-visit ids)
     pub prefetch: Option<Exl3Prefetch>,
+}
+
+#[must_use]
+pub fn new_hm() -> cu::DevBuf {
+    let d = cu::DevBuf::new_bytes(8);
+    d.write_bytes_async(&[0u8; 8]);
+    d
 }
 
 /// Per-layer prefetch bank + seqlock for host-issued side-stream promotion.
@@ -422,7 +431,8 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
                 c.prefetch.as_ref().map_or(std::ptr::null(), |p| p.ptag.dev_ptr().cast()),
                 c.prefetch.as_ref().map_or(std::ptr::null(), |p| p.pready.dev_ptr().cast()),
                 c.prefetch.as_ref().map_or(std::ptr::null_mut(), |p| p.bank.dev_ptr()),
-                c.prefetch.as_ref().map_or(std::ptr::null_mut(), |p| unsafe { p.pf_miss.dev_ptr().cast::<i32>().add(8) }));
+                c.prefetch.as_ref().map_or(std::ptr::null_mut(), |p| unsafe { p.pf_miss.dev_ptr().cast::<i32>().add(8) }),
+                c.hm.dev_ptr().cast());
         } else {
             if std::env::var_os("INKWELL_MOE_IDLOG").is_some() { moe_idlog(ids_dev, a.layer); }
             cu::exl3_moe_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev, ids_dev,
@@ -462,7 +472,7 @@ fn moe_pool() -> Option<&'static Exl3Cache> {
         eprintln!("exl3 global pool: k={pk} ({:.0} MiB)",
             pk as f64 * 3.0 * EXL3_STAGE_PROJ as f64 / 1e6);
         Some(Exl3Cache { buf, tag, cnt, k: pk as i32,
-            slot: EXL3_STAGE_PROJ, prefetch: None })
+            slot: EXL3_STAGE_PROJ, hm: new_hm(), prefetch: None })
     }).as_ref()
 }
 
@@ -523,14 +533,14 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
     let w8 = src(2) as *const f32;
     let out8 = unsafe { inkwell_ggml::ink_tensor_data(dst) } as *mut f32;
     unsafe {
-        let (cache, tag, cnt, k, slot_proj, key_base) = if let Some(p) = moe_pool() {
+        let (cache, tag, cnt, k, slot_proj, key_base, hm) = if let Some(p) = moe_pool() {
             (p.buf.dev_ptr(), p.tag.dev_ptr().cast::<i32>(), p.cnt.dev_ptr().cast::<i32>(),
-             p.k, p.slot as i64, a.layer * 128)
+             p.k, p.slot as i64, a.layer * 128, p.hm.dev_ptr().cast())
         } else if let Some(c) = &a.cache {
             (c.buf.dev_ptr(), c.tag.dev_ptr().cast::<i32>(), c.cnt.dev_ptr().cast::<i32>(),
-             c.k, c.slot as i64, 0)
+             c.k, c.slot as i64, 0, c.hm.dev_ptr().cast())
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0, 0, 0)
+            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0, 0, 0, std::ptr::null_mut())
         };
         cu::exl3_moe_ntok_async(a.descs_g.dev, a.descs_u.dev, a.descs_d.dev,
             x8, ids8, w8, out8,
@@ -553,7 +563,7 @@ unsafe extern "C" fn moe_cb_exl3_ntok(dst: *mut c_void, _ith: i32, _nth: i32, ud
             st.sdescs_u.lock().expect("su").dev_ptr(),
             st.sdescs_d.lock().expect("sd").dev_ptr(),
             a.on_dev, key_base,
-            SPEC_NSLOTS.load(std::sync::atomic::Ordering::Relaxed));
+            SPEC_NSLOTS.load(std::sync::atomic::Ordering::Relaxed), hm);
     }
 }
 

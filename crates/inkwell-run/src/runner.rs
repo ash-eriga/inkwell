@@ -877,6 +877,7 @@ impl Runner {
         let mut pinned_bytes = 0usize;
         let mut expert_dev: Vec<inkwell_cuda::DevBuf> = Vec::new();
         let mut moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>> = Vec::new();
+        let mut moe_esz: Vec<[u32; 128]> = Vec::new();
         let conv = |il: usize| il % 6 == 5;
         for il in 0..24usize {
             let mut l = L {
@@ -1017,6 +1018,7 @@ impl Runner {
                 let mut descs: Vec<u64> = vec![0; 3 * 128 * 4];
                 let mut off = 0usize;
                 let mut max_slot = 0usize;
+                let mut esz = [0u32; 128];
                 for e in 0..128usize {
                     for (pi, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
                         let base = format!("{pre}.{e}.{proj}");
@@ -1031,9 +1033,12 @@ impl Runner {
                         descs[pi * 512 + e * 4 + 3] = (k16 / 16) as u64 | (((k16 % 16 != 0) as u64) << 8);
                         // per-layer cache slot = max expert blob (trellis+suh+svh)
                         let w = (k16 / 16) * 8 + usize::from(k16 % 16 != 0) * 4;
-                        max_slot = max_slot.max(10368 * w * 4 + 6912);
+                        let blob = 10368 * w * 4 + 6912;
+                        esz[e] = esz[e].max(blob as u32);
+                        max_slot = max_slot.max(blob);
                     }
                 }
+                moe_esz.push(esz);
                 let (f_free, _) = inkwell_cuda::mem_info();
                 eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
                 let dev_margin: usize = std::env::var("INKWELL_DEV_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
@@ -1142,9 +1147,25 @@ impl Runner {
                 cnt.write_bytes_async(&[0u8; 128 * 4]);
                 a.cache = Some(crate::moe::Exl3Cache {
                     buf, tag, cnt, k: ck as i32, slot: a.max_slot,
+                    hm: crate::moe::new_hm(),
                     prefetch: std::env::var_os("INKWELL_MOE_PREFETCH").is_some()
                         .then(|| crate::moe::Exl3Prefetch::new(a.max_slot)).flatten(),
                 });
+                if std::env::var_os("INKWELL_KSIZES").is_some() {
+                    let esz = &moe_esz[i];
+                    let mut sizes: Vec<u32> = esz.iter().copied().collect();
+                    sizes.sort_unstable();
+                    sizes.dedup();
+                    let dist: Vec<String> = sizes.iter()
+                        .map(|&s| format!("{}:{}", s >> 10, esz.iter().filter(|&&e| e == s).count()))
+                        .collect();
+                    let sum: u64 = esz.iter().map(|&e| u64::from(e)).sum();
+                    eprintln!("KSIZES L{} max={}KiB sum_max={:.1}MiB sum_esz={:.1}MiB k_eff={:.1} [{}]",
+                        a.layer, a.max_slot >> 10,
+                        128.0 * a.max_slot as f64 / 1048576.0, sum as f64 / 1048576.0,
+                        ck as f64 * a.max_slot as f64 * 128.0 / sum as f64,
+                        dist.join(" "));
+                }
                 eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED free={}MiB",
                     a.max_slot, cbytes as f64 / 1e6, f >> 20);
             }
@@ -1967,8 +1988,16 @@ impl Runner {
 
     /// Issue this token's expert prefetch on the side stream.
     fn issue_moe_prefetch(&mut self, pos: i64) {
+        let pfstat = pos % 7 == 6 && std::env::var_os("INKWELL_PF_STAT").is_some();
         for a in &mut self.moe_args_exl3 {
             let Some(c) = &mut a.cache else { continue };
+            if pfstat {
+                let mut b = [0u8; 8];
+                c.hm.read_bytes(&mut b);
+                let hits = i32::from_le_bytes(b[0..4].try_into().unwrap());
+                let misses = i32::from_le_bytes(b[4..8].try_into().unwrap());
+                eprintln!("PFSTAT L{} hits={} misses={}", a.layer, hits, misses);
+            }
             let Some(pf) = &mut c.prefetch else { continue };
             unsafe {
                 inkwell_cuda::exl3_prefetch2_async(
@@ -1977,13 +2006,6 @@ impl Runner {
                     pf.bank.dev_ptr(), pf.ptag.dev_ptr().cast(),
                     pf.pready.dev_ptr().cast(), pf.pf_map.dev_ptr().cast(),
                     pf.pf_miss.dev_ptr().cast(), 8, c.k, c.slot as i64);
-            }
-            if pos % 7 == 6 && std::env::var_os("INKWELL_PF_STAT").is_some() {
-                let mut b = [0u8; 40];
-                pf.pf_miss.read_bytes(&mut b);
-                let hits = i32::from_le_bytes(b[32..36].try_into().unwrap());
-                let misses = i32::from_le_bytes(b[36..40].try_into().unwrap());
-                eprintln!("PFSTAT L{} hits={} misses={}", a.layer, hits, misses);
             }
         }
     }
