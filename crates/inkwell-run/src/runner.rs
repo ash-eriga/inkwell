@@ -1346,8 +1346,8 @@ impl Runner {
         let n_kv = if is_swa { step.n_kv_swa_pad } else { step.n_kv_full_pad };
         let kv_idx = if is_swa { step.kv_idx_swa } else { step.kv_idx_full };
         // set_rows wants b [hd, n_idx, hkv]: permute [hd,hkv,1] -> [hd,1,hkv]
-        let k_rows = t::cont(c, t::permute(c, k, 0, 2, 1, 3));
-        let v_rows = t::cont(c, t::permute(c, v, 0, 2, 1, 3));
+        let k_rows = t::permute(c, k, 0, 2, 1, 3);
+        let v_rows = t::permute(c, v, 0, 2, 1, 3);
         let k_upd = t::set_rows(c, self.k_arena[slot], k_rows, kv_idx);
         let v_upd = t::set_rows(c, self.v_arena[slot], v_rows, kv_idx);
 
@@ -1880,8 +1880,8 @@ impl Runner {
         for j in 0..NT {
             let k_j = t::reshape3(c, self.tokslice(c, k8, hd * hkv, j as i64), hd, hkv, 1);
             let v_j = t::reshape3(c, self.tokslice(c, v8, hd * hkv, j as i64), hd, hkv, 1);
-            let k_rows = t::cont(c, t::permute(c, k_j, 0, 2, 1, 3));
-            let v_rows = t::cont(c, t::permute(c, v_j, 0, 2, 1, 3));
+            let k_rows = t::permute(c, k_j, 0, 2, 1, 3);
+            let v_rows = t::permute(c, v_j, 0, 2, 1, 3);
             let kv_idx = if is_swa { step.kv_idx_swa[j] } else { step.kv_idx_full[j] };
             k_cur = t::set_rows(c, k_cur, k_rows, kv_idx);
             v_cur = t::set_rows(c, v_cur, v_rows, kv_idx);
