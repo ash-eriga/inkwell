@@ -40,6 +40,136 @@ não-diagnosticado; repetir o run se crashar.
 
 Ledger completo em opt/ledger.md. Abaixo: histórico das sessões.
 
+# HANDOFF — Inkwell REXL3 / spec decode (sessão 5, 2026-11-23 ~20:40)
+
+## ★ RESUME AQUI (estado real, HEAD = ae0a72b + WIP não commitado listado abaixo)
+
+**Objetivo do usuário (ordem vigente):** fazer SPECULATIVE DECODING vencer o serial.
+Serial hoje: **~88 ms/tok (11,3 TPS)** medido com apps ligados (mais rápido que os ~97 do
+handoff anterior). Spec pós-bugfix: **3,3–4,3 TPS** (mediana 3,5), emit 1,9–2,6.
+
+### O que mudou nesta sessão (tudo commitado em ae0a72b, exceto o WIP v2)
+1. **BUG FIX crítico**: o loop MTP processava o anchor em `pos+1` (anchor entrava 2× no
+   contexto: "capital of **of** the Netherlands"). Fix: `c = pos` em inkwell-cli/src/main.rs.
+   Depois do fix: 38/39 linhas de verify == serial-96 tokens (tool: opt/tools/cmp_spec.py);
+   texto do spec == continuação do serial. A aceitação "real" caiu para 21%/2,45 (a medida
+   antes era feita sobre contexto corrompido).
+2. **VTEST8** (`INKWELL_VTEST8=1`): a cada passo serial roda `step_block` com os 8 tokens
+   reais e compara as 8 linhas com os logits seriais. 96 passos → **712 linhas, 0 divergências
+   de argmax**. O caminho de bloco está CORRETO (incl. linhas fundas). MAO: max|d| salta para
+   ~1,2–1,4 após tokens raros e decai por ~6 tokens → near-ties viram (1×: " Canada"→" Mexico").
+3. **Perfil nsys real do verify** (12 blocos, GPU 98% busy — NÃO é gap de host):
+   gemv_moe_ntok 358 ms/bloco (73,5%, 96 calls, 3,73 ms médio; VRAM-layers 2,7 ms ≈ 12,6 GB/s,
+   pinned-layers 3,7–5,5 ms ≈ 4,5–7 GB/s); gemv_dp4a_ntok 47 ms; had 28 ms; swarm ~54 ms;
+   entre blocos ~85 ms (draft 45 ms de kernel — unembed 7×1,7 ms — + ~40 ms host).
+4. **CORREÇÃO do handoff anterior**: a união de experts real é **mediana 28** (min 13, máx 44,
+   dump `INKWELL_DUMP_IDS`, 384 visitas), NÃO ~12. Consequência: verify lê ~10,7 G pesos MoE
+   / 2,45 tok = 4,4 G pesos/token vs 3,05 G do serial — **o verify faz MAIS trabalho MoE por
+   token emitido que o serial**. Dedup só 2,3×.
+5. **Estatística de aceitação (214 rodadas, 4 prompts)**: P(aceito)=47%/25%/16%/9%/3,4%/2,3%/1,4%
+   para drafts 1..7 → emit satura: 8 drafts = 2,05; **linhas 5–8 custam 3 linhas de verify por
+   +0,07 tok**. Ref do próprio autor do drafter (megakernel-zoo/engine/ngram.py): 2,74→3,09
+   tok/ciclo. **Alavanca estrutural: NT variável 2–4 linhas** (união: 2 linhas=45%, 3=58%, 4=70%
+   do custo de 8).
+6. **Custo de decodificação EXL3 no Pascal medido** (opt/kbench/probe_decode.cu): ~5,0 ciclos
+   por peso (nc=1), 12,8 (nc=8) — **17 instr/peso, 3,7 IPC de 4 → limitado por CONTAGEM de
+   instruções**, não por XMAD/pipe/latência/VRAM. Variantes testadas (2 XMAD, shifts 32-bit,
+   conversão magic-number) NÃO dominam. SASS do laço: 9 instr de decode + 2×LDS.128 + 8 FFMA
+   + 7 FADD (Σx redundante) por 8 pesos/consumidor; 66 LDL/STL (spill). Device: smem 48 KB/
+   bloco, L2 1,5 MB → LUT 64 KB impossível. Piso com dieta de instruções: gemvs do verify
+   425 → ~168 ms/bloco (MoE-pinned fica ~104 ms de PCIe — irreduzível sem residente).
+7. **Kernels v2 (WIP, COM BUG CONHECIDO — ver abaixo)**: `crates/inkwell-cuda/src/exl3_gemv_v2.cuh`
+   (denso `gemv_n<NTOK>` + união `gemv_moe_n<DEPTH>`): 4 janelas consecutivas por funnel-shift,
+   Σx hoisted, laços de consumidor desdobrados (sem divisão/índice dinâmico), fila de prefetch
+   DEPTH em registradores + anel smem 2 estágios. Bench (opt/kbench/gemv_v2_bench.cu) mostra
+   **ganho já com números errados**: MoE pinned 645→450 ms (1,43×), MoE VRAM 183→133 ms (1,36×);
+   denso NTOK: v1-ntok8 ~95 µs, v2 ntok8 110–137, **ntok4 59–84, ntok2 36–49, ntok1 30–42 µs**
+   → NT variável também paga no denso.
+
+### ★★ ESTADO DO V2 (o próximo passo é ISTO)
+- **Referência CPU validada**: kernel v1 bate na ref (0/64 col erradas). Geometria de janelas
+  (win_geo com wrap `(bstart-b+r_bits) % r_bits`) validada na CPU para ka=1..5 ±halfk: 0/5120.
+- **BUG**: `gemv_n` v2 diverge da ref CPU com dados aleatórios (128/128 col), MAS passa com
+  padrões analíticos all-zero e all-0xffff → o caminho Σx/redução/afim está CERTO; o erro está
+  na **extração de bits do anel em smem** (staging `Slots/Ring` ou o `__funnelshift_l` na GPU).
+  Padrão de falha com uma única palavra não-zero: 16/64 col erradas (4 valores de c por tile).
+  O debug tool já existe: `opt/kbench/gemv_v2_dbg.cu` (ref CPU + v1 in-bench + padrões
+  `argv[7]`: 1=zero, 2=ffff, 3+=palavra única).
+  **PRÓXIMO PASSO PRESCRITO**: escrever no dbg um kernel `__global__` que só roda
+  win_geo+funnelshift por lane (c,m) e escreve os 4 w16 em global; comparar com a sim CPU
+  para todo (c,m) — isola geometria+extração do staging. Se passar, o bug é no `Slots::init`/
+  `Ring::store` (índices g/r/q*4). Depois: rodar o bench completo (ref: `bash opt/kbench/
+  build.sh gemv_v2_bench && opt/kbench/gemv_v2_bench opt/kbench/ids_block.bin 4`), exigir
+  max rel < 2e-5 nos 3 testes antes de integrar.
+- Integração pendente (após verde): launchers FFI em kernels.cu/lib.rs (exl3_moe_ntok_async +
+  ink_launch_exl3_gemv_ntok ganham paths v2; fallback v1 para `!pairable_ka(ka,halfk)` ou
+  nky>1), VTEST8 + golden + nsys, e só então NT variável no runner (NT é `const NT=8` em
+  runner.rs; kernels v2 já são NTOK-genéricos; Mtp::propose propõe NT-1).
+
+### Comandos (todos com apps de desktop LIGADOS — regra do usuário)
+```bash
+cd ~/inkwell && cargo build -p inkwell-cli --release
+# serial (48 tok):
+INKWELL_GENS=48 INKWELL_MAX_CTX=1024 INKWELL_EXL3_CACHE_K=4 ./target/release/inkwell ~/models/inkling --run
+# spec:
+INKWELL_SPEC=mtp INKWELL_SPEC_GENS=48 (mesmo resto) ... --run
+# A/B harness → opt/ledger.jsonl (recusa se já há inkwell rodando):
+opt/spec_bench.sh <cfg> <N> [serial|spec]   # exporte INKWELL_* antes
+# VTEST8 (equivalência bloco×serial):
+INKWELL_VTEST8=1 INKWELL_GENS=48 ... --run
+# ids reais p/ bench: INKWELL_DUMP_IDS=/tmp/ikw/ids.bin (com INKWELL_SPEC=mtp)
+# nsys (graphs precisam --cuda-graph-trace=node; stats → sqlite):
+~/lfm-gtx1060-bench/cuda-12.6/bin/nsys profile --trace=cuda --cuda-graph-trace=node -o /tmp/ikw/x ./target/release/inkwell ...
+python3 -I opt/tools/nsys_rounds.py /tmp/ikw/x.sqlite 12 42   # por-bloco
+python3 -I opt/tools/nsys_bylayer.py /tmp/ikw/x.sqlite 10     # gemv por camada (dev/pinned)
+# kbench v2: bash opt/kbench/build.sh gemv_v2_bench && opt/kbench/gemv_v2_bench opt/kbench/ids_block.bin 4
+```
+Antes de cada run: `pgrep -x inkwell` (zumbi → OOM no próximo run). 1ª run serial às vezes
+morre com OOM no graph instantiate (cache come VRAM até ~126 MiB livres; margin 50 é pouco) —
+ignorar 1 falha, não é regressão. err=900 flaky só sob INKWELL_MNTOK_DBG=6.
+
+### Números de referência (mediana, apps ligados, K=4 spec / K=25 serial)
+| config | resultado |
+|---|---|
+| serial K=25 | 88,1 ms/tok (11,3 TPS), golden ✓ |
+| spec K=4 pós-fix | 3,3/3,5/3,5/4,3 TPS; verify ~530 ms; draft ~45 ms; emit 1,9–2,6 |
+| aceitação por prompt | prosa 12%, código 20%, técnico 9% (tok/round 1,86/2,39/1,64) |
+| v2 MoE (INVÁLIDO até corrigir) | pinned 450 ms, VRAM 133 ms por bloco |
+| piso físico do verify | ~225–250 ms (MoE-pinned ~104 PCIe + aritmética ~100 + denso ~25 + unembed ~6) |
+
+### Matemática da vitória do spec (para não recalcular)
+spec TPS = emit / (verify + draft). Com verify 250 + draft 45: emit 2,0 → 6,8 TPS (perde);
+emit 2,05 (NT=8 hoje) nunca vence 11,3. **Caminho realista**: NT=3–4 (emit ~1,9–2,25, verify
+~150–180 ms com v2 no piso) → ~10–11 TPS ≈ empate; para VENCER precisa também cortar
+had_moe/swarm/host (~185 ms fora dos gemvs) e/ou draft (~45 ms: unembed é 7×1,7 ms de
+gemv denso — folding/caching é lever). Meta aspiracional 15 TPS exige ~130 ms/round × emit 2.
+
+### Regras do usuário (INALTERADAS)
+- SEM megakernels; Rust p/ host-path; kernels CUDA via FFI ok
+- Tabelas de perf em PT-BR; medir com apps de desktop ligados
+- Ledger (opt/ledger.md) a cada rodada; UM commit por mudança validada
+- Avisar o usuário em PT ao bater 15 TPS estáveis — NUNCA parar
+- Skill: inference-optimisation (A/B com controles dos dois lados, ≥3 amostras, mediana)
+- Golden serial: `" Paris. The capital of the United States is Washington, D.C. ..."`
+  (spec deve reproduzir a continuação do serial; 1 divergência em near-tie com margem
+  <0,2 é fp-chaos aceitável, documentar)
+
+### Armadilhas novas desta sessão
+- `__funnelshift_l(lo,hi,d)` = (lo<<d)|(hi>>(32-d)) — bits do anel são MSB-first por palavra.
+- Wrap do anel: offset relativo de janela precisa `(Δ + r_bits) % r_bits` (validado ka=1..5).
+- `block_sum_rows`/`finish` em exl3_gemv_v2.cuh estão CORRETOS (padrões zero/ffff passam).
+- O kbench gemv_v2_bench inclui kernels.cu INTEIRO → não compilar junto com targets que já
+  o têm (é bench standalone, ok).
+- nsys sqlite: kernels em graph-replay SÓ aparecem com --cuda-graph-trace=node.
+- ids_block.bin (opt/kbench/) = 8 blocos × 48 visitas de ids REAIS (união med 28).
+
+### WIP não commitado (commitar junto com este handoff)
+- `crates/inkwell-cuda/src/exl3_gemv_v2.cuh` (v2, bug da extração em smem documentado acima)
+- `opt/kbench/gemv_v2_bench.cu`, `opt/kbench/gemv_v2_dbg.cu` (harness + debug)
+- `opt/tools/` (nsys_rounds.py, nsys_bylayer.py, cmp_spec.py — copiados de /tmp)
+- Fork src-v2 (~/lfm-gtx1060-bench/src-v2): diff não commitado é SÓ debug print (GDBG) +
+  gate GGML_PASCAL_GRAPHS — já funcional; limpar prints antes de publicar (lever antigo).
+
 ## Missão
 **60 ms/tok (~16.7 TPS) no caminho NÃO-spec primeiro**, depois speculative.
 Spec já implementado/verificado mas não paga (verify ~500ms, accept ~14%).
