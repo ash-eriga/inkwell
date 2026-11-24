@@ -4757,3 +4757,66 @@ extern "C" void ink_launch_rms2down(const float* x0, const float* x1,
         inkwell_rms2down<float><<<(unsigned)nrows, 256, 0, (cudaStream_t)stream>>>(
             x0, x1, (const float*)w, dst, n, eps);
 }
+
+// ---- device argmax: Rust total_cmp order + last-max tiebreak ----
+// key(f) is a monotonic u32 map of the f32 bit pattern (IEEE totalOrder,
+// identical to f32::total_cmp); on equal keys the larger index wins, which
+// matches Iterator::max_by returning the last equal maximum.
+__device__ __forceinline__ unsigned am_key(float f) {
+    const unsigned b = __float_as_uint(f);
+    return b ^ (b & 0x80000000u ? 0xFFFFFFFFu : 0x80000000u);
+}
+__device__ __forceinline__ void am_better(unsigned k, int i, unsigned& bk, int& bi) {
+    if (k > bk || (k == bk && i > bi)) { bk = k; bi = i; }
+}
+// out: [0]=idx, [1]=key (final, written by last block); [8..8+2*grid] partials.
+// ctr: self-resetting ticket (must start 0).
+__global__ void __launch_bounds__(256) inkwell_argmax(
+        const float* __restrict__ x, int n, unsigned* __restrict__ out,
+        unsigned* __restrict__ ctr) {
+    unsigned bk = 0; int bi = -1;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) {
+        am_better(am_key(__ldg(x + i)), i, bk, bi);
+    }
+    __shared__ unsigned sk[256];
+    __shared__ int si[256];
+    __shared__ bool last;
+    for (int r = 0; r < 2; ++r) {
+        sk[threadIdx.x] = bk; si[threadIdx.x] = bi;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s; s >>= 1) {
+            if (threadIdx.x < s) {
+                const unsigned k2 = sk[threadIdx.x + s];
+                const int i2 = si[threadIdx.x + s];
+                if (k2 > sk[threadIdx.x] ||
+                    (k2 == sk[threadIdx.x] && i2 > si[threadIdx.x])) {
+                    sk[threadIdx.x] = k2; si[threadIdx.x] = i2;
+                }
+            }
+            __syncthreads();
+        }
+        if (r == 0) {
+            if (threadIdx.x == 0) {
+                out[8 + 2 * blockIdx.x] = sk[0];
+                out[9 + 2 * blockIdx.x] = (unsigned)si[0];
+                __threadfence();
+                last = atomicAdd(ctr, 1) == gridDim.x - 1;
+                if (last) *ctr = 0;
+            }
+            __syncthreads();
+            if (!last) return;
+            bk = 0; bi = -1;
+            for (int b = threadIdx.x; b < (int)gridDim.x; b += blockDim.x) {
+                am_better(out[8 + 2 * b], (int)out[9 + 2 * b], bk, bi);
+            }
+            __syncthreads();
+        }
+    }
+    if (threadIdx.x == 0) { out[0] = (unsigned)si[0]; out[1] = sk[0]; }
+}
+extern "C" void ink_launch_argmax(const float* x, int n, unsigned* out,
+        unsigned* ctr, void* stream) {
+    const int nb = (n + 255) / 256 > 128 ? 128 : (n + 255) / 256;
+    inkwell_argmax<<<nb, 256, 0, (cudaStream_t)stream>>>(x, n, out, ctr);
+}

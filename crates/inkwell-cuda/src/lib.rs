@@ -22,6 +22,7 @@ extern "C" {
     fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
     fn cudaStreamSynchronize(s: *mut c_void) -> i32;
     fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
+    fn cudaEventSynchronize(e: *mut c_void) -> i32;
     fn cudaEventRecord(e: *mut c_void, s: *mut c_void) -> i32;
     fn cudaStreamWaitEvent(s: *mut c_void, e: *mut c_void, flags: u32) -> i32;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
@@ -736,6 +737,34 @@ pub unsafe fn exl3_gemv_async(trel: *const c_void, suh: *const c_void, svh: *con
 pub unsafe fn exl3_gemv_async_side(trel: *const c_void, suh: *const c_void, svh: *const c_void,
     x: *const f32, y: *mut f32, k: usize, n: usize, ka: usize, halfk: bool, scratch: *mut f32) {
     unsafe { ink_launch_exl3_gemv(trel, suh, svh, x, y, k as i64, n as i64, ka as i64, halfk as i64, scratch, side_stream()) };
+}
+/// Create a timing-disabled event.
+///
+/// # Panics
+/// On creation failure.
+#[must_use]
+pub fn event_new() -> *mut c_void {
+    let mut e = std::ptr::null_mut();
+    assert_eq!(unsafe { cudaEventCreateWithFlags(&raw mut e, 2) }, 0, "event create");
+    e
+}
+/// Block until `e` fires.
+///
+/// # Safety
+/// CUDA event plumbing.
+pub unsafe fn event_sync(e: *mut c_void) {
+    assert_eq!(unsafe { cudaEventSynchronize(e) }, 0, "event sync");
+}
+extern "C" {
+    fn ink_launch_argmax(x: *const f32, n: i32, out: *mut u32, ctr: *mut u32, stream: *mut c_void);
+}
+/// Device argmax over `n` f32 (total_cmp order, last-max tiebreak).
+/// `out` = device u32 buf >= 8+2*128 elems ([0]=idx [1]=key), `ctr` = zeroed u32.
+///
+/// # Safety
+/// Raw device pointers; launched on the current stream.
+pub unsafe fn argmax_async(x: *const c_void, n: usize, out: *mut u32, ctr: *mut u32) {
+    unsafe { ink_launch_argmax(x.cast(), n as i32, out, ctr, stream()) };
 }
 /// Record `e` on stream `s`.
 ///

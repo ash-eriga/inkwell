@@ -156,6 +156,10 @@ void ink_sched_reset(ggml_backend_sched_t s) { ggml_backend_sched_reset(s); }
 int ink_sched_compute(ggml_backend_sched_t s, ggml_cgraph* g) {
     return (int)ggml_backend_sched_graph_compute(s, g);
 }
+// launch splits without the final all-backend synchronize
+int ink_sched_compute_async(ggml_backend_sched_t s, ggml_cgraph* g) {
+    return (int)ggml_backend_sched_graph_compute_async(s, g);
+}
 ggml_backend_buffer_t ink_alloc_ctx_tensors_buft(ggml_context* c, ggml_backend_buffer_type_t buft) {
     return ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
 }

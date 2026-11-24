@@ -81,6 +81,7 @@ extern "C" {
     pub fn ink_tensor_type(t: *mut c_void) -> i32;
     pub fn ink_sched_set_tensor_backend(s: *mut c_void, t: *mut c_void, b: *mut c_void);
     pub fn ink_sched_compute(s: *mut c_void, g: *mut c_void) -> c_int;
+    pub fn ink_sched_compute_async(s: *mut c_void, g: *mut c_void) -> c_int;
     pub fn ink_sched_reset(s: *mut c_void);
     pub fn ink_alloc_ctx_tensors_buft(c: *mut c_void, buft: *mut c_void) -> *mut c_void;
     pub fn ink_alloc_ctx_tensors(c: *mut c_void, b: *mut c_void) -> *mut c_void;

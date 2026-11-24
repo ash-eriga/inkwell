@@ -113,6 +113,8 @@ pub struct Runner {
     /// built step graph kept alive across tokens while padded n_kv shapes are
     /// stable (rebuild on each 64-token boundary). `None` after `step_block`.
     step_gcache: Option<StepCache>,
+    /// pinned/device side buffers for the `step_id` decode path
+    sid: Option<SidBufs>,
 }
 
 /// Live objects of a built step graph: the cgraph + its input tensors (via
@@ -125,6 +127,9 @@ struct StepCache {
     graph: Ptr,
     /// final tensor read back for logits (`cur` at graph end)
     out: Ptr,
+    /// device offsets of the 9 input tensors inside `in_buf` + span bytes
+    in_offs: [usize; 9],
+    in_span: usize,
 }
 
 /// tensor dims (ne0..) of a gguf tensor
@@ -747,7 +752,7 @@ impl Runner {
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits,
-            n_full, step_gcache: None,
+            n_full, step_gcache: None, sid: None,
         }
     }
 
@@ -1314,7 +1319,7 @@ impl Runner {
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits, n_full,
-            step_gcache: None,
+            step_gcache: None, sid: None,
         }
     }
 }
@@ -1937,11 +1942,13 @@ impl Runner {
         }
         let buf = self.in_buf.as_ref().unwrap().clone();
         let mut o = 0usize;
-        for x in [ids, pos_t, kv_idx_full, kv_idx_swa, rel_pos_full, rel_pos_swa, mask_full, mask_swa, sink_zero] {
+        let mut in_offs = [0usize; 9];
+        for (i, x) in [ids, pos_t, kv_idx_full, kv_idx_swa, rel_pos_full, rel_pos_swa, mask_full, mask_swa, sink_zero].iter().enumerate() {
             unsafe { inkwell_ggml::ink_set_input(x.0) };
             let off = (o + 255) & !255;
-            buf.assign(x, off);
-            o = off + t::nbytes(x);
+            buf.assign(*x, off);
+            in_offs[i] = off;
+            o = off + t::nbytes(*x);
         }
         // keep buf alive for the graph
         std::mem::forget(buf);
@@ -2056,7 +2063,7 @@ impl Runner {
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         if caching {
             // keep ctx + cgraph + sched split + instantiated CUDA graph alive
-            self.step_gcache = Some(StepCache { step, graph: g, out: cur });
+            self.step_gcache = Some(StepCache { step, graph: g, out: cur, in_offs, in_span: o });
         } else {
             // release the cached split plan so the next step's graph gets re-allocated
             unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
@@ -2179,6 +2186,268 @@ impl Runner {
         if prof { eprintln!("PROF logits={:.1}ms", tl0.elapsed().as_secs_f64()*1e3); }
         logits
     }
+
+    /// Lazily create the pinned/device side buffers of the `step_id` path.
+    fn sid_bufs(&mut self) -> &mut SidBufs {
+        if self.sid.is_none() {
+            let am = inkwell_cuda::DevBuf::new(8 + 2 * 128 + 8);
+            am.zero(); // argmax ticket ctr must start at 0
+            let in_pin = [
+                inkwell_cuda::host_alloc_mapped(1 << 20),
+                inkwell_cuda::host_alloc_mapped(1 << 20),
+            ];
+            // zero once: the sink_zero mirror region stays zero forever
+            unsafe {
+                std::ptr::write_bytes(in_pin[0].host, 0, 1 << 20);
+                std::ptr::write_bytes(in_pin[1].host, 0, 1 << 20);
+            }
+            self.sid = Some(SidBufs {
+                am,
+                out_pin: inkwell_cuda::host_alloc_mapped(64),
+                in_pin,
+                emb_pin: inkwell_cuda::host_alloc_mapped(2304 * 4 + 256),
+                ev: inkwell_cuda::event_new(),
+                marshaled: i64::MIN,
+            });
+        }
+        self.sid.as_mut().expect("sid")
+    }
+
+    /// Raw pointers into `sid` (argmax buf, readback, mirrors, event) —
+    /// copied out so no `&mut self` borrow persists across kernel launches.
+    fn sid_parts(&mut self) -> SidParts {
+        let s = self.sid_bufs();
+        SidParts {
+            am: s.am.dev_ptr(),
+            ctr: unsafe { (s.am.dev_ptr() as *mut u32).add(8 + 2 * 128) },
+            out: s.out_pin.host,
+            inp: [s.in_pin[0].host, s.in_pin[1].host],
+            emb: s.emb_pin.host,
+            ev: s.ev,
+        }
+    }
+    /// Pos whose pos-dep inputs are marshaled in `in_pin` (`i64::MIN` = none).
+    fn marshaled(&self) -> i64 {
+        self.sid.as_ref().map_or(i64::MIN, |s| s.marshaled)
+    }
+    /// Record the pos the `in_pin` mirror now holds (or `i64::MIN`).
+    fn set_marshaled(&mut self, v: i64) {
+        if let Some(s) = self.sid.as_mut() { s.marshaled = v; }
+    }
+
+    /// Marshal the pos-dependent inputs into the pinned `in_buf` mirror.
+    /// `ids` is written by the caller once the token id is known; the
+    /// sink_zero region stays zeroed since buffer init.
+    fn marshal_inputs(&self, s: &Step, offs: &[usize; 9], pos: i64, dst: *mut u8) {
+        unsafe {
+            (dst.add(offs[1]) as *mut i32).write(pos as i32);
+            (dst.add(offs[2]) as *mut i32).write(pos as i32);
+            (dst.add(offs[3]) as *mut i32).write(pos.min(self.swa - 1) as i32);
+            let nfr = pos + 1;
+            let nsr = (pos + 1).min(self.swa);
+            let ext = self.cfg.rel_extent as i64;
+            let rf = dst.add(offs[4]) as *mut i32;
+            for j in 0..s.n_kv_full_pad {
+                rf.add(j as usize).write(if j < nfr { (nfr - 1 - j).min(ext) as i32 } else { 0 });
+            }
+            let rs = dst.add(offs[5]) as *mut i32;
+            for j in 0..s.n_kv_swa_pad {
+                rs.add(j as usize).write(if j < nsr { (nsr - 1 - j).min(ext) as i32 } else { 0 });
+            }
+            let mf = dst.add(offs[6]) as *mut f32;
+            for j in 0..=s.n_kv_full_pad {
+                mf.add(j as usize).write(if j < nfr || j == s.n_kv_full_pad { 0.0 } else { f32::NEG_INFINITY });
+            }
+            let ms = dst.add(offs[7]) as *mut f32;
+            for j in 0..=s.n_kv_swa_pad {
+                ms.add(j as usize).write(if j < nsr || j == s.n_kv_swa_pad { 0.0 } else { f32::NEG_INFINITY });
+            }
+        }
+    }
+
+    /// Device argmax of the step logits: 4 B readback instead of the full
+    /// [vocab] DtoH. Bit-identical to host `max_by(total_cmp)` (same key
+    /// order, same last-max tiebreak).
+    fn read_argmax(&mut self, gc: &StepCache) -> u32 {
+        let sp = self.sid_parts();
+        let (nv, cap, ne) = (self.cfg.vocab_unpadded as usize, self.cfg.softcap, self.cfg.n_embd as usize);
+        unsafe {
+            inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+            if let Some((w, x_dev, y_dev)) = self.out_head.as_mut() {
+                // own-head: normed activations -> host-launched IQ4_XS mmvq
+                let mut normed = vec![0f32; ne];
+                t::get(gc.out, normed.as_mut_ptr().cast(), 0, ne * 4);
+                x_dev.write(&normed);
+                inkwell_cuda::mmvq_iq4_xs_moe(
+                    w.dev_ptr(), x_dev.dev_ptr(), y_dev, 201024, 2304, 2304, 1);
+                inkwell_cuda::softcap(y_dev, cap);
+                inkwell_cuda::argmax_async(y_dev.dev_ptr(), nv, sp.am.cast(), sp.ctr);
+            } else {
+                inkwell_cuda::argmax_async(inkwell_ggml::tensor_data(gc.out.0),
+                    nv, sp.am.cast(), sp.ctr);
+            }
+            inkwell_cuda::memcpy_d2h_async(sp.out.cast(), sp.am, 4);
+            inkwell_cuda::event_record(sp.ev, inkwell_ggml::cuda_stream());
+            inkwell_cuda::event_sync(sp.ev);
+            *(sp.out as *const u32)
+        }
+    }
+
+    /// Decode one step and return the greedy token id.
+    /// Fast path: packed pinned input upload + async sched compute + device
+    /// argmax (4 B readback) + pos-dep marshal of the next step overlapped
+    /// with the GPU. `INKWELL_NO_GARGMAX` restores the Vec logits read-back
+    /// + host argmax; `INKWELL_NO_ASYNCSTEP` restores the per-tensor synced
+    /// uploads + blocking sched compute (device argmax is kept).
+    ///
+    /// # Panics
+    /// On sched compute failure.
+    pub fn step_id(&mut self, id: u32, pos: i64) -> u32 {
+        static NO_GA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_GA.get_or_init(|| std::env::var_os("INKWELL_NO_GARGMAX").is_some()) {
+            return host_argmax(&self.step(id, pos));
+        }
+        static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none()) {
+            if let Some(gc) = self.step_gcache.take() {
+                let n_kv_full = ((pos + 1 + 63) & !63).min(self.max_ctx);
+                let n_kv_swa = (((pos + 1).min(self.swa) + 63) & !63).min(self.swa);
+                if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
+                    let r = self.step_id_cached(id, pos, &gc);
+                    self.step_gcache = Some(gc);
+                    return r;
+                }
+                self.step_gcache = Some(gc);
+            }
+        }
+        host_argmax(&self.step(id, pos))
+    }
+
+    /// Gcache-hit step returning the greedy id (see [`Self::step_id`]).
+    fn step_id_cached(&mut self, id: u32, pos: i64, gc: &StepCache) -> u32 {
+        static NO_AS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static PROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let prof = *PROF.get_or_init(|| std::env::var_os("INKWELL_PROF").is_some());
+        if *NO_AS.get_or_init(|| std::env::var_os("INKWELL_NO_ASYNCSTEP").is_some()) {
+            // killswitch: per-tensor synced uploads + blocking sched compute
+            self.upload_step_inputs(&gc.step, id, pos);
+            self.upload_embd_row(id);
+            self.issue_moe_prefetch(pos);
+            unsafe {
+                assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, gc.graph.0), 0, "sched compute");
+                self.dump_all();
+            }
+            return self.read_argmax(gc);
+        }
+        let tb0 = std::time::Instant::now();
+        let sp = self.sid_parts();
+        let cur_pin = sp.inp[(pos & 1) as usize];
+        if self.marshaled() != pos {
+            self.marshal_inputs(&gc.step, &gc.in_offs, pos, cur_pin);
+        }
+        unsafe { (cur_pin.add(gc.in_offs[0]) as *mut i32).write(id as i32) };
+        // embd row dequant into pinned staging, then one async copy
+        let (src, ty, stride) = self.embd_src;
+        let row = sp.emb as *mut f32;
+        if ty == -2 {
+            let s = unsafe { src.add(id as usize * stride) } as *const u16;
+            for i in 0..2304 {
+                unsafe { *row.add(i) = f32::from_bits(u32::from(*s.add(i)) << 16) };
+            }
+        } else {
+            let rc = unsafe {
+                inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row, 2304)
+            };
+            assert_eq!(rc, 0, "dequant embd row");
+        }
+        unsafe {
+            inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+            let base = inkwell_ggml::ink_buf_base(self.in_buf.as_ref().expect("in_buf").0 .0);
+            inkwell_cuda::memcpy_h2d_async(base, cur_pin.cast_const().cast(), gc.in_span);
+            inkwell_cuda::memcpy_h2d_async(
+                inkwell_ggml::tensor_data(self.embd_row.0),
+                sp.emb.cast_const().cast(), 2304 * 4);
+        }
+        if prof { eprintln!("PROF build={:.1}ms", tb0.elapsed().as_secs_f64() * 1e3); }
+        let t0 = std::time::Instant::now();
+        self.issue_moe_prefetch(pos);
+        unsafe {
+            assert_eq!(
+                inkwell_ggml::ink_sched_compute_async(self.sched.0, gc.graph.0), 0,
+                "sched compute async");
+            self.dump_all();
+        }
+        if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        // queue argmax + 4B readback after the replay, then marshal the next
+        // step's pos-dep inputs while the GPU is still busy (single pinned
+        // buf: this step's copy already ran before the graph).
+        let next = pos + 1;
+        let n_kv_full = ((next + 1 + 63) & !63).min(self.max_ctx);
+        let n_kv_swa = (((next + 1).min(self.swa) + 63) & !63).min(self.swa);
+        let premarshal = n_kv_full == gc.step.n_kv_full_pad && n_kv_swa == gc.step.n_kv_swa_pad;
+        unsafe {
+            inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+            if self.out_head.is_none() {
+                inkwell_cuda::argmax_async(inkwell_ggml::tensor_data(gc.out.0),
+                    self.cfg.vocab_unpadded as usize, sp.am.cast(), sp.ctr);
+                inkwell_cuda::memcpy_d2h_async(sp.out.cast(), sp.am, 4);
+                inkwell_cuda::event_record(sp.ev, inkwell_ggml::cuda_stream());
+            }
+        }
+        if premarshal {
+            self.marshal_inputs(&gc.step, &gc.in_offs, next, sp.inp[(next & 1) as usize]);
+            self.set_marshaled(next);
+        } else {
+            self.set_marshaled(i64::MIN);
+        }
+        if self.out_head.is_some() {
+            // own-head needs host launches: sync then take the slow read path
+            unsafe { inkwell_cuda::DevBuf::sync() };
+            return self.read_argmax(gc);
+        }
+        unsafe { inkwell_cuda::event_sync(sp.ev) };
+        unsafe { *(sp.out as *const u32) }
+    }
+}
+
+/// Raw pointers into [`SidBufs`], copied out of the `&mut self` borrow.
+struct SidParts {
+    /// argmax device buf base
+    am: *mut std::ffi::c_void,
+    /// ticket counter (u32 index 8+2*128)
+    ctr: *mut u32,
+    /// 4 B readback pinned buf
+    out: *mut u8,
+    /// in_buf mirror pinned bufs (parity by pos)
+    inp: [*mut u8; 2],
+    /// embd row staging pinned buf
+    emb: *mut u8,
+    /// readback event
+    ev: *mut std::ffi::c_void,
+}
+
+/// Pinned/device side buffers for `Runner::step_id`.
+#[derive(Debug)]
+struct SidBufs {
+    /// argmax device buf: [0..2] final {idx,key}, [8..264] block partials,
+    /// ticket ctr at u32 index 8+2*128
+    am: inkwell_cuda::DevBuf,
+    /// 4 B argmax readback
+    out_pin: inkwell_cuda::PinnedBuf,
+    /// mirror of the `in_buf` input block (packed single HtoD), parity by
+    /// pos so next-step marshaling can't race this step's async copy
+    in_pin: [inkwell_cuda::PinnedBuf; 2],
+    /// dequantized embd row staging (one async HtoD)
+    emb_pin: inkwell_cuda::PinnedBuf,
+    /// argmax readback completion event
+    ev: *mut std::ffi::c_void,
+    /// pos whose pos-dep inputs are already marshaled in `in_pin`
+    marshaled: i64,
+}
+
+/// Host-side greedy argmax (the pre-`step_id` selection rule).
+fn host_argmax(l: &[f32]) -> u32 {
+    l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
 }
 
 // ============ spec-decode verify: ntok=8 block forward ============

@@ -322,21 +322,29 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let mut hist_logits: std::collections::VecDeque<Vec<f32>> = Default::default();
     let mut hist_snaps: std::collections::VecDeque<Vec<Vec<f32>>> = Default::default();
     let (mut vt8_rows, mut vt8_bad) = (0usize, 0usize);
+    // INKWELL_STEPDBG: per-token stepwall/gen/top5/poststep prints (they cost
+    // ~0.5ms of unbuffered stderr + scans on the token boundary); default off.
+    let stepdbg = std::env::var_os("INKWELL_STEPDBG").is_some() || vtest8;
     for g in 0..n_gen {
         if vtest8 { hist_snaps.push_back(r.snapshot_conv()); }
         let ts = Instant::now();
-        logits = r.step(id, pos);
-        eprintln!("stepwall={:.1}ms", ts.elapsed().as_secs_f64()*1e3);
+        let (best, fed_id);
+        if stepdbg {
+            logits = r.step(id, pos);
+            eprintln!("stepwall={:.1}ms", ts.elapsed().as_secs_f64()*1e3);
+            let ta = Instant::now();
+            best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            fed_id = id;
+            if g == 0 { eprintln!("gen0-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]); }
+            eprintln!("gen {g}: id={id} next={best} top5={:?}", top(&logits, 5));
+            eprintln!("poststep={:.1}ms", ta.elapsed().as_secs_f64()*1e3);
+        } else {
+            best = r.step_id(id, pos) as usize;
+            fed_id = id;
+        }
         pos += 1;
-        let ta = Instant::now();
-        let (best, _) = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
-        let fed_id = id;
-        if g == 0 { eprintln!("gen0-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]); }
-        eprintln!("gen {g}: id={id} next={best} top5={:?}",
-            top(&logits, 5));
         id = best as u32;
         gen_ids.push(id);
-        eprintln!("poststep={:.1}ms", ta.elapsed().as_secs_f64()*1e3);
         if vtest8 {
             fed.push(fed_id);
             hist_logits.push_back(logits.clone());
