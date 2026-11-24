@@ -198,3 +198,10 @@ Decodificação pura (anel em smem), ciclos por peso por SM: **~5,0 (nc=1), 12,8
 - A/B: control ~115ms / NKY=2 ~96-101ms (2 runs) / control ~113-118 / NKY=3 ~110 / NKY=4 ~111 → NKY=2 é o sweet spot.
 - BEST env serial: GGML_PASCAL_GRAPHS=1 INKWELL_MAX_CTX=512 INKWELL_CACHE_MARGIN_MB=10 INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_V2=1 INKWELL_MOE_NKY=2 → ~99ms/tok ≈ 10.1 TPS (era 117).
 - Nota: o gemv_moe_n (v2) não suporta split-K (escreve dn direto, sem atomics); o kernel antigo inkwell_exl3_gemv_moe faz memset+atomicAdd. Candidato: portar split-K pro v2.
+
+## 2026-11-24 — v2 split-K (atomic) — REJEITADO
+- Port de split-K pro gemv_moe_n (kpi por blockIdx.z/nsel, atomicAdd, affine offset só no partial 0): saída DEGENERADA e ~121ms. Revertido — o bug estava na port (não no gate). O caminho provado fica: nky>1 → kernel antigo inkwell_exl3_gemv_moe (que JÁ faz split-K próprio, provável N-split não K).
+- Suspeita: o nky do kernel antigo pode ser split de OUTPUT (não de K) — mais blocos de saída, sem atomics — por isso é correto e rápido.
+- stage threads 256→512: sem efeito (~99ms). Mantido 512 (neutro).
+- K=22@ctx256+margin0: ~97-116ms — igual K=20. Cap VRAM segue.
+- ESTADO FINAL serial: ~99ms/tok ≈ 10.1 TPS golden. Próximos levers reais restantes: (a) CUDA-graph explícito da cadeia MoE (~2-3ms), (b) descobrir decomposição dos ~53ms non-MoE (lm head? attn?), (c) hit-rate da cache (K=20/128).
