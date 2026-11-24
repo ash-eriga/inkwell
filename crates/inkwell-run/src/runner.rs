@@ -1235,12 +1235,12 @@ impl Runner {
         if let Some(rq) = l.attn_res_query {
             let mixed = self.mix(blocks, cur, rq);
             for (j, inp) in inputs.iter_mut().enumerate() {
-                *inp = t::cont(c, t::view2(c, mixed, n_embd, 1, t::nb(mixed, 2), (if is_swa { 0 } else { j as i64 }) * t::nb(mixed, 1)));
+                *inp = t::view2(c, mixed, n_embd, 1, t::nb(mixed, 2), (if is_swa { 0 } else { j as i64 }) * t::nb(mixed, 1));
             }
         }
         if let Some(msgs) = messages {
             for (j, inp) in inputs.iter_mut().enumerate() {
-                let m = t::cont(c, t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), j as i64 * t::nb(msgs, 1)));
+                let m = t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), j as i64 * t::nb(msgs, 1));
                 *inp = self.control(*inp, m, l, j);
             }
         }
@@ -1393,7 +1393,7 @@ impl Runner {
         // ffn mix + control + norm
         let mut fcur = t::reshape2(c, self.mix(blocks, cur, l.ffn_res_query.expect("ffn_res")), n_embd, 1);
         if let Some(msgs) = messages {
-            let m = t::cont(c, t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), 3 * t::nb(msgs, 1)));
+            let m = t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), 3 * t::nb(msgs, 1));
             fcur = self.control(fcur, m, l, 3);
         }
         fcur = self.norm(fcur, l.ffn_norm.expect("ffn_norm"));
