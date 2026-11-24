@@ -1338,3 +1338,80 @@ warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
   all ≥3 instructions. 2-XMAD needs a SASS rewrite → brief `opt/MATH_CHALLENGE_STEP2.md`
   (count model: experts 8.81 → 7.58 instr/w).
 - K=6 trellis tensors are vision-encoder only (self_attn.*, mlp.c_fc/c_proj, visual.*); not on the text decode path.
+
+## 2026-11-24 — host decode step: CUDA graph chunk shrink — REJECTED, reverted
+
+Scope: host step path only (`runner.rs`); no kernel, VRAM, KV, cache-sizing, or
+attention-launch changes. Prior accepted host-latency pass was read first; it
+already removed the large graph-build, logits-readback, per-tensor-copy and
+stderr/token-boundary costs.
+
+### Pre-change nsys profile
+
+nsys 2024.5.1, `--trace=cuda,osrt --cuda-graph-trace=node`, BEST env,
+`/tmp/graphchunk-nsys-ctl.sqlite` (control binary used `INKWELL_NO_GRAPHCHUNK128=1`,
+which is the unmodified ggml default path). Token boundary = the 4 B device-argmax
+DtoH copy. Last 40 steady tokens:
+
+| measurement | ctl |
+|---|---:|
+| 4 B DtoH end -> first compute kernel, median | **819.6 us/tok** |
+| same, minimum | 696.9 us/tok |
+| GPU span median | 37.265 ms/tok |
+| GPU union-busy median | 34.852 ms/tok |
+| GPU union-idle median | 2.147 ms/tok |
+| `cudaGraphLaunch` API duration median | 598.2 us |
+
+Typical ordered critical path inside that boundary hole: `cudaEventSynchronize`
+wake (~5-13 us after the 4 B copy), two small pinned HtoD copies, ggml CUDA graph
+key/scheduler host work, then the first chunked `cudaGraphLaunch`. The first
+graph-launch API call is the dominant host-attributable piece under nsys. Note
+that nsys inflates CUDA API durations; these are attribution numbers, not a
+prediction of the same magnitude in an uninstrumented run.
+
+### Experiment — `GGML_CUDA_GRAPH_CHUNK_SIZE=128`
+
+Commit `a7e2c2d` made the runner set `GGML_CUDA_GRAPH_CHUNK_SIZE=128` when the
+user had not set it. Killswitch: `INKWELL_NO_GRAPHCHUNK128=1` restored the ggml
+default (512). Candidate nsys (`/tmp/graphchunk-nsys-cand.sqlite`):
+
+| measurement | ctl 512 | cand 128 |
+|---|---:|---:|
+| 4 B DtoH end -> first compute kernel, median | 819.6 us | **372.5 us** |
+| `cudaGraphLaunch` API duration median | 598.2 us | **135.8 us** |
+| GPU union-idle median | 2.147 ms | **1.814 ms** |
+
+This does reduce the instrumented host/idle boundary, but the uninstrumented
+end-to-end effect was not a win.
+
+A/B: 16 interleaved neighbour pairs in run order ctl,cand,cand,ctl ×8, one
+flock, ctl = `INKWELL_NO_GRAPHCHUNK128=1`; md5 `5cbe8e06` on all 32 runs;
+peak process VRAM 5052-5060 MiB (cap 5080):
+
+| rep | ctl1 | cand1 | cand2 | ctl2 |
+|---:|---:|---:|---:|---:|
+| 1 | 38.36 | 38.06 | 38.49 | 37.96 |
+| 2 | 38.61 | 38.64 | 38.30 | 38.25 |
+| 3 | 38.42 | 38.60 | 38.72 | 36.50 |
+| 4 | 39.02 | 38.26 | 38.25 | 38.38 |
+| 5 | 37.33 | 38.75 | 40.13 | 37.80 |
+| 6 | 38.22 | 37.53 | 38.61 | 38.43 |
+| 7 | 38.43 | 38.71 | 38.51 | 38.74 |
+| 8 | 39.88 | 38.25 | 38.63 | 38.70 |
+
+Sorted ctl: 36.50 37.33 37.80 37.96 38.22 38.25 38.36 38.38
+38.42 38.43 38.43 38.61 38.70 38.74 39.02 39.88.
+Sorted cand: 37.53 38.06 38.25 38.25 38.26 38.30 38.49 38.51
+38.60 38.61 38.63 38.64 38.71 38.72 38.75 40.13.
+
+ctl median **38.40** ms/tok; cand median **38.56** ms/tok (**+0.16**, worse).
+Pair wins **7/16** (bar >=12/16). Verdict: **REJECTED**; commit `a7e2c2d` was
+reverted by `4840361`, so the default numeric/launch path is unchanged.
+
+Likely interpretation: the profiler-visible launch-cost reduction is mostly not
+on the uninstrumented critical path, and/or finer chunks repay it with more
+chunk-boundary work. No second host-path change was shipped: the remaining
+default serial step already uses cached `OnceLock` switches, packed pinned input
+upload, async sched compute, device argmax with a 4 B readback, double-buffered
+premarshal, and no default per-token logits `Vec` readback. Remaining `env` or
+small-copy costs are in the GPU shadow or far below the A/B noise floor.
