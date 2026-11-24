@@ -230,6 +230,17 @@ unsafe extern "C" fn router_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32,
         inkwell_ggml::ink_tensor_data(dst).cast(), 8, 128, a.wscale, a.wfloor) };
 }
 
+struct MixArgs { embd: i32, rows: i32, qcols: i32, scale: f32 }
+
+unsafe extern "C" fn mix_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*(ud as *const MixArgs) };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let st = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 0)) as *const f32 };
+    let q = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 1)) as *const f32 };
+    unsafe { inkwell_cuda::mix_async(st.cast(), q.cast(),
+        inkwell_ggml::ink_tensor_data(dst).cast(), a.embd, a.rows, a.qcols, a.scale) };
+}
+
 unsafe extern "C" fn clip_l2_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
     let a = unsafe { &*ud.cast::<ClipL2Args>() };
     unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
@@ -1106,12 +1117,23 @@ impl Runner {
                 p
             }
         };
-        let mut states = if blocks.is_empty() { prefix } else { t::concat(c, prefix, t::reshape3(c, cur, n_embd, 1, 1), 1) };
-        states = t::rms_norm(c, states, 1e-6);
-        let n_rows = t::ne(query, 1);
-        let queries = t::repeat(c, query, t::new(c, F32, &[n_embd, n_rows, 1]));
-        let scores = t::soft_max(c, t::mmq(c, states, queries), Ptr(std::ptr::null_mut()), 1.0 / (n_embd as f32).sqrt(), 0.0);
-        t::mmq(c, t::cont(c, t::transpose(c, states)), scores)
+        let states = if blocks.is_empty() { prefix } else { t::concat(c, prefix, t::reshape3(c, cur, n_embd, 1, 1), 1) };
+        let n_rows = t::ne(states, 1);
+        let q_cols = t::ne(query, 1);
+        if n_rows <= 64 && q_cols <= 8 && std::env::var_os("INKWELL_NO_MIXFUSE").is_none() {
+            let mut margs = [states.0, query.0];
+            let ud = Box::leak(Box::new(MixArgs {
+                embd: n_embd as i32, rows: n_rows as i32, qcols: q_cols as i32,
+                scale: 1.0 / (n_embd as f32).sqrt() }));
+            Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_embd, q_cols, 1, 1], &mut margs,
+                mix_cb as usize, (ud as *mut MixArgs).cast()) })
+        } else {
+            let states = t::rms_norm(c, states, 1e-6);
+            let n_rows = t::ne(query, 1);
+            let queries = t::repeat(c, query, t::new(c, F32, &[n_embd, n_rows, 1]));
+            let scores = t::soft_max(c, t::mmq(c, states, queries), Ptr(std::ptr::null_mut()), 1.0 / (n_embd as f32).sqrt(), 0.0);
+            t::mmq(c, t::cont(c, t::transpose(c, states)), scores)
+        }
     }
 
     /// conv state: x rows [4, ch] = [past(3), cur]; shift-store last 3 into region.

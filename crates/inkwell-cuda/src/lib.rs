@@ -9,6 +9,8 @@ use std::ffi::c_void;
 
 #[link(name = "cudart")]
 extern "C" {
+    pub fn ink_launch_mix(st: *const std::ffi::c_void, q: *const std::ffi::c_void, out: *mut std::ffi::c_void,
+        embd: i32, rows: i32, qcols: i32, scale: f32, stream: *mut std::ffi::c_void);
     pub fn ink_launch_router(logits: *const std::ffi::c_void, bias: *const std::ffi::c_void,
         out: *mut std::ffi::c_void, k: i32, n_exp: i32, wscale: f32, wfloor: f32, stream: *mut std::ffi::c_void);
 
@@ -1025,5 +1027,13 @@ pub unsafe fn draft_argmax_async(z: *const f32, n: usize, cap: f32, o: *mut i32)
 pub unsafe fn router_async(logits: *const std::ffi::c_void, bias: *const std::ffi::c_void,
     out: *mut std::ffi::c_void, k: i32, n_exp: i32, wscale: f32, wfloor: f32) -> bool {
     unsafe { ink_launch_router(logits, bias, out, k, n_exp, wscale, wfloor, stream()) };
+    true
+}
+
+/// Fused depth-stack mix (norm+scores+softmax+sum, 1 launch).
+#[must_use]
+pub unsafe fn mix_async(st: *const std::ffi::c_void, q: *const std::ffi::c_void,
+    out: *mut std::ffi::c_void, embd: i32, rows: i32, qcols: i32, scale: f32) -> bool {
+    unsafe { ink_launch_mix(st, q, out, embd, rows, qcols, scale, stream()) };
     true
 }

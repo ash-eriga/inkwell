@@ -3683,3 +3683,52 @@ extern "C" void ink_launch_router(const void* logits, const void* bias, void* ou
     inkwell_router<<<1, 256, 0, (cudaStream_t)stream>>>(
         (const float*)logits, (const float*)bias, (float*)out, k, n_exp, wscale, wfloor);
 }
+
+// Fused depth-stack mix, multi-query:
+// out[:,qc] = normed(states) @ softmax(scale * normed(states)^T @ q[:,qc])
+// states [embd, rows] col-major; q [embd, qcols]; out [embd, qcols].
+// rows <= 64, qcols <= 8.
+__global__ void inkwell_mix(const float* __restrict__ st,
+                            const float* __restrict__ q,
+                            float* __restrict__ out,
+                            int embd, int rows, int qcols, float scale) {
+    __shared__ float s_rms[64];
+    __shared__ float s_p[64 * 8];
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    for (int j = w; j < rows; j += nw) {
+        const float* col = st + (size_t)j * embd;
+        float ss = 0.f;
+        for (int i = lane; i < embd; i += 32) ss += col[i] * col[i];
+        for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(~0u, ss, m);
+        const float rms = sqrtf(ss / (float)embd + 1e-6f);
+        if (lane == 0) s_rms[j] = rms;
+        for (int qc = 0; qc < qcols; ++qc) {
+            float dp = 0.f;
+            for (int i = lane; i < embd; i += 32) dp += col[i] / rms * q[(size_t)qc * embd + i];
+            for (int m = 16; m; m >>= 1) dp += __shfl_xor_sync(~0u, dp, m);
+            if (lane == 0) s_p[j * 8 + qc] = dp;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < qcols) {
+        const int qc = threadIdx.x;
+        float mx = -INFINITY;
+        for (int j = 0; j < rows; ++j) { s_p[j * 8 + qc] *= scale; mx = fmaxf(mx, s_p[j * 8 + qc]); }
+        float d = 0.f;
+        for (int j = 0; j < rows; ++j) { s_p[j * 8 + qc] = __expf(s_p[j * 8 + qc] - mx); d += s_p[j * 8 + qc]; }
+        for (int j = 0; j < rows; ++j) s_p[j * 8 + qc] /= d;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < embd * qcols; i += (int)blockDim.x) {
+        const int c = i / embd, e = i - c * embd;
+        float a = 0.f;
+        for (int j = 0; j < rows; ++j) a += st[(size_t)j * embd + e] / s_rms[j] * s_p[j * 8 + c];
+        out[i] = a;
+    }
+}
+extern "C" void ink_launch_mix(const void* st, const void* q, void* out,
+                               int embd, int rows, int qcols, float scale, void* stream) {
+    inkwell_mix<<<1, 256, 0, (cudaStream_t)stream>>>(
+        (const float*)st, (const float*)q, (float*)out, embd, rows, qcols, scale);
+}
+
