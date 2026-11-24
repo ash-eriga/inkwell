@@ -747,6 +747,64 @@ impl Runner {
         let mckv = dtp("model.llm.middle_cycle_cross_pass_kv_queries");
         let row: fn(&[u8], usize) -> &[u8] = |b, r| &b[r * 2304 * 4..(r + 1) * 2304 * 4];
 
+        // ---- on_dev expert placement plan ----
+        // Loop layers (6..18) run 3 passes/token, the rest 1: plan which layers'
+        // expert blobs sit in VRAM by visits/byte desc within an expert budget,
+        // instead of greedy index order (which put all of 0-11 on_dev while loop
+        // layers 12-17 paid PCIe misses). INKWELL_PLACE_INDEX=1 restores the old
+        // index-order policy; INKWELL_DEV_LAYERS="6-17,..." forces an explicit set;
+        // INKWELL_DEV_EXPERT_MB overrides the budget. A planned layer still falls
+        // back to pinned at load time if it does not fit (same margin check).
+        let place_plan: Option<Vec<bool>> = if std::env::var_os("INKWELL_PLACE_INDEX").is_some() {
+            None
+        } else {
+            // sizing pre-pass: header metadata only, no data reads
+            let mut totals = [0usize; 24];
+            for il in 0..24usize {
+                let pre = lp(il, "mlp.experts");
+                for e in 0..128usize {
+                    for proj in ["gate_proj", "up_proj", "down_proj"] {
+                        for part in ["trellis", "suh", "svh"] {
+                            totals[il] += tp(&format!("{pre}.{e}.{proj}.{part}")).nbytes() as usize;
+                        }
+                    }
+                }
+            }
+            let mut plan = vec![false; 24];
+            let mut budget = None;
+            if let Ok(spec) = std::env::var("INKWELL_DEV_LAYERS") {
+                for tok in spec.split(',') {
+                    let t = tok.trim();
+                    if t.is_empty() { continue }
+                    let (a, b) = t.split_once('-').unwrap_or((t, t));
+                    if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                        for il in a..=b.min(23) { plan[il] = true; }
+                    }
+                }
+            } else {
+                // default = what index-order placed with the BEST env (layers 0-11)
+                let bud = std::env::var("INKWELL_DEV_EXPERT_MB").ok()
+                    .and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
+                    .unwrap_or(3_121_348_608);
+                budget = Some(bud);
+                let mut ord: Vec<usize> = (0..24).collect();
+                ord.sort_by(|&a, &b| {
+                    let va = if (6..18).contains(&a) { 3usize } else { 1 };
+                    let vb = if (6..18).contains(&b) { 3usize } else { 1 };
+                    (vb * totals[a]).cmp(&(va * totals[b]))
+                });
+                let mut used = 0usize;
+                for &il in &ord {
+                    if used + totals[il] <= bud { plan[il] = true; used += totals[il]; }
+                }
+            }
+            let on: Vec<usize> = (0..24).filter(|&i| plan[i]).collect();
+            let mib: usize = on.iter().map(|&i| totals[i] >> 20).sum();
+            eprintln!("place: on_dev={on:?} experts={mib}MiB budget={}MiB",
+                budget.map_or("inf".to_string(), |b| (b >> 20).to_string()));
+            Some(plan)
+        };
+
         // ---- per-layer ----
         let mut layers = Vec::with_capacity(24);
         let mut pinned: Vec<inkwell_cuda::PinnedBuf> = Vec::new();
@@ -913,7 +971,9 @@ impl Runner {
                 let (f_free, _) = inkwell_cuda::mem_info();
                 eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
                 let dev_margin: usize = std::env::var("INKWELL_DEV_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
-                let base = if (f_free as usize) > total + (dev_margin << 20) {
+                let on_dev = place_plan.as_ref().map_or(true, |p| p[il])
+                    && (f_free as usize) > total + (dev_margin << 20);
+                let base = if on_dev {
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
                     blob.write_bytes(&host);
                     drop(host);
@@ -936,7 +996,6 @@ impl Runner {
                     unsafe { std::ptr::copy_nonoverlapping(descs[pi * 512..].as_ptr().cast::<u8>(), pb.host, 128 * 32) };
                     pb
                 };
-                let on_dev = f_free as usize > total + (dev_margin << 20);
                 l.moe_exl3 = Some(moe_args_exl3.len());
                 moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),

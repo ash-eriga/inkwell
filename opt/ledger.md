@@ -396,3 +396,56 @@ runs — no token flips. Warning count unchanged (60 `warning:` lines before/aft
 
 VERDICT: **ACCEPT** — candidate median faster (-18.6%), gold passes every K/nky
 incl. empty chunks, byte-identical output, killswitch default OFF = new kernel.
+
+## 2026-11-24 — on_dev expert placement by visits/byte (lever 0)
+
+Hypothesis (Review 2026-11-24): index-order greedy placement puts layers 0-11
+on_dev, so loop layers 12-17 (3 visits/tok each) pay PCIe misses while prelude
+0-5 (1 visit each) sits in VRAM. Planning on_dev by visits/byte desc inside the
+same expert-VRAM budget should cut staged bytes/tok.
+
+Change (crates/inkwell-run/src/runner.rs, one place): sizing pre-pass from
+safetensor headers (no data reads) -> greedy fill by visits/total desc.
+Default budget 3_121_348_608 B = exactly what index-order placed with BEST env
+(layers 0-11 = 2976.75 MiB). Env: INKWELL_DEV_EXPERT_MB overrides budget,
+INKWELL_DEV_LAYERS forces a set, INKWELL_PLACE_INDEX=1 = old policy (killswitch).
+Planned layers keep the old free>total+margin(1300) fit check -> pinned fallback.
+
+Plan chosen (default): on_dev={6..15} 2796 MiB = 30 visits resident (was 24);
+14 pinned layers all still got k=20 caches (free ~435 MiB after load).
+
+### e2e A/B (BEST env + INKWELL_EXL3_CACHE_K=20, alternating C/A; ms/tok = s*1000/64)
+| pair | control (PLACE_INDEX=1) | candidate (default plan) |
+| 1 | 3.7157s = 58.06 | 3.8081s = 59.50 |
+| 2 | 3.7484s = 58.57 | 3.6778s = 57.47 |
+| 3 | 3.7604s = 58.76 | 3.6939s = 57.72 |
+| 4 | 3.7779s = 59.03 | 3.7064s = 57.91 |
+| median | **58.66** | **57.82** (-1.4%) |
+Candidate beat both neighbouring controls in 3/4 pairs -> ACCEPT (small).
+md5 5cbe8e06 prefix on "generated text" in every run. Warnings 60 -> 60.
+
+### Sweep
+| config | on_dev (actual) | caches | ms/tok |
+| DEV_LAYERS=6-17 (margin 1300) | {6-15}; 16,17 margin-fallback | 14 | 59.30 |
+| DEV_LAYERS=6-17 margin=600 | {6-17} all loop resident | 8 | OOM at runtime (16 MiB graph alloc) |
+| DEV_LAYERS=6-17 margin=600 cache_margin=150 | {6-17} | 6 | 62.64 |
+| DEV_EXPERT_MB=2727 | {2,6-14} 28 visits | 14 | 59.18 |
+| DEV_EXPERT_MB=3227 | {6-15}; 16 margin-fallback | 14 | 58.07 |
+| DEV_EXPERT_MB=3227 margin=800 | {6-16} | 13 | OOM (153 MiB left) |
+| DEV_EXPERT_MB=3227 margin=800 cache_margin=250 | {6-16} | 10 | 61.32 |
+| k=16, default place | {6-15} | 14 | 60.24 |
+| k=24, default place | {6-15} | 14 | 55.23 / 56.11 / 57.37 (med 56.11) |
+| k=20, default place (extra) | {6-15} | 14 | 57.85 |
+
+Notes: dev_margin (1300) is the binding constraint, not the budget — layer 16/17
+can only go on_dev by lowering it, and every resident layer beyond ~2.8 GiB
+trades ~4-6 caches (uncached pinned layers cost more than a k=20 layer's misses).
+k=24 beats k=20 neighbours in all 3 runs: ACCEPT as new best env knob
+(INKWELL_EXL3_CACHE_K=24, ~281 MiB free after load — tight; keep an eye on it).
+Next: INKWELL_EXL3_CACHE_K=28; visits/byte could also weight small nonloop
+layers once a ~2.2bpw quant makes all loop layers fit.
+- Review repro (2026-11-24, interleaved idx20/plc20/plc24/plc28 x3, BEST env):
+  idx20 58.79/60.03/61.95 | plc20 58.22/57.65/56.60 | plc24 55.54/57.06/58.03 | plc28 FAIL x3 (OOM).
+  Placement ACCEPTED (plc20 beats both idx20 neighbours in all 3). k=24 inconclusive (+~1%, inside noise)
+  and k=28 OOMs -> k=24 sits near the VRAM edge; BEST env keeps INKWELL_EXL3_CACHE_K=20.
+  Known limit: default budget (3121348608 B) is calibrated for this quant; a new quant needs INKWELL_DEV_EXPERT_MB.
