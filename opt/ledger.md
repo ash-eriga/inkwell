@@ -866,3 +866,19 @@ hot pool. Global-LFU + allocator keeps the working-set choice free.
   pair wins 11/16 (69%). Median faster; pair-win rate just under the 75% bar —
   the remaining misses are the bigger blobs and part of the copy is hidden by
   the side stream, so the byte savings translate at ~1/3 of the naive estimate.
+
+### Brain re-validation on master: kslot variable-size expert slots — ACCEPTED
+
+- Cherry-picked 0046981 and 640db2b onto e4d6044.
+- Review:
+  - the free list holds at most 3·64+1 extents, inside KSLOT_FLMAX = 256;
+  - the eviction loop terminates, since each pass evicts one entry or breaks;
+  - experts claimed by this token (hits or new allocations) are never evicted;
+  - experts that do not fit fall back to EXL3_DIRECT;
+  - the prefetch bank keeps the uniform stride.
+- A/B with BEST env + graphs on top of the glue fusions, ctl,ks,ks,ctl ×4 (ctl = `INKWELL_NO_KSLOT=1`):
+  - ctl median 47.87 ms/tok (46.82–50.84);
+  - ks median 46.78 ms/tok (45.77–47.18);
+  - **−2.3%**; ks wins 6/8 neighbouring pairs; md5 5cbe8e06 on all 16 runs; warnings 62.
+  The child's run on the older base gave −1.4% with 11/16 pair wins.
+- Exposed staging measured by the child (INKWELL_SKIP_CCOPY, debug only): ~8.8 ms/tok. It is still the largest single item; the next lever is prefetch.
