@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "exl3_gemv_v2.cuh"
 
 extern "C" {
@@ -4632,4 +4633,51 @@ extern "C" void ink_launch_relbias_gather(const float* mm, const float* sinks,
     const int t = nkv * nh;
     inkwell_relbias_gather<<<(t + 255) / 256, 256, 0, (cudaStream_t)stream>>>(
         mm, sinks, (const int*)rel_pos, y, nkv, nh, ext);
+}
+
+// ---- ctrl gf_cat GEMV + ctrl_apply fusion (INKWELL_NO_GFAPPLY=1 disables) ----
+// One warp per output element i: gain = dot(row i, gate), forget =
+// dot(row fo+i, gate), then the ctrl_apply tail. Replicates mmvf's
+// warp-per-row 64-col dot (lane -> one pair, shfl_xor 16..1) so the sums
+// are bit-identical to the unfused mmvf + inkwell_ctrl_apply chain.
+__device__ __forceinline__ float2 gf_wload(const float* p, int i) {
+    return ((const float2*)p)[i];
+}
+__device__ __forceinline__ float2 gf_wload(const __nv_bfloat16* p, int i) {
+    const __nv_bfloat162 v = ((const __nv_bfloat162*)p)[i];
+    return make_float2(__bfloat162float(v.x), __bfloat162float(v.y));
+}
+template <typename T>
+__global__ void inkwell_gf_apply(const T* __restrict__ x,
+        const float* __restrict__ y, const float* __restrict__ cur,
+        const float* __restrict__ msg, float* __restrict__ dst, int n, int fo) {
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int i = blockIdx.x * 8 + w;
+    if (i >= n) return;
+    float g = 0.f, f = 0.f;
+    const float2 t = ((const float2*)y)[lane];
+    const float2 tg = gf_wload(x + (size_t)i * 64, lane);
+    const float2 tf = gf_wload(x + (size_t)(fo + i) * 64, lane);
+    g += tg.x * t.x; g += tg.y * t.y;
+    f += tf.x * t.x; f += tf.y * t.y;
+    for (int m = 16; m; m >>= 1) {
+        g += __shfl_xor_sync(0xffffffffu, g, m);
+        f += __shfl_xor_sync(0xffffffffu, f, m);
+    }
+    if (lane == 0) {
+        const float gn = tanhf(g), fg = tanhf(f);
+        const float r = __fsub_rn(cur[i], __fmul_rn(fg, cur[i]));
+        dst[i] = __fadd_rn(r, __fmul_rn(gn, msg[i]));
+    }
+}
+extern "C" void ink_launch_gf_apply(const void* x, int x_is_bf16,
+        const float* y, const float* cur, const float* msg,
+        float* dst, int n, int fo, void* stream) {
+    const unsigned g = (unsigned)(n + 7) / 8;
+    if (x_is_bf16)
+        inkwell_gf_apply<__nv_bfloat16><<<g, 256, 0, (cudaStream_t)stream>>>(
+            (const __nv_bfloat16*)x, y, cur, msg, dst, n, fo);
+    else
+        inkwell_gf_apply<float><<<g, 256, 0, (cudaStream_t)stream>>>(
+            (const float*)x, y, cur, msg, dst, n, fo);
 }

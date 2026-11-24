@@ -940,3 +940,37 @@ Full study (`opt/kbench/drafter/REPORT.md`) answering cost model, head/body desi
   - batch 2 (8 pairs, pre-registered: accept if 16-pair total ≥12/16 and median faster): ctl 49.64, pw 49.37, 6/8;
   - total **11/16**, median 47.97 → 47.04. md5 5cbe8e06 on all 32 runs. Other agents were building concurrently (batch 2 is ~3 ms slower overall).
 - Verdict: below the bar. Code stays on master **default off**, opt-in with `INKWELL_PW16=1`. Re-test on an idle machine; the expected effect (~1 ms) is close to the pair noise.
+## 2026-11-24 — BF16 ctrl/router weights + ctrl-cluster GEMV fusions (worktree t3-f8755cfb)
+
+### Finding: ggml-cuda mmvf already handles BF16 src0 on sm_61
+`mul_mat_vec_f<nv_bfloat16, float>` runs the identical strided col2 loop
+and F32 `acc += v*u` (bf16->f32 is an exact 16-bit shift; the file's BF16
+was widened to F32 at load). Block reduce is type-independent. So a
+loader-only change is bit-exact. supports_op: prec_src1=UNDEFINED ->
+passes; should_use_mmvf: sm_61 !mmf -> ne11<=8 -> mmvf. The NT=8 block
+path also shifts cublas->mmvf per-column, making block-vs-serial MORE
+consistent (same per-column order).
+
+### Change 1 — BF16 storage (commit 2178e4b; killswitch INKWELL_NO_BF16CTRL)
+densew! keeps file BF16 for: controllers down/gain/forget (+gf_cat),
+mlp.gate.weight, attn_sink_proj, k/v_sconv.weight_proj. dev_bytes sized
+to match. All are mul_mat src0 only; rel_bias pad + non-matmul misc stay
+F32. VRAM peak 5010 -> 4938 MiB (-72). md5 5cbe8e06 on all runs.
+A/B 4x (ctl,cand,cand,ctl): ctl med 48.96, cand med 48.86, wins 3/8 --
+inside noise (run sigma ~2.5ms vs ~0.3ms expected kernel saving).
+Misses/tok UNCHANGED (13046 cum): kslot budget is pinned by
+INKWELL_EXL3_CACHE_K=20, so freed VRAM does NOT auto-grow arenas; it is
+headroom for a bigger K or other work.
+
+### Change 2 — gf_cat GEMV + ctrl_apply fused (inkwell_gf_apply;
+killswitch INKWELL_NO_GFAPPLY). One warp per output i: 2x 32-pair dots
+(gain row i, forget row fo+i) + ctrl_apply tail; replicates mmvf's
+warp-per-row 64-col dot + shfl_xor 16..1 -> bit-identical (md5 holds).
+Removes the g3 intermediate + 96 mmvf + 96 ctrl_apply -> 96 launches.
+
+### Change 3 — rms2cat + ctrl_down GEMV fused (inkwell_rms2down;
+killswitch INKWELL_NO_RMSDOWN). Per output row: 256-thr block emulates
+the 1024-thr rms2cat reduce exactly (real thread t owns virtual tids
+{t,t+256,t+512}; real warp w covers virtual warps {w,w+8,w+16}), stages
+gate[4608] in smem, then the mmvf-256 dot (same pair map, same reduces).
+-96 rms2cat + -96 mmvf -> +96 fused launches.

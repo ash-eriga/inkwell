@@ -75,6 +75,7 @@ extern "C" {
     fn ink_launch_conv_step(x_in: *const f32, state: *mut f32, region_off: i32, w: *const f32, dyn_p: *const f32, ch: i32, n_heads: i32, scale: f32, out: *mut f32, snap: *mut f32, stream: *mut c_void);
     fn ink_launch_ctrl_apply(g3: *const f32, cur: *const f32, msg: *const f32, y: *mut f32, n: i32, ng: i32, stream: *mut c_void);
     fn ink_launch_rms2cat(x0: *const f32, x1: *const f32, y: *mut f32, n: i32, eps: f32, stream: *mut c_void);
+    fn ink_launch_gf_apply(x: *const c_void, x_is_bf16: i32, y: *const f32, cur: *const f32, msg: *const f32, dst: *mut f32, n: i32, fo: i32, stream: *mut c_void);
     fn ink_launch_relbias_gather(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, y: *mut f32, nkv: i32, nh: i32, ext: i32, stream: *mut c_void);
     fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_exl3_gemv_mz(trel: *const *const c_void, suh: *const *const c_void, svh: *const *const c_void, x: *const *const f32, y: *mut f32, ystride: i64, scr: *const *mut f32, k: *const i64, n: *const i64, ka: *const i64, halfk: *const i64, nz: i32, stream: *mut c_void);
@@ -789,6 +790,15 @@ pub unsafe fn ctrl_apply_async(g3: *const f32, cur: *const f32, msg: *const f32,
 /// Raw device pointers; launched on the ggml cuda stream.
 pub unsafe fn rms2cat_async(x0: *const f32, x1: *const f32, y: *mut f32, n: i32, eps: f32) {
     unsafe { ink_launch_rms2cat(x0, x1, y, n, eps, stream()) };
+}
+/// Fused ctrl gain/forget GEMV + apply: y[i] = (cur - tanh(dot(row fo+i))*cur)
+/// + tanh(dot(row i))*msg over the concatenated gain|forget weight.
+///
+/// # Safety
+/// `x` is the `[64, n+fo]` weight tensor (f32 or bf16 per `x_is_bf16`).
+pub unsafe fn gf_apply_async(x: *const c_void, x_is_bf16: i32, gate: *const f32,
+    cur: *const f32, msg: *const f32, y: *mut f32, n: i32, fo: i32) {
+    unsafe { ink_launch_gf_apply(x, x_is_bf16, gate, cur, msg, y, n, fo, stream()) };
 }
 /// rel-bias gather + sink subtract: y[j + h*nkv] = mm[rp[j] + h*ext] - sinks[h].
 ///

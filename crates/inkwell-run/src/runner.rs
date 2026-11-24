@@ -275,6 +275,23 @@ unsafe extern "C" fn ctrl_apply_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: 
     };
 }
 
+/// `ggml_custom_op_t`: fused ctrl gain/forget GEMV + apply.
+/// srcs = [gf_cat weight, gate, cur, msg]; dst [n]; userdata = forget offset fo.
+unsafe extern "C" fn gf_apply_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let fo = ud as usize as i32;
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let w = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let n = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let is_bf16 = i32::from(unsafe { inkwell_ggml::ink_tensor_type(w) } == BF16);
+    unsafe {
+        inkwell_cuda::gf_apply_async(inkwell_ggml::ink_tensor_data(w), is_bf16,
+            s(1), s(2), s(3), inkwell_ggml::ink_tensor_data(dst).cast(), n, fo)
+    };
+}
+
 /// `ggml_custom_op_t`: concat(rms_norm(x0), rms_norm(x1)) in one launch.
 /// srcs = [x0, x1]; dst [2n] with x0 in [0..n).
 unsafe extern "C" fn rms2cat_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
@@ -1505,12 +1522,20 @@ impl Runner {
         let gate = t::mmq(c, l.ctrl_down[ctrl].expect("ctrl_down"), gate);
         let (gain, forget);
         if let Some(cat) = l.ctrl_gf_cat[ctrl] {
-            let g3 = t::mmq(c, cat, gate);
             let [go, fo] = l.ctrl_gf_off[ctrl];
+            let ok = fuse && n % 4 == 0 && n / 4 <= 1024 && go == 0 && fo == n && t::ne(cat, 1) - fo == n;
+            // gf_apply fuses the g3 GEMV + apply tail (INKWELL_NO_GFAPPLY=1
+            // restores the mmq + ctrl_apply chain). Bit-identical to it.
+            if ok && std::env::var_os("INKWELL_NO_GFAPPLY").is_none() {
+                let mut args = [cat.0, gate.0, cur.0, msg.0];
+                return Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n, 1, 1, 1], &mut args,
+                    gf_apply_cb as *const () as usize, fo as usize as *mut std::ffi::c_void) });
+            }
+            let g3 = t::mmq(c, cat, gate);
             // fused kernel reads gain = g3[0..n), forget = g3[fo..fo+n):
             // only valid for that exact layout. ng travels in the userdata
             // pointer value (no per-build allocation).
-            if fuse && n % 4 == 0 && n / 4 <= 1024 && go == 0 && fo == n && t::ne(cat, 1) - fo == n {
+            if ok {
                 let mut args = [g3.0, cur.0, msg.0];
                 return Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n, 1, 1, 1], &mut args,
                     ctrl_apply_cb as *const () as usize, fo as usize as *mut std::ffi::c_void) });
