@@ -4630,58 +4630,43 @@ __global__ void inkwell_mix(const float* __restrict__ st,
         out[i] = a;
     }
 }
-// Multi-block mix (default; INKWELL_NO_MIXMB=1 = single-block kernel above).
-// The single-block kernel is latency-bound: rows is 1..6 in practice, so 1-6
-// warps each walk 72 dependent global loads per pass. mix_pre runs one warp
-// per (column j, query qc) and preloads the lane's 72 column and query values
-// into registers, then runs the SAME lane-strided sums (t = 0..71 in order)
-// and xor-shuffle trees; every (j,qc) warp recomputes rms identically.
-// mix_post recomputes the softmax exactly as before (thread 0, sequential j)
-// and splits the output elements over blocks, with loads batched 8 rows at a
-// time but accumulated in j order. Bit-identical to the single-block kernel.
+// Fused multi-block mix (default; INKWELL_NO_MIXMB=1 = single-block kernel
+// above). The single-block kernel is latency-bound: rows is 1..6 in practice,
+// so 1-6 warps each walk 72 dependent global loads per pass. Here block
+// (bx, qc) owns 256 output elements of query qc. Its warps first recompute
+// rms[j] and p[j][qc] for every row j (rows x 9 KiB, from L2): the lane's 72
+// column and query values are preloaded into registers, then the SAME
+// lane-strided sums (t = 0..71 in order) and xor-shuffle trees run. Thread 0
+// then does the sequential softmax exactly as before, and each thread
+// accumulates its element over j in order. One launch, no global scratch.
+// Bit-identical to the single-block kernel (md5-checked).
 #define MIX_NPL 72   // embd / 32 for embd = 2304; other embd use the old kernel
-#define MIX_SCR_STRIDE (64 + 64 * 8)
-__device__ float g_mix_scr[4 * MIX_SCR_STRIDE];
 
-__global__ void __launch_bounds__(32) inkwell_mix_pre(const float* __restrict__ st,
-                                const float* __restrict__ q,
-                                int embd, int qcols, int slot) {
-    float* s_rms = g_mix_scr + slot * MIX_SCR_STRIDE;
-    float* s_p = s_rms + 64;
-    const int j = blockIdx.x, qc = blockIdx.y, lane = threadIdx.x;
-    const float* col = st + (size_t)j * embd;
-    float c[MIX_NPL], qq[MIX_NPL];
-#pragma unroll
-    for (int t = 0; t < MIX_NPL; ++t) c[t] = col[lane + 32 * t];
-    if (qc < qcols) {
-#pragma unroll
-        for (int t = 0; t < MIX_NPL; ++t) qq[t] = q[(size_t)qc * embd + lane + 32 * t];
-    }
-    float ss = 0.f;
-#pragma unroll
-    for (int t = 0; t < MIX_NPL; ++t) ss += c[t] * c[t];
-    for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(~0u, ss, m);
-    const float rms = sqrtf(ss / (float)embd + 1e-6f);
-    if (qc == 0 && lane == 0) s_rms[j] = rms;
-    if (qc >= qcols) return;
-    float dp = 0.f;
-#pragma unroll
-    for (int t = 0; t < MIX_NPL; ++t) dp += c[t] / rms * qq[t];
-    for (int m = 16; m; m >>= 1) dp += __shfl_xor_sync(~0u, dp, m);
-    if (lane == 0) s_p[j * 8 + qc] = dp;
-}
-
-__global__ void inkwell_mix_post(const float* __restrict__ st,
-                                 float* __restrict__ out,
-                                 int embd, int rows, float scale, int slot) {
+__global__ void __launch_bounds__(256) inkwell_mix_fused(const float* __restrict__ st,
+                                const float* __restrict__ q, float* __restrict__ out,
+                                int embd, int rows, float scale) {
     __shared__ float s_rms[64];
     __shared__ float s_p[64];
     const int qc = blockIdx.y;
-    const float* g_rms = g_mix_scr + slot * MIX_SCR_STRIDE;
-    const float* g_p = g_rms + 64;
-    if (threadIdx.x < rows) {
-        s_rms[threadIdx.x] = g_rms[threadIdx.x];
-        s_p[threadIdx.x] = g_p[threadIdx.x * 8 + qc];
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    float qq[MIX_NPL];
+#pragma unroll
+    for (int t = 0; t < MIX_NPL; ++t) qq[t] = q[(size_t)qc * embd + lane + 32 * t];
+    for (int j = w; j < rows; j += nw) {
+        const float* col = st + (size_t)j * embd;
+        float c[MIX_NPL];
+#pragma unroll
+        for (int t = 0; t < MIX_NPL; ++t) c[t] = col[lane + 32 * t];
+        float ss = 0.f;
+#pragma unroll
+        for (int t = 0; t < MIX_NPL; ++t) ss += c[t] * c[t];
+        for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(~0u, ss, m);
+        const float rms = sqrtf(ss / (float)embd + 1e-6f);
+        float dp = 0.f;
+#pragma unroll
+        for (int t = 0; t < MIX_NPL; ++t) dp += c[t] / rms * qq[t];
+        for (int m = 16; m; m >>= 1) dp += __shfl_xor_sync(~0u, dp, m);
+        if (lane == 0) { s_rms[j] = rms; s_p[j] = dp; }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -4710,13 +4695,8 @@ extern "C" void ink_launch_mix(const void* st, const void* q, void* out,
     static int mb = -1;
     if (mb < 0) mb = getenv("INKWELL_NO_MIXMB") ? 0 : 1;
     if (mb && embd == 32 * MIX_NPL && rows >= 1 && rows <= 64 && qcols >= 1 && qcols <= 8) {
-        // 4 rotating scratch slots: consecutive mixes never share one
-        static unsigned mix_slot = 0;
-        const int slot = (int)(mix_slot++ & 3u);
-        inkwell_mix_pre<<<dim3(rows, qcols), 32, 0, (cudaStream_t)stream>>>(
-            (const float*)st, (const float*)q, embd, qcols, slot);
-        inkwell_mix_post<<<dim3((embd + 127) / 128, qcols), 128, 0, (cudaStream_t)stream>>>(
-            (const float*)st, (float*)out, embd, rows, scale, slot);
+        inkwell_mix_fused<<<dim3((embd + 255) / 256, qcols), 256, 0, (cudaStream_t)stream>>>(
+            (const float*)st, (const float*)q, (float*)out, embd, rows, scale);
         return;
     }
     inkwell_mix<<<1, 256, 0, (cudaStream_t)stream>>>(
