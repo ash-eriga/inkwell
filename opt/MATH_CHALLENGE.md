@@ -5,7 +5,7 @@ This is a math problem that can be worked on a CPU alone. The deliverable is a t
 ## 1. Why it matters
 Decoding one token of Inkling-2-Mini on a GTX 1060 takes ~38–41 ms. The largest single kernel, the MoE expert GEMV (~16 ms per token in nsys), is dot products whose weights are stored compressed as an EXL3 trellis.
 - ~3.06 billion weights are decoded per token: 48 layer visits × 8 experts × 3 matrices × 2304 × 1152, plus the dense layers.
-- The cost is instruction count, not memory traffic. Today it takes ~7.2 GPU instructions per weight.
+- The cost is instruction count, not memory traffic. The shipped kernel issues 9.47 GPU instructions per weight (SASS count).
 
 ## 2. The object
 For one 16×16 tile and an input vector x, the GPU computes
@@ -37,7 +37,11 @@ For one 16×16 tile and an input vector x, the GPU computes
 | bytesum + bias | 1 IDP (dp4a against 0x01010101) |
 | s → float, multiply-accumulate with x | I2F + FFMA |
 
-That is ~8 useful instructions, ~7.2 achieved per weight on average. The best exact variant found reaches ~5.6.
+The shipped loop issues 9.47 instructions per weight, because the multiply is lowered with extra XMADs and the window extraction is not shared between weights. The best exact variants measured in benchmarks reach 6.875–7.2.
+
+An earlier study derived an exact batch-1 lower bound of ≥5.63–6.19 instructions per weight, under the assumption that the multiply by c is done as written (hand-written 2-XMAD SASS). Beating it needs a reformulation that does not form c·w the usual way.
+
+Practical constraint learned on silicon: fewer instructions alone did not pay. A 7.2-instruction variant ran 40% slower at 48 registers per thread, because occupancy fell. Any answer must fit in ≤40 registers per thread with no spills.
 
 Other cost facts on sm_61:
 - `dp4a`, `prmt`, `lop3` (any 3-input bitwise function), and shifts each cost 1 instruction.
@@ -62,7 +66,7 @@ Other cost facts on sm_61:
 Find an algorithm that computes, for one tile, either
 (a) the sequence s(w_0), …, s(w_255), or
 (b) directly the integer-weighted sum Σ_k s(w_{n,k}) · x[k] up to the exact s → v map,
-with **provably the same result** as the reference and **fewer GPU instructions per weight** than ~5.6 under the cost model of §3.
+with **provably the same result** as the reference and **fewer GPU instructions per weight** than ~5.63 under the cost model of §3.
 
 Directions, none of them known to work:
 - exploit the recurrence of §4 to replace the 3-XMAD multiply;
@@ -71,7 +75,7 @@ Directions, none of them known to work:
 - bucket by s, so that Σ_k v(s_k) x_k = Σ_s v(s) · (Σ_{k : s_k = s} x_k), when that is cheaper;
 - use structure of c = 0x83DCD12D itself.
 
-A proof that ~5.6 instructions per weight is a floor under this cost model is also a valid answer.
+A proof that ~5.63 instructions per weight is a floor for every exact method under this cost model, not only for methods that form c·w, is also a valid answer.
 
 ## 7. Deliverables
 1. **Lean 4 (with Mathlib; pin the toolchain and Mathlib version):**
