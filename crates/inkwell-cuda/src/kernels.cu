@@ -4936,6 +4936,172 @@ __global__ void inkwell_gf_apply(const T* __restrict__ x,
         dst[i] = __fadd_rn(r, __fmul_rn(gn, msg[i]));
     }
 }
+// ---- bit-exact controller kernels with no 18.7 KiB gate staging buffer ----
+// Pointer tables travel in kernel parameter memory (by value), not in device
+// memory. A null gate pointer selects the fixed batched-triad scratch below.
+struct InkCtrlRmsPtrs {
+    const float* x0[3];
+    const float* x1[3];
+    const __nv_bfloat16* w[3];
+    float* dst[3];
+};
+struct InkCtrlGfPtrs {
+    const __nv_bfloat16* w[3];
+    const float* y[3];
+    const float* cur[3];
+    const float* msg[3];
+    float* dst[3];
+};
+struct InkCtrlTriadIo {
+    const float* cur[3];
+    const float* msg[3];
+    const void* down[3];
+    const void* gf[3];
+    float* dst;
+};
+__device__ float inkwell_ctrl_gate_scratch[3 * 64];
+
+template <int R, int B>
+__global__ void inkwell_rms2down_nosmem_mr(InkCtrlRmsPtrs ps, int n, float eps) {
+    __shared__ float s_sum[32];
+    __shared__ float s_buf[R][32];
+    const int b = (B == 1) ? 0 : blockIdx.y;
+    const float* __restrict__ x0 = ps.x0[b];
+    const float* __restrict__ x1 = ps.x1[b];
+    const __nv_bfloat16* __restrict__ w = ps.w[b];
+    float* __restrict__ dst = ps.dst[b];
+    if (!dst) dst = inkwell_ctrl_gate_scratch + b * 64;
+
+    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    const int n4 = n >> 2;
+    if (tid >= 24 && tid < 32) s_sum[tid] = 0.0f;
+
+    float scales[2];
+#pragma unroll
+    for (int bx = 0; bx < 2; ++bx) {
+        const float* x = bx ? x1 : x0;
+        float p[3];
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int vt = tid + k * 256;
+            if (vt < n4) {
+                const float4 q = __ldg(&((const float4*)x)[vt]);
+                p[k] = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+            } else {
+                p[k] = 0.0f;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            float v = p[k];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0) s_sum[wid + 8 * k] = v;
+        }
+        __syncthreads();
+        float t = s_sum[lane];
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) t += __shfl_xor_sync(0xffffffffu, t, m);
+        scales[bx] = rsqrtf(__fdiv_rn(t, (float)n) + eps);
+    }
+
+    if (tid < 32) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) s_buf[r][tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const int r0 = blockIdx.x * R;
+    const size_t stride2 = (size_t)n;
+    const __nv_bfloat162* wbase = (const __nv_bfloat162*)w + (size_t)r0 * stride2;
+    const float2* x0_2 = (const float2*)x0;
+    const float2* x1_2 = (const float2*)x1;
+    const int half2 = n >> 1;
+
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+
+    for (int c = tid; c < n; c += 256) {
+        const bool in0 = (c < half2);
+        const float2 raw = in0 ? __ldg(&x0_2[c]) : __ldg(&x1_2[c - half2]);
+        const float sc = in0 ? scales[0] : scales[1];
+        const float2 tg = make_float2(__fmul_rn(sc, raw.x), __fmul_rn(sc, raw.y));
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const __nv_bfloat162 tw = wbase[(size_t)r * stride2 + c];
+            acc[r] += __bfloat162float(tw.x) * tg.x;
+            acc[r] += __bfloat162float(tw.y) * tg.y;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], m);
+        if (lane == 0) s_buf[r][wid] = acc[r];
+    }
+    __syncthreads();
+    if (wid < R) {
+        const int r = wid;
+        float v = s_buf[r][lane];
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+        if (lane == 0) dst[r0 + r] = v;
+    }
+}
+
+template <int B>
+__global__ void inkwell_gf_apply_batch(InkCtrlGfPtrs ps, int n, int fo) {
+    const int b = (B == 1) ? 0 : blockIdx.y;
+    const __nv_bfloat16* __restrict__ x = ps.w[b];
+    const float* __restrict__ y = ps.y[b];
+    if (!y) y = inkwell_ctrl_gate_scratch + b * 64;
+    const float* __restrict__ cur = ps.cur[b];
+    const float* __restrict__ msg = ps.msg[b];
+    float* __restrict__ dst = ps.dst[b];
+
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int i = blockIdx.x * 8 + w;
+    if (i >= n) return;
+    const float2 t = __ldg(&((const float2*)y)[lane]);
+    const __nv_bfloat162 vg = ((const __nv_bfloat162*)(x + (size_t)i * 64))[lane];
+    const __nv_bfloat162 vf = ((const __nv_bfloat162*)(x + (size_t)(fo + i) * 64))[lane];
+    float g = 0.0f, f = 0.0f;
+    g += __bfloat162float(vg.x) * t.x; g += __bfloat162float(vg.y) * t.y;
+    f += __bfloat162float(vf.x) * t.x; f += __bfloat162float(vf.y) * t.y;
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        g += __shfl_xor_sync(0xffffffffu, g, m);
+        f += __shfl_xor_sync(0xffffffffu, f, m);
+    }
+    if (lane == 0) {
+        const float gn = tanhf(g), fg = tanhf(f);
+        const float r = __fsub_rn(cur[i], __fmul_rn(fg, cur[i]));
+        dst[i] = __fadd_rn(r, __fmul_rn(gn, msg[i]));
+    }
+}
+
+extern "C" void ink_launch_ctrl_triad(const InkCtrlTriadIo* io, int n, float eps,
+        int fo, void* stream) {
+    InkCtrlRmsPtrs rp{};
+    InkCtrlGfPtrs gp{};
+    for (int b = 0; b < 3; ++b) {
+        rp.x0[b] = io->cur[b];
+        rp.x1[b] = io->msg[b];
+        rp.w[b] = (const __nv_bfloat16*)io->down[b];
+        rp.dst[b] = nullptr;
+        gp.w[b] = (const __nv_bfloat16*)io->gf[b];
+        gp.y[b] = nullptr;
+        gp.cur[b] = io->cur[b];
+        gp.msg[b] = io->msg[b];
+        gp.dst[b] = io->dst + (size_t)b * (size_t)n;
+    }
+    const cudaStream_t st = (cudaStream_t)stream;
+    inkwell_rms2down_nosmem_mr<4, 3><<<dim3(16, 3), 256, 0, st>>>(rp, n, eps);
+    inkwell_gf_apply_batch<3><<<dim3((unsigned)(n + 7) / 8, 3), 256, 0, st>>>(gp, n, fo);
+}
+
 extern "C" void ink_launch_gf_apply(const void* x, int x_is_bf16,
         const float* y, const float* cur, const float* msg,
         float* dst, int n, int fo, void* stream) {
@@ -5016,7 +5182,16 @@ __global__ void inkwell_rms2down(const float* __restrict__ x0,
 extern "C" void ink_launch_rms2down(const float* x0, const float* x1,
         const void* w, int w_is_bf16, float* dst, int n, int nrows,
         float eps, void* stream) {
-    if (w_is_bf16)
+    static int no_ctrlbatch = -1;
+    if (no_ctrlbatch < 0) no_ctrlbatch = getenv("INKWELL_NO_CTRLBATCH") ? 1 : 0;
+    if (w_is_bf16 && !no_ctrlbatch && n == 2304 && nrows % 4 == 0) {
+        InkCtrlRmsPtrs ps{};
+        ps.x0[0] = x0;
+        ps.x1[0] = x1;
+        ps.w[0] = (const __nv_bfloat16*)w;
+        ps.dst[0] = dst;
+        inkwell_rms2down_nosmem_mr<4, 1><<<(unsigned)(nrows / 4), 256, 0, (cudaStream_t)stream>>>(ps, n, eps);
+    } else if (w_is_bf16)
         inkwell_rms2down<__nv_bfloat16><<<(unsigned)nrows, 256, 0, (cudaStream_t)stream>>>(
             x0, x1, (const __nv_bfloat16*)w, dst, n, eps);
     else

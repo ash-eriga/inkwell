@@ -311,6 +311,40 @@ unsafe extern "C" fn gf_apply_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i3
     };
 }
 
+#[repr(C)]
+struct CtrlTriadIo {
+    cur: [*const f32; 3],
+    msg: [*const f32; 3],
+    down: [*const std::ffi::c_void; 3],
+    gf: [*const std::ffi::c_void; 3],
+    dst: *mut f32,
+}
+
+struct CtrlTriadArgs {
+    down: [*const std::ffi::c_void; 3],
+    gf: [*const std::ffi::c_void; 3],
+    fo: i32,
+}
+
+/// `ggml_custom_op_t`: batched q/k/v controller triad.
+/// srcs = [cur0,msg0,cur1,msg1,cur2,msg2]; dst is [n,3].
+unsafe extern "C" fn ctrl_triad_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*(ud as *const CtrlTriadArgs) };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let io = CtrlTriadIo {
+        cur: [s(0), s(2), s(4)],
+        msg: [s(1), s(3), s(5)],
+        down: a.down,
+        gf: a.gf,
+        dst: unsafe { inkwell_ggml::ink_tensor_data(dst) as *mut f32 },
+    };
+    let n = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    unsafe { inkwell_cuda::ctrl_triad_async((&io as *const CtrlTriadIo).cast(), n, 1e-6, a.fo) };
+}
+
 /// `ggml_custom_op_t`: fused rms2cat + ctrl_down GEMV.
 /// srcs = [x0, x1, weight]; dst [nrows] where nrows = weight->ne[1].
 unsafe extern "C" fn rms2down_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
@@ -1562,6 +1596,45 @@ impl Runner {
         }
     }
 
+    /// Batch the three attention controllers into one custom op when their
+    /// BF16 concatenated gain/forget layout exactly matches gf_apply.
+    fn control_triad(&self, inputs: [Ptr; 3], msgs: [Ptr; 3], l: &L) -> Option<[Ptr; 3]> {
+        if std::env::var_os("INKWELL_NO_CTRLBATCH").is_some() { return None; }
+        let c = self.cur_ctx;
+        let n = t::ne(inputs[0], 0);
+        if n != 2304 { return None; }
+        let mut down = [std::ptr::null(); 3];
+        let mut gf = [std::ptr::null(); 3];
+        let mut fo = 0i32;
+        for j in 0..3 {
+            let (dn, cat) = (l.ctrl_down[j]?, l.ctrl_gf_cat[j]?);
+            let [go, foj] = l.ctrl_gf_off[j];
+            unsafe {
+                if inkwell_ggml::ink_tensor_type(dn.0) != BF16
+                    || inkwell_ggml::ink_tensor_type(cat.0) != BF16
+                    || inkwell_ggml::ink_tensor_ne(dn.0, 0) != 2 * n
+                    || inkwell_ggml::ink_tensor_ne(dn.0, 1) != 64
+                    || inkwell_ggml::ink_tensor_ne(cat.0, 0) != 64
+                    || go != 0 || foj != n || inkwell_ggml::ink_tensor_ne(cat.0, 1) - foj != n {
+                    return None;
+                }
+                down[j] = inkwell_ggml::ink_tensor_data(dn.0);
+                gf[j] = inkwell_ggml::ink_tensor_data(cat.0);
+            }
+            fo = foj as i32;
+        }
+        let ud = Box::leak(Box::new(CtrlTriadArgs { down, gf, fo }));
+        let mut args = [inputs[0].0, msgs[0].0, inputs[1].0, msgs[1].0, inputs[2].0, msgs[2].0];
+        let out = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n, 3, 1, 1], &mut args,
+            ctrl_triad_cb as *const () as usize, (ud as *mut CtrlTriadArgs).cast()) });
+        let stride = t::nb(out, 1);
+        Some([
+            t::view2(c, out, n, 1, stride, 0),
+            t::view2(c, out, n, 1, stride, stride),
+            t::view2(c, out, n, 1, stride, 2 * stride),
+        ])
+    }
+
     /// loop control gate: (1-forget)*cur + gain*msg
     fn control(&self, cur: Ptr, msg: Ptr, l: &L, ctrl: usize) -> Ptr {
         let c = self.cur_ctx;
@@ -1636,9 +1709,17 @@ impl Runner {
             }
         }
         if let Some(msgs) = messages {
-            for (j, inp) in inputs.iter_mut().enumerate() {
-                let m = t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), j as i64 * t::nb(msgs, 1));
-                *inp = self.control(*inp, m, l, j);
+            let ms = [
+                t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), 0),
+                t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), t::nb(msgs, 1)),
+                t::view2(c, msgs, n_embd, 1, t::nb(msgs, 2), 2 * t::nb(msgs, 1)),
+            ];
+            if let Some(batched) = self.control_triad(inputs, ms, l) {
+                inputs = batched;
+            } else {
+                for (j, inp) in inputs.iter_mut().enumerate() {
+                    *inp = self.control(*inp, ms[j], l, j);
+                }
             }
         }
         if il == 0 && std::env::var("INKWELL_DUMP").is_ok() {
