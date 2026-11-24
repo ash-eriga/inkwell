@@ -253,6 +253,20 @@ unsafe extern "C" fn router_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32,
         inkwell_ggml::ink_tensor_data(dst).cast(), 8, 128, a.wscale, a.wfloor) };
 }
 
+/// `ggml_custom_op_t`: fused BF16 mlp.gate GEMV + router top-k.
+/// srcs = [gate weight, input, bias]; dst[0..8]=weights, dst[8..16]=ids.
+unsafe extern "C" fn gate_router_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*(ud as *const RouterArgs) };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let w = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let x = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 1)) as *const f32 };
+    let bias = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 2)) as *const f32 };
+    let nrows = unsafe { inkwell_ggml::ink_tensor_ne(w, 1) } as i32;
+    let ncols2 = (unsafe { inkwell_ggml::ink_tensor_ne(w, 0) } / 2) as i32;
+    unsafe { inkwell_cuda::gate_router_async(inkwell_ggml::ink_tensor_data(w), x, bias.cast(),
+        inkwell_ggml::ink_tensor_data(dst).cast(), nrows, ncols2, 8, a.wscale, a.wfloor) };
+}
+
 struct MixArgs { embd: i32, rows: i32, qcols: i32, scale: f32 }
 
 unsafe extern "C" fn mix_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
@@ -1790,19 +1804,33 @@ impl Runner {
         fcur = self.norm(fcur, l.ffn_norm.expect("ffn_norm"));
 
         // MoE — sigmoid gating + bias select, fused gate_up, SITU
-        let logits = t::mmq(c, l.ffn_gate_inp.expect("g"), fcur); // [128, 1]
+        let gate_w = l.ffn_gate_inp.expect("g");
         let (ids, weights3);
         if std::env::var_os("INKWELL_NO_ROUTERFUSE").is_none() {
             // fused: sigmoid+bias+top8+normalize in one kernel; dst[0..8]=w, dst[8..16]=ids bits
             let pb = l.ffn_exp_probs_b.expect("pb");
-            let mut rargs = [logits.0, pb.0];
             let ud = Box::leak(Box::new(RouterArgs {
                 wscale: self.cfg.expert_weights_scale, wfloor: 6.103515625e-5 }));
-            let r_out = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [16, 1, 1, 1], &mut rargs,
-                router_cb as usize, (ud as *mut RouterArgs).cast()) });
+            let fuse_gate = unsafe {
+                inkwell_ggml::ink_tensor_type(gate_w.0) == BF16
+                    && inkwell_ggml::ink_tensor_ne(gate_w.0, 0) == 2304
+                    && inkwell_ggml::ink_tensor_ne(gate_w.0, 1) == 128
+            };
+            let r_out = if fuse_gate {
+                let mut rargs = [gate_w.0, fcur.0, pb.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [16, 1, 1, 1], &mut rargs,
+                    gate_router_cb as *const () as usize, (ud as *mut RouterArgs).cast()) })
+            } else {
+                // Non-BF16 fallback: keep the ggml GEMV but use the parallel router.
+                let logits = t::mmq(c, gate_w, fcur); // [128, 1]
+                let mut rargs = [logits.0, pb.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [16, 1, 1, 1], &mut rargs,
+                    router_cb as *const () as usize, (ud as *mut RouterArgs).cast()) })
+            };
             ids = t::view1(c, r_out, 8, 32);
             weights3 = t::reshape3(c, t::view1(c, r_out, 8, 0), 1, 8, 1);
         } else {
+            let logits = t::mmq(c, gate_w, fcur); // [128, 1]
             let probs = t::sigmoid(c, logits);
             let sel = t::add(c, probs, l.ffn_exp_probs_b.expect("pb"));
             ids = t::argsort_top_k(c, sel, 8); // [8, ntok]

@@ -4554,10 +4554,162 @@ __global__ void inkwell_router(const float* __restrict__ logits,
     }
 }
 
+// Parallel 4-warp router for the fixed 128-expert decode gate. The selection
+// rounds use the same first-lowest-index tie break as thread-0 serial argmax.
+__device__ __forceinline__ void inkwell_router_par_128_body(
+        const float* __restrict__ logits,
+        const float* __restrict__ bias,
+        float* __restrict__ out,
+        int k, float wscale, float wfloor) {
+    __shared__ float s_prb[128];
+    __shared__ float s_wv[4];
+    __shared__ int s_wi[4];
+    __shared__ int s_best;
+    __shared__ int s_ids[16];
+
+    const int t = threadIdx.x;
+    const int wid = t >> 5, lane = t & 31;
+    float sel = -INFINITY;
+    if (t < 128) {
+        const float l = logits[t];
+        const float p = 1.0f / (1.0f + __expf(-l));
+        s_prb[t] = p;
+        sel = p + bias[t];
+    }
+    __syncthreads();
+
+    for (int j = 0; j < k; ++j) {
+        if (t < 128) {
+            float bv = sel;
+            int bi = t;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, m);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, m);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (lane == 0) { s_wv[wid] = bv; s_wi[wid] = bi; }
+        }
+        __syncthreads();
+        if (t == 0) {
+            float bv = s_wv[0];
+            int bi = s_wi[0];
+#pragma unroll
+            for (int w = 1; w < 4; ++w) {
+                if (s_wv[w] > bv || (s_wv[w] == bv && s_wi[w] < bi)) {
+                    bv = s_wv[w]; bi = s_wi[w];
+                }
+            }
+            s_best = bi;
+            s_ids[j] = bi;
+        }
+        __syncthreads();
+        if (t == s_best) sel = -INFINITY;
+    }
+    if (t == 0) {
+        float wsum = 0.0f;
+        for (int j = 0; j < k; ++j) wsum += s_prb[s_ids[j]];
+        if (wsum < wfloor) wsum = wfloor;
+        const float inv = wscale / wsum;
+        for (int j = 0; j < k; ++j) {
+            out[j] = s_prb[s_ids[j]] * inv;
+            out[k + j] = __int_as_float(s_ids[j]);
+        }
+    }
+}
+
+__global__ void inkwell_router_par_128(const float* __restrict__ logits,
+        const float* __restrict__ bias, float* __restrict__ out,
+        int k, float wscale, float wfloor) {
+    inkwell_router_par_128_body(logits, bias, out, k, wscale, wfloor);
+}
+
 extern "C" void ink_launch_router(const void* logits, const void* bias, void* out,
                                   int k, int n_exp, float wscale, float wfloor, void* stream) {
-    inkwell_router<<<1, 256, 0, (cudaStream_t)stream>>>(
-        (const float*)logits, (const float*)bias, (float*)out, k, n_exp, wscale, wfloor);
+    if (n_exp == 128) {
+        inkwell_router_par_128<<<1, 128, 0, (cudaStream_t)stream>>>(
+            (const float*)logits, (const float*)bias, (float*)out, k, wscale, wfloor);
+    } else {
+        inkwell_router<<<1, 256, 0, (cudaStream_t)stream>>>(
+            (const float*)logits, (const float*)bias, (float*)out, k, n_exp, wscale, wfloor);
+    }
+}
+
+// Fused mlp.gate BF16 GEMV + router. Rows keep the exact ggml mmvf-256
+// accumulation/reduction order; the last block runs the parallel router.
+__device__ float inkwell_gate_router_logits[128];
+__device__ unsigned int inkwell_gate_router_ticket;
+
+template <int R>
+__global__ void inkwell_gate_router_fused_exact(
+        const __nv_bfloat16* __restrict__ w,
+        const float* __restrict__ x,
+        const float* __restrict__ bias,
+        float* __restrict__ out,
+        int ncols2, int k, float wscale, float wfloor) {
+    const int r0 = blockIdx.x * R;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5, lane = tid & 31;
+    __shared__ float buf[R][32];
+    __shared__ unsigned int ticket;
+    if (tid < 32) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) buf[r][tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const float2* y2 = (const float2*)x;
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
+
+    const size_t stride2 = (size_t)ncols2;
+    const __nv_bfloat162* base = (const __nv_bfloat162*)w + (size_t)r0 * stride2;
+
+    for (int col2 = tid; col2 < ncols2; col2 += 256) {
+        const float2 tmpy = __ldg(&y2[col2]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const __nv_bfloat162 tw = base[(size_t)r * stride2 + col2];
+            sum[r] += __bfloat162float(tw.x) * tmpy.x;
+            sum[r] += __bfloat162float(tw.y) * tmpy.y;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], m);
+        if (lane == 0) buf[r][wid] = sum[r];
+    }
+    __syncthreads();
+    if (wid < R) {
+        const int r = wid;
+        float v = buf[r][lane];
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+        if (lane == 0) inkwell_gate_router_logits[r0 + r] = v;
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) ticket = atomicAdd(&inkwell_gate_router_ticket, 1u);
+    __syncthreads();
+    if (ticket != gridDim.x - 1) return;
+    __threadfence();
+    if (tid == 0) inkwell_gate_router_ticket = 0u;
+
+    __shared__ float s_log[128];
+    if (tid < 128) s_log[tid] = __ldcg(&inkwell_gate_router_logits[tid]);
+    __syncthreads();
+    inkwell_router_par_128_body(s_log, bias, out, k, wscale, wfloor);
+}
+
+extern "C" void ink_launch_gate_router(const void* w, const float* x, const void* bias,
+        void* out, int nrows, int ncols2, int k, float wscale, float wfloor, void* stream) {
+    if (nrows == 128) {
+        inkwell_gate_router_fused_exact<4><<<nrows / 4, 256, 0, (cudaStream_t)stream>>>(
+            (const __nv_bfloat16*)w, x, (const float*)bias, (float*)out,
+            ncols2, k, wscale, wfloor);
+    }
 }
 
 // Fused depth-stack mix, multi-query:
