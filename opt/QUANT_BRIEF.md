@@ -4,7 +4,7 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 
 ## 1. The bottom line
 
-1. **Keep the EXL3 mul1 trellis.** Do not move to an int8-constrained codebook (TQIR-INT8, CPTC-INT8), int4, int8 or fp16. Section 4 gives the reasons.
+1. **Keep the EXL3 mul1 trellis for the experts.** Do not move them to an int8-constrained codebook (TQIR-INT8, CPTC-INT8), int4, int8 or fp16. Section 4 gives the reasons. The dense weights are the one exception worth testing (item 8).
 2. **On the GTX 1060, a lower bpw does not make the GEMV kernels faster per weight.** They are limited by instruction issue, not memory bandwidth. Bits per weight change speed only through which experts fit in VRAM and how many bytes cross PCIe per token.
 3. **The master spec's 128K plan fits on paper, with 5–25 MiB to spare.** Its expert layout is "loop layers resident, other layers streamed every token" (§6). Under that plan:
    - the loop-layer bpw decides whether the plan fits at all;
@@ -13,6 +13,7 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 5. **Report quality the same way as the current quant:** mean KLD and top-1 agreement against the source, using float64 logits over the full vocabulary.
 6. **For the drafter, acceptance decides the gain, not drafter speed.** Inkwell's drafter kernels already run a round in 0.24–0.68 ms. The first-draft acceptance p1 must reach ~0.75 for a +17% gain; at 0.5 speculation only breaks even (§7).
 7. **Build the drafter by surgery on today's DSpark head plus a distillation finetune, with no pretraining** (§7). Use the file format in §9.
+8. **Optional, measured: dense weights as group-wise INT4.** Attention and the unembed at INT4 g128 (4.125 bpw) cut the dense chain from ~10.24 to 6.98 ms/token (−3.26 ms) for +43 MiB. Inkwell adopts it only if KLD and top-1 are equal or better than all-EXL3 (§5.4).
 
 ## 2. What Inkwell is
 
@@ -24,7 +25,7 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 - **Current quant:** "SAGE REXL3 2.26 bpw", a mixed-precision EXL3 quant.
   - Size: 8.00 GiB. Experts take 6.130 GiB (2.153 bpw on average, including suh/svh). Loop-layer experts take 3.441 GiB (2.42 bpw including suh/svh). The dense trellis takes 0.488 GiB and the unembed 221.3 MiB.
   - Quality: mean KLD 0.0475, top-1 agreement 94.66%.
-- **Current speed:** 46.8 ms/token (~21.4 tok/s) at short context, on a desktop with apps running.
+- **Current speed (2026-11-24):** ~41 ms/token (~24 tok/s) at short context, on a desktop with apps running. Master measured 42.98 ms after per-layer cache sizing; a host-latency pass then measured −2.06 ms in its own A/B on master. Earlier sections of this brief that quote 46.8 ms predate both.
 
 ## 3. How the runtime uses the quant
 
@@ -36,19 +37,20 @@ This document is self-contained. It tells the quantization agent what the Inkwel
 - **Tensor names.** Experts are `...mlp.experts.{e}.{gate_proj,up_proj,down_proj}.{trellis,suh,svh}`. Keep the current naming and safetensors layout.
 - **Other tensors.**
   - Embeddings are dequantized on the host one row at a time, so their size does not matter for VRAM.
-  - The ctrl and router weights are BF16 in the file. The runtime widens them to F32 today, which costs 148 MiB on device. Moving them to BF16 on device is a runtime change, not a quant change.
+  - The ctrl and router weights are BF16 in the file. The runtime now keeps them as BF16 on device (done; it saved ~76 MiB against widening them to F32). Keep them BF16.
 
 ### 3.2 Where each expert lives
 
 The runtime splits a fixed VRAM budget for experts as follows:
 
 1. **Resident layers.** All 128 experts of the layer stay in VRAM. Layers are chosen by visits per byte, so loop layers come first. Today layers 6–15 are resident, within a budget of 3,121,348,608 B (2.907 GiB). That budget is tuned to the current quant.
-2. **Cached layers.** Every other layer gets an LFU expert cache in VRAM, sized at 20 of the layer's largest expert. That covers 14 layers today, ~811 MiB in total. Slots are packed by each expert's actual size, so smaller experts fit more of them.
-3. **Misses.** An expert that is neither resident nor cached is copied from pinned host memory over PCIe during the token. The caches hit 73.9% of selections, which leaves ~37.6 misses and ~64 MiB copied per token.
+2. **Cached layers.** Every other layer gets an LFU expert cache in VRAM. Each layer's cache size comes from a measured table: replayed expert-ID traces give a miss-bytes curve per layer, and the budget goes where it saves the most bytes. That covers 14 layers today, 940 MiB in total; the loop layers L16 and L17 get 156 MiB each, the others 44–64 MiB. Slots are packed by each expert's actual size, so smaller experts fit more of them.
+3. **Misses.** An expert that is neither resident nor cached is copied from pinned host memory over PCIe during the token. With the per-layer table the caches hit ~81% of selections, which leaves ~28 misses and ~53 MiB copied per token (the uniform sizing it replaced: 73.9%, ~37.6 misses, ~64 MiB).
+4. **The table is tied to this quant.** A new quant that makes L16/L17 resident drops their entries by itself; Inkwell re-runs the trace replay to re-size the rest.
 
 ### 3.3 Measured VRAM limits
 
-- **The process cap is 5,120 MiB.** The owner keeps the display reserve as a hard safety margin. The best config peaks at 5,010 MiB.
+- **The process cap is 5,120 MiB.** The owner keeps the display reserve as a hard safety margin. The best config peaks at 5,052 MiB.
 - **Free VRAM after load:** 150–435 MiB.
 - **OOM thresholds observed** (re-checked against the logs):
   - a crash in `cudaGraphInstantiate` with ~96 MiB free;
@@ -182,7 +184,7 @@ Inkwell plans speculative decoding with a small drafter. The drafter's precision
 
 ### 7.1 Acceptance decides the gain
 
-Modeled speed against today's 46.8 ms/token serial, with p1 = P(first draft accepted) and q = P(each later draft accepted). Draft rounds take 0.24 ms (1 draft) to 0.68 ms (3 drafts), measured.
+Modeled speed against the 46.8 ms/token serial speed of the time (the runtime is now ~41 ms; the ratios still apply), with p1 = P(first draft accepted) and q = P(each later draft accepted). Draft rounds take 0.24 ms (1 draft) to 0.68 ms (3 drafts), measured.
 
 | p1 | q | best k (drafts per round) | ms/token | vs serial |
 |---|---|---|---|---|
