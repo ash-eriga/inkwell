@@ -449,3 +449,19 @@ layers once a ~2.2bpw quant makes all loop layers fit.
   Placement ACCEPTED (plc20 beats both idx20 neighbours in all 3). k=24 inconclusive (+~1%, inside noise)
   and k=28 OOMs -> k=24 sits near the VRAM edge; BEST env keeps INKWELL_EXL3_CACHE_K=20.
   Known limit: default budget (3121348608 B) is calibrated for this quant; a new quant needs INKWELL_DEV_EXPERT_MB.
+
+## 2026-11-24 — EXL3 decode math (Gemini 4 Neon, opt/kbench/exl3_math/, CPU-proved)
+- Exhaustive CPU tests reproduced (all 65536 windows, 4.06M incremental transitions, 7 K geometries): FAIL=0.
+- Review correction: REPORT.md "slot-equivalents" SUM per-pipe costs (I2F x3.6, SHF x1.9). That predicts
+  today's kernel <=100-128 Gw/s, but kbench measures 211 Gw/s -> the model is wrong. Use issued instr/weight
+  (1 slot each) + per-pipe limits checked separately. Issued instr/weight from its SASS counts:
+  | variant | instr/w | exact? | relerr (zero-mean x / all-positive x) |
+  | today MAC=0 (I2F) | 8.50 | yes | 1.7e-6 / 1.2e-4 |
+  | C1c magic-FADD + paired (D,D+16) windows via .H0/.H1, M=32 | 6.75 (-21%) | yes | 1.4e-6 / 1.8e-6 |
+  | C4 IDP4A(-510) + XMAD.S16 MAC, int16 x per 16-blk | 5.69 (-33%) | no | 2.0e-5 / 1.3e-5 |
+  211 Gw/s at 8.5 instr/w = 1.79 T instr/s ~= 78% of 10 SM x 128 x ~1.8 GHz -> near issue-bound, so the
+  instruction cut should translate (C1c -> ~270-340 Gw/s, C4 -> ~320-400 Gw/s).
+- Bandwidth floor (722 Gw/s @ 204 GB/s, 2.26 bpw) needs <= ~3.2 instr/w: unreachable losslessly
+  (3 XMAD for h*C via ptxas + 1 IDP + >=1 MAC + extract). "Native 2-XMAD" needs cubin patching: not pursued.
+- Next: port C1c (exact, also more accurate than today) + paired-window extraction into sgemv_run after the
+  occupancy/ILP agent lands; C4 as a separate gated variant (needs e2e text check).
