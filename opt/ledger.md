@@ -1196,3 +1196,42 @@ Brain re-A/B on master 3f60c55 (16 pairs, ctl = `INKWELL_NO_GARGMAX=1 INKWELL_NO
 ctl median 45.22, cand 43.16 ms/tok, **−2.06 ms, 12/16** pair wins, md5 5cbe8e06 on all 32 runs.
 Fast-forwarded master to `t3/host-latency-token-critical-path` (61ab1dc + ledger). Killswitches
 `INKWELL_NO_GARGMAX`, `INKWELL_NO_ASYNCSTEP`; per-token prints now behind `INKWELL_STEPDBG`.
+## 2026-11-24 — Multi-block inkwell_mix + merged had_in (worktree t3-3ed86fc4)
+
+### Target 1: multi-block inkwell_mix — NOT ACCEPTED, opt-in INKWELL_MIXMB=1 (3171b17)
+
+- `inkwell_mix<<<1,256>>>` split into `mix_pre` (one warp per column over
+  many blocks; per-column lane-strided sums + xor-shuffle trees verbatim)
+  and `mix_post` (per-block redundant sequential softmax, output split
+  over SMs by element). 4-slot rotated `__device__` scratch (9 KiB).
+- nsys, BEST env, one run each: `inkwell_mix` 240 x 27.8us avg (19.2 med)
+  = 6.67 ms -> `mix_pre` 240 x 17.7us + `mix_post` 240 x 4.6us = 5.37 ms.
+  Kernel saving ~20us/tok. NOTE: measured 3.75 mix launches/tok here, not
+  the 120/tok in the task brief — the real total is ~0.10 ms/tok, not 2.64.
+- E2E A/B (ctl,cand,cand,ctl) x8, both arms INKWELL_NO_HADMERGE=1,
+  ctl = INKWELL_NO_MIXMB=1:
+  - ctl: 2.913 3.135 3.000 2.976 2.911 2.936 3.304 3.233 3.217 3.109
+         3.021 3.005 3.149 3.014 2.946 2.913 (med 3.009s = 47.02 ms/tok)
+  - cand: 3.036 2.962 2.993 2.931 2.937 2.953 3.239 3.318 2.988 3.352
+          3.083 3.411 3.445 3.126 2.887 3.001 (med 3.018s = 47.16 ms/tok)
+  - wins 8/16. md5 5cbe8e06 on all 32 runs.
+- Verdict: real -19% kernel time but ~25x below the E2E noise floor on this
+  shared machine; below the bar. Ships default-off, opt-in INKWELL_MIXMB=1
+  (INKWELL_NO_MIXMB vetoes).
+
+### Target 2: merged had_in — NOT ACCEPTED, opt-in INKWELL_HADMERGE=1 (7743082)
+
+- `inkwell_exl3_had_in_n` (HadNArgs by value, up to 8 members) does the
+  identical 128-point butterfly per member. mz groups projections by
+  identical (x,k): leader's stream runs one merged had_in before member
+  gemv tails (`exl3_gemv_tail` factored out of ink_launch_exl3_gemv).
+  ntok merges its 8 sequential had_ins into one launch.
+- nsys, same env: `had_in` 578 x 3.3us = 1.89 ms -> `had_in_n` 208 x 4.2us
+  + `had_in` 98 = 1.12 ms per run (-41%, ~12us/tok; launches -272).
+- Verdict: same noise-floor problem; no separate A/B run since the kernel
+  saving (~0.77 ms/run) is under the measured run-to-run sigma. md5
+  5cbe8e06 on all opt-in runs. Ships default-off (INKWELL_NO_HADMERGE
+  vetoes).
+
+warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
++9 KiB static scratch only (no new allocations); commits 3171b17, 7743082.
