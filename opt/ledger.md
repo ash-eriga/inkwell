@@ -974,3 +974,14 @@ the 1024-thr rms2cat reduce exactly (real thread t owns virtual tids
 {t,t+256,t+512}; real warp w covers virtual warps {w,w+8,w+16}), stages
 gate[4608] in smem, then the mmvf-256 dot (same pair map, same reduces).
 -96 rms2cat + -96 mmvf -> +96 fused launches.
+
+### Combined fusions A/B (ctl = INKWELL_NO_RMSDOWN=1 + INKWELL_NO_GFAPPLY=1,
+cand = both on), 4x (ctl,cand,cand,ctl):
+ctl: 47.47 45.38 48.79 49.67 47.23 45.71 47.80 47.75 (med 47.61)
+cand: 45.42 47.02 46.41 47.25 46.68 46.16 47.32 48.85 (med 46.85)
+-> -0.76 ms/tok (-1.6%), wins 5/8 -- under the 6/8 gate, trend positive.
+md5 5cbe8e06 on all 16 runs; warnings 62; VRAM peak 4934 MiB (<5120);
+misses 13046 cum unchanged. Launches/tok: -192 vs unfused ctrl chain
+(2 fused ops/site replacing 4). Serial sanity path: 48.30 base ->
+47.62 (bf16) -> 46.38 (+gf) -> 46.22 (+rms2down).
+Commits: 2178e4b (BF16 storage), a25ff40 (gf_apply), 282ef33 (rms2down).
