@@ -993,3 +993,10 @@ Commits: 2178e4b (BF16 storage), a25ff40 (gf_apply), 282ef33 (rms2down).
   - ctl median 48.09 ms/tok, bf median 46.58 ms/tok, **−1.51 ms (−3.1%)**;
   - bf wins **14/16** neighbouring pairs; md5 5cbe8e06 on all 32 runs; warnings 62.
 - VRAM peak 5010 → 4934 MiB (child measurement). The 76 MiB freed are not yet spent on caches (CACHE_K pins the arena).
+
+### Pre-gate expert prefetch (branch t3/pregate-expert-prefetch, f9715d4) — REJECTED, not merged
+
+- d=1 pre-gate on fcur claims the top-M experts of the next layer in its kslot arena and copies them on the side stream. Killswitch INKWELL_NO_PREGATE; md5 identical.
+- Misses fall ~3.6× (37.6 → ~15/tok at M=12), but the token gets slower: M=12 59.2–62.5 ms, M=8 54.0 ms, vs 46.78 baseline.
+- Cause: PCIe 3.0 bytes are the cost. Claims move ~125 MB/tok against ~86 MB/tok of demand; the 1.24× prediction waste is wire time, and the ~0.7 ms window between issue and join per visit cannot hide 0.5–0.9 ms of copies. A ≥2-visit predictor would be needed, and step 0 found none.
+- Lesson: on this box, fewer bytes over PCIe wins (cache sizing, smaller streamed experts), not earlier bytes.
