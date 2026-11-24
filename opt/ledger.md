@@ -1316,3 +1316,25 @@ warnings 59 (47 run + 11 cuda + 1 cli); kernels.cu 4905 lines; VRAM
   exited with no output; 6 follow-up runs with full logs all passed with md5
   `5cbe8e06`; the same empty-exit happened once on the startup branch, which
   lacks this change, so it is not attributed to devdesc). ACCEPTED.
+
+## 2026-11-24 — startup-to-first-decode branch (t3/startup-to-first-decode, 0d48987): A/B on master base — HELD for owner
+
+- ctl = master-equivalent binary (devdesc worktree, same crates as 1218f58); cand = branch rebased on 1218f58.
+  BEST env, 3 rounds of ctl,st,st,ctl, one flock. md5 `5cbe8e06` on all 12 runs.
+- Peak RSS (VmHWM): ctl median **5,148 MiB**, cand **4,590 MiB** → **−558 MiB**, lower in **6/6** pairs.
+- Launch → first decode: ctl median 21.24 s, cand 23.21 s → **+1.97 s**, slower in **5/6** pairs.
+  Wall: 24.92 → 27.00 s.
+- Decode: ctl 38.00, cand 37.77 ms/tok (no regression).
+- Verdict: the branch's stated goal (startup time) is not met; the RSS cut is real. Not merged;
+  the RAM-vs-startup trade-off goes to the owner.
+
+## 2026-11-24 — production SASS per K (nvcc 12.6, sm_61), for MATH_CHALLENGE_STEP2
+
+- `opt/tools/sass_loops.py` on `cuobjdump -sass` of kernels.cu at 60c73af. Main loop = 4 tiles × 8 windows = 32 w/lane.
+- `gemv_moe_s` (40 regs): K1.5 8.41, K2 8.44, K2.5 9.22, K3 9.34, K3.5 9.47, K4 9.44, K5 9.38 instr/w;
+  expert-weighted **8.81**. `gemv_sf` (48 regs) within 5 instr per loop; `gemv_s` 40 regs.
+- Every loop: XMAD = 96 (3/w), IDP = I2F = FFMA = 32. All LOP32I are 0xffff window masks; SHR is the D=0 `>>16`.
+- PTX forms tried for a 2-XMAD mul1 (opaque c × (v>>16), cvt.u32.u16 + mul.lo, mad.lo with 0x83DC0000):
+  all ≥3 instructions. 2-XMAD needs a SASS rewrite → brief `opt/MATH_CHALLENGE_STEP2.md`
+  (count model: experts 8.81 → 7.58 instr/w).
+- K=6 trellis tensors are vision-encoder only (self_attn.*, mlp.c_fc/c_proj, visual.*); not on the text decode path.
