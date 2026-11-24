@@ -242,3 +242,16 @@ near the ~1500-instr estimate). No scheduling trick helps; only fewer instr/weig
 (dp4a — dead on x-int8 accuracy) or re-quant (vetoed). Serial sits ~97ms/tok,
 ~10.3 TPS. Remaining upside <10 0.000000rom here absent a new quant or a GPU with
 native low-bit MMA.
+
+## 2026-11-23 — dp4a-broadcast x8 (dense gemv path) — REJECTED (correct, slower)
+- Variant `inkwell_exl3_gemv_dp4a_x8` behind `INKWELL_EXL3_X8=1` (tk<=160 only):
+  x int8 per-16-window (prologue-quantized to smem), weight = dp4a.u32.s32 of
+  w16*0x83DCD12D plane-bytes × broadcast x byte. sx term from raw xh (required —
+  quantizing sx diverged generation).
+- Correctness: GOLDEN after fixes (mixed-sign dp4a asm; byte-pattern broadcast;
+  accumulator as both in/out; prologue ring fill; amax=0 guard).
+- Speed: ~95-110ms vs ~92ms baseline — quant prologue + extra smem traffic eats
+  the ~15-30% inner-loop instruction cut. The binding cost is the w16 bit-window
+  extract (funnel+mask, ~3-4 instr/weight), which dp4a cannot remove.
+- Conclusion: dp4a variants on the EXL3 dense path are exhausted; the per-weight
+  window-extract is the floor. Same reason the moe path port is unlikely to pay.

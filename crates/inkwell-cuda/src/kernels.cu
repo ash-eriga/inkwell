@@ -1680,6 +1680,145 @@ __global__ void inkwell_exl3_had_out(const float* __restrict__ t,
 // bytesum → t[c] = k_inv * sum_r xh[r] * bytesum(w_rc*M) + k_bias * sum_r xh[r].
 // bytesum = dp4a(w*M, 0x01010101). One thread per output column c loops all r:
 // no atomics, no fp16 decode in the inner loop.
+// x-int8-per-16-group + weight plane-byte dp4a variant.
+// Per weight: xh[r]*bs[r] == dp4a(w16*MAGIC_bytes, broadcast(x8[r])) exactly,
+// where x8 = per-window int8 quant of xh (16 elems share a scale).
+// All windows' x8+scale are quantized once in the prologue (smem, no per-iter
+// barrier). Requires tk <= 160 (launcher falls back otherwise).
+__global__ void inkwell_exl3_gemv_dp4a_x8(const uint32_t* __restrict__ trel,
+                                        const float* __restrict__ xh,
+                                        float* __restrict__ t,
+                                        int tk, int tn, int ka, int halfk) {
+    const int g = threadIdx.x >> 6;
+    const int u = threadIdx.x & 63;
+    const int c = u >> 2, rp = u & 3;
+    const int tn_i = blockIdx.x * 4 + g;
+    const int w = r_bits_words(ka, halfk);
+    __shared__ uint32_t rings[4 * 8 * 80];
+    __shared__ int8_t xq8[160][16];
+    __shared__ float xsc[160];
+    __shared__ float xhb[4][16];
+    const bool live = tn_i < tn;
+    const int tkc = (tk + gridDim.y - 1) / gridDim.y;
+    const int tk0 = blockIdx.y * tkc;
+    const int tk1 = min(tk0 + tkc, tk);
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    float s = 0.f, sx = 0.f;
+    uint32_t widx[4];
+    {
+        const int r_bits = halfk ? 256 * ka + 128 : 256 * ka;
+        const int nw = r_bits >> 5;
+        int q = 0;
+        for (int r = rp; r < 16; r += 4, ++q) {
+            const int i = ((((c & 7) << 2) | ((r >> 1) & 3)) << 3)
+                        | (r & 1) | ((r & 8) >> 2) | ((c & 8) >> 1);
+            const int s_i = halfk ? (i + 1) * ka + ((i + 1) >> 1) : (i + 1) * ka;
+            const int b0 = s_i - 16 + (s_i < 16 ? r_bits : 0);
+            const int i0 = b0 >> 5;
+            const int s0 = 48 - (b0 & 31);
+            const int i1 = (i0 + 1 == nw) ? 0 : i0 + 1;
+            widx[q] = (uint32_t)(i0 | (i1 << 7) | (s0 << 14));
+        }
+    }
+    // prologue 1: quantize ALL of this block's windows (16-lane groups, shfl amax)
+    {
+        const int lane = threadIdx.x & 15;
+        const int wgrp = threadIdx.x >> 4;  // 16 groups x 16 lanes
+        for (int win = wgrp; win < tk1 - tk0; win += 16) {
+            const float xv = xh[(tk0 + win) * 16 + lane];
+            float amax = fabsf(xv);
+#pragma unroll
+            for (int m = 8; m > 0; m >>= 1)
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+            const float sc = fmaxf(amax / 127.f, 1e-12f);
+            const float inv = amax > 0.f ? 127.f / amax : 0.f;
+            const int v = max(-127, min(127, (int)roundf(xv * inv)));
+            xq8[win][lane] = (int8_t)v;
+            if (lane == 0) xsc[win] = sc;
+        }
+    }
+    // prologue 2: fill ring + xhb for batch tk0
+    if (threadIdx.x < 64) {
+        const int j = threadIdx.x;
+        const int tkn0h = min(4, tk1 - tk0);
+        if (j < 16 * tkn0h) xhb[j >> 4][j & 15] = xh[(tk0 + (j >> 4)) * 16 + (j & 15)];
+    }
+    if (live) {
+        const int tkn0 = min(4, tk1 - tk0);
+        uint32_t* rg = rings + g * 4 * 80;
+        for (int bn = 0; bn < tkn0; ++bn) {
+            const uint32_t* ring = trel + (size_t)((tk0 + bn) * tn + tn_i) * (size_t)w;
+            if (u < w) rg[bn * 80 + u] = ring[u];
+            if (u + 64 < w) rg[bn * 80 + u + 64] = ring[u + 64];
+        }
+    }
+    __syncthreads();
+    for (int tkb0 = tk0; tkb0 < tk1; tkb0 += 4) {
+        const int tkn = min(4, tk1 - tkb0);
+        const int nb0 = tkb0 + 4;
+        const int tkn2 = min(4, tk1 - nb0);
+        uint32_t pfb[4][2];
+        float pfx = 0.f;
+        if (live && nb0 < tk1) {
+            for (int b = 0; b < tkn2; ++b) {
+                const uint32_t* ring = trel + (size_t)((nb0 + b) * tn + tn_i) * (size_t)w;
+                if (u < w) pfb[b][0] = ring[u];
+                if (u + 64 < w) pfb[b][1] = ring[u + 64];
+            }
+        }
+        if (threadIdx.x < 64 && nb0 < tk1) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn2) pfx = xh[(nb0 + (j >> 4)) * 16 + (j & 15)];
+        }
+        if (live) {
+            const uint32_t* rg = rings + g * 4 * 80;
+            for (int b = 0; b < tkn; ++b) {
+                const int win = tkb0 + b - tk0;
+                const float scb = xsc[win];
+                const int8_t* xw = xq8[win];
+                uint32_t x8b[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    x8b[q] = (uint32_t)(uint8_t)xw[rp + 4 * q] * 0x01010101u;
+                int qint = 0;
+                float sxl = 0.f;
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const uint32_t wi = widx[q];
+                    const uint64_t v = ((uint64_t)rg[b * 80 + (wi & 127)] << 32)
+                                     | (uint64_t)rg[b * 80 + ((wi >> 7) & 127)];
+                    const uint32_t w16 = (uint32_t)(v >> (wi >> 14)) & 0xffffu;
+                    asm volatile("dp4a.u32.s32 %0, %1, %2, %0;" : "+r"(qint)
+                                 : "r"(w16 * 0x83DCD12Du), "r"(x8b[q]));
+                    sxl += (float)(int8_t)x8b[q];
+                }
+                s += scb * (float)qint;
+                sx += xhb[b][rp] + xhb[b][rp + 4] + xhb[b][rp + 8] + xhb[b][rp + 12];
+                (void)sxl;
+            }
+        }
+        __syncthreads();
+        if (live && nb0 < tk1) {
+            uint32_t* rg = rings + g * 4 * 80;
+            for (int b = 0; b < tkn2; ++b) {
+                if (u < w) rg[b * 80 + u] = pfb[b][0];
+                if (u + 64 < w) rg[b * 80 + u + 64] = pfb[b][1];
+            }
+        }
+        if (threadIdx.x < 64 && nb0 < tk1) {
+            const int j = threadIdx.x;
+            if (j < 16 * tkn2) xhb[j >> 4][j & 15] = pfx;
+        }
+        __syncthreads();
+    }
+    s += __shfl_xor_sync(0xffffffffu, s, 1);
+    sx += __shfl_xor_sync(0xffffffffu, sx, 1);
+    s += __shfl_xor_sync(0xffffffffu, s, 2);
+    sx += __shfl_xor_sync(0xffffffffu, sx, 2);
+    if (live && rp == 0) t[blockIdx.y * (tn * 16) + tn_i * 16 + c] = fmaf(KINV, s, KOFF * sx);
+}
+
 __global__ void inkwell_exl3_gemv_dp4a(const uint32_t* __restrict__ trel,
                                        const float* __restrict__ xh,
                                        float* __restrict__ t,
@@ -1987,8 +2126,11 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
       while (nb * nky < tgt && nky < 8 && nky * 16 <= tk) nky *= 2; }
     if (nky > 1) cudaMemsetAsync(scratch + k, 0, nky * n * 4, (cudaStream_t)stream);
     dim3 gsz((unsigned)nb, (unsigned)nky, 1);
-    inkwell_exl3_gemv_dp4a<<<gsz, 256, 0, (cudaStream_t)stream>>>(
-        (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
+    { static int x8 = -1; if (x8 < 0) { const char* e = getenv("INKWELL_EXL3_X8"); x8 = e ? atoi(e) : 0; }
+      if (x8 && tk <= 160) inkwell_exl3_gemv_dp4a_x8<<<gsz, 256, 0, (cudaStream_t)stream>>>(
+              (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
+      else inkwell_exl3_gemv_dp4a<<<gsz, 256, 0, (cudaStream_t)stream>>>(
+        (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk); }
     inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
         scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
 }
