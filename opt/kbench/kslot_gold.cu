@@ -105,6 +105,7 @@ static void hfree(HFl& f, int base, int len) {
 }
 
 struct Ctx {
+    std::vector<uint32_t> pre;
     uint32_t* dA;
     uint32_t* dB;
     uint32_t* dflag;
@@ -137,9 +138,21 @@ static void sync_stage(const char* stage, long call) {
 
 static void print_diff(Ctx& c, uint32_t w, long call, const CallInput& in,
                        int kmax, int key_base, int arena) {
-    std::vector<uint32_t> ha(STW), hb(STW);
+    std::vector<uint32_t> ha(STW), hb(STW), ge(GENN);
     CK(cudaMemcpy(ha.data(), c.dA, STW * 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(hb.data(), c.dB, STW * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ge.data(), c.d_gexp, GENN * 4, cudaMemcpyDeviceToHost));
+    FILE* df = fopen("/tmp/kslot_dump.bin", "wb");
+    if (df) {
+        int hdr[8] = {kmax, in.ns, key_base, arena, in.ns_arg,
+                      (int)in.use_pnexp, in.force_direct, in.pready};
+        fwrite(hdr, 4, 8, df);
+        fwrite(c.pre.data(), 4, STW, df);
+        fwrite(in.ids.data(), 4, 64, df);
+        fwrite(in.ptag.data(), 4, 64, df);
+        fwrite(ge.data(), 4, GENN, df);
+        fclose(df);
+    }
     const char* reg = w < (uint32_t)OFF_TAG ? "fl" :
         w < (uint32_t)OFF_SOFF ? "tag" :
         w < (uint32_t)OFF_CNT ? "soff" :
@@ -175,6 +188,8 @@ static void print_diff(Ctx& c, uint32_t w, long call, const CallInput& in,
 static bool run_one(Ctx& c, const CallInput& in, int kmax, int key_base,
                     int arena, long call, bool check_sync) {
     State sa = st_of(c.dA), sb = st_of(c.dB);
+    c.pre.resize(STW);
+    CK(cudaMemcpy(c.pre.data(), c.dA, STW * 4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(c.d_ids, in.ids.data(), 64 * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(c.d_ptag, in.ptag.data(), 64 * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(c.d_pready, &in.pready, 4, cudaMemcpyHostToDevice));
