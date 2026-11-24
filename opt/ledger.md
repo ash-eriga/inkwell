@@ -770,3 +770,7 @@ cand median 49.09 (-5.7%); adjacent-pair wins 6/8
 md5 5cbe8e06f2d8d82feb7f2ca287a7bc59 all runs. **ACCEPTED** (commit
 1f8c66a). Note: measured on post-gcache master where per-launch bubble
 is smaller (~3.4ms union idle) — gain is mostly launch-count-driven.
+OPCNT after (fusions on): ADD 88 MUL 218 CONCAT 164 RMS_NORM 202
+UNARY 49 CUSTOM 937 SUB 0 CONT 0 GET_ROWS 0 -> kernel-launching
+nodes/token 2830 -> 2114 (-716, -25%). CONT/GET_ROWS/SUB fully
+eliminated from the per-token graph.
