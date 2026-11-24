@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
             return [&, nkyv]() {
                 if (nkyv > 1) CK(cudaMemsetAsync(dt, 0, (size_t)nslots * n * 4));
                 inkwell_exl3_gemv_moe_s<<<dim3((tn + 7) / 8, nslots, S.nsel * nkyv), 256>>>(
-                    DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, nkyv, nullptr, 0);
+                    DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, nkyv, nullptr, 0, ink_pw16_mask());
             };
         };
         CK(cudaMemset(dt, 0, (size_t)nslots * n * 4)); old1(); verdict("old nky=1", rel());
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
             std::vector<float> sent((size_t)nslots * n, -777.f);
             CK(cudaMemcpy(dt, sent.data(), sent.size() * 4, cudaMemcpyHostToDevice));
             inkwell_exl3_gemv_moe_s<<<dim3((tn + 7) / 8, nslots, S.nsel), 256>>>(
-                DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, 1, dmiss, sm);
+                DA, DB, dids, dxh, dxh2, xh2s, dt, n, tzoff, tk, tn, S.k, n, 1, dmiss, sm, ink_pw16_mask());
             CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
             CK(cudaMemcpy(outbuf.data(), dt, outbuf.size() * 4, cudaMemcpyDeviceToHost));
             double e = 0; int untouched = 1;

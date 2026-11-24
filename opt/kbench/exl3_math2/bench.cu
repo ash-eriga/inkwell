@@ -1445,6 +1445,7 @@ static void timeit_interleaved(FB&& fbase, FC&& fcand, Timing& tb, Timing& tc, i
 
 int main(int argc, char** argv) {
     const int mask = (argc > 1) ? atoi(argv[1]) : 7;
+    const int pwmask = (argc > 2) ? atoi(argv[2]) : 0;
     const int nslots = 8;
     const uint32_t CM = 0x83DCD12Du;
     struct Stage { const char* name; int k, nout, nsel; };
@@ -1539,7 +1540,7 @@ int main(int argc, char** argv) {
             };
             const dim3 g((tn + 7) / 8, nslots, S.nsel);
             auto fship = [&]() {
-                inkwell_exl3_gemv_moe_s<<<g, 256>>>(dd1_raw, dd2_raw, dids, dxg, dxu, S.k, dt, n, tzoff, tk, tn, S.k, n, 1, nullptr, 0);
+                inkwell_exl3_gemv_moe_s<<<g, 256>>>(dd1_raw, dd2_raw, dids, dxg, dxu, S.k, dt, n, tzoff, tk, tn, S.k, n, 1, nullptr, 0, pwmask);
             };
             int idx = 0;
             auto run_one = [&](const char* name, auto fn) {
@@ -1554,6 +1555,7 @@ int main(int argc, char** argv) {
             };
 
             run_one("Shipped sgemv_run (nky=1, exact)", fship);
+            run_one("PW16-port C0c (ship kern, exact)", [&]() { inkwell_exl3_gemv_moe_s<<<g, 256>>>(dd1_raw, dd2_raw, dids, dxg, dxu, S.k, dt, n, tzoff, tk, tn, S.k, n, 1, nullptr, 0, 16); });
             run_one("M=8-Opt C0c (zero-ctr I2F, exact)", [&]() { r2::gemv_m8_k2<0><<<g, 256>>>(dd1_rot, dd2_rot, dxg, dxu, dt, tzoff, tk, tn, S.k, n, CM); });
             run_one("M=8-Opt C3b (folded FP32 per-tile)", [&]() { r2::gemv_m8_k2<1><<<g, 256>>>(dd1_rot, dd2_rot, dxg, dxu, dt, tzoff, tk, tn, S.k, n, CM); });
             run_one("M=8-Opt C4 (IDP4A+XMAD.S16, blk=128)", [&]() { r2::gemv_m8_k2<2><<<g, 256>>>(dd1_rot, dd2_rot, dxg, dxu, dt, tzoff, tk, tn, S.k, n, CM); });
@@ -1630,7 +1632,7 @@ int main(int argc, char** argv) {
         CK(cudaMalloc(&dt_d, (size_t)nslots * n * 4));
         const dim3 g((tn + 7) / 8, nslots, S.nsel);
         auto fship_b1 = [&]() {
-            inkwell_exl3_gemv_moe_s<<<g, 256>>>(dd1_raw, dd2_raw, dids, dx_d1, dx_d2, S.k, dt_d, n, tzoff, tk, tn, S.k, n, 1, nullptr, 0);
+            inkwell_exl3_gemv_moe_s<<<g, 256>>>(dd1_raw, dd2_raw, dids, dx_d1, dx_d2, S.k, dt_d, n, tzoff, tk, tn, S.k, n, 1, nullptr, 0, pwmask);
         };
         printf("%-26s %2s %8s %8s %8s %9s %9s %7s %9s\n",
                "Kernel", "B", "Ship1_us", "Cand_us", "CandMed", "Rd_Gw/s", "Eff_GMAC", "vsShip", "max_rel");
@@ -1812,7 +1814,7 @@ int main(int argc, char** argv) {
             };
             const dim3 g((tn + 7) / 8, nslots, S.nsel);
             auto fship = [&]() {
-                inkwell_exl3_gemv_moe_s<<<g, 256>>>(dd1_raw, dd2_raw, dids, dxg, dxu, S.k, dt, n, tzoff, tk, tn, S.k, n, 1, nullptr, 0);
+                inkwell_exl3_gemv_moe_s<<<g, 256>>>(dd1_raw, dd2_raw, dids, dxg, dxu, S.k, dt, n, tzoff, tk, tn, S.k, n, 1, nullptr, 0, pwmask);
             };
             int idx = 0;
             auto run_one = [&](const char* name, auto fn) {

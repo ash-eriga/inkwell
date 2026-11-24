@@ -882,3 +882,32 @@ hot pool. Global-LFU + allocator keeps the working-set choice free.
   - **−2.3%**; ks wins 6/8 neighbouring pairs; md5 5cbe8e06 on all 16 runs; warnings 62.
   The child's run on the older base gave −1.4% with 11/16 pair wins.
 - Exposed staging measured by the child (INKWELL_SKIP_CCOPY, debug only): ~8.8 ms/tok. It is still the largest single item; the next lever is prefetch.
+
+## 2026-11-24 — M=16-Paired C0c port into shipped sgemv cores (K=2/2.5/3/4): verified, shipped (`INKWELL_NO_PW16`)
+
+PORT of r2's exact FP32 `M=16-Paired C0c` into `inkwell_exl3_gemv_s`, `inkwell_exl3_gemv_sf`,
+`inkwell_exl3_gemv_moe_s` (`crates/inkwell-cuda/src/kernels.cu`). The L1 ring rotation is folded
+into the lane bit-offset in-kernel (rot bit q == raw bit q+KA-16 mod R) — no load-time data
+transform, so ntok/dp4a/v2/dbg readers stay valid. CM reaches the MAC asm from the opaque
+`__device__` var `ink_pw16_cm` (the r2 CM trick — a literal refolds to 4-XMAD and costs ~26%).
+src[sub-1] for the rotation is fetched via `__shfl` from lane sub-1, not a 3rd LDG (LSU-bound).
+New kernel arg `pw16` = per-K enable bitmask; `ink_pw16_mask()` = `INKWELL_NO_PW16 ? 0 : PW16_KMASK`.
+2-way in-block tk-split (part=tid>>7), 16 lanes/tile, xor-merge + smem cross-part reduce, epilogue
+`fmaf(KINV, acc, (KOFF+510*KINV)*sx)`. Dispatch: `pw = (pw16>>kk)&1` per block (kk=ka*2+hk).
+
+Per-K kbench (DRAM-bound moe_s, distinct tensors, nky=1, interleaved min-of-31, GU 144x72 / DN 72x144):
+  K1.5 -8.5/-5.6 | K2.0 +6.0/+8.0 | K2.5 -0.2/+5.0 | K3.0 +3.6/+7.7 | K3.5 -11.8/-4.0 | K4.0 +6.8/+8.5 | K5.0 -19.0/-13.2
+Enabled: PW16_KMASK = bits{4,5,6,8} = K2.0, K2.5, K3.0, K4.0. In the r2 harness the K=2 port measured
+265 vs shipped 247 Gw/s (+7%); r2's physically-rotated variant reaches ~295 — the ~10% gap is the
+in-kernel rotation overhead, accepted to keep all other readers valid.
+
+GOLD (sgemv_gold MoE, sgemv_dense_gold, real dumps): PASS on all shapes/skipmodes; pw16 errs
+~0.9-2.0e-6 <= shipped 2.75e-6 (e.g. GU nky=1: 1.99e-6 vs 2.75e-6). Regs: moe_s/gemv_s/gemv_sf all
+40 regs, moe_s 0 spills, gemv_sf 4B stack spill; 6 blk/SM maintained. kernels.cu 4164 -> 4494 lines.
+
+E2E A/B (--run, GGML_PASCAL_GRAPHS=1 INKWELL_MAX_CTX=512 INKWELL_CACHE_MARGIN_MB=10
+INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_V2=1 INKWELL_MOE_NKY=2, flock, 8 pairs ctl,cand,cand,ctl):
+  ctl  s: 3.169 3.128 3.053 3.035 3.278 3.169 3.095 3.298  -> median 3.148 (49.2 ms/tok)
+  cand s: 3.079 3.044 3.044 3.139 3.072 3.008 3.106 3.069  -> median 3.070 (48.0 ms/tok)
+  cand median -2.5%, pair wins 6/8 -> ACCEPT.
+  generated text md5 identical ctl==cand (no divergent token).

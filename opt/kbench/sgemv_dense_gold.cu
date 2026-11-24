@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
             auto newk = [&]() {
                 if (nky > 1) CK(cudaMemsetAsync(S.dt, 0, (size_t)nky * n * 4));
                 inkwell_exl3_gemv_s<<<dim3((tn + 7) / 8, nky, 1), 256>>>(
-                    S.dtr, S.dxh, S.dt, tk, tn, S.ka, S.hk);
+                    S.dtr, S.dxh, S.dt, tk, tn, S.ka, S.hk, ink_pw16_mask());
             };
             char cfg[32]; snprintf(cfg, sizeof cfg, "new nky=%d", nky);
             newk(); const double e = sum_and_rel(nky);
@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
             std::vector<float> big((size_t)nky * n);
             float* dtl; CK(cudaMalloc(&dtl, (size_t)nky * n * 4));
             inkwell_exl3_gemv_s<<<dim3((tn + 7) / 8, nky, 1), 256>>>(
-                S.dtr, S.dxh, dtl, tk, tn, S.ka, S.hk);
+                S.dtr, S.dxh, dtl, tk, tn, S.ka, S.hk, ink_pw16_mask());
             CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
             CK(cudaMemcpy(big.data(), dtl, big.size() * 4, cudaMemcpyDeviceToHost));
             double e = 0;
@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
                     Shape& S = *ms[z]; const int nky = pick_new(S.tn, S.tk, tgt);
                     if (nky > 1) cudaMemsetAsync(S.dt, 0, (size_t)nky * S.n() * 4, st[z]);
                     inkwell_exl3_gemv_s<<<dim3((S.tn + 7) / 8, nky, 1), 256, 0, st[z]>>>(
-                        S.dtr, S.dxh, S.dt, S.tk, S.tn, S.ka, S.hk);
+                        S.dtr, S.dxh, S.dt, S.tk, S.tn, S.ka, S.hk, ink_pw16_mask());
                 }
                 for (int z = 0; z < 5; ++z) CK(cudaStreamSynchronize(st[z]));
             };

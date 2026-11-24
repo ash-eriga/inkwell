@@ -1935,6 +1935,238 @@ __device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int t
                                           int tk_lo, int tk_hi, const float* __restrict__ xs,
                                           float& a0, float& a1);
 
+// ---- M=16-paired "C0c" core (port of opt/kbench/exl3_math2 r2::gemv_m16 MODE 0) ----
+// 16 lanes per tile (sub = threadIdx.x & 15), 2-way in-block tk split
+// (part = threadIdx.x >> 7), exact FP32 I2F: acc += x * (bytesum(h*C) - 510),
+// out = KINV*acc + (KOFF + 510*KINV)*sx.
+// The round-2 L1 ring rotation (rot bit q == raw bit (q + KA - 16) mod R) is
+// folded into the lane bit offset, so trellis words on disk/device are NOT
+// transformed and every other reader (ntok, dp4a, v2, dbg) stays valid.
+// Killswitch: INKWELL_NO_PW16 -> launchers pass pw16=0 (shipped core).
+#define PW16_CENT 0xFFFFFE02u   // -510: zero-centered bytesum bias
+#define PW16_KOFFC -0.0018157958984375f  // KOFF + 510*KINV
+// CM must reach the MAC asm from an opaque (device-memory) source or ptxas
+// refolds h*0x83DCD12D into the slower 4-XMAD form (r2 "CM trick").
+__device__ uint32_t ink_pw16_cm = 0x83DCD12Du;
+__device__ __forceinline__ uint32_t pw16_h0(uint32_t U, uint32_t cm) {
+    uint32_t t, p;
+    asm("{\n\t.reg .u16 lo, hi, cl, ch;\n\tmov.b32 {lo, hi}, %1;\n\tmov.b32 {cl, ch}, %2;\n\tmul.wide.u16 %0, lo, cl;\n\t}"
+        : "=r"(t) : "r"(U), "r"(cm));
+    asm("{\n\t.reg .u16 lo, hi, cl, ch;\n\t.reg .u32 q;\n\tmov.b32 {lo, hi}, %1;\n\tmov.b32 {cl, ch}, %2;\n\t"
+        "mul.wide.u16 q, lo, ch;\n\tmad.lo.u32 %0, q, 65536, %3;\n\t}"
+        : "=r"(p) : "r"(U), "r"(cm), "r"(t));
+    return p;
+}
+__device__ __forceinline__ uint32_t pw16_h1(uint32_t U, uint32_t cm) {
+    uint32_t t, p;
+    asm("{\n\t.reg .u16 lo, hi, cl, ch;\n\tmov.b32 {lo, hi}, %1;\n\tmov.b32 {cl, ch}, %2;\n\tmul.wide.u16 %0, hi, cl;\n\t}"
+        : "=r"(t) : "r"(U), "r"(cm));
+    asm("{\n\t.reg .u16 lo, hi, cl, ch;\n\t.reg .u32 q;\n\tmov.b32 {lo, hi}, %1;\n\tmov.b32 {cl, ch}, %2;\n\t"
+        "mul.wide.u16 q, hi, ch;\n\tmad.lo.u32 %0, q, 65536, %3;\n\t}"
+        : "=r"(p) : "r"(U), "r"(cm), "r"(t));
+    return p;
+}
+__device__ __forceinline__ void pw16_pair(uint32_t U, float x1, float x0,
+                                          float& a1, float& a0, uint32_t cm) {
+    a1 = fmaf(x1, (float)(int)__dp4a(pw16_h1(U, cm), 0x01010101u, PW16_CENT), a1);
+    a0 = fmaf(x0, (float)(int)__dp4a(pw16_h0(U, cm), 0x01010101u, PW16_CENT), a0);
+}
+template <int KA, int H>
+__device__ __forceinline__ void pw16_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
+                                         int a_lo, int a_hi, const float* __restrict__ xs,
+                                         float& a0, float& a1) {
+    constexpr int NW = 8 * KA + 4 * H;
+    const int sub = threadIdx.x & 15;
+    const int hx_f = (sub & 1) ? 8 : 0;
+    const uint32_t cm = ink_pw16_cm;
+    if constexpr (KA == 2 && H == 0) {
+        // rot word w = fsl(src[w], src[w-1], 18); lane sub needs rot sub & sub+1.
+        // src[sub-1] is lane sub-1's S0 -> SHFL instead of a third LDG (LSU-bound).
+        const size_t stride = (size_t)tn * 16;
+        const uint32_t* p0 = tb + ((size_t)a_lo * tn + tn_i) * 16 + sub;
+        const uint32_t* p1 = tb + ((size_t)a_lo * tn + tn_i) * 16 + ((sub + 1) & 15);
+        const int prv = (threadIdx.x & 16) | ((sub + 15) & 15);   // lane sub-1 in own tile group
+        const uint32_t tmask = 0xffffu << (threadIdx.x & 16);
+#pragma unroll 2
+        for (int a = a_lo; a < a_hi; ++a, p0 += stride, p1 += stride) {
+            const uint32_t S0 = __ldg(p0), S1 = __ldg(p1);
+            const uint32_t Sm = __shfl_sync(tmask, S0, prv);
+            const uint32_t W0 = __funnelshift_l(S0, Sm, 18);
+            const uint32_t W1 = __funnelshift_l(S1, S0, 18);
+            const float4 xA = *(const float4*)&xs[a * 16 + hx_f + 0];
+            const float4 xB = *(const float4*)&xs[a * 16 + hx_f + 4];
+            pw16_pair(W0,                          xA.x, xA.z, a0, a0, cm);
+            pw16_pair(__funnelshift_l(W1, W0, 2), xA.y, xA.w, a0, a0, cm);
+            pw16_pair(__funnelshift_l(W1, W0, 4), xB.x, xB.z, a0, a0, cm);
+            pw16_pair(__funnelshift_l(W1, W0, 6), xB.y, xB.w, a0, a0, cm);
+            pw16_pair(__funnelshift_l(W1, W0, 8), xA.x, xA.z, a1, a1, cm);
+            pw16_pair(__funnelshift_l(W1, W0,10), xA.y, xA.w, a1, a1, cm);
+            pw16_pair(__funnelshift_l(W1, W0,12), xB.x, xB.z, a1, a1, cm);
+            pw16_pair(__funnelshift_l(W1, W0,14), xB.y, xB.w, a1, a1, cm);
+        }
+        return;
+    }
+    if constexpr (KA == 4 && H == 0) {
+        // rot word w = fsl(src[w], src[w-1], 20); lane sub needs rot 2sub..2sub+2.
+        // src[2sub-1] is lane sub-1's S1 -> SHFL; 3 LDG like the rotated-ring version.
+        const size_t stride = (size_t)tn * 32;
+        const uint32_t* p0 = tb + ((size_t)a_lo * tn + tn_i) * 32 + ((2 * sub) & 31);
+        const uint32_t* p1 = tb + ((size_t)a_lo * tn + tn_i) * 32 + ((2 * sub + 1) & 31);
+        const uint32_t* p2 = tb + ((size_t)a_lo * tn + tn_i) * 32 + ((2 * sub + 2) & 31);
+        const int prv = (threadIdx.x & 16) | ((sub + 15) & 15);
+        const uint32_t tmask = 0xffffu << (threadIdx.x & 16);
+        auto do_mac = [&](int j, uint32_t U, bool h1, const float* xv) {
+            const int s = j >> 3, k = j & 7;
+            const int r_loc = ((k & 2) ? 4 : 0) + 2 * s + (k & 1);
+            float& acc = (k & 4) ? a1 : a0;
+            const uint32_t p = h1 ? pw16_h1(U, cm) : pw16_h0(U, cm);
+            acc = fmaf(xv[r_loc], (float)(int)__dp4a(p, 0x01010101u, PW16_CENT), acc);
+        };
+#pragma unroll 1
+        for (int a = a_lo; a < a_hi; ++a, p0 += stride, p1 += stride, p2 += stride) {
+            const uint32_t S0 = __ldg(p0), S1 = __ldg(p1), S2 = __ldg(p2);
+            const uint32_t Sm = __shfl_sync(tmask, S1, prv);
+            const uint32_t W[3] = {
+                __funnelshift_l(S0, Sm, 20), __funnelshift_l(S1, S0, 20), __funnelshift_l(S2, S1, 20)};
+            const float4 xA = *(const float4*)&xs[a * 16 + hx_f + 0];
+            const float4 xB = *(const float4*)&xs[a * 16 + hx_f + 4];
+            const float xv[8] = {xA.x, xA.y, xA.z, xA.w, xB.x, xB.y, xB.z, xB.w};
+            do_mac(0,  W[0], true, xv); do_mac(4,  W[0], false, xv);
+            do_mac(8,  W[1], true, xv); do_mac(12, W[1], false, xv);
+            { uint32_t U = __funnelshift_l(W[1], W[0],  4); do_mac(1, U, true, xv); do_mac(5, U, false, xv); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],  8); do_mac(2, U, true, xv); do_mac(6, U, false, xv); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 12); do_mac(3, U, true, xv); do_mac(7, U, false, xv); }
+            { uint32_t U = __funnelshift_l(W[2], W[1],  4); do_mac(9, U, true, xv); do_mac(13,U, false, xv); }
+            { uint32_t U = __funnelshift_l(W[2], W[1],  8); do_mac(10,U, true, xv); do_mac(14,U, false, xv); }
+            { uint32_t U = __funnelshift_l(W[2], W[1], 12); do_mac(11,U, true, xv); do_mac(15,U, false, xv); }
+        }
+        return;
+    }
+    // generic K: lane base in raw bits = rot base + KA - 16 (mod R)
+    int base_bit = sub * (16 * KA + 8 * H) + KA - 16;
+    if (base_bit < 0) base_bit += 32 * NW;
+    const int w0 = base_bit >> 5, o = base_bit & 31;
+    constexpr int MAX_SPAN = 15 * KA + 8 * H + 16;
+    constexpr int NA = (MAX_SPAN + 31) / 32;
+    const uint32_t stride_b = (uint32_t)(tn * NW * 4);
+    const char* qb = (const char*)(tb + ((size_t)a_lo * tn + tn_i) * NW);
+    int wi[NA + 1];
+#pragma unroll
+    for (int m = 0; m <= NA; ++m) { int t = w0 + m; wi[m] = (t >= NW) ? (t - NW) : t; }
+#pragma unroll 1
+    for (int a = a_lo; a < a_hi; ++a, qb += stride_b) {
+        const uint32_t* ptr = (const uint32_t*)qb;
+        uint32_t W[NA];
+        {
+            uint32_t rprev = __ldg(ptr + wi[0]);
+#pragma unroll
+            for (int m = 0; m < NA; ++m) {
+                const uint32_t rcur = __ldg(ptr + wi[m + 1]);
+                W[m] = __funnelshift_l(rcur, rprev, o);
+                rprev = rcur;
+            }
+        }
+        const float4 xA = *(const float4*)&xs[a * 16 + hx_f + 0];
+        const float4 xB = *(const float4*)&xs[a * 16 + hx_f + 4];
+        const float xv[8] = {xA.x, xA.y, xA.z, xA.w, xB.x, xB.y, xB.z, xB.w};
+        auto get_u = [&](int d) -> uint32_t {
+            const int i = d >> 5, bi = d & 31;
+            if (bi == 0) return W[i];
+            if (bi <= 16) return W[i] << bi;
+            return __funnelshift_l(W[i + 1], W[i], bi);
+        };
+        auto do_mac_j = [&](int j, uint32_t U, bool h1, float& t0, float& t1) {
+            const int s = j >> 3, k = j & 7;
+            const int r_loc = ((k & 2) ? 4 : 0) + 2 * s + (k & 1);
+            float& acc = (k & 4) ? t1 : t0;
+            const uint32_t p = h1 ? pw16_h1(U, cm) : pw16_h0(U, cm);
+            acc = fmaf(xv[r_loc], (float)(int)__dp4a(p, 0x01010101u, PW16_CENT), acc);
+        };
+        if constexpr (KA == 4 && H == 0) {
+            do_mac_j(0,  W[0], true, a0, a1); do_mac_j(4,  W[0], false, a0, a1);
+            do_mac_j(8,  W[1], true, a0, a1); do_mac_j(12, W[1], false, a0, a1);
+            { uint32_t U = __funnelshift_l(W[1], W[0],  4); do_mac_j(1, U, true, a0, a1); do_mac_j(5, U, false, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],  8); do_mac_j(2, U, true, a0, a1); do_mac_j(6, U, false, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 12); do_mac_j(3, U, true, a0, a1); do_mac_j(7, U, false, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[2], W[1],  4); do_mac_j(9, U, true, a0, a1); do_mac_j(13,U, false, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[2], W[1],  8); do_mac_j(10,U, true, a0, a1); do_mac_j(14,U, false, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[2], W[1], 12); do_mac_j(11,U, true, a0, a1); do_mac_j(15,U, false, a0, a1); }
+        } else if constexpr (KA == 1 && H == 1) {
+            do_mac_j(0, W[0], true, a0, a1);
+            { uint32_t U = __funnelshift_l(W[1], W[0], 2); do_mac_j(1, U, true, a0, a1); do_mac_j(12, U, false, a0, a1); do_mac_j(2, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 5); do_mac_j(3, U, true, a0, a1); do_mac_j(14, U, false, a0, a1); do_mac_j(4, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 8); do_mac_j(5, U, true, a0, a1); do_mac_j(6, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],11); do_mac_j(7, U, true, a0, a1); do_mac_j(8, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],14); do_mac_j(9, U, true, a0, a1); do_mac_j(10,U + U, true, a0, a1); }
+            do_mac_j(11, __funnelshift_l(W[1], W[0], 17), true, a0, a1);
+            do_mac_j(13, __funnelshift_l(W[1], W[0], 20), true, a0, a1);
+            do_mac_j(15, __funnelshift_l(W[1], W[0], 23), true, a0, a1);
+        } else if constexpr (KA == 2 && H == 1) {
+            do_mac_j(0, W[0], true, a0, a1);
+            { uint32_t U = __funnelshift_l(W[1], W[0],  2); do_mac_j(7,  U, false, a0, a1); do_mac_j(1, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],  4); do_mac_j(8,  U, false, a0, a1); do_mac_j(2, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],  7); do_mac_j(9,  U, false, a0, a1); do_mac_j(3, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],  9); do_mac_j(10, U, false, a0, a1); do_mac_j(4, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 12); do_mac_j(11, U, false, a0, a1); do_mac_j(5, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 14); do_mac_j(12, U, false, a0, a1); do_mac_j(6, U + U, true, a0, a1); }
+            do_mac_j(13, W[1] + W[1], true, a0, a1);
+            do_mac_j(14, W[1] << 3, true, a0, a1);
+            do_mac_j(15, W[1] << 6, true, a0, a1);
+        } else if constexpr (KA == 3 && H == 0) {
+            do_mac_j(0, W[0], true, a0, a1);
+            { uint32_t U = __funnelshift_l(W[1], W[0],  2); do_mac_j(6,  U, false, a0, a1); do_mac_j(1, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],  5); do_mac_j(7,  U, false, a0, a1); do_mac_j(2, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0],  8); do_mac_j(8,  U, false, a0, a1); do_mac_j(3, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 11); do_mac_j(9,  U, false, a0, a1); do_mac_j(4, U + U, true, a0, a1); }
+            { uint32_t U = __funnelshift_l(W[1], W[0], 14); do_mac_j(10, U, false, a0, a1); do_mac_j(5, U + U, true, a0, a1); }
+            do_mac_j(11, W[1] + W[1], true, a0, a1);
+            do_mac_j(12, W[1] << 4, true, a0, a1);
+            do_mac_j(13, W[1] << 7, true, a0, a1);
+            do_mac_j(14, W[1] << 10, true, a0, a1);
+            do_mac_j(15, W[1] << 13, true, a0, a1);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int D = j * KA + H * ((j + 1) >> 1);
+                if ((D & 15) == 0) do_mac_j(j, W[D >> 5], (D & 16) == 0, a0, a1);
+                else do_mac_j(j, get_u(D), true, a0, a1);
+            }
+        }
+    }
+}
+
+// pw16 per-block epilogue: xor-merge even/odd lane pairs, cross-part reduce
+// through `red` (must point at scratch smem >= 128 floats; caller guarantees all
+// reads of it are done), then `writer` lanes (part 0, even sub, live tile) hold
+// final a0/a1 for output columns tn_i*16 + (sub>>1) [+8].
+__device__ __forceinline__ void pw16_reduce(int part, int t_in_blk, int sub, bool live,
+                                            float* red, float& a0, float& a1) {
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 1);
+    a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+    __syncthreads();
+    if (part == 1 && (sub & 1) == 0 && live) {
+        red[t_in_blk * 16 + (sub >> 1)] = a0;
+        red[t_in_blk * 16 + (sub >> 1) + 8] = a1;
+    }
+    __syncthreads();
+    if (part == 0 && (sub & 1) == 0 && live) {
+        a0 += red[t_in_blk * 16 + (sub >> 1)];
+        a1 += red[t_in_blk * 16 + (sub >> 1) + 8];
+    }
+}
+
+// compile-time enable mask: bit (ka*2+hk) -> use pw16 for that K
+#ifndef PW16_KMASK
+#define PW16_KMASK ((1 << 4) | (1 << 5) | (1 << 6) | (1 << 8))   // K=2.0/2.5/3.0/4.0 (per-K kbench)
+#endif
+// killswitch INKWELL_NO_PW16=1 -> mask 0 (shipped core for every K)
+static inline int ink_pw16_mask() {
+    static int m = -1;
+    if (m < 0) m = getenv("INKWELL_NO_PW16") ? 0 : PW16_KMASK;
+    return m;
+}
+
+
 // "stream-decode" dense single-token gemv (same design as inkwell_exl3_gemv_moe_s):
 // one warp per 16-wide tile column, 256 threads = 8 warps = 8 tile columns;
 // lane t owns 8 consecutive ring windows at compile-time offsets, 3 __ldg words
@@ -1948,18 +2180,21 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_s(
                                        const uint32_t* __restrict__ trel,
                                        const float* __restrict__ xh,
                                        float* __restrict__ t,
-                                       int tk, int tn, int ka, int halfk) {
+                                       int tk, int tn, int ka, int halfk, int pw16) {
     const int tkc = (tk + gridDim.y - 1) / gridDim.y;
     const int tk_lo = blockIdx.y * tkc;
     const int tk_hi = min(tk_lo + tkc, tk);
+    const int kk = ka * 2 + halfk;
+    const bool pw = (pw16 >> kk) & 1;
     __shared__ __align__(16) float xs[SGEMV_DENSE_MAXK];
     __shared__ float red[8];
-    // prologue: stage this block's k-range of x and its Σx
+    // prologue: stage this block's k-range of x and its Σx (pw16 permutes lanes)
     float sxl = 0.f;
     for (int e = tk_lo * 16 + threadIdx.x; e < tk_hi * 16; e += 256) {
         const float v = xh[e];
         sxl += v;
-        xs[e] = v;
+        if (pw) { const int r = e & 15; xs[(e & ~15) + ((r & 4) ? 8 : 0) + ((r & 8) ? 4 : 0) + (r & 3)] = v; }
+        else xs[e] = v;
     }
 #pragma unroll
     for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
@@ -1968,10 +2203,41 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_s(
     float sx = 0.f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) sx += red[i];
+    if (pw) {
+        const int part = threadIdx.x >> 7;
+        const int t_in_blk = (threadIdx.x & 127) >> 4;
+        const int sub = threadIdx.x & 15;
+        const int tn_i = blockIdx.x * 8 + t_in_blk;
+        const int span = tk_hi - tk_lo;
+        const int a_lo = tk_lo + ((part * span) >> 1);
+        const int a_hi = tk_lo + (((part + 1) * span) >> 1);
+        float a0 = 0.f, a1 = 0.f;
+        const bool live = tn_i < tn;
+        if (live) {
+            switch (kk) {
+                case 3:  pw16_run<1, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 4:  pw16_run<2, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 5:  pw16_run<2, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 6:  pw16_run<3, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 7:  pw16_run<3, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 8:  pw16_run<4, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 10: pw16_run<5, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                default: __trap();
+            }
+        }
+        pw16_reduce(part, t_in_blk, sub, live, xs, a0, a1);
+        if (part == 0 && (sub & 1) == 0 && live) {
+            const float KINV = __half2float(__ushort_as_half(0x1eee));
+            const float off = PW16_KOFFC * sx;
+            float* dst = &t[(size_t)blockIdx.y * (tn * 16) + tn_i * 16 + (sub >> 1)];
+            dst[0] = fmaf(KINV, a0, off); dst[8] = fmaf(KINV, a1, off);
+        }
+        return;
+    }
     const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tn_i >= tn) return;
     float a0 = 0.f, a1 = 0.f;
-    switch (ka * 2 + halfk) {
+    switch (kk) {
         case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
@@ -2008,22 +2274,25 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf(
                                        float* __restrict__ y,
                                        float* __restrict__ t,
                                        int* __restrict__ ctr,
-                                       int tk, int tn, int ka, int halfk) {
+                                       int tk, int tn, int ka, int halfk, int pw16) {
     const int n = tn * 16;
     const int tkc = (tk + gridDim.y - 1) / gridDim.y;
     const int tk_lo = blockIdx.y * tkc;
     const int tk_hi = min(tk_lo + tkc, tk);
+    const int kk = ka * 2 + halfk;
+    const bool pw = (pw16 >> kk) & 1;
     __shared__ __align__(16) float xs[SGEMV_DENSE_MAXK];
     __shared__ float red[8];
     __shared__ unsigned int ticket;
     __shared__ float strip[128];
     const int e_lo = tk_lo * 16, e_hi = tk_hi * 16;
-    // prologue: stage this block's k-range of x and its Sigma_x (as gemv_s)
+    // prologue: stage this block's k-range of x and its Sigma_x (pw16 permutes lanes)
     float sxl = 0.f;
     for (int e = e_lo + threadIdx.x; e < e_hi; e += 256) {
         const float v = xh[e];
         sxl += v;
-        xs[e] = v;
+        if (pw) { const int r = e & 15; xs[(e & ~15) + ((r & 4) ? 8 : 0) + ((r & 8) ? 4 : 0) + (r & 3)] = v; }
+        else xs[e] = v;
     }
 #pragma unroll
     for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
@@ -2032,10 +2301,31 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf(
     float sx = 0.f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) sx += red[i];
-    const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int part = threadIdx.x >> 7;
+    const int t_in_blk = (threadIdx.x & 127) >> 4;
+    const int sub = threadIdx.x & 15;
+    const int tn_i = blockIdx.x * 8 + (pw ? t_in_blk : (threadIdx.x >> 5));
+    const bool live = tn_i < tn;
     float a0 = 0.f, a1 = 0.f;
-    if (tk_hi > tk_lo && tn_i < tn) {
-        switch (ka * 2 + halfk) {
+    if (pw) {
+        const int span = tk_hi - tk_lo;
+        const int a_lo = tk_lo + ((part * span) >> 1);
+        const int a_hi = tk_lo + (((part + 1) * span) >> 1);
+        if (live && span > 0) {
+            switch (kk) {
+                case 3:  pw16_run<1, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 4:  pw16_run<2, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 5:  pw16_run<2, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 6:  pw16_run<3, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 7:  pw16_run<3, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 8:  pw16_run<4, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 10: pw16_run<5, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                default: __trap();
+            }
+        }
+        pw16_reduce(part, t_in_blk, sub, live, xs, a0, a1);
+    } else if (tk_hi > tk_lo && tn_i < tn) {
+        switch (kk) {
             case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
@@ -2046,25 +2336,30 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf(
             default: __trap();
         }
     }
-    a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
-    a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+    if (!pw) {
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+    }
     const int lane = threadIdx.x & 31;
     const float KINV = __half2float(__ushort_as_half(0x1eee));
-    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    const float KOFF = pw ? PW16_KOFFC
+                          : 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
     const float off = KOFF * sx;
+    const bool wr = live && (pw ? (part == 0 && (sub & 1) == 0) : ((lane & 3) == 0));
+    const int scol = (pw ? t_in_blk : (threadIdx.x >> 5)) * 16 + (pw ? (sub >> 1) : (lane >> 2));
     if (gridDim.y == 1) {
         // single-k-block: strip lives in smem only; zero first so columns
         // >= n contribute 0 to the butterfly exactly like had_out's v=0.
         if (threadIdx.x < 128) strip[threadIdx.x] = 0.f;
         __syncthreads();
-        if (tn_i < tn && (lane & 3) == 0) {
-            strip[(threadIdx.x >> 5) * 16 + (lane >> 2)]     = fmaf(KINV, a0, off);
-            strip[(threadIdx.x >> 5) * 16 + (lane >> 2) + 8] = fmaf(KINV, a1, off);
+        if (wr) {
+            strip[scol]     = fmaf(KINV, a0, off);
+            strip[scol + 8] = fmaf(KINV, a1, off);
         }
         __syncthreads();
     } else {
-        if (tn_i < tn && (lane & 3) == 0) {
-            float* dst = &t[(size_t)blockIdx.y * n + tn_i * 16 + (lane >> 2)];
+        if (wr) {
+            float* dst = &t[(size_t)blockIdx.y * n + blockIdx.x * 128 + scol];
             dst[0] = fmaf(KINV, a0, off); dst[8] = fmaf(KINV, a1, off);
         }
         __threadfence();
@@ -2308,7 +2603,7 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
             dim3 gsz((unsigned)nb, (unsigned)nky, 1);
             inkwell_exl3_gemv_sf<<<gsz, 256, 0, (cudaStream_t)stream>>>(
                 (const uint32_t*)trel, scratch /* xh */, (const uint16_t*)svh,
-                y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk);
+                y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk, ink_pw16_mask());
             return;
           } }
         inkwell_exl3_had_in<<<(unsigned)(k / 128), 128, 512, (cudaStream_t)stream>>>(
@@ -2316,7 +2611,7 @@ extern "C" void ink_launch_exl3_gemv(const void* trel, const void* suh, const vo
         if (nky > 1) cudaMemsetAsync(scratch + k, 0, (size_t)nky * n * 4, (cudaStream_t)stream);
         dim3 gsz((unsigned)nb, (unsigned)nky, 1);
         inkwell_exl3_gemv_s<<<gsz, 256, 0, (cudaStream_t)stream>>>(
-            (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk);
+            (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk, ink_pw16_mask());
         inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
             scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
         return;
@@ -2615,7 +2910,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
                                       const float* __restrict__ xh2, int xh2s,
                                       float* __restrict__ t, int tslot, int tzoff,
                                       int tk, int tn, int k, int n, int nky,
-                                      const int* __restrict__ missf, int skipmode) {
+                                      const int* __restrict__ missf, int skipmode, int pw16) {
     const int slot = blockIdx.y;
     // skipmode 1: hits only; 2: misses only; 0: all slots (uniform per block)
     if (skipmode && ((missf[slot] != 0) == (skipmode == 1))) return;
@@ -2626,14 +2921,19 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     const int tk_lo = (ky * tk) / nky;
     const int tk_hi = ((ky + 1) * tk) / nky;
     const float* xg = zsel ? xh2 + (size_t)slot * xh2s : xh + (size_t)slot * k;
+    const uint32_t* tb = (const uint32_t*)(uintptr_t)d[0];
+    const int ka = (int)(d[3] & 0xff), hk = (int)((d[3] >> 8) & 1);
+    const int kk = ka * 2 + hk;
+    const bool pw = (pw16 >> kk) & 1;
     __shared__ __align__(16) float xs[SGEMV_MAXK];
     __shared__ float red[8];
-    // prologue: stage this block's k-range of x and its Σx
+    // prologue: stage this block's k-range of x and its Σx (pw16 permutes lanes)
     float sxl = 0.f;
     for (int e = tk_lo * 16 + threadIdx.x; e < tk_hi * 16; e += 256) {
         const float v = xg[e];
         sxl += v;
-        xs[e] = v;
+        if (pw) { const int r = e & 15; xs[(e & ~15) + ((r & 4) ? 8 : 0) + ((r & 8) ? 4 : 0) + (r & 3)] = v; }
+        else xs[e] = v;
     }
 #pragma unroll
     for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
@@ -2642,12 +2942,42 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     float sx = 0.f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) sx += red[i];
+    if (pw) {
+        const int part = threadIdx.x >> 7;
+        const int t_in_blk = (threadIdx.x & 127) >> 4;
+        const int sub = threadIdx.x & 15;
+        const int tn_i = blockIdx.x * 8 + t_in_blk;
+        const int span = tk_hi - tk_lo;
+        const int a_lo = tk_lo + ((part * span) >> 1);
+        const int a_hi = tk_lo + (((part + 1) * span) >> 1);
+        float a0 = 0.f, a1 = 0.f;
+        const bool live = tn_i < tn;
+        if (live) {
+            switch (kk) {
+                case 3:  pw16_run<1, 1>(tb, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 4:  pw16_run<2, 0>(tb, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 5:  pw16_run<2, 1>(tb, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 6:  pw16_run<3, 0>(tb, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 7:  pw16_run<3, 1>(tb, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 8:  pw16_run<4, 0>(tb, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 10: pw16_run<5, 0>(tb, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                default: __trap();
+            }
+        }
+        pw16_reduce(part, t_in_blk, sub, live, xs, a0, a1);
+        if (part == 0 && (sub & 1) == 0 && live) {
+            const float KINV = __half2float(__ushort_as_half(0x1eee));
+            const float off = PW16_KOFFC * sx;   // chunk Σx belongs to every column once
+            float* dst = &t[(size_t)slot * n + zsel * tzoff + tn_i * 16 + (sub >> 1)];
+            const float v0 = fmaf(KINV, a0, off), v1 = fmaf(KINV, a1, off);
+            if (nky > 1) { atomicAdd(dst, v0); atomicAdd(dst + 8, v1); } else { dst[0] = v0; dst[8] = v1; }
+        }
+        return;
+    }
     const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
     if (tn_i >= tn) return;
-    const uint32_t* tb = (const uint32_t*)(uintptr_t)d[0];
-    const int ka = (int)(d[3] & 0xff), hk = (int)((d[3] >> 8) & 1);
     float a0 = 0.f, a1 = 0.f;
-    switch (ka * 2 + hk) {
+    switch (kk) {
         case 3:  sgemv_run<1, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 4:  sgemv_run<2, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
         case 5:  sgemv_run<2, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
@@ -3205,7 +3535,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0);
+                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0, ink_pw16_mask());
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, nullptr, 0,
         nullptr, nullptr, nullptr, nullptr);   // GU stays fp32: int8-x loses ~10%/window
@@ -3225,7 +3555,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
         inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, ink_pw16_mask());
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, nullptr, nullptr);
@@ -3340,7 +3670,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                                    (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 1);
+                                                   (const int*)miss, 1, ink_pw16_mask());
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1,
         nullptr, nullptr, nullptr, nullptr);
@@ -3357,7 +3687,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                                    (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 2);
+                                                   (const int*)miss, 2, ink_pw16_mask());
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2,
         nullptr, nullptr, nullptr, nullptr);
@@ -3377,7 +3707,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
         inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, ink_pw16_mask());
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, nullptr, nullptr);
