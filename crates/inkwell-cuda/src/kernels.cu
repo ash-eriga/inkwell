@@ -2077,7 +2077,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf(
         const int c = blockIdx.x * 128 + threadIdx.x;
         if (threadIdx.x < 128) {
             float v = 0.f;
-            if (c < n) for (int z = 0; z < (int)gridDim.y; ++z) v += t[(size_t)z * n + c];
+            if (c < n) for (int z = 0; z < (int)gridDim.y; ++z) v += __ldcg(&t[(size_t)z * n + c]);   // L2: written by other blocks
             strip[threadIdx.x] = v;
         }
         __syncthreads();

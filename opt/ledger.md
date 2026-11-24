@@ -585,3 +585,13 @@ e2e A/B (BEST env + graphs, alternating C/A x4):
 Candidate beats neighbouring control in 3/4 pairs; generated text
 byte-identical (md5 5cbe8e06f2d8d82feb7f2ca287a7bc59) in all 8 runs;
 warnings 60 before = after. VERDICT: **ACCEPT**.
+
+### Brain re-validation on master: sgemv epilogue fold (gemv_sf) — ACCEPTED
+
+- Integrated 0c3fe65+d28e3d1 on top of bb34d45, plus `__ldcg` on the last-block partial reads (they come from other blocks; L2 is the coherence point).
+- Review: the counters live in a per-`Exl3W` scratch (+512 floats, zeroed at load) and reset themselves. mz streams run different matrices, and the 3 loop visits are sequential, so no counters are shared.
+- A/B with BEST env + graphs, 16 runs in the order ctl,sf,sf,ctl ×4 (ctl = `INKWELL_NO_SGEMV_FUSE=1`):
+  - ctl median 58.12 ms/tok (57.40–60.58);
+  - sf median 56.43 ms/tok (55.19–59.79);
+  - **−2.9%**; sf beats its neighbouring ctl in 7/8 pairs;
+  - md5 5cbe8e06 on all 16 runs; warnings 64 = baseline.
