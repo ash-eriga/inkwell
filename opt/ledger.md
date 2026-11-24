@@ -255,3 +255,14 @@ native low-bit MMA.
   extract (funnel+mask, ~3-4 instr/weight), which dp4a cannot remove.
 - Conclusion: dp4a variants on the EXL3 dense path are exhausted; the per-weight
   window-extract is the floor. Same reason the moe path port is unlikely to pay.
+
+## 2026-11-23 — session-2 ledger additions
+- Router fused kernel (COMMITTED 3a48c39): ~1ms real win, golden.
+- INKWELL_EXL3_X8 dp4a-broadcast dense gemv (COMMITTED abeb30f, off): exact math
+  achieved after 4 fixes, but ~95-110ms vs ~92 — REJECTED: w16 window-extract
+  (funnel+mask ~3-4 instr/weight) is the floor, not the MAC.
+- Mix fused kernel multi-q (COMMITTED): golden, ~neutral (~0-1ms).
+- GEMV_NKY_TGT sweep 256/768: both worse than 512 — 512 confirmed.
+- Cache coverage: ALL 12 moe layers CACHED K=20 — no stage_p in serial path.
+- PLATEAU CONFIRMED at ~91-93ms (~10.8 TPS): moe_cb ~54ms + mz ~19ms +
+  exl3_cb ~12ms are all bound by the same per-weight bit-window extract.
