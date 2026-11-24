@@ -1080,3 +1080,65 @@ Commits: see HEAD. Killswitch `INKWELL_NO_CACHEL=1` (uniform ck sizing);
   - **`W4_g128_dp2a` (int16 x):** `6.71 ms` (−0.27 ms vs F32, 100× worse rel err `4.2e-5` vs `3.8e-7`) → keep exact F32.
   - **`W5` (`8.12 ms`, +175 MiB) & `W6` (`9.28–9.52 ms`, +307 MiB):** rejected globally (too much VRAM on 6 GB; `W6` slower than bare EXL3).
 - Verdict: not ~2× (capped by 192 GB/s DRAM), but **−3.2 ms/tok for +43–60 MiB** fits inside existing headroom; adopt `W4_g128_sym` or `W4_g128_asym`/`W4_g64_sym` if quantizer meets KLD ≤ 0.0475 and top-1 ≥ 94.66%. Format contract in `opt/kbench/w4dense/REPORT.md` §6.
+
+## 2026-11-24 — exl3_gemv_moe_s tail balance study (worktree t3-1f0e2b0b, branch t3/exl3-moe-tail-balance)
+
+Task: shrink `inkwell_exl3_gemv_moe_s` (~18.6 ms/tok, ~114 launches/tok ~163us)
+with BIT-IDENTICAL output. GPU shared under flock; all e2e runs use the A/B env
+(GGML_PASCAL_GRAPHS=1 MAX_CTX=512 CACHE_MARGIN_MB=10 EXL3_CACHE_K=20 MOE_V2=1 MOE_NKY=2).
+
+### Tail model and what was measured
+- Launch structure: GU (9,nslots=8,2)=144 blocks fused gate+up; down (18,8,1)=144
+  blocks; cached path splits GU into hit/miss launches. 256 thr/block, 40 regs,
+  9.2KB smem -> 6 blocks/SM = 60 resident on 10 SMs -> ~2.4 waves/launch.
+- Per-block cost hypothesis was bytes ∝ r_bits_words (K): real dump K mix gives
+  words 12..32 per (slot,zsel) item. LPT (heavy-first) sim vs identity order
+  predicted 0-6% makespan gain.
+
+### Change 1 — heavy-first ordering (commit fbedae1, opt-in INKWELL_MOEBAL)
+Each warp ranks all P<=32 items by r_bits_words via shfl (lane<P holds key,
+rank = #{j: kj>ki || eq && j<i}, ballot selects rank==p). Only block->work map
+changes -> bit-identical by construction.
+- GOLD: sgemv_gold bal/bal2 bitexact PASS (nky=1/2), skipmode bal0/bal1 PASS,
+  all relerr <=2.1e-6. e2e md5 5cbe8e06 all runs.
+- KERNEL TIMING (moebal_bench, real dumps, nky=1): GU 173.9->173.5us (+0.2%),
+  down 94.2->95.8us (-1.7%). nky=2 both worse. VERDICT: NEUTRAL/NEGATIVE.
+  Block cost does NOT scale with K strongly enough (kernel is issue/latency-
+  bound, not BW-bound) -> ordering pays ~nothing, just adds prologue cost.
+  Kept opt-in default OFF. E2E A/B skipped on kernel-level evidence.
+
+### Change 2 — INKWELL_SGEMV_NKY=2: kernel-timing REJECTED
+GU 174.9 (nky=2) vs 172.0 (nky=1); down 99.3 vs 93.1us. Doubling blocks doubles
+prologue+epilogue cost and loses ~4-6%. Not e2e-tested further. (md5 did hold
+on a single sanity run, but speed already loses.)
+
+### Change 3 — MISSPAR (miss-chain on side stream ss): e2e A/B REJECTED, reverted
+Moved GU had_in/gemv miss-skipmode=2 work onto the bulk-copy stream ss right
+after the trel copy it depends on (concurrent with GU-hit tail instead of
+serialized behind ev_join). Same kernels/outputs -> bit-identical.
+- A/B 8x(ctl,cand,cand,ctl), ctl=INKWELL_NO_MISSPAR=1:
+  ctl med 47.47 ms, cand med 47.75 ms (-0.28 ms), pair wins 8/16 -> FAILS bar.
+  md5 5cbe8e06 all 32 runs. Reverted (miss gemv was never the critical path:
+  the bulk copy dominates the ev_join wait).
+
+### nsys tail data (master config, 64 tok, graphs on, cuda-graph-trace=node)
+inkwell_exl3_gemv_moe_s: 7752 launches (~121/tok), total 1250.4 ms (~19.5 ms/tok),
+avg 161.3us, med 134us, min 2us (empty miss grids), max 1.25ms, sd 107us.
+Duration spread is dominated by WHICH slots are live (hit vs miss grids), not
+just K order; GU-miss launches with few live blocks are latency-floor bound.
+
+### pw16 re-validation on this tree — NOT ACCEPTED (11/16), stays opt-in
+A/B 8x(ctl,cand,cand,ctl), cand=INKWELL_PW16=1 (default off), all md5 5cbe8e06:
+  ctl med 46.19 ms, cand med 45.75 ms (+0.44 ms), pair wins 11/16.
+Same verdict as the earlier master run (11/16): median faster but under the
+12/16 bar. My balance work did not land (ordering opt-in, misspar reverted), so
+this single A/B covers both "before" and "after" states. PW16_KMASK unchanged.
+
+### Status
+- kernels.cu 4797 lines, build warnings 58 emitted (62 incl. summary lines) <= 64.
+- Commit fbedae1: moebal ordering, OPT-IN only (INKWELL_MOEBAL=1 / NO_MOEBAL=1).
+- Everything else reverted or env-only. Net e2e change on master: none.
+- Remaining tail idea (untested): miss-gemv is copy-latency bound, not
+  scheduling bound; the real gap is the ~160us avg launch cost itself being
+  issue-bound (sgemv inner loop instr/weight), addressed by the pw16 core --
+  which needs a cleaner A/B on an idle machine to clear 12/16.
