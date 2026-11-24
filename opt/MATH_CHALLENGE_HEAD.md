@@ -72,6 +72,12 @@ Directions, none of them known to work:
    - certified token = supplied GPU token on 100% of steps;
    - the same at batch 2–4, which is speculative verification.
 
+## Workflow and gates
+1. **Cheap falsification first.** Test each idea on CPU against the reference before you formalise it. Most wrong ideas die in seconds on random or exhaustive inputs.
+2. **Lean proof.** Formalise only the ideas that survive step 1. The proof is the gate: `lake build` passes, there is no `sorry`, and `#print axioms` on the main theorem shows only the standard axioms (propext, Classical.choice, Quot.sound), plus `Lean.ofReduceBool` if `native_decide` is used and declared.
+3. **Final CPU implementation.** It must implement exactly the algorithm that the Lean file defines, and pass the tests above against the reference.
+4. **Port (done by the Inkwell team).** The CUDA/Rust port starts only after step 2 is checked on our machine. Then it goes through the usual interleaved A/B on the GTX 1060.
+
 ## 5. Data supplied
 - `unembed.trellis`: int16 [144, 12568, 64]. There are 144 × 12,568 tiles of 16 × 16 weights at K = 4 (1,024 bits per tile).
 - `unembed.suh`: fp16 [2304]. `unembed.svh`: fp16 [201088]. The constant mul1 = 0x83DCD12D.

@@ -79,6 +79,12 @@ Directions, none of them known to work:
 
 A proof that ~5.63 instructions per weight is a floor for every exact method under this cost model, not only for methods that form c·w, is also a valid answer.
 
+## Workflow and gates
+1. **Cheap falsification first.** Test each idea on CPU against the reference before you formalise it. Most wrong ideas die in seconds on random or exhaustive inputs.
+2. **Lean proof.** Formalise only the ideas that survive step 1. The proof is the gate: `lake build` passes, there is no `sorry`, and `#print axioms` on the main theorem shows only the standard axioms (propext, Classical.choice, Quot.sound), plus `Lean.ofReduceBool` if `native_decide` is used and declared.
+3. **Final CPU implementation.** It must implement exactly the algorithm that the Lean file defines, and pass the tests above against the reference.
+4. **Port (done by the Inkwell team).** The CUDA/Rust port starts only after step 2 is checked on our machine. Then it goes through the usual interleaved A/B on the GTX 1060.
+
 ## 7. Deliverables
 1. **Lean 4 (with Mathlib; pin the toolchain and Mathlib version):**
    - faithful definitions of the reference: the ring, the window extraction including the half-K schedule and wraparound, and s(w);
