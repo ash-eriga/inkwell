@@ -1055,3 +1055,17 @@ Streaming L15 frees ~324 MiB of resident experts; re-spent as cache
 
 Commits: see HEAD. Killswitch `INKWELL_NO_CACHEL=1` (uniform ck sizing);
 `INKWELL_CACHE_MB_L="0:56,16:156,..."` per-layer override.
+
+### Brain re-validation on master: per-layer expert-cache sizing (INKWELL_NO_CACHEL) — ACCEPTED
+
+- Rebased 8c51c01 onto 98d30c8 (BF16 ctrl + fusions included). Review: the table is MiB per layer; resident layers skip it, so the coming quant with L16/L17 resident drops those entries by itself. The other entries need a re-run of opt/tools/kslot_replay.py on the new quant. A layer that does not fit is still skipped whole (same as uniform sizing).
+- A/B, the usual env, ctl,cl,cl,ctl ×8 (ctl = `INKWELL_NO_CACHEL=1`):
+  - ctl median 45.60 ms/tok, cl median **42.98 ms/tok**, **−2.62 ms (−5.7%)**;
+  - cl wins **16/16** neighbouring pairs; md5 5cbe8e06 on all 32 runs; warnings 62.
+- VRAM peak 5,052 MiB (child measurement), under the 5,120 cap.
+
+### Brain re-validation: register-preloaded inkwell_mix + had_in merge (branch t3/mix-kernel-multiblock-bitexact, 69e97b1) — PENDING, noisy A/B
+
+- The child's multi-block mix profiled without `--cuda-graph-trace=node` and saw 240 launches instead of 8,160; with node trace it was slower (2.66 → 3.11 ms/tok).
+- Rewrite: one warp per (column, query) with the lane's 72 values preloaded into registers (156 regs, 0 spills) and post loads batched 8 rows at a time; same op order. nsys (node trace, 68 steps): mix 2.75 → 1.45 ms/tok, had_in 1.18 → 0.60 ms/tok. md5 5cbe8e06.
+- 16-pair A/B: ctl 48.38, mx 47.98 (−0.40), 11/16, with runs spread 43–67 ms (4 agents active, zram swapping). Not accepted yet; re-run on a quieter box.
