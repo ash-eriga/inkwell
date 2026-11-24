@@ -122,6 +122,13 @@ Today Inkwell keeps 2.907 GiB of experts resident: loop layers first, layers 6�
 - **Quality cost (estimate).** Lowering the loop from 2.42 to ~2.2 bpw is expected to cost KLD +12–25% (0.0475 → ~0.053–0.060). This is extrapolated from exllamav3's KLD-vs-bpw slope. The loop layers run 3 times, so their error may weigh more. Measure it.
 - **Keep the 2.26 bpw SAGE quant for cards with 8–12 GB or more.** The low-bpw variant is for 6 GB cards.
 
+### 5.4 Optional: dense weights as group-wise INT4 (needs your quality check)
+
+This applies only to the dense, non-expert weights: attention (645.81M params, 278.7 MiB today at ~3.6 bpw) and the unembed (461M params, 221 MiB at K=4). The experts stay EXL3.
+- **Why:** the dense EXL3 GEMVs are decode-bound. They take ~10.4 ms/token, while their bandwidth floor is ~3.7 ms. A group-wise INT4 format with float activations unpacks in ~3 instructions per weight against ~7–8 for the trellis, so it should run near the bandwidth floor at similar bytes. Modeled saving: 4–5 ms/token for ~+90 MiB VRAM. Inkwell is measuring the kernel now.
+- **The open question is quality.** Group-wise INT4 at ~4.1–4.25 bpw is not obviously as good as an EXL3 trellis at ~3.6 bpw.
+- **Ask:** quantize the dense weights with GPTQ (or AWQ), INT4 with one F16 scale per 128 inputs (also g64, and INT5/INT6 for the most sensitive tensors if INT4 loses), with the experts unchanged. Report mean KLD and top-1 against the source, next to the all-EXL3 quant measured with the same harness. Inkwell adopts it only if KLD and top-1 are equal or better. Inkwell will send the exact tensor packing.
+
 ## 6. Context length: 128K re-check (done)
 
 A reviewer re-derived the master spec's full 128K VRAM budget from the safetensors headers, the model config and measured probes.
@@ -244,5 +251,6 @@ File `drafter.safetensors`:
 2. **Quality:** mean KLD and top-1 agreement against the source checkpoint (float64 logits, full vocabulary), plus the same figures for the current 2.26 bpw quant measured with your harness.
 3. **The total file size** and the bytes of the 12 loop layers' experts, including suh/svh.
 4. **If you build a drafter:** a `drafter.safetensors` in the §9 format, its dims (D, layers, FF, heads, V′), and p1 and q on held-out text against the target, before and after the finetune.
+5. **If you test §5.4:** KLD and top-1 for each dense format, and the per-tensor bits you chose.
 
 Inkwell will measure speed with its own A/B protocol: ≥8 interleaved pairs, generated-text checks, and the resident budget set through `INKWELL_DEV_EXPERT_MB`.
