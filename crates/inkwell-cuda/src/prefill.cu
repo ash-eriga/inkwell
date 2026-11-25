@@ -1332,6 +1332,26 @@ extern "C" void ink_launch_pf_ctrl_apply(const float* gain, const float* forget,
     inkwell_pf_ctrl_apply<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(gain, forget, cur, msg, n);
 }
 
+// Concatenated gain/forget GEMM output is token-major [C,2n]: gain occupies
+// columns [0,n) and forget columns [n,2n) of each row.
+extern "C" __global__ void inkwell_pf_ctrl_apply_cat(const float* __restrict__ gf,
+        float* __restrict__ cur, const float* __restrict__ msg, int C, int n) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < C && i < n) {
+        const size_t x = (size_t)t * n + i;
+        const float g = tanhf(gf[(size_t)t * 2 * n + i]);
+        const float f = tanhf(gf[(size_t)t * 2 * n + n + i]);
+        cur[x] = (1.f - f) * cur[x] + g * msg[x];
+    }
+}
+
+extern "C" void ink_launch_pf_ctrl_apply_cat(const float* gf, float* cur,
+        const float* msg, int C, int n, void* stream) {
+    dim3 g((n + 255) / 256, C);
+    inkwell_pf_ctrl_apply_cat<<<g, 256, 0, (cudaStream_t)stream>>>(gf, cur, msg, C, n);
+}
+
 extern "C" __global__ void inkwell_pf_router8(const float* __restrict__ logits,
         const float* __restrict__ bias, int C, float wscale, float wfloor,
         int* __restrict__ ids, float* __restrict__ weights) {

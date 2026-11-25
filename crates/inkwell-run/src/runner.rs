@@ -4228,7 +4228,10 @@ fn pf_exl3(e: &Exl3W, x: *const f32, y: *mut f32, c: usize, scratch: *mut f32) {
 fn pf_dbg(name: &str, x: *const f32, n: usize) {
     if std::env::var_os("INKWELL_PFDBG").is_none() { return; }
     let mut v = vec![0f32; n];
-    unsafe { inkwell_cuda::memcpy_d2h_sync(v.as_mut_ptr().cast(), x.cast(), n * 4) };
+    unsafe {
+        inkwell_cuda::memcpy_d2h_async(v.as_mut_ptr().cast(), x.cast(), n * 4);
+        inkwell_cuda::DevBuf::sync();
+    }
     eprintln!("PFDBG {name} sum={:.6} first8={:?}", v.iter().sum::<f32>(), &v[..8.min(n)]);
 }
 
@@ -4265,15 +4268,14 @@ impl Runner {
             }
         }
         self.pf_dense(cat.cast_const(), l.ctrl_down[ctrl].expect("ctrl_down"), gate, c, 64, 2 * n);
-        let (gp, fp) = if let Some(gfcat) = l.ctrl_gf_cat[ctrl] {
+        if let Some(gfcat) = l.ctrl_gf_cat[ctrl] {
             self.pf_dense(gate.cast_const(), gfcat, gain, c, 2 * n, 64);
-            (gain, unsafe { gain.add(c * n) })
+            unsafe { inkwell_cuda::pf_ctrl_apply_cat_async(gain.cast_const(), cur, msg, c as i32, n as i32) };
         } else {
             self.pf_dense(gate.cast_const(), l.ctrl_gain[ctrl].expect("ctrl_gain"), gain, c, n, 64);
             self.pf_dense(gate.cast_const(), l.ctrl_forget[ctrl].expect("ctrl_forget"), unsafe{gain.add(c*n)}, c, n, 64);
-            (gain, unsafe{gain.add(c*n)})
-        };
-        unsafe { inkwell_cuda::pf_ctrl_apply_async(gp, fp, cur, msg, (h) as i64) };
+            unsafe { inkwell_cuda::pf_ctrl_apply_async(gain.cast_const(), unsafe{gain.add(c*n)}.cast_const(), cur, msg, (h) as i64) };
+        }
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -4293,7 +4295,7 @@ impl Runner {
         if let Some(rq) = l.attn_res_query {
             let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([cur.cast_const()]).collect();
             self.pf_mix_run(&states, rq, a.ptr("mixbuf"), c, if is_swa {1} else {3});
-            inputs = [a.ptr("mixbuf"), unsafe{a.ptr("mixbuf").add(c*n)}, unsafe{a.ptr("mixbuf").add(2*c*n)}];
+            inputs = if is_swa { [a.ptr("mixbuf"), a.ptr("mixbuf"), a.ptr("mixbuf")] } else { [a.ptr("mixbuf"), unsafe{a.ptr("mixbuf").add(c*n)}, unsafe{a.ptr("mixbuf").add(2*c*n)}] };
         }
         // Loop-pass controller messages. The message tensor rows are materialized by mixbuf.
         if messages {
@@ -4376,6 +4378,7 @@ impl Runner {
         unsafe {
             inkwell_cuda::conv_prefill_async(a.ptr("wo").cast_const(), conv_state, 2048, tdata(l.attn_post_conv.expect("postconv")).cast_const(),
                 std::ptr::null(), c as i32, 2304, 0, scale_static, a.ptr("woout"));
+            if il == 0 { pf_dbg("attn_post-0", a.ptr("woout"), 8); }
         }
         if ip % (self.cfg.attn_res_block_size as usize) == 0 {
             let bi = blocks.len().min(3);
@@ -4396,7 +4399,7 @@ impl Runner {
             self.pf_control(a, fcur, unsafe{a.ptr("msgbuf").add(3*c*n)}.cast_const(), l, 3);
         }
         self.pf_norm(fcur, l.ffn_norm.expect("ffn_norm"), c, n);
-        if il == 0 { pf_dbg("moe_in-0", fcur, 8); }
+        if il == 0 { pf_dbg("ffn_inp-0", cur, 8); pf_dbg("moe_in-0", fcur, 8); }
         self.pf_dense(fcur.cast_const(), l.ffn_gate_inp.expect("gate"), a.ptr("router"), c, 128, n);
         unsafe {
             inkwell_cuda::pf_router8_async(a.ptr("router").cast_const(), tdata(l.ffn_exp_probs_b.expect("pb")).cast_const(), c as i32,
@@ -4419,10 +4422,11 @@ impl Runner {
                 a.ptr("moews"), a.ptr("moe_out"));
             inkwell_cuda::conv_prefill_async(a.ptr("moe_out").cast_const(), conv_state, 2048 + 2304,
                 tdata(l.ffn_post_conv.expect("fpc")).cast_const(), std::ptr::null(), c as i32, 2304, 0, scale_static, a.ptr("ffnout"));
+            if il == 0 { pf_dbg("ffn_out-0", a.ptr("ffnout"), 8); }
             inkwell_cuda::pf_add_async(a.ptr("ffnout"), cur, (c*n) as i64);
         }
         pf_copy(cur, a.ptr("ffnout"), hbytes);
-        if il == 0 { pf_dbg("l_out-0", cur, 8); }
+        if matches!(il, 0|1|2|5|6|11|12|17|18|23) { let name = format!("l_out-{il}"); pf_dbg(&name, cur, 8); }
     }
 
     /// Encode token ids in chunks through the batched prefill path. Returns the
@@ -4483,7 +4487,7 @@ impl Runner {
                 vi += 1;
             }
             // final mix + norm; compute lm_head only for the last row of the final chunk.
-            let is_last_chunk = pos + c as i64 == ids.len() as i64;
+            let is_last_chunk = pos + c as i64 == pos0 + ids.len() as i64;
             let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([a.ptr("cur").cast_const()]).collect();
             if is_last_chunk {
             self.pf_mix_run(&states, self.output_res_query, a.ptr("head"), c, 1);

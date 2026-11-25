@@ -107,7 +107,7 @@ static int test_flash(){
  CK(cudaMemcpy(dK,hk.data(),ks*2,cudaMemcpyHostToDevice));CK(cudaMemcpy(dV,hv.data(),ks*2,cudaMemcpyHostToDevice));CK(cudaMemcpy(dq,hq.data(),qs*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(drr,hr.data(),rs*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dw,hw.data(),ws*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(ds,hs.data(),ss*4,cudaMemcpyHostToDevice));
  float *dbias,*dmask,*dout;CK(cudaMalloc(&dbias,(size_t)24*1600*4));CK(cudaMalloc(&dmask,1601*4));CK(cudaMalloc(&dout,24*128*4));
  const float scale=1.f/sqrtf(128.f);
- bool pass=true;std::pair<int,int> cases[]={{1100,1024},{1500,1024},{700,0}};for(auto cs:cases){
+ bool pass=true;std::pair<int,int> cases[]={{0,1024},{0,0},{64,1024},{1100,1024},{1500,1024},{700,0}};for(auto cs:cases){
   ink_launch_flash_prefill_gqa3(dK,dV,dq,drr,dw,ds,da,C,cs.first,cap,cs.second,scale,nullptr);
   CK(cudaDeviceSynchronize());CK(cudaMemcpy(ha.data(),da,qs*4,cudaMemcpyDeviceToHost));
   float ma=0;int rows[]={0,1,17,31,63};
