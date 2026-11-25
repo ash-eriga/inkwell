@@ -4137,14 +4137,15 @@ unsafe extern "C" fn dense_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, 
 
 #[derive(Debug)]
 struct PfArena {
-    buf: inkwell_cuda::DevBuf,
+    buf: Option<inkwell_cuda::DevBuf>,
+    base: *mut u8,
     c: usize,
     off: HashMap<&'static str, usize>,
     bytes: usize,
 }
 
 impl PfArena {
-    fn new(c: usize) -> Self {
+    fn layout(c: usize) -> (HashMap<&'static str, usize>, usize) {
         let mut off = HashMap::new();
         let mut o = 0usize;
         let mut put = |name: &'static str, bytes: usize, off: &mut HashMap<&'static str, usize>, o: &mut usize| {
@@ -4189,11 +4190,22 @@ impl PfArena {
         put("moews", p * 6912 * 4 + p * 4 + 256, &mut off, &mut o);
         put("scratch", c * (3072 + 3072) * 4, &mut off, &mut o);
         put("logits", 201024 * 4 + 256, &mut off, &mut o);
-        let bytes = o;
-        Self { buf: inkwell_cuda::DevBuf::new_bytes(bytes), c, off, bytes }
+        (off, o)
+    }
+    fn new(c: usize) -> Self {
+        let (off, bytes) = Self::layout(c);
+        let buf = inkwell_cuda::DevBuf::new_bytes(bytes);
+        let base = buf.dev_ptr().cast();
+        Self { buf: Some(buf), base, c, off, bytes }
+    }
+    /// Borrow an already allocated device buffer. The caller guarantees that
+    /// it remains alive for the whole encode and is not otherwise in use.
+    fn borrowed(c: usize, base: *mut u8) -> Self {
+        let (off, bytes) = Self::layout(c);
+        Self { buf: None, base, c, off, bytes }
     }
     fn ptr(&self, name: &'static str) -> *mut f32 {
-        unsafe { self.buf.dev_ptr().cast::<u8>().add(self.off[name]).cast() }
+        unsafe { self.base.add(self.off[name]).cast() }
     }
 }
 
@@ -4400,8 +4412,21 @@ impl Runner {
     /// final row's unpadded logits. State writes match serial teacher forcing.
     pub fn prefill_chunked(&mut self, ids: &[u32], pos0: i64) -> Vec<f32> {
         let cmax = std::env::var("INKWELL_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64).clamp(1, 512);
-        let mut a = PfArena::new(cmax);
-        eprintln!("prefill arena: {} MiB chunk={cmax}", a.bytes >> 20);
+        let need = PfArena::layout(cmax).1;
+        // Reuse the largest decode expert-cache arena while encoding. The
+        // direct driver reads expert weights from their resident/pinned source
+        // instead of those caches; cache metadata is invalidated before decode.
+        let borrow = self.moe_args_exl3.iter()
+            .filter_map(|m| m.cache.as_ref().map(|c| (m.layer, c.buf.dev_ptr().cast::<u8>(), c.buf.len * 4)))
+            .filter(|&(_, _, bytes)| bytes >= need)
+            .max_by_key(|&(_, _, bytes)| bytes);
+        let (mut a, borrowed_layer) = if let Some((layer, base, _)) = borrow {
+            (PfArena::borrowed(cmax, base), Some(layer))
+        } else {
+            (PfArena::new(cmax), None)
+        };
+        eprintln!("prefill arena: {} MiB chunk={cmax}{}", a.bytes >> 20,
+            borrowed_layer.map_or(String::new(), |l| format!(" borrowed=L{l}")));
         let mut pos = pos0;
         let mut out_logits = Vec::new();
         for chunk in ids.chunks(cmax) {
@@ -4461,6 +4486,25 @@ impl Runner {
             pos += c as i64;
         }
         inkwell_cuda::DevBuf::sync();
+        if let Some(layer) = borrowed_layer {
+            if let Some(m) = self.moe_args_exl3.iter_mut().find(|m| m.layer == layer) {
+                if let Some(c) = &mut m.cache {
+                    c.tag.write_bytes(&vec![0xFFu8; c.k as usize * 4]);
+                    c.cnt.write_bytes(&vec![0u8; 128 * 4]);
+                    c.hm.write_bytes(&[0u8; 8]);
+                    if let Some(soff) = &mut c.soff {
+                        soff.write_bytes(&vec![0u8; 3 * c.k as usize * 8]);
+                    }
+                    if let Some(fl) = &mut c.fl {
+                        let mut fl_h = vec![0i32; 513];
+                        fl_h[0] = 1;
+                        fl_h[257] = (c.buf.len * 4 / 6912) as i32;
+                        fl.write_bytes(unsafe { std::slice::from_raw_parts(fl_h.as_ptr().cast::<u8>(), 513 * 4) });
+                    }
+                }
+            }
+            eprintln!("prefill arena: invalidated borrowed cache L{layer}");
+        }
         out_logits
     }
 }
