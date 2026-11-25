@@ -1527,3 +1527,11 @@ IADD3 and LOP32I ran alone: IADD3 at 1.94 per cycle (half rate), LOP32I at full 
 - Per-pair Δ (cand − ctl, ms): −4.57 0.98 −0.64 −0.66 −0.77 −1.65 0.31 −0.69 −1.79 1.70 −5.70 −1.22 −0.88 1.74 −3.76 0.62.
 - Noisy host: the machine had rebooted 6 min before (run 1 cold), and another agent's CPU jobs held load average ~4.5. The child had measured −0.56 ms.
 - Decision: not merged. Re-run on a quiet host before deciding again.
+
+## 2026-11-24 — dense W4 opt-in branch, default-path check on master: INCONCLUSIVE
+
+- Candidate: `t3/dense-w4-runtime-optin` ec2625b, rebased on 74eeeb6 (conflicts were append-only: kernels.cu, runner.rs log line, ledger). Build: 62 warnings.
+- Default path only (no W4 file, `w4_w=0`); load logs identical to master apart from the `w4_w` field (dev_buf 78.4/85.0 MiB both).
+- Interleaved A/B, 16 pairs, same env as the resolve-warp check. Median ctl 34.550 ms, cand 35.219 ms (+0.67 ms); candidate wins 6/16. md5 5cbe8e06 in all 32 runs; peak 5,034 MiB both.
+- Per-pair Δ (cand − ctl, ms): 0.36 2.46 0.02 0.07 1.11 −0.09 0.05 −0.19 0.67 0.73 −1.90 −0.35 −1.62 0.15 −3.87 1.01.
+- Reading: no clear regression (6/16 is a coin flip), but no clean pass either. Not merged; re-run on a quiet host together with resolve-warp.
