@@ -3806,7 +3806,7 @@ static Ch2DenseState g_ch2dense;
 static int ch2dense_requested() {
     if (getenv("INKWELL_NO_CH2DENSE")) return 0;
     const char* e = getenv("INKWELL_CH2DENSE");
-    return e ? atoi(e) != 0 : 0;   // opt-in until the acceptance gate passes
+    return e ? atoi(e) != 0 : 1;   // accepted; INKWELL_CH2DENSE=0 still opts out
 }
 
 static CUresult ch2dense_driver_launch(CUfunction f, dim3 grid,
