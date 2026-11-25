@@ -1588,6 +1588,26 @@ impl Runner {
         unsafe { (*self.dump_list.get()).push((name.to_string(), t0)); }
     }
     fn dump_list_get(&self) -> &Vec<(String, Ptr)> { unsafe { &*self.dump_list.get() } }
+    fn attn_dump_enabled(il: usize, pass: usize, nkv: i64) -> bool {
+        static FILTER: std::sync::OnceLock<Vec<(Option<usize>, Option<usize>, Option<i64>)>> = std::sync::OnceLock::new();
+        let filter = FILTER.get_or_init(|| {
+            let parse_opt_u = |s: &str| if s == "*" { None } else { s.parse::<usize>().ok() };
+            let parse_opt_i = |s: &str| if s == "*" { None } else { s.parse::<i64>().ok() };
+            let Ok(spec) = std::env::var("INKWELL_ATTN_DUMP_FILTER") else {
+                return vec![(Some(5), Some(0), None)];
+            };
+            spec.split(',').filter_map(|ent| {
+                let mut p = ent.trim().split(':');
+                let l = parse_opt_u(p.next()?);
+                let pass = parse_opt_u(p.next()?);
+                let nkv = parse_opt_i(p.next()?);
+                Some((l, pass, nkv))
+            }).collect()
+        });
+        filter.iter().any(|(l, p, n)| {
+            l.is_none_or(|x| x == il) && p.is_none_or(|x| x == pass) && n.is_none_or(|x| x == nkv)
+        })
+    }
     fn dump_attn_bin(&self, name: String, t0: Ptr) {
         if std::env::var_os("INKWELL_ATTN_DUMP_DIR").is_none() { return; }
         t::output(t0);
@@ -1603,10 +1623,11 @@ impl Runner {
                 let mut it = name.split('_');
                 let _ = it.next();
                 let pos = it.next().and_then(|x| x.strip_prefix("pos")?.parse::<i64>().ok()).unwrap_or(0);
+                let lp = it.next().unwrap_or("l5p0");
                 let kind = it.next().unwrap_or("x");
                 let nkv = pos + 1;
                 let ext = if kind == "k" || kind == "v" { "f16" } else { "f32" };
-                let outdir = std::path::Path::new(&dir).join(nkv.to_string());
+                let outdir = std::path::Path::new(&dir).join(nkv.to_string()).join(lp);
                 let _ = std::fs::create_dir_all(&outdir);
                 if let Ok(mut f) = std::fs::File::create(outdir.join(format!("{kind}.{ext}"))) {
                     use std::io::Write as _;
@@ -2087,12 +2108,13 @@ impl Runner {
         let kq_mask = if is_swa { step.mask_swa } else { step.mask_full };
         let v_view = t::view3(c, v_upd, hd, n_kv, hkv, t::nb(v_upd, 1), t::nb(v_upd, 2), 0);
         let pow2_ctx = (step.pos_val + 1) & step.pos_val == 0;
-        if il == 5 && !is_swa && pow2_ctx && (1024..=32768).contains(&(step.pos_val + 1)) {
-            self.dump_attn_bin(format!("attn_pos{}_k", step.pos_val), t::cont(c, k_view));
-            self.dump_attn_bin(format!("attn_pos{}_v", step.pos_val), t::cont(c, v_view));
-            self.dump_attn_bin(format!("attn_pos{}_q", step.pos_val), q);
-            self.dump_attn_bin(format!("attn_pos{}_bias", step.pos_val), kq_b);
-            self.dump_attn_bin(format!("attn_pos{}_mask", step.pos_val), kq_mask);
+        if !is_swa && pow2_ctx && (1024..=32768).contains(&(step.pos_val + 1))
+            && Self::attn_dump_enabled(il, pass, step.pos_val + 1) {
+            self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_k", step.pos_val), t::cont(c, k_view));
+            self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_v", step.pos_val), t::cont(c, v_view));
+            self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_q", step.pos_val), q);
+            self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_bias", step.pos_val), kq_b);
+            self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_mask", step.pos_val), kq_mask);
         }
         let out = t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh); // [hd*nh, 1]
 
@@ -2244,7 +2266,9 @@ impl Runner {
         // while the shape signature is unchanged: only input data varies.
         // Killswitch: INKWELL_NO_GCACHE=1 forces the per-step rebuild.
         let caching = std::env::var_os("INKWELL_NO_GCACHE").is_none();
-        if caching {
+        let dump_pow2 = std::env::var_os("INKWELL_ATTN_DUMP_DIR").is_some()
+            && ((pos + 1) & pos) == 0 && (1024..=32768).contains(&(pos + 1));
+        if caching && !dump_pow2 {
             if let Some(gc) = self.step_gcache.take() {
                 if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
                     let logits = self.step_cached(id, pos, &gc);
@@ -3108,6 +3132,43 @@ impl Runner {
     pub fn restore_conv(&self, snap: &[Vec<f32>]) {
         for (s, v) in self.conv_state.iter().zip(snap.iter()) {
             unsafe { t::set(*s, v.as_ptr().cast(), 0, v.len() * 4) };
+        }
+    }
+
+    /// Save all persistent decode state tensors (KV arenas + conv states).
+    pub fn save_state(&self, path: &str) {
+        let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter()).copied().collect();
+        let mut f = std::fs::File::create(path).expect("create state snapshot");
+        use std::io::Write as _;
+        f.write_all(b"INKWST01").expect("write state magic");
+        f.write_all(&(tensors.len() as u64).to_le_bytes()).expect("write state count");
+        for x in tensors {
+            let n = t::nbytes(x);
+            let mut v = vec![0u8; n];
+            unsafe { t::get(x, v.as_mut_ptr(), 0, n) };
+            f.write_all(&(n as u64).to_le_bytes()).expect("write state length");
+            f.write_all(&v).expect("write state tensor");
+        }
+    }
+
+    /// Load state written by [`Runner::save_state`].
+    pub fn load_state(&self, path: &str) {
+        let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter()).copied().collect();
+        let mut f = std::fs::File::open(path).expect("open state snapshot");
+        use std::io::Read as _;
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic).expect("read state magic");
+        assert_eq!(&magic, b"INKWST01", "state snapshot magic");
+        let mut u64b = [0u8; 8];
+        f.read_exact(&mut u64b).expect("read state count");
+        assert_eq!(u64::from_le_bytes(u64b) as usize, tensors.len(), "state tensor count");
+        for x in tensors {
+            f.read_exact(&mut u64b).expect("read state length");
+            let n = u64::from_le_bytes(u64b) as usize;
+            assert_eq!(n, t::nbytes(x), "state tensor byte length");
+            let mut v = vec![0u8; n];
+            f.read_exact(&mut v).expect("read state tensor");
+            unsafe { t::set(x, v.as_ptr(), 0, n) };
         }
     }
 

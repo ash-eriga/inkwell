@@ -51,6 +51,10 @@ static void cpu_ref_one(int h, int nh, int hkv, int n_kv, int hd,
     const size_t row = (size_t)hd;
     const size_t head = (size_t)n_kv * hd;
     for (int j = 0; j < n_kv; ++j) {
+        if (!std::isfinite(mask[j])) {
+            score[j] = -INFINITY;
+            continue;
+        }
         double a = 0.0;
         for (int d = 0; d < hd; ++d) {
             a += (double)q[h * hd + d] * (double)half_host(kh[hk * head + j * row + d]);
@@ -62,13 +66,13 @@ static void cpu_ref_one(int h, int nh, int hkv, int n_kv, int hd,
     std::vector<double> weight(n_kv);
     double den = exp((double)mask[n_kv] - mx);
     for (int j = 0; j < n_kv; ++j) {
-        weight[j] = exp(score[j] - mx);
+        weight[j] = std::isfinite(mask[j]) ? exp(score[j] - mx) : 0.0;
         den += weight[j];
     }
     for (int d = 0; d < hd; ++d) {
         double o = 0.0;
         for (int j = 0; j < n_kv; ++j) {
-            o += weight[j] * (double)half_host(vh[hk * head + j * row + d]);
+            if (std::isfinite(mask[j])) o += weight[j] * (double)half_host(vh[hk * head + j * row + d]);
         }
         out[h * hd + d] = o / den;
     }
