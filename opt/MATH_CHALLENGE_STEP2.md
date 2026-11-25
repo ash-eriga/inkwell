@@ -211,7 +211,7 @@ All integer arithmetic is mod 2^32. lo(a) = a mod 2^16, hi(a) = ⌊a/2^16⌋, an
 
 ## 4. What is known
 
-### 4.1 Facts (checked on CPU or proved in step 1; use them or prove them)
+### 4.1 Facts (checked on CPU or proved earlier; use them or prove them)
 - **F1, 2-XMAD product.** For w < 2^16: c·w mod 2^32 = 0xD12D·w + ((0x83DC·w) mod 2^16)·2^16. That is `XMAD p, w, 0xd12d, RZ` followed by `XMAD.PSL p, w, 0x83dc, p`. Our compiler never emits this form, but we can, so you may use it.
 - **F2, register halves.** XMAD reads only the selected 16-bit half. A register holding ring bits [D, D+32), MSB-first, has window D in its high half and window D+16 in its low half. Neither needs masking.
 - **F3, which windows pair up.** Count, per K, the windows i for which some window starts exactly 16 bits later:
@@ -228,7 +228,7 @@ All integer arithmetic is mod 2^32. lo(a) = a mod 2^16, hi(a) = ⌊a/2^16⌋, an
   The correction depends only on the 2K bits (hi, b). The same holds for half-integer K, step by step.
 - **F5, residues.** bytesum(a) ≡ a (mod 255). But s(w) ≢ c·w (mod 255) for 65,278 of the 65,536 windows, because the reduction mod 2^32 subtracts ⌊c·w/2^32⌋. Since s ≤ 1005, s = (P mod 255) + 255·u with P = c·w mod 2^32 and u ∈ {0, 1, 2, 3}.
 - **F6, the float stage.** `IDP.4A p, 0x01010101, 0x4B000000` yields the bit pattern of the fp32 number 2^23 + s. One `FADD` of −2^23 then gives fp32(s) exactly. So `I2F` can be traded for a full-rate `FADD`, which matters if the conversion pipe binds (§2.5).
-- **F7, step 1's bound.** If c·w is formed as written, with 2 XMAD, a counting argument gives ≥ 5.63–6.19 instr/weight. That count left out per-tile overhead, so it is optimistic. Beating it needs a different way to obtain s.
+- **F7, an earlier bound.** If c·w is formed as written, with 2 XMAD, a counting argument gives ≥ 5.63–6.19 instr/weight. That count left out per-tile overhead, so it is optimistic. Beating it needs a different way to obtain s.
 
 ### 4.2 What failed, and why (do not repeat without a new idea)
 - **L1, fewer instructions but fatter lanes.** A variant with 32 windows per lane issued 25% fewer instructions and ran 40% slower. It needed 48 registers (40 warps/SM), or 40 with spills, and it had fewer warps per launch.
