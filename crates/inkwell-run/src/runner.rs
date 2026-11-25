@@ -40,6 +40,42 @@ fn kv_bucket(n: i64, max: i64) -> i64 {
     ((n + 63) & !63).min(max)
 }
 
+/// Device-scalar exact n_kv attention is the default decode path.  The
+/// unfused rel-bias fallback and the pow2 attention dump keep the old shapes.
+fn dyn_nkv_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("INKWELL_NO_DYN_NKV").is_none()
+        && std::env::var_os("INKWELL_NO_RELGATHER").is_none()
+        && std::env::var_os("INKWELL_ATTN_DUMP_DIR").is_none())
+}
+
+/// `(no_split, split_min, chunk_override)`, mirroring the CUDA dispatcher.
+fn attn_split_cfg() -> (bool, i64, i64) {
+    static CFG: std::sync::OnceLock<(bool, i64, i64)> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let no_split = std::env::var_os("INKWELL_NO_ATTNSPLIT").is_some();
+        let split_min = std::env::var("INKWELL_ATTNSPLIT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(320);
+        let mut chunk = std::env::var("INKWELL_ATTNSPLIT_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if chunk != 0 && chunk < 32 { chunk = 32; }
+        (no_split, split_min, chunk)
+    })
+}
+
+/// Kernel-topology regime for the padded length master would have used.  Using
+/// the padded length here (rather than raw n_kv) preserves master's exact kernel
+/// choice at pos=256 while the dynamic kernels still skip padded work on device.
+fn attn_regime_for_pad(n_kv_pad: i64) -> u8 {
+    let (no_split, split_min, chunk_override) = attn_split_cfg();
+    if no_split || n_kv_pad < split_min { return 0; }
+    if chunk_override == 0 && n_kv_pad > 16384 { 2 } else { 1 }
+}
+
+fn attn_chunk_len(regime: u8) -> i32 {
+    let (_, _, chunk_override) = attn_split_cfg();
+    let v = if chunk_override != 0 { chunk_override } else if regime == 2 { 256 } else { 32 };
+    i32::try_from(v).expect("attention chunk length fits i32")
+}
+
 /// per-layer weight handles resolved by name
 #[derive(Debug, Default)]
 struct L {
@@ -143,11 +179,14 @@ struct StepCache {
     out: Ptr,
     /// normalised hidden state entering the output head
     head_in: Ptr,
-    /// device offsets of the 9 input tensors inside `in_buf` + span bytes
-    in_offs: [usize; 9],
+    /// device offsets of the input tensors inside `in_buf` + span bytes
+    /// (indices 9/10 are the dynamic n_kv scalars when enabled)
+    in_offs: [usize; 11],
     in_span: usize,
     /// embedding row offset inside the packed input span (`usize::MAX` when unpacked)
     embd_off: usize,
+    /// packed input bytes needed by the pipelined device-resolver path
+    input_copy_len: usize,
 }
 
 /// One cached-step host timing row, microseconds.
@@ -479,6 +518,48 @@ unsafe extern "C" fn relbias_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32
         inkwell_cuda::relbias_gather_async(inkwell_ggml::ink_tensor_data(mm).cast(),
             s(1).cast(), s(2).cast(), inkwell_ggml::ink_tensor_data(dst).cast(),
             nkv, nh, ext)
+    };
+}
+
+/// `ggml_custom_op_t`: fixed-capacity rel-bias gather; exact length is src[3].
+unsafe extern "C" fn relbias_dyn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let mm = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i))
+    };
+    let cap = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let nh = unsafe { inkwell_ggml::ink_tensor_ne(mm, 1) } as i32;
+    let ext = unsafe { inkwell_ggml::ink_tensor_ne(mm, 0) } as i32;
+    unsafe {
+        inkwell_cuda::relbias_gather_dyn_async(inkwell_ggml::ink_tensor_data(mm).cast(),
+            s(1).cast(), s(2).cast(), s(3).cast(), inkwell_ggml::ink_tensor_data(dst).cast(),
+            cap, nh, ext)
+    };
+}
+
+struct RelbiasDynPosArgs {
+    mode: i32,
+    swa: i32,
+    rel_extent: i32,
+}
+
+/// `ggml_custom_op_t`: fixed-capacity rel-bias gather whose integer relative
+/// positions are computed on device. srcs = [table, sinks, pos, n_kv].
+unsafe extern "C" fn relbias_dynpos_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<RelbiasDynPosArgs>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let mm = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i))
+    };
+    let cap = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let nh = unsafe { inkwell_ggml::ink_tensor_ne(mm, 1) } as i32;
+    let ext = unsafe { inkwell_ggml::ink_tensor_ne(mm, 0) } as i32;
+    unsafe {
+        inkwell_cuda::relbias_gather_dynpos_async(inkwell_ggml::ink_tensor_data(mm).cast(),
+            s(1).cast(), s(2).cast(), s(3).cast(), inkwell_ggml::ink_tensor_data(dst).cast(),
+            cap, nh, ext, a.mode, a.swa, a.rel_extent)
     };
 }
 
@@ -2201,9 +2282,15 @@ impl Runner {
 
         // KV write via set_rows: in-place write into arena + dep edge so the
         // attention reads below see this token's k/v (upstream pattern).
-        // n_kv padded to a multiple of 64: constant shapes across steps keep
-        // the CUDA graph reusable (recapture only on 64-token boundaries).
-        let n_kv = if is_swa { step.n_kv_swa_pad } else { step.n_kv_full_pad };
+        // Dynamic mode uses fixed-capacity views and reads exact n_kv from a
+        // device scalar; the fallback keeps master's 64-token padded shapes.
+        let n_kv = if step.dyn_nkv {
+            if is_swa { step.cap_swa } else { step.cap_full }
+        } else if is_swa {
+            step.n_kv_swa_pad
+        } else {
+            step.n_kv_full_pad
+        };
         let kv_idx = if is_swa { step.kv_idx_swa } else { step.kv_idx_full };
         // set_rows wants b [hd, n_idx, hkv]: permute [hd,hkv,1] -> [hd,1,hkv]
         let k_rows = t::permute(c, k, 0, 2, 1, 3);
@@ -2225,7 +2312,21 @@ impl Runner {
         let rel_pos = if is_swa { step.rel_pos_swa } else { step.rel_pos_full };
         // fused gather+sub (INKWELL_NO_RELGATHER=1 restores the chain):
         // kq_b[j,0,h] = table[rel_pos[j], h] - sinks[h] in one kernel.
-        let kq_b = if std::env::var_os("INKWELL_NO_RELGATHER").is_none() {
+        let kq_b = if step.dyn_nkv {
+            let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
+            if step.direct_relbias {
+                let mode = if !is_swa { 0 } else if self.swa_legacy_min { 2 } else { 1 };
+                let ud = Box::leak(Box::new(RelbiasDynPosArgs {
+                    mode, swa: self.swa as i32, rel_extent: self.cfg.rel_extent as i32 }));
+                let mut args = [table.0, sinks.0, step.pos.0, nkv_dev.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                    relbias_dynpos_cb as *const () as usize, (ud as *mut RelbiasDynPosArgs).cast()) })
+            } else {
+                let mut args = [table.0, sinks.0, rel_pos.0, nkv_dev.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                    relbias_dyn_cb as *const () as usize, std::ptr::null_mut()) })
+            }
+        } else if std::env::var_os("INKWELL_NO_RELGATHER").is_none() {
             let mut args = [table.0, sinks.0, rel_pos.0];
             Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
                 relbias_cb as *const () as usize, std::ptr::null_mut()) })
@@ -2252,7 +2353,22 @@ impl Runner {
             self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_bias", step.pos_val), kq_b);
             self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_mask", step.pos_val), kq_mask);
         }
-        let out = t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh); // [hd*nh, 1]
+        let out = if step.dyn_nkv {
+            let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
+            let (regime, allow_gqa) = if is_swa {
+                (step.attn_regime_swa, step.attn_allow_gqa_swa)
+            } else {
+                (step.attn_regime_full, step.attn_allow_gqa_full)
+            };
+            let ud = Box::leak(Box::new(AttnDynArgs {
+                use_split: i32::from(regime != 0), allow_gqa: i32::from(allow_gqa),
+                chunk_len: attn_chunk_len(regime), split_min: attn_split_cfg().1,
+            }));
+            t::attn_fused_dyn(c, k_view, v_view, q3, kq_b, kq_mask, nkv_dev, hd, nh,
+                (ud as *mut AttnDynArgs).cast())
+        } else {
+            t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh)
+        }; // [hd*nh, 1]
 
         let mut cur = out;
         cur = t::mul(c, cur, t::sigmoid(c, gate_lin));
@@ -2373,6 +2489,30 @@ struct Step {
     mask_swa: Ptr,
     n_kv_full_pad: i64,
     n_kv_swa_pad: i64,
+    n_kv_full_dev: Option<Ptr>,
+    n_kv_swa_dev: Option<Ptr>,
+    cap_full: i64,
+    cap_swa: i64,
+    attn_regime_full: u8,
+    attn_regime_swa: u8,
+    attn_allow_gqa_full: bool,
+    attn_allow_gqa_swa: bool,
+    dyn_nkv: bool,
+    direct_relbias: bool,
+}
+
+fn step_shape_match(step: &Step, pos: i64, max_ctx: i64, swa: i64) -> bool {
+    let n_kv_full = kv_bucket(pos + 1, max_ctx);
+    let n_kv_swa = kv_bucket((pos + 1).min(swa), swa);
+    if step.dyn_nkv {
+        let (_, split_min, _) = attn_split_cfg();
+        step.attn_regime_full == attn_regime_for_pad(n_kv_full)
+            && step.attn_regime_swa == attn_regime_for_pad(n_kv_swa)
+            && step.attn_allow_gqa_full == (n_kv_full < split_min)
+            && step.attn_allow_gqa_swa == (n_kv_swa < split_min)
+    } else {
+        step.n_kv_full_pad == n_kv_full && step.n_kv_swa_pad == n_kv_swa
+    }
 }
 
 impl Runner {
@@ -2402,7 +2542,7 @@ impl Runner {
             && ((pos + 1) & pos) == 0 && (1024..=32768).contains(&(pos + 1));
         if caching && !dump_pow2 {
             if let Some(gc) = self.step_gcache.take() {
-                if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
+                if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity()) {
                     let logits = self.step_cached(id, pos, &gc);
                     self.step_gcache = Some(gc);
                     if dump_selection && crate::head_dump::enabled() {
@@ -2432,15 +2572,23 @@ impl Runner {
         let n_rep = nh / hkv;
 
         // --- inputs ---
+        let dyn_nkv = dyn_nkv_enabled();
+        let cap_full = if dyn_nkv { self.max_ctx } else { n_kv_full };
+        let cap_swa = if dyn_nkv { self.max_ctx.min(self.swa_capacity()) } else { n_kv_swa };
         let ids = t::new(c, I32, &[1]);
         let pos_t = t::new(c, I32, &[1]);
         let kv_idx_full = t::new(c, I32, &[1]);
         let kv_idx_swa = t::new(c, I32, &[1]);
-        let rel_pos_full = t::new(c, I32, &[n_kv_full, 1]);
-        let rel_pos_swa = t::new(c, I32, &[n_kv_swa, 1]);
-        let mask_full = t::new(c, F32, &[n_kv_full + 1, 1, 1, 1]);
-        let mask_swa = t::new(c, F32, &[n_kv_swa + 1, 1, 1, 1]);
+        let rel_pos_full = t::new(c, I32, &[cap_full, 1]);
+        let rel_pos_swa = t::new(c, I32, &[cap_swa, 1]);
+        let mask_full = t::new(c, F32, &[cap_full + 1, 1, 1, 1]);
+        let mask_swa = t::new(c, F32, &[cap_swa + 1, 1, 1, 1]);
         let sink_zero = t::new(c, F32, &[1, 1, hkv, n_rep]);
+        let (n_kv_full_dev, n_kv_swa_dev) = if dyn_nkv {
+            (Some(t::new(c, I32, &[1])), Some(t::new(c, I32, &[1])))
+        } else {
+            (None, None)
+        };
         // upload input data into cpu-side buffers? These tensors are graph
         // inputs — allocate them in the device buffer and set.
         // (they're tiny; alloc in dev buf of the step)
@@ -2449,14 +2597,26 @@ impl Runner {
         }
         let buf = self.in_buf.as_ref().unwrap().clone();
         let mut o = 0usize;
-        let mut in_offs = [0usize; 9];
-        for (i, x) in [ids, pos_t, kv_idx_full, kv_idx_swa, rel_pos_full, rel_pos_swa, mask_full, mask_swa, sink_zero].iter().enumerate() {
+        let mut in_offs = [usize::MAX; 11];
+        let mut inputs: Vec<(usize, Ptr)> = vec![
+            (0, ids), (1, pos_t), (2, kv_idx_full), (3, kv_idx_swa)];
+        if let (Some(nf), Some(ns)) = (n_kv_full_dev, n_kv_swa_dev) {
+            inputs.push((9, nf));
+            inputs.push((10, ns));
+        }
+        let n_small_inputs = inputs.len();
+        inputs.extend([
+            (4, rel_pos_full), (5, rel_pos_swa), (6, mask_full), (7, mask_swa), (8, sink_zero)]);
+        let mut small_end = 0usize;
+        for (ord, (i, x)) in inputs.iter().enumerate() {
             unsafe { inkwell_ggml::ink_set_input(x.0) };
             let off = (o + 255) & !255;
             buf.assign(*x, off);
-            in_offs[i] = off;
+            in_offs[*i] = off;
             o = off + t::nbytes(*x);
+            if ord + 1 == n_small_inputs { small_end = o; }
         }
+        let direct_relbias = dyn_nkv && !self.swa_oracle;
         // Pack the embedding row after the small inputs so the cached fast path
         // needs one HtoD copy per token. INKWELL_NO_ONEH2D keeps the old copy pair.
         let embd_off = if std::env::var_os("INKWELL_NO_ONEH2D").is_none() {
@@ -2467,6 +2627,7 @@ impl Runner {
         } else {
             usize::MAX
         };
+        let input_copy_len = if direct_relbias { small_end } else { embd_off };
         // keep buf alive for the graph
         std::mem::forget(buf);
 
@@ -2477,7 +2638,12 @@ impl Runner {
         let tau = t::reshape3(c, t::scale_bias(c, tau, self.cfg.log_scale_alpha, 1.0), 1, 1, 1);
 
         let step = Step { ids, kv_idx_full, kv_idx_swa, pos: pos_t, rel_pos_full, rel_pos_swa, sink_zero, tau, pos_val: pos,
-                          mask_full, mask_swa, n_kv_full_pad: n_kv_full, n_kv_swa_pad: n_kv_swa };
+                          mask_full, mask_swa, n_kv_full_pad: n_kv_full, n_kv_swa_pad: n_kv_swa,
+                          n_kv_full_dev, n_kv_swa_dev, cap_full, cap_swa,
+                          attn_regime_full: attn_regime_for_pad(n_kv_full),
+                          attn_regime_swa: attn_regime_for_pad(n_kv_swa),
+                          attn_allow_gqa_full: n_kv_full < attn_split_cfg().1,
+                          attn_allow_gqa_swa: n_kv_swa < attn_split_cfg().1, dyn_nkv, direct_relbias };
         self.upload_step_inputs(&step, id, pos);
 
         // embed: dequantize the row host-side (embd stays quantized, ~230 MiB not 1.85 GiB)
@@ -2585,7 +2751,7 @@ impl Runner {
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         if caching {
             // keep ctx + cgraph + sched split + instantiated CUDA graph alive
-            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o, embd_off });
+            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o, embd_off, input_copy_len });
         } else {
             // release the cached split plan so the next step's graph gets re-allocated
             unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
@@ -2626,16 +2792,46 @@ impl Runner {
             let rp = |nk: i64, raw: i64| -> Vec<i32> {
                 (0..nk).map(|j| if j < raw { (raw - 1 - j).min(self.cfg.rel_extent as i64) as i32 } else { 0 }).collect()
             };
-            let rp_f = rp(s.n_kv_full_pad, n_kv_full_raw);
-            let rp_s: Vec<i32> = (0..s.n_kv_swa_pad).map(|j| if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 }).collect();
-            t::set(s.rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
-            t::set(s.rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
-            // -inf on padded columns (plus a 0 for the appended sink column)
+            let n_kv_swa_raw = self.swa_positions(pos + 1);
+            if let Some(nf) = s.n_kv_full_dev {
+                t::set(nf, [n_kv_full_raw as i32].as_ptr().cast(), 0, 4);
+            }
+            if let Some(ns) = s.n_kv_swa_dev {
+                t::set(ns, [n_kv_swa_raw as i32].as_ptr().cast(), 0, 4);
+            }
+            if !s.direct_relbias {
+                let rp_f: Vec<i32> = if s.dyn_nkv {
+                    (0..n_kv_full_raw).map(|j| (n_kv_full_raw - 1 - j).min(self.cfg.rel_extent as i64) as i32).collect()
+                } else {
+                    rp(s.n_kv_full_pad, n_kv_full_raw)
+                };
+                let rp_s: Vec<i32> = if s.dyn_nkv {
+                    (0..n_kv_swa_raw).map(|j| self.swa_rel_pos(pos, j)).collect()
+                } else {
+                    (0..s.n_kv_swa_pad).map(|j| if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 }).collect()
+                };
+                t::set(s.rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
+                t::set(s.rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
+            }
+            // Dynamic mode never reads padding, so its mask is all zero.  The
+            // fallback preserves master's -inf padded columns (plus the sink 0).
             let mk = |nk: i64, raw: i64| -> Vec<f32> {
-                (0..=nk).map(|j| if j < raw || j == nk { 0.0 } else { f32::NEG_INFINITY }).collect()
+                (0..=nk).map(|j| if s.dyn_nkv || j < raw || j == nk { 0.0 } else { f32::NEG_INFINITY }).collect()
             };
-            let mk_f = mk(s.n_kv_full_pad, n_kv_full_raw);
-            let mk_s: Vec<f32> = (0..=s.n_kv_swa_pad).map(|j| if j == s.n_kv_swa_pad || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY }).collect();
+            let mk_f: Vec<f32> = if s.direct_relbias {
+                vec![0.0; (s.cap_full + 1) as usize]
+            } else if s.dyn_nkv {
+                vec![0.0; (n_kv_full_raw + 1) as usize]
+            } else {
+                mk(s.n_kv_full_pad, n_kv_full_raw)
+            };
+            let mk_s: Vec<f32> = if s.direct_relbias {
+                vec![0.0; (s.cap_swa + 1) as usize]
+            } else if s.dyn_nkv {
+                (0..=n_kv_swa_raw).map(|j| if j == n_kv_swa_raw || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY }).collect()
+            } else {
+                (0..=s.n_kv_swa_pad).map(|j| if j == s.n_kv_swa_pad || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY }).collect()
+            };
             t::set(s.mask_full, mk_f.as_ptr().cast(), 0, mk_f.len() * 4);
             t::set(s.mask_swa, mk_s.as_ptr().cast(), 0, mk_s.len() * 4);
             let z = vec![0f32; (t::ne(s.sink_zero, 2) * t::ne(s.sink_zero, 3)) as usize];
@@ -2796,28 +2992,56 @@ impl Runner {
     /// Marshal the pos-dependent inputs into the pinned `in_buf` mirror.
     /// `ids` is written by the caller once the token id is known; the
     /// sink_zero region stays zeroed since buffer init.
-    fn marshal_inputs(&self, s: &Step, offs: &[usize; 9], pos: i64, dst: *mut u8) {
+    fn marshal_inputs(&self, s: &Step, offs: &[usize; 11], pos: i64, dst: *mut u8) {
         unsafe {
             (dst.add(offs[1]) as *mut i32).write(pos as i32);
             (dst.add(offs[2]) as *mut i32).write(pos as i32);
             (dst.add(offs[3]) as *mut i32).write(self.swa_kv_idx(pos) as i32);
             let nfr = pos + 1;
-            let ext = self.cfg.rel_extent as i64;
-            let rf = dst.add(offs[4]) as *mut i32;
-            for j in 0..s.n_kv_full_pad {
-                rf.add(j as usize).write(if j < nfr { (nfr - 1 - j).min(ext) as i32 } else { 0 });
+            let nsr = self.swa_positions(pos + 1);
+            if s.dyn_nkv {
+                (dst.add(offs[9]) as *mut i32).write(nfr as i32);
+                (dst.add(offs[10]) as *mut i32).write(nsr as i32);
             }
-            let rs = dst.add(offs[5]) as *mut i32;
-            for j in 0..s.n_kv_swa_pad {
-                rs.add(j as usize).write(if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 });
+            if !s.direct_relbias {
+                let ext = self.cfg.rel_extent as i64;
+                let rf = dst.add(offs[4]) as *mut i32;
+                if s.dyn_nkv {
+                    for j in 0..nfr {
+                        rf.add(j as usize).write((nfr - 1 - j).min(ext) as i32);
+                    }
+                } else {
+                    for j in 0..s.cap_full {
+                        rf.add(j as usize).write(if j < nfr { (nfr - 1 - j).min(ext) as i32 } else { 0 });
+                    }
+                }
+                let rs = dst.add(offs[5]) as *mut i32;
+                if s.dyn_nkv {
+                    for j in 0..nsr {
+                        rs.add(j as usize).write(self.swa_rel_pos(pos, j));
+                    }
+                } else {
+                    for j in 0..s.cap_swa {
+                        rs.add(j as usize).write(if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 });
+                    }
+                }
             }
-            let mf = dst.add(offs[6]) as *mut f32;
-            for j in 0..=s.n_kv_full_pad {
-                mf.add(j as usize).write(if j < nfr || j == s.n_kv_full_pad { 0.0 } else { f32::NEG_INFINITY });
-            }
-            let ms = dst.add(offs[7]) as *mut f32;
-            for j in 0..=s.n_kv_swa_pad {
-                ms.add(j as usize).write(if j == s.n_kv_swa_pad || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY });
+            if s.dyn_nkv {
+                if self.swa_oracle {
+                    let ms = dst.add(offs[7]) as *mut f32;
+                    for j in 0..=nsr {
+                        ms.add(j as usize).write(if j == nsr || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY });
+                    }
+                }
+            } else {
+                let mf = dst.add(offs[6]) as *mut f32;
+                for j in 0..=s.n_kv_full_pad {
+                    mf.add(j as usize).write(if j < nfr || j == s.n_kv_full_pad { 0.0 } else { f32::NEG_INFINITY });
+                }
+                let ms = dst.add(offs[7]) as *mut f32;
+                for j in 0..=s.n_kv_swa_pad {
+                    ms.add(j as usize).write(if j == s.n_kv_swa_pad || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY });
+                }
             }
         }
     }
@@ -2867,9 +3091,7 @@ impl Runner {
         static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none()) {
             if let Some(gc) = self.step_gcache.take() {
-                let n_kv_full = kv_bucket(pos + 1, self.max_ctx);
-                let n_kv_swa = kv_bucket(self.swa_positions(pos + 1), self.swa_capacity());
-                if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
+                if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity()) {
                     let r = self.step_id_cached(id, pos, &gc);
                     self.step_gcache = Some(gc);
                     return r;
@@ -2962,9 +3184,7 @@ impl Runner {
         // step's pos-dep inputs while the GPU is still busy (single pinned
         // buf: this step's copy already ran before the graph).
         let next = pos + 1;
-        let n_kv_full = kv_bucket(next + 1, self.max_ctx);
-        let n_kv_swa = kv_bucket(self.swa_positions(next + 1), self.swa_capacity());
-        let premarshal = n_kv_full == gc.step.n_kv_full_pad && n_kv_swa == gc.step.n_kv_swa_pad;
+        let premarshal = step_shape_match(&gc.step, next, self.max_ctx, self.swa_capacity());
         unsafe {
             inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
             if self.out_head.is_none() {
@@ -2989,7 +3209,7 @@ impl Runner {
             unsafe {
                 inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
                 let base = inkwell_ggml::ink_buf_base(self.in_buf.as_ref().expect("in_buf").0 .0);
-                inkwell_cuda::memcpy_h2d_async(base, next_pin.cast_const().cast(), gc.embd_off);
+                inkwell_cuda::memcpy_h2d_async(base, next_pin.cast_const().cast(), gc.input_copy_len);
                 let b = base as *mut u8;
                 inkwell_cuda::pipe_resolve_async(
                     sp.am.cast(), self.embd_dev.cast_const(), stride,
@@ -3652,6 +3872,49 @@ unsafe extern "C" fn attn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _
             inkwell_ggml::ink_tensor_nb(q_t, 2) / 4, inkwell_ggml::ink_tensor_nb(b_t, 2) / 4,
             1.0 / (hd as f32).sqrt(),
             kv16,
+        );
+    }
+}
+
+struct AttnDynArgs {
+    use_split: i32,
+    allow_gqa: i32,
+    chunk_len: i32,
+    split_min: i64,
+}
+
+/// `ggml_custom_op_t` for shape-invariant fused decode attention.
+/// src[0..4] mirror `attn_cb`; src[5] is the device exact-n_kv scalar.
+pub fn attn_dyn_cb_addr() -> usize { attn_dyn_cb as *const () as usize }
+
+unsafe extern "C" fn attn_dyn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<AttnDynArgs>() };
+    unsafe {
+        inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+        let k_t = inkwell_ggml::ink_tensor_src(dst, 0);
+        let v_t = inkwell_ggml::ink_tensor_src(dst, 1);
+        let q_t = inkwell_ggml::ink_tensor_src(dst, 2);
+        let b_t = inkwell_ggml::ink_tensor_src(dst, 3);
+        let m_t = inkwell_ggml::ink_tensor_src(dst, 4);
+        let nkv_t = inkwell_ggml::ink_tensor_src(dst, 5);
+        let hd = inkwell_ggml::ink_tensor_ne(k_t, 0);
+        let cap = inkwell_ggml::ink_tensor_ne(k_t, 1);
+        let hkv = inkwell_ggml::ink_tensor_ne(k_t, 2);
+        let nh = inkwell_ggml::ink_tensor_ne(q_t, 2);
+        let kv16 = inkwell_ggml::ink_tensor_type(k_t) == 1;
+        inkwell_cuda::attn_decode_dyn_async(
+            inkwell_ggml::ink_tensor_data(k_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(v_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(q_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(b_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(m_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(dst).cast::<f32>(),
+            nh, hkv, inkwell_ggml::ink_tensor_data(nkv_t).cast_const().cast(), hd, cap,
+            inkwell_ggml::ink_tensor_nb(k_t, 1), inkwell_ggml::ink_tensor_nb(k_t, 2),
+            inkwell_ggml::ink_tensor_nb(v_t, 1), inkwell_ggml::ink_tensor_nb(v_t, 2),
+            inkwell_ggml::ink_tensor_nb(q_t, 2) / 4, inkwell_ggml::ink_tensor_nb(b_t, 2) / 4,
+            1.0 / (hd as f32).sqrt(), kv16,
+            a.use_split != 0, a.allow_gqa != 0, a.chunk_len, a.split_min,
         );
     }
 }
