@@ -7,3 +7,4 @@ opt/kbench/sgemv_bench
 opt/kbench/sgemv_gold
 opt/kbench/sgemv_dense_gold
 opt/kbench/sgemv_var
+opt/kbench/isa_rates/isa_rates

@@ -1451,3 +1451,22 @@ Build: `cargo build --release` rc=0, warnings **62** (master budget ≤64), `ker
 - The child's −2.36 ms (router fusion) was measured before devdesc landed; most of it does not
   survive on the current master. Meets the bar (median faster, ≥12/16, md5). ACCEPTED.
 - Killswitches: INKWELL_NO_ROUTERFUSE, INKWELL_NO_KVBATCH.
+
+### sm_61 instruction rates on the GTX 1060 (2026-11-24) — MEASUREMENT
+
+- Tool: `opt/kbench/isa_rates/run.sh`. It runs 1 block of 1024 threads per SM, with 8 independent chains per thread. Counts are taken from the loop SASS, and cycles from clock64.
+- Rates, in warp-instructions per cycle per SM:
+
+  | Class | Rate |
+  |---|---|
+  | FFMA, FADD, LOP3, IDP.4A, XMAD | 3.7–3.9 (issue-bound) |
+  | SHF, SHR, BFE, BFI, PRMT, ISCADD | 1.93–2.00 |
+  | IADD3 | 1.87 |
+  | I2F, POPC, SHFL, LDS.32 (own bank or broadcast) | 1.00 |
+  | LDS.32 at random addresses | 0.45 |
+
+- Mixes:
+  - 3 FFMA + 1 I2F reached 3.98 instructions per cycle, so the slow pipe runs beside issue.
+  - 1 FFMA + 1 I2F, LDS or SHFL was held to 1 pair per cycle.
+- Shipped expert loop under the max(N, 2H, 4Q)/Wp model: issue-bound at every K, e.g. K=2 has N=270, H=36, Q=40 per 32 weights.
+- Use: this is the cost model of `opt/MATH_CHALLENGE_STEP2.md` §2.5. Pipe sharing between slow classes is still open, and the mix run is queued.
