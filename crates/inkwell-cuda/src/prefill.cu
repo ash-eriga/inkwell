@@ -1469,11 +1469,70 @@ extern "C" __global__ void inkwell_pf_mix(PfMixStates states,
     }
 }
 
+#define PF_MIX_NPL 72
+
+// Batched equivalent of inkwell_mix_fused: same lane-strided associations,
+// xor-shuffle trees, sequential softmax, and row accumulation order.  Grid
+// z is the token; states are token-major [C,n] planes.
+__global__ void __launch_bounds__(256) inkwell_pf_mix_exact(PfMixStates states,
+        int rows, const float* __restrict__ q, float* __restrict__ out,
+        int C, int embd, float scale) {
+    __shared__ float s_rms[64];
+    __shared__ float s_p[64];
+    const int token = blockIdx.z;
+    const int qc = blockIdx.y;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    float qq[PF_MIX_NPL];
+#pragma unroll
+    for (int t = 0; t < PF_MIX_NPL; ++t) qq[t] = q[(size_t)qc * embd + lane + 32 * t];
+    for (int j = w; j < rows; j += nw) {
+        const float* col = states.p[j] + (size_t)token * embd;
+        float c[PF_MIX_NPL];
+#pragma unroll
+        for (int t = 0; t < PF_MIX_NPL; ++t) c[t] = col[lane + 32 * t];
+        float ss = 0.f;
+#pragma unroll
+        for (int t = 0; t < PF_MIX_NPL; ++t) ss += c[t] * c[t];
+        for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(~0u, ss, m);
+        const float rms = sqrtf(ss / (float)embd + 1e-6f);
+        float dp = 0.f;
+#pragma unroll
+        for (int t = 0; t < PF_MIX_NPL; ++t) dp += c[t] / rms * qq[t];
+        for (int m = 16; m; m >>= 1) dp += __shfl_xor_sync(~0u, dp, m);
+        if (lane == 0) { s_rms[j] = rms; s_p[j] = dp; }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mx = -INFINITY;
+        for (int j = 0; j < rows; ++j) { s_p[j] *= scale; mx = fmaxf(mx, s_p[j]); }
+        float d = 0.f;
+        for (int j = 0; j < rows; ++j) { s_p[j] = __expf(s_p[j] - mx); d += s_p[j]; }
+        for (int j = 0; j < rows; ++j) s_p[j] /= d;
+    }
+    __syncthreads();
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= embd) return;
+    float a = 0.f;
+    for (int j0 = 0; j0 < rows; j0 += 8) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = (j0 + u < rows) ? states.p[j0 + u][(size_t)token * embd + e] : 0.f;
+#pragma unroll
+        for (int u = 0; u < 8; ++u) if (j0 + u < rows) a += v[u] / s_rms[j0 + u] * s_p[j0 + u];
+    }
+    out[((size_t)qc * C + token) * embd + e] = a;
+}
+
 extern "C" void ink_launch_pf_mix(const void* const* states, int rows, const float* query,
         float* out, int C, int n, int qcols, float scale, float eps, void* stream) {
     PfMixStates tmp{};
     for (int i = 0; i < rows && i < 8; ++i) tmp.p[i] = (const float*)states[i];
-    inkwell_pf_mix<<<C * qcols, 256, 0, (cudaStream_t)stream>>>(tmp, rows, query, out, C, n, qcols, scale, eps);
+    if (n == 32 * PF_MIX_NPL && rows <= 64) {
+        dim3 g((n + 255) / 256, qcols, C);
+        inkwell_pf_mix_exact<<<g, 256, 0, (cudaStream_t)stream>>>(tmp, rows, query, out, C, n, scale);
+    } else {
+        inkwell_pf_mix<<<C * qcols, 256, 0, (cudaStream_t)stream>>>(tmp, rows, query, out, C, n, qcols, scale, eps);
+    }
 }
 
 // Phase-2 H2D staging-ring contract (stub in Phase 1):

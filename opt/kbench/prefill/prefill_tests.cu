@@ -32,7 +32,7 @@ static int test_gemm(){
  struct S{const char*name;int K,N,ka,hk;} ss[]={{"MoE_gu",2304,1152,2,1},{"MoE_dn",1152,2304,2,1},{"Dense_wq",2304,3072,3,0},{"Dense_wo",3072,2304,3,1}};
  bool pass=true; printf("gemm_smem\n");
  for(auto sh:ss){
-  int tk=sh.K/16,tn=sh.N/16,maxM=64;size_t nw=(size_t)tk*tn*((sh.hk ? 256*sh.ka+128 : 256*sh.ka)/32);
+  int tk=sh.K/16,tn=sh.N/16,maxM=128;size_t nw=(size_t)tk*tn*((sh.hk ? 256*sh.ka+128 : 256*sh.ka)/32);
   std::vector<uint32_t> ht(nw);for(auto&x:ht)x=rnd();
   std::vector<float> hx(maxM*sh.K),hsu(sh.K),hsv(sh.N);for(auto&x:hx)x=frnd();
   std::vector<uint16_t> hu(sh.K),hv(sh.N);for(auto&x:hu)x=(uint16_t)(0x3800+(rnd()&0x3ff));for(auto&x:hv)x=(uint16_t)(0x3800+(rnd()&0x3ff));
@@ -40,7 +40,7 @@ static int test_gemm(){
   CK(cudaMalloc(&dx,hx.size()*4));CK(cudaMalloc(&dy,(size_t)maxM*sh.N*4));CK(cudaMalloc(&dr,(size_t)maxM*sh.N*4));CK(cudaMalloc(&ds,(size_t)maxM*(sh.K+sh.N)*4));
   CK(cudaMemcpy(dw,ht.data(),nw*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dx,hx.data(),hx.size()*4,cudaMemcpyHostToDevice));
   CK(cudaMemcpy(du,hu.data(),sh.K*2,cudaMemcpyHostToDevice));CK(cudaMemcpy(dv,hv.data(),sh.N*2,cudaMemcpyHostToDevice));
-  for(int M: {1,16,64}){
+  for(int M: {1,16,64,127,128}){
    // Reference: same Hadamard kernels + scalar exact core.
    float*xh=ds,*tm=ds+(size_t)M*sh.K;
    inkwell_exl3_had_in_prefill<<<dim3(sh.K/128,M),128>>>(dx,du,xh,M,sh.K);

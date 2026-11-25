@@ -4426,7 +4426,14 @@ impl Runner {
             inkwell_cuda::pf_add_async(a.ptr("ffnout"), cur, (c*n) as i64);
         }
         pf_copy(cur, a.ptr("ffnout"), hbytes);
-        if matches!(il, 0|1|2|5|6|11|12|17|18|23) { let name = format!("l_out-{il}"); pf_dbg(&name, cur, 8); }
+        if matches!(il, 0|1|2|5|6|11|12|17|18|23) {
+            let name = format!("l_out-{il}");
+            pf_dbg(&name, cur, 8);
+            if c > 1 {
+                let last = format!("llast_out-{il}");
+                pf_dbg(&last, unsafe { cur.add((c - 1) * n) }, 8);
+            }
+        }
     }
 
     /// Encode token ids in chunks through the batched prefill path. Returns the
