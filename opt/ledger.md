@@ -2068,3 +2068,20 @@ Single-run decode at 4K: master 43.599 ms/tok vs fixed 48.663 ms/tok. The master
 - A/B vs frozen CTL e03df94: −0.104 ms (9/16), then −0.117 ms (11/16). Median faster both times, pair gate missed.
 - Rejected inside the branch: T7 (bit-exact, slower on dn); T6 (+0.57 ms with T7, 3/16; 8/16 without); post-SASS MOV removal (illegal address); K4 paired extraction (ptxas reassociated the XMADs).
 - Verdict: not merged on its own. It edits the same loop as t3/challenge3b-whole-loop-port, which gets lower (6.775 instr/w in part 1; target 6.442). Its techniques were handed to the 3b part-2 agent, and the near-miss retry is folded into that A/B.
+
+## t3/prefill-chunked-encode-phase0-1 — Phase 0 headless encode + Phase 1 prefill kernels
+
+Base `fb9180a`; branch `t3/prefill-chunked-encode-phase0-1`. Implements the serial-encode lm_head skip and the standalone Phase 1 kernels in `crates/inkwell-cuda/src/prefill.cu`; no prefill driver is wired into decode.
+
+**Phase 0.** The remaining step_block hit/miss ordering bug is fixed in `ink_launch_exl3_moe_ntok` (hit expert GEMV now precedes the miss GEMV on the joined stream). Non-final teacher-forced encode rows use `step_prompt_state`: the cached graph ends at the normed hidden state, so lm_head, argmax, and logit readback are omitted while state-update nodes stay unchanged; `clear_step_cache` drops that headless cache before headed generation. Controlled same-session encode A/B, `/tmp/inkwell-phase0-before` vs `/tmp/inkwell-phase0-headless-final`: ctx512 16.554603 s/511 = 32.396 ms/tok before vs 14.947819 s/511 = 29.252 ms/tok after (−3.144 ms/tok, −9.71%), generated text `";"` md5-line hash 21b63086 both; ctx2048 73.761369 s/2047 = 36.034 ms/tok before vs 65.639186 s/2047 = 32.066 ms/tok after (−3.968 ms/tok, −11.01%), generated text `"h"` md5-line hash 55522e02 both. The gain is below the study's ~15% prediction.
+
+**Validation.** Exact final binary canonical ctx512: md5 `5cbe8e06` on 3/3 runs, decode 28.839 / 29.643 / 29.240 ms/tok, peak 5,060 MiB each run (cap 5,080), `ch2nopless: enabled`. Release warning lines 59 (limit 64). INKWELL_VTEST8 runs without the master controller-shape crash but remains numerically non-exact (8 rows, 6 mismatches), consistent with the pre-existing batch FP-order mismatch documented under `t3/swa-ring-fix`. Memory caveat: one earlier exact-final validation attempt aborted in `cudaGraphInstantiate` after a 1,200 MiB cache-table allocation; the quiet-queue rerun passed 3/3 at 5,060 MiB. This margin is thin and Phase 2 should reserve/arena graph memory deliberately.
+
+**Kernel harness.** Re-runnable harness: `cd opt/kbench/prefill && make test` (uses `gpu-run`; binary ignored). Final `prefill_tests all`: OVERALL PASS.
+
+- EXL3 GEMM: 0 bit diffs vs the single-token order for M=1/16/64. M=64 TFLOP/s: MoE gu 0.74, MoE dn 1.05, dense wq 0.89, dense wo 1.17.
+- conv_prefill: PASS, 0 bit diffs vs C sequential conv steps.
+- flash_prefill_gqa3: PASS, max_abs 1.583e-8/2.282e-8 at pos1100/1500 SWA with ring wrap and 1.770e-8 at pos700 full attention (tolerance 5e-5); 0.91 TFLOP/s. This misses the ≥1.0 target. Best variant was branchless relative-bias; vectorized float K/V lost more occupancy than it saved in conversions, and shared rel_w caching was slower.
+- MoE group/sort/grouped GEMM: PASS, 0 bit diffs, 0.68 TFLOP/s on the realistic grouped shape; deterministic fused SiLU/weighted scatter pipeline PASS, 0 bit diffs.
+
+**Phase 2 requirements.** The kernels take caller-owned scratch and already valid device descriptors. The MoE H2D ring contract is documented at the end of `prefill.cu`: a 32 MiB device ring in two 16 MiB buffers, tile t+1 copied on the side stream, buffer reuse only after tile t−2 compute, descriptor rewriting to ring addresses, and events ordered before grouped GEMM. The driver must also preserve prompt-state ordering, use headed logits only for the final prompt row, handle ring wrap/SWA masks exactly, and solve CUDA-graph/activation memory headroom instead of relying on the current marginal 5,060 MiB peak.

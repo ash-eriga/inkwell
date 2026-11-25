@@ -720,6 +720,7 @@ pub unsafe fn pipe_resolve_async(am: *const u32, embd: *const c_void, row_stride
     idout: *mut i32, row: *mut f32, nblocks: usize) {
     unsafe { ink_launch_pipe_resolve(am, embd, row_stride as i64, idout, row, nblocks as i64, stream()) };
 }
+
 /// # Safety
 /// `dst`/`src` device memory valid for `bytes`.
 pub unsafe fn memcpy_d2d_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
@@ -1211,4 +1212,82 @@ pub unsafe fn mix_async(st: *const std::ffi::c_void, q: *const std::ffi::c_void,
     out: *mut std::ffi::c_void, embd: i32, rows: i32, qcols: i32, scale: f32) -> bool {
     unsafe { ink_launch_mix(st, q, out, embd, rows, qcols, scale, stream()) };
     true
+}
+
+extern "C" {
+    fn ink_launch_exl3_gemm_smem(trel: *const c_void, suh: *const c_void, svh: *const c_void,
+        x: *const f32, y: *mut f32, m: i32, k: i64, n: i64, ka: i64, halfk: i64,
+        scratch: *mut f32, stream: *mut c_void);
+    fn ink_launch_exl3_moe_group_sort(ids: *const i32, weights: *const f32, c: i32,
+        expert_offsets: *mut i32, sorted_token: *mut i32, sorted_slot: *mut i32,
+        sorted_weight: *mut f32, inverse_row: *mut i32, tile_expert: *mut i32,
+        tile_start: *mut i32, tile_count: *mut i32, tile_n: *mut i32, stream: *mut c_void);
+    fn ink_launch_exl3_moe_grouped_gemm(dg: *const c_void, du: *const c_void, dd: *const c_void,
+        x: *const f32, c: i32, sorted_token: *const i32, tile_expert: *const i32,
+        tile_start: *const i32, tile_count: *const i32, tile_n: *const i32,
+        sorted_weight: *const f32, inverse_row: *const i32,
+        workspace: *mut f32, out: *mut f32, stream: *mut c_void);
+    fn ink_launch_conv_prefill(x: *const f32, state: *mut f32, region_off: i32,
+        w: *const f32, dyn_p: *const f32, c: i32, ch: i32, n_heads: i32,
+        scale: f32, out: *mut f32, stream: *mut c_void);
+    fn ink_launch_flash_prefill_gqa3(k: *const c_void, v: *const c_void, q: *const f32,
+        r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+        c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32, stream: *mut c_void);
+}
+
+/// Batched EXL3 prefill GEMM with Hadamard input and output.
+///
+/// # Safety
+/// All pointers are device pointers. `scratch` must contain at least
+/// `m*k + m*n` f32 elements. `x`/`y` are row-major `[m,k]`/`[m,n]`.
+pub unsafe fn exl3_gemm_smem_async(trel: *const c_void, suh: *const c_void, svh: *const c_void,
+    x: *const f32, y: *mut f32, m: i32, k: usize, n: usize, ka: usize, halfk: bool,
+    scratch: *mut f32) {
+    unsafe { ink_launch_exl3_gemm_smem(trel, suh, svh, x, y, m, k as i64, n as i64,
+        ka as i64, halfk as i64, scratch, stream()) };
+}
+
+/// Sort the token-major `[c,8]` router selections into expert-grouped rows.
+///
+/// # Safety
+/// Output arrays must have room for `8*c` rows, 129 offsets, and
+/// `8*c/64+128` tile records.
+pub unsafe fn exl3_moe_group_sort_async(ids: *const i32, weights: *const f32, c: i32,
+    expert_offsets: *mut i32, sorted_token: *mut i32, sorted_slot: *mut i32,
+    sorted_weight: *mut f32, inverse_row: *mut i32, tile_expert: *mut i32,
+    tile_start: *mut i32, tile_count: *mut i32, tile_n: *mut i32) {
+    unsafe { ink_launch_exl3_moe_group_sort(ids, weights, c, expert_offsets, sorted_token,
+        sorted_slot, sorted_weight, inverse_row, tile_expert, tile_start, tile_count, tile_n, stream()) };
+}
+
+/// Run the deterministic grouped EXL3 MoE pipeline for sorted selections.
+///
+/// # Safety
+/// Device pointers must match the layout documented in `prefill.cu`.
+pub unsafe fn exl3_moe_grouped_gemm_async(dg: *const c_void, du: *const c_void, dd: *const c_void,
+    x: *const f32, c: i32, sorted_token: *const i32, tile_expert: *const i32,
+    tile_start: *const i32, tile_count: *const i32, tile_n: *const i32,
+    sorted_weight: *const f32, inverse_row: *const i32, workspace: *mut f32, out: *mut f32) {
+    unsafe { ink_launch_exl3_moe_grouped_gemm(dg, du, dd, x, c, sorted_token, tile_expert,
+        tile_start, tile_count, tile_n, sorted_weight, inverse_row, workspace, out, stream()) };
+}
+
+/// Parallel causal FIR convolution over a prompt chunk.
+///
+/// # Safety
+/// Device pointers valid for `[c,ch]` and the persistent conv-state layout.
+pub unsafe fn conv_prefill_async(x: *const f32, state: *mut f32, region_off: i32,
+    w: *const f32, dyn_p: *const f32, c: i32, ch: i32, n_heads: i32, scale: f32, out: *mut f32) {
+    unsafe { ink_launch_conv_prefill(x, state, region_off, w, dyn_p, c, ch, n_heads, scale, out, stream()) };
+}
+
+/// GQA-3 flash attention over a prompt chunk.
+///
+/// # Safety
+/// Device pointers valid for the layouts documented in `prefill.cu`.
+pub unsafe fn flash_prefill_gqa3_async(k: *const c_void, v: *const c_void, q: *const f32,
+    r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+    c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32) {
+    unsafe { ink_launch_flash_prefill_gqa3(k, v, q, r, rel_w, sinks, out, c, pos0, kv_cap,
+        swa_win, scale, stream()) };
 }

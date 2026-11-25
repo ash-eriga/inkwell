@@ -5740,20 +5740,20 @@ extern "C" void ink_launch_exl3_moe_ntok(
     if (cached) {
         // hits first: resident already, gemv overlaps the miss bulk copy on ss
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
-            2 * NG, KG, miss, 2, euni, etok);
-        if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin2 err=%d\n", (int)cudaGetLastError()); }
-        if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, 64, 2), 256, 0, st>>>(G, U, uids, estart, xh_e,
-            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, unexp, miss, 2);
-        else inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
-            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2, unexp);
-        cudaStreamWaitEvent(st, ev_join, 0);
-        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
             2 * NG, KG, miss, 1, euni, etok);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin1 err=%d\n", (int)cudaGetLastError()); }
         if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, 64, 2), 256, 0, st>>>(G, U, uids, estart, xh_e,
             (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, unexp, miss, 1);
         else inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
             (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 1, unexp);
+        cudaStreamWaitEvent(st, ev_join, 0);
+        inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,
+            2 * NG, KG, miss, 2, euni, etok);
+        if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  hadin2 err=%d\n", (int)cudaGetLastError()); }
+        if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, 64, 2), 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, unexp, miss, 2);
+        else inkwell_exl3_gemv_moe_ntok<<<gg, 256, 0, st>>>(G, U, uids, estart, xh_e,
+            (const float*)gu_e, 2 * NG, dn_e, ND, NG, KG / 16, NG / 16, KG, ND, nky, miss, 2, unexp);
         if (dbg) { cudaStreamSynchronize(st); fprintf(stderr, "  gemv1 err=%d\n", (int)cudaGetLastError()); }
     } else {
         inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, eids, x8, xh_e, gu_e,

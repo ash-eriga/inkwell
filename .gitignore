@@ -17,3 +17,5 @@ opt/kbench/kslot_gold
 opt/kbench/kslot_replay
 
 opt/hostlat/
+
+opt/kbench/prefill/prefill_tests
