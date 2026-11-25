@@ -1869,3 +1869,4 @@ Branch `t3/host-latency`, based on master `79cd1e1` (same code as ledger-only `4
 ## t3/host-latency (aac66a8) — pipelined decode input resolution, pinned embed — ACCEPTED, merged
 - Re-validated on master 16adb17 (merge 561d038): CTL 31.885 vs CAND 30.041 ms/tok median (−1.843), 16/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB.
 - Host RAM cost: 883 MiB pinned BF16 embed table (MemAvailable −918 MiB). Killswitches INKWELL_NO_PIPESTEP / INKWELL_NO_ONEH2D / INKWELL_NO_EMBED_WARM.
+- Post-merge master fab1ac7 (ctrlbatch + host), 3 runs: 29.711 / 29.899 / 29.619 ms/tok, md5 5cbe8e06 x3, peak 5,032 MiB, 62 warnings.
