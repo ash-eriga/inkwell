@@ -1950,3 +1950,9 @@ K5 is the unchanged fallback; the small ratio difference is noise. Before the in
 - Re-validated merged onto 54dc27f (74527c7), CTL frozen 54dc27f: CTL 29.480 vs CAND 28.267 ms/tok (−1.212), 16/16, md5 5cbe8e06 all runs, peak 5,032 MiB. Self-test 0.41 ms.
 - Killswitch INKWELL_NO_CH2DENSE=1. Follow-up: dynamic smem for gemv_sf xs[] (2-wave tail on 36-CTA wo_ud), predicted −0.2–0.5 ms.
 - Post-merge master e03df94, 3 runs: 30.075 / 34.351 / 28.961 ms/tok, md5 5cbe8e06 x3, ch2dense enabled x3, peak 5,032 MiB, 62 warnings. Run 2 outlier: desktop GPU processes (t3code/electron) active; A/B pairs are the reference.
+
+## t3/mix-rework (8f1c9f0) — msg batching (12×qcols=4 → 1×qcols=48 per pass) — PARKED (A/B inconclusive)
+- Bit-exact (0 diffs, all shapes + packed vs 12 independent). kbench: 132.37 → 14.57 µs per pass (×2 passes ≈ −0.235 ms/tok deterministic).
+- Narrow 1A/1B rejected (qcols=1 slower; A/B 2/16, 6/16).
+- Batch-only A/B: −0.269 (11/16), retry −0.348 (9/16) on a noisy host. Not merged; no third solo retry.
+- Plan: re-gate bundled with the next small exact change (e.g. gemv_sf dynamic smem) on a quiet host.
