@@ -30,11 +30,12 @@ int main(int argc,char**argv){
     if(argc<2){fprintf(stderr,"usage: %s dense.cubin [correctonly]\n",argv[0]);return 1;}
     bool correctonly=argc>2;
     CK(cudaFree(0)); CU(cuInit(0)); Mod z=loadmod(argv[1]);
-    struct K{int ka,hk;const char*name;} ks[]={{3,0,"3.0"},{3,1,"3.5"},{4,0,"4.0"},{5,0,"5.0"}};
+    struct K{int ka,hk,tk,tn;const char*name;} ks[]={{3,0,144,192,"3.0/gate"},{3,1,192,144,"3.5/wo"},{4,0,144,12568,"4.0/unembed"},{5,0,144,24,"5.0/wr"}};
     bool exact=true;
     cudaEvent_t ev0,ev1; CK(cudaEventCreate(&ev0)); CK(cudaEventCreate(&ev1));
     for(auto K:ks){
-        const int tk=144,tn=192,nky=2,k=tk*16,n=tn*16,nw=8*K.ka+4*K.hk,nb=(tn+7)/8;
+        const int tk=K.tk,tn=K.tn,k=tk*16,n=tn*16,nw=8*K.ka+4*K.hk,nb=(tn+7)/8;
+        int nky=1; while (nb*nky < 32 && nky < 8 && nky*2 <= tk) nky *= 2;
         const size_t words=(size_t)tk*tn*nw;
         std::vector<uint32_t> hw(words); for(auto& w:hw)w=rnd();
         std::vector<float> hx(k),ha(n),hb(n); for(auto& v:hx)v=((int)(rnd()%2001)-1000)/512.f;
