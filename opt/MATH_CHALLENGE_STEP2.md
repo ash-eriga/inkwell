@@ -140,29 +140,44 @@ All integer arithmetic is mod 2^32. lo(a) = a mod 2^16, hi(a) = ⌊a/2^16⌋, an
 | Class | Instructions | Rate | Dependent-chain time, 1 warp |
 |---|---|---|---|
 | **Full** | FFMA, FADD, LOP3, IDP.4A, XMAD | 3.7–3.9 (issue-bound) | ~9 cycles |
-| **Half** | SHF, SHR, BFE, BFI, PRMT, ISCADD | 1.93–2.00 | ~9 cycles |
-| **Quarter** | I2F, POPC, SHFL, LDS.32 | 1.00 | I2F ~15; LDS ~26; SHFL ~29 cycles |
+| **Half** | SHF, SHR, BFE, BFI, ISCADD, IADD3; PRMT | 1.93–2.00 | ~9 cycles |
+| **Quarter** | I2F, POPC; SHFL, LDS.32 | 1.00 | I2F ~15; LDS ~26; SHFL ~29 cycles |
 
-- **Not isolated.** IADD ran 1:1 with IDP.4A at 3.87 combined, which fits full rate. Treat IADD, LOP32I, MOV and SEL as full rate.
-- **IADD3** ran at 1.87 per cycle in our test. Treat it as half rate.
+- **Also full rate.** LOP32I ran at full rate. IADD ran 1:1 with IDP.4A at 3.87 combined, which fits full rate. Treat IADD, MOV and SEL as full rate.
+- **IADD3** ran at 1.94 per cycle, which is half rate.
 - **LDS with bank conflicts.** LDS.32 at 32 random addresses ran at 0.45 per cycle, so random conflicts cost ~2.2 passes. Same-word reads (broadcast) ran at the full 1.00.
 - **Wide LDS.** Not measured. Count an LDS.64 as 2 passes and an LDS.128 as 4 (128 bytes per pass).
 - **Slow pipes run beside issue.**
   - 3 FFMA + 1 I2F sustained 3.98 instructions per cycle.
   - 3 FFMA + 1 LDS sustained 3.67.
   - 1 FFMA + 1 I2F (or LDS, or SHFL) was held to one pair per cycle by the slow op.
-- **Shared or separate slow pipes.** Not yet known: whether the half-rate classes share one pipe, and whether I2F, SHFL and LDS share one. Assume they share (the conservative case). If your scheme only pays off when they are separate, say so, and we will measure it.
+- **Which slow ops share a pipe.** Measured as 1:1 mixes, in pairs per cycle:
+
+  | Mix | Pairs/cycle | Reading |
+  |---|---|---|
+  | SHF + BFE, SHF + ISCADD | 0.98 | one shared shift pipe |
+  | SHF + PRMT | 1.84 | PRMT has its own pipe |
+  | SHF + I2F | 1.00 | separate |
+  | I2F + POPC | 0.50 | one conversion pipe |
+  | SHFL + LDS | 0.50 | one shared-memory pipe |
+  | I2F + LDS | 0.99 | separate |
+  | I2F + SHFL | 0.67 | partial contention |
+
+  BFI and IADD3 were not mixed. Count them on the shift pipe.
 - **Cost of a program.** For one pass that decodes Wp weights per lane, count:
   - N, all instructions, including loads, address arithmetic, x reads and loop control;
-  - H, the half-rate ones;
-  - Q, the quarter-rate ones, with LDS counted in passes.
+  - H, the shift-pipe ops: SHF, SHR, SHL, BFE, BFI, ISCADD and IADD3;
+  - M, the PRMTs;
+  - V, the conversion-pipe ops: I2F and POPC;
+  - S, the shared-memory-pipe ops: SHFL, plus LDS counted in passes;
+  - F, the SHFLs alone.
 
-  Then cycles per pass per SM ≈ max(N/4, H/2, Q), and the cost per weight in issue-slot equivalents is
+  Then cycles per pass per SM ≈ max(N/4, H/2, M/2, V, S, 0.75·(V + F)), and the cost per weight in issue-slot equivalents is
 
-  **C_K = max(N, 2H, 4Q) / Wp.**
+  **C_K = max(N, 2H, 2M, 4V, 4S, 3(V + F)) / Wp.**
 
   - One I2F per weight alone forces C_K ≥ 4. F6 (§4.1) removes that floor.
-  - A table lookup per weight by LDS or SHFL adds another 4 per weight on the quarter-rate side.
+  - A table lookup per weight costs 4 per weight on the shared-memory pipe. It runs beside I2F if done by LDS, but not if done by SHFL.
 - **Headline score.** E = Σ_K share_K · C_K, with the expert shares of §3.
 - **How costs turn into time.** At today's E = 8.81, the expert loop issues 842 M warp-instructions per token. At 40 issue slots per cycle and ~1.76 GHz, that is ~12.0 ms, and nsys measured ~16 ms. Each 1.0 of E saved is worth ~1.4 ms of the ~38 ms token time, as long as the loop stays issue-bound. The DRAM floor for the expert weights is ~4.5 ms per token, so issue stays the binding resource down to about E ≈ 3.3.
 
@@ -250,7 +265,7 @@ Everything below is yours to choose, per K:
 - accumulation order (§1.4).
 
 Directions worth a look. None of them is known to work.
-- **Recurrences.** F4 as `ISCADD` plus a 2K-bit table lookup. For K ≤ 2 the table has ≤ 16 entries, so it fits one register per lane read with `SHFL`, or a conflict-free LDS. By §2.5, one lookup per weight costs 4 on the quarter-rate side, so lookups must be shared between weights. Also: a recurrence on s itself, or on (P mod 255, u).
+- **Recurrences.** F4 as `ISCADD` plus a 2K-bit table lookup. For K ≤ 2 the table has ≤ 16 entries, so it fits one register per lane read with `SHFL`, or a conflict-free LDS. By §2.5, one lookup per weight costs 4 on the shared-memory pipe, so lookups must be shared between weights. Also: a recurrence on s itself, or on (P mod 255, u).
 - **Shared structure.** Of the 16-bit windows of one ring, of c = 0x83DCD12D, or of the carries in bytesum.
 - **Split windows.** Split a window into parts and combine small tables, keeping within the bank and register limits.
 - **Lane maps.** Ones that create the pairs of F2 for K = 1.5, or that make the extraction offsets cheaper for odd K.
