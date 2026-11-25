@@ -65,8 +65,14 @@ def loop_rows(sass, kernel='gemv_moe_s'):
         cnt = Counter(o for _, o, _ in body)
         shifts = frozenset(int(im[0], 16) for _, o, full in body if o == 'SHF'
                            for im in [re.findall(r",\s*0x([0-9a-f]+),", full)] if im)
+        k = SHIFT_SETS.get(shifts, 'unknown')
+        if k == 'unknown':
+            if cnt['SHF'] == 24 and cnt['PRMT'] == 8:
+                k = 'K2'
+            elif cnt['SHF'] == 8 and cnt['PRMT'] == 20:
+                k = 'K4'
         rows.append({'start': target, 'end': addr, 'n': len(body), 'psl': psl, 'cnt': cnt,
-                     'k': SHIFT_SETS.get(shifts, 'unknown')})
+                     'k': k})
     rows.sort(key=lambda x: (x['end'], -x['n']))
     dedup = []
     for r in rows:
@@ -84,38 +90,42 @@ SHIFT_SETS = {
     frozenset((3, 6, 9, 12, 15, 18, 21)): 'K3',
     frozenset((4, 8, 12, 16, 20, 24, 28)): 'K4',
 }
-# Per-K loop shape without NOPs: (instructions, SHF, LDG). K2.5-K4 get their other
-# ring words from donor lanes via SHFL.IDX (one LDG stream). K1.5/K2 use the TOP32
-# two-word stream with W1 from a donor lane via SHFL.IDX (one LDG stream, no lo shift).
+# Per-K fixed-stride loop shape without NOPs:
+# (instructions, SHF, LDG, SHFL).  The expert kernel carries one copy for
+# tn=72 and one for tn=144; both must have exactly the same shape.
 LOOP_SHAPE = {
-    'K1.5': (225, 32, 4), 'K2': (225, 32, 4),
-    'K2.5': (233, 36, 4), 'K3': (233, 36, 4), 'K3.5': (233, 36, 4), 'K4': (233, 36, 4),
+    'K1.5': (215, 32, 4, 4), 'K2': (215, 24, 4, 4),
+    'K2.5': (219, 36, 4, 4), 'K3': (219, 36, 4, 4),
+    'K3.5': (223, 36, 4, 8), 'K4': (211, 8, 4, 4),
 }
-# The dense fused epilogue/prologue changes the surrounding register schedule;
-# its donor-lane CH2 loops are one instruction shorter than the expert loops.
+# Dense uses the generic runtime-stride implementation.  K3.5 is the only
+# dense/generic case that still needs the W2 donor shuffle.
 DENSE_LOOP_SHAPE = {
-    'K3': (232, 36, 4), 'K3.5': (232, 36, 4), 'K4': (232, 36, 4),
+    'K3': (223, 36, 4, 4), 'K3.5': (228, 36, 4, 8), 'K4': (216, 8, 4, 4),
 }
 
-def require_loop_shape(rows, nops, shape=LOOP_SHAPE, label='CH2'):
+def require_loop_shape(rows, nops, shape=LOOP_SHAPE, label='CH2', copies=1):
     by_k = {}
     for r in rows:
-        if r['k'] in LOOP_SHAPE:
-            if r['k'] in by_k:
-                raise Ch2Fail(f"duplicate CH2 loop for {r['k']}")
-            by_k[r['k']] = r
-    if set(by_k) != set(shape):
-        raise Ch2Fail(f'expected {len(shape)} {label} loops, found {sorted(by_k)}')
-    for name, (n, shf, ldg) in shape.items():
-        r = by_k[name]
-        c = r['cnt']
+        if r['k'] in shape:
+            by_k.setdefault(r['k'], []).append(r)
+    if set(by_k) != set(shape) or any(len(v) != copies for v in by_k.values()):
+        raise Ch2Fail(f'expected {len(shape) * copies} {label} loops ({copies} copies each), found '
+                      f'{sorted((k, len(v)) for k, v in by_k.items())}')
+    for name, (n, shf, ldg, shfl) in shape.items():
         want_n = n + (32 if nops else 0)
-        if r['n'] != want_n or c['NOP'] != (32 if nops else 0):
-            raise Ch2Fail(f'{name} loop count mismatch: ins={r["n"]} NOP={c["NOP"]} (want {want_n})')
-        for op, want in [('PSL', 32), ('XMAD', 64), ('SHF', shf), ('IDP', 32), ('FFMA', 32), ('LDS', 8), ('LDG', ldg)]:
-            got = r['psl'] if op == 'PSL' else c[op]
-            if got != want:
-                raise Ch2Fail(f'{name} loop {op} count mismatch: {got} != {want}')
+        for r in by_k[name]:
+            c = r['cnt']
+            if r['n'] != want_n or c['NOP'] != (32 if nops else 0):
+                raise Ch2Fail(f'{name} loop count mismatch: ins={r["n"]} NOP={c["NOP"]} (want {want_n})')
+            for op, want in [('PSL', 32), ('XMAD', 64), ('SHF', shf), ('IDP', 32), ('FFMA', 32),
+                             ('LDS', 4), ('LDG', ldg), ('SHFL', shfl)]:
+                got = r['psl'] if op == 'PSL' else c[op]
+                if got != want:
+                    raise Ch2Fail(f'{name} loop {op} count mismatch: {got} != {want}')
+            want_prmt = {'K2': 8, 'K4': 20}.get(name, 0)
+            if c['PRMT'] != want_prmt:
+                raise Ch2Fail(f'{name} loop PRMT count mismatch: {c["PRMT"]} != {want_prmt}')
 
 def instruction_offsets(sass, kernel='gemv_moe_s'):
     chunk = target_chunk(sass, kernel)
@@ -347,16 +357,16 @@ def generate(obj, outcubin, workdir, cuda_home):
     shutil.copyfile(unpatched, patched)
     pout = run([str(venvpy), str(ch2 / 'patch_sass.py'), str(patched), str(cuobj)], workdir, workdir / 'patch.log', env, capture=True)
     pm = re.search(r'fake=(\d+) lp=(\d+) words=(\d+) hi_d12d=(\d+)', pout)
-    if not pm or tuple(map(int, pm.groups())) != (583, 587, 2198, 588):
+    if not pm or tuple(map(int, pm.groups())) != (1078, 1088, 4388, 1086):
         raise Ch2Fail('patched-with-NOPs baseline pattern mismatch: ' + (pout.strip() or 'no patch output'))
     sassp = run([str(cuobj), '-sass', str(patched)], workdir, workdir / 'patched.sass.stdout', env, capture=True)
     (workdir / 'kernels_patched_nops.sass').write_text(sassp)
-    require_loop_shape(loop_rows(sassp), nops=True)
+    require_loop_shape(loop_rows(sassp), nops=True, copies=2)
     require_loop_shape(loop_rows(sassp, 'gemv_sf_ch2'), nops=True, shape=DENSE_LOOP_SHAPE, label='dense CH2')
 
     run([str(venvpy), str(cuasm / 'bin/cuasm.py'), str(patched), '-o', 'kernels_patched_nops.cuasm'],
         workdir, workdir / 'cuasm_disassemble.log', env)
-    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges.json', 'gemv_moe_s', '6'],
+    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges.json', 'gemv_moe_s', '12'],
         workdir, workdir / 'loop_ranges.log', env)
     run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges_dense.json', 'gemv_sf_ch2', '3'],
         workdir, workdir / 'loop_ranges_dense.log', env)
@@ -370,7 +380,7 @@ def generate(obj, outcubin, workdir, cuda_home):
     sassn = run([str(cuobj), '-sass', str(nopless)], workdir, workdir / 'nopless.sass.stdout', env, capture=True)
     (workdir / 'kernels_patched_nopless.sass').write_text(sassn)
     rows_n = loop_rows(sassn)
-    require_loop_shape(rows_n, nops=False)
+    require_loop_shape(rows_n, nops=False, copies=2)
     require_loop_shape(loop_rows(sassn, 'gemv_sf_ch2'), nops=False, shape=DENSE_LOOP_SHAPE, label='dense CH2')
     patch_and_verify_nvinfo(nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2'])
     repair_indirect_branch_tables(patched, sassp, nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2'])

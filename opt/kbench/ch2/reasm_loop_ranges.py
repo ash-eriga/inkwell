@@ -46,10 +46,16 @@ for addr, op, full in ins:
         im = re.findall(r",\s*0x([0-9a-f]+),", f)
         if im:
             shifts.append(int(im[0], 16))
+    k = SHIFT_SETS.get(frozenset(shifts), "unknown")
+    if k == "unknown":
+        if cnt["SHF"] == 24 and cnt["PRMT"] == 8:
+            k = "K2"
+        elif cnt["SHF"] == 8 and cnt["PRMT"] == 20:
+            k = "K4"
     rows.append({
         "start": target,
         "end": addr,
-        "k": SHIFT_SETS.get(frozenset(shifts), "unknown"),
+        "k": k,
         "instructions": len(body),
     })
 

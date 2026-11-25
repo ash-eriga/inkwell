@@ -2013,3 +2013,49 @@ Raw: /tmp/prefill-study/results/{kbench,default_ctx512,vtest8_ctx512}.log. Only 
 - FP32 tiled prefill at C=512 with GQA-3 flash attention is predicted at 81.9 tok/s (2K), 80.2 (8K), 75.2 (32K) and 69.6 (64K; needs K4V2). It borrows 108.8 MiB from the expert cache.
 - Plan: FP-order prefill gated by teacher-forced KLD (<1e-3 first token, <5e-4 64-tok mean), killswitch INKWELL_NO_PREFILL. Phases: 0 = step_block fixes + step_id encode; 1 = prefill.cu kernels; 2 = PrefillArena + Runner::prefill.
 - Orchestrator note: ~80 tok/s is the FP32 path. Challenge 4 (integer Tier Q numerics) targets ≥150 MAC/SM-cycle for the 500 tok/s goal.
+
+## t3/challenge3b-whole-loop-port — practical whole-loop hybrid — BIT-EXACT, PARTIAL vs requested schedule
+
+**Scope.** Ports the implementable parts of the Challenge 3b whole-loop schedule into the production sm_61 expert GEMV module while preserving the shipped arithmetic core, reduction, epilogue, weight layout, and FFMA order. K5 remains on the scalar path. This is deliberately recorded as a **practical hybrid**, not the full direct-`LDG`/no-donor schedule.
+
+**Implemented.**
+- Shared-memory x is permuted at block start so each lane reads `x[r0],x[r0+1],x[r0+8],x[r0+9]` as one conflict-free `LDS.128` (`r0=2*(t&3)`). Dense CH2 K3/K3.5/K4 uses the same layout; scalar/pw16 layouts are unchanged.
+- Production expert widths `tn=72` and `tn=144` are compile-time specialized. ptxas folds the per-tile row stride into `LDG` immediate offsets; unusual widths use the exact scalar path with unpermuted x.
+- K2 uses the aligned stream and exact byte-permutation windows for j=3/j=7.
+- K4 uses paired funnels `(j,j+4)`, one shared `PRMT sel=0x0765` for j=1/j=5, and the free high half for j=3.
+- K2.5/K3 no longer fetch the provably unused W2 ring word. K3.5 still needs W2.
+- `INKWELL_NO_CH3B=1` disables both runtime-patched CH2 users (`ch2nopless` expert and `ch2dense` dense), making it a true pre-change fallback. The expert startup self-test now covers all six K values in both production MoE shapes (`tk=144,tn=72` and `tk=72,tn=144`) before enabling.
+
+**Not implemented / deviation from the requested construction.** Donor `SHFL` remains for W1 (and for W2 in K3.5). Free low-half XMAD operands are not yet patched, so K4 low halves still need byte-permutation movement; generic K2.5/K3/K3.5 windows still use aligned funnels. An isolated direct cyclic-`LDG` experiment removed every donor shuffle but compiled the expert at **REG:48** and increased fixed-loop instruction counts by roughly 2–6 instructions per 32 weights, because wrap-safe cyclic ring lanes require independent 64-bit bases on sm_61 and `LDG` has no register+register index form. It was rejected rather than silently accepting a slower/nonconforming form.
+
+**Final expert SASS instruction counts.** Per 32 weights after NOP deletion; both tn=72 and tn=144 copies were shape-checked separately. Baseline is the previously shipped production nopless kernel.
+
+| K | baseline instr/32w | new instr/32w | instr/w | target instr/32w | extraction actually present |
+|---|---:|---:|---:|---:|---|
+| K1.5 | 225 | **215** | **6.7188** | 207 | 32 SHF, 0 PRMT, 4 LDG, 4 LDS, 4 SHFL |
+| K2 | 225 | **215** | **6.7188** | 205 | 24 SHF, 8 PRMT, 4 LDG, 4 LDS, 4 SHFL |
+| K2.5 | 233 | **219** | **6.8438** | 207 | 36 SHF, 0 PRMT, 4 LDG, 4 LDS, 4 SHFL |
+| K3 | 233 | **219** | **6.8438** | 207 | 36 SHF, 0 PRMT, 4 LDG, 4 LDS, 4 SHFL |
+| K3.5 | 233 | **223** | **6.9688** | 211 | 36 SHF, 0 PRMT, 4 LDG, 4 LDS, 8 SHFL |
+| K4 | 233 | **211** | **6.5938** | 189 | 8 SHF, 20 PRMT, 4 LDG, 4 LDS, 4 SHFL |
+
+Weighted static instruction count: **6.774625 instr/w** vs baseline **7.141** (−5.13%); Challenge 3b target was 6.442125. Both kernels remain `REG:40 STACK:0 LOCAL:0` (expert shared 9,248 B; dense shared 12,848 B).
+
+**Build/pipeline.** `build_nopless.py` remains fail-closed and now validates all 12 expert fixed-stride loop copies plus the 3 dense generic loops. Patch fingerprint `fake=1078 lp=1088 words=4388 hi_d12d=1086`; duplicate loop ranges are accounted per range, not per K. Generated cubin sha256 **`b4f032bdcaecbd32a0bfb71dfa3cdb594f6656d293ed4a5e4e95a987963e1a08`**, **1,478,480 bytes**. Final release build rc **0**, warnings **58** (limit 64). Final binary sha256 **`4fc1d051586a05a9ecc5a5db7bcd16c382713f663817e710e02fc1152bd195bf`**.
+
+**Per-K GPU gate.** `reasm_drv_perk`, both MoE shapes, min-of-31. All bitwise rows were **`badbits=0`** for both the old production nopless module and the new candidate. New/old production min-time speedups:
+
+| K | gu old ms | gu new ms | gu speedup | dn old ms | dn new ms | dn speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| K1.5 | 0.0696 | 0.0676 | **1.0298x** | 0.0724 | 0.0702 | **1.0305x** |
+| K2 | 0.0695 | 0.0666 | **1.0447x** | 0.0716 | 0.0696 | **1.0285x** |
+| K2.5 | 0.0717 | 0.0694 | **1.0327x** | 0.0737 | 0.0717 | **1.0286x** |
+| K3 | 0.0727 | 0.0696 | **1.0441x** | 0.0753 | 0.0736 | **1.0226x** |
+| K3.5 | 0.0744 | 0.0734 | **1.0131x** | 0.0768 | 0.0765 | **1.0042x** |
+| K4 | 0.0767 | 0.0745 | **1.0292x** | 0.0788 | 0.0776 | **1.0161x** |
+
+Workload-share aggregate of those isolated timings: gu **+3.61%**, dn **+2.64%**, equal-shape aggregate **+3.12%**. This is only marginally above the 3% honesty threshold and far below the modelled 14% whole-loop target.
+
+**End-to-end validation.** `validate.sh` on the final release binary, three runs each. Default: md5 **`5cbe8e06` ×3**, decode ms/tok **31.093 / 28.480 / 30.855**, peak VRAM **5,032 MiB** each, `ch2nopless enabled` and `ch2dense enabled`. With `INKWELL_NO_CH3B=1`: md5 **`5cbe8e06` ×3**, decode ms/tok **32.341 / 31.975 / 31.810**, peak VRAM **5,032 MiB** each, no CH2 module enable line. Single-run comparison uses run 1: default **31.093 ms/tok**, killswitch **32.341 ms/tok** (−1.248 ms/tok for that pair; noisy single runs, not the 16-pair A/B). Startup self-test cost in the first default run: expert **13.72 ms** (12 production-shape cases), dense **0.33 ms**; validation script rc **0**.
+
+**Interpretation.** Bitwise and end-to-end exactness gates pass, register/spill limits pass, warning and VRAM limits pass, and the isolated expert microbench is marginally above 3% on the equal-shape aggregate. Nevertheless this does **not** implement the requested no-donor/direct-`LDG` schedule and does not approach the modelled 14% decode saving, so it should be treated as a partial hybrid rather than a completed Challenge 3b port.
