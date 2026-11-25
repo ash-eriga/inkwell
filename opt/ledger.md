@@ -2119,3 +2119,5 @@ Workload-share aggregate of those isolated timings: gu **+3.61%**, dn **+2.64%**
 - 16 pairs vs frozen CTL e03df94: ctl_med 28.467, cand_med 28.200 (−0.267 ms/tok). Wins 13/16. md5 5cbe8e06 on all runs. Peak 5,032 MiB.
 - Per-block deltas: −0.13, −0.08, −0.24, +0.08, −0.20, −0.24, −0.11, −0.44.
 - Part 2 (direct LDG, per-window SHF, K4 PRMT 20→4, free half operands; target 6.442 instr/w) is in progress on a child branch of 93f69cc.
+- Post-merge check on master e7ac0fb (59 warnings), ctx512: md5 5cbe8e06 ×3; 28.08 / 29.17 / 30.34 ms/tok; ch2nopless enabled.
+  - Runs 2–3 went through `gpu-run -p high` after the plain-flock attempt starved for more than 1 h.
