@@ -1574,3 +1574,67 @@ Verdict: **do not enable as a production exactness-preserving path yet**. It is 
 - The magic-FADD variant (F6) is bitwise exact for K1.5–4 but slower than I2F on the dominant Ks. Per-K speed (new/old): K1.5 0.887×, K2 0.90×, K2.5 ~0.99×, K3 1.01×, K3.5 1.02×, K4 1.00×. K5 is wrong (4608/9216 bad) and is gated back to the shipped core.
 - The lane maps (paired views) were not ported. The final I2F build has no GPU validation (no md5, no A/B).
 - Next: a feasibility probe on t3/sass-reasm-probe — sm_61 SASS reassembly that deletes the NOPs, with a byte-identical round trip, per-K bitwise checks and timing. Go/no-go for a SASS-level challenge-2 loop.
+
+## 2026-11-24 — split-K attention noise gate: PASSED; default lowered to 320
+
+Branch `t3/splitk-attn-noise-gate`. Harness commit `6d100f4` (plus bytecode cleanup `df514a6`) added filtered power-of-two attention dumps, an fp64 real-tensor probe path, exact-length prompts, full-vocabulary fp64 KLD comparison, and state-backed A/B benchmarking. The graph-cache bypass is required: power-of-two positions normally reuse the graph captured at the start of their 64-token shape bucket, so the original layer-5 dump hook never fired without it.
+
+### Real-tensor fp64 accuracy
+
+Real old-kernel Q/K/V/bias/mask dumps from an 8K run, two independent global layers at each of n_kv 1024/4096/8192. `old_ref` is the one-block kernel against a CPU fp64 reference; `split_ref` is split-K chunk 32 against the same reference. Errors are max absolute and output-scale-relative.
+
+| n_kv | layer/pass | old_ref abs | old_ref rel | split_ref abs | split_ref rel | closer |
+|---:|---|---:|---:|---:|---:|---:|
+| 1024 | l5p0 | 1.26889e-5 | 1.47259e-6 | 1.82527e-6 | 2.11828e-7 | 7.0x |
+| 4096 | l5p0 | 4.52656e-6 | 5.50399e-7 | 1.42224e-6 | 1.72935e-7 | 3.2x |
+| 8192 | l5p0 | 1.51894e-5 | 1.73143e-6 | 1.8783e-6 | 2.14105e-7 | 8.1x |
+| 1024 | l11p0 | 3.85549e-6 | 9.74415e-7 | 1.22606e-6 | 3.09867e-7 | 3.1x |
+| 4096 | l17p0 | 4.72457e-6 | 1.05643e-6 | 9.33353e-7 | 2.08701e-7 | 5.1x |
+| 8192 | l23p0 | 3.7129e-6 | 1.06185e-6 | 6.51375e-7 | 1.86287e-7 | 5.7x |
+
+Chunk 64 was similarly close (0.5-1.9e-6 absolute in these cases). Split is closer to fp64 than old in every real case.
+
+### End-to-end divergence and noise floor
+
+Exact 4096-token prompt, `INKWELL_MAX_CTX=4352`, 256 generated positions, full-vocabulary fp64 KLD. Arms: old (`INKWELL_NO_ATTNSPLIT=1`), production split (`INKWELL_ATTNSPLIT_MIN=320`, chunk 32), and the exact-in-real-arithmetic noise-floor perturbation (`INKWELL_ATTNSPLIT_CHUNK=64`).
+
+- old vs split32: generated text identical (`b08cc28f`), top-1 **256/256**, first mismatch none, max logit abs diff **2.29755**; KLD mean **0.000728/0.000711**, p95 **0.00250/0.00240**, max **0.00547/0.00532**.
+- split32 vs split64 noise floor: top-1 **255/256**, first mismatch row 3; full-trajectory KLD mean **0.00347/0.00323**, p95 **0.0103/0.0119**, max **0.399/0.277**. The first flip had small margins (0.150 and 0.084), after which the two numerically valid trajectories diverged autoregressively.
+- old vs split64 showed the same amplification pattern: first mismatch row 3, full KLD mean **0.00350/0.00309**, max **0.397/0.271**.
+- Thus old-vs-split divergence is inside the noise floor's full-trajectory range, with better top-1 agreement than the floor itself. The row-3 margins show the mechanism directly: old/split remained tied despite margins of 0.026/0.150, while the chunk reorder's 0.150/0.084 margins flipped.
+
+The 8K end-to-end split-arm quality run was not repeated; 4K is the required gate and 8K was optional under the brief. The fp64 table above does cover 8K real attention inputs.
+
+### Decode speed
+
+State-backed decode A/B. The prompt state was encoded once with the control kernel, all KV/conv persistent state tensors were saved, and later processes reloaded that state. A 1024-token validation produced byte-identical generated text from serial and loaded state. Later runs start with cold expert caches in both arms; the first control is warm from its encode, so if anything pair 1 is biased against the candidate. Four interleaved pairs, order ctl,cand,cand,ctl, one flock, 64 generated tokens/run.
+
+4K (`INKWELL_VRAM_CAP_MB` default):
+
+| pair | ctl 12097 ms/tok | cand 320 ms/tok | cand−ctl |
+|---:|---:|---:|---:|
+| 1 | 56.513 | 52.445 | −4.068 |
+| 2 | 51.649 | 42.648 | −9.001 |
+| 3 | 50.772 | 43.601 | −7.171 |
+| 4 | 48.435 | 39.011 | −9.424 |
+
+Median 4K: ctl **51.210**, cand **43.124**, **−8.086 ms/tok**, **4/4 pair wins**; peaks 4894/4902 MiB.
+
+8K (`INKWELL_VRAM_CAP_MB=4900` after the default target OOMed once while foreign desktop memory was resident):
+
+| pair | ctl 12097 ms/tok | cand 320 ms/tok | cand−ctl |
+|---:|---:|---:|---:|
+| 1 | 72.857 | 46.851 | −26.006 |
+| 2 | 66.344 | 44.608 | −21.736 |
+| 3 | 70.378 | 44.182 | −26.196 |
+| 4 | 71.929 | 44.199 | −27.730 |
+
+Median 8K: ctl **71.154**, cand **44.403**, **−26.750 ms/tok**, **4/4 pair wins**; peaks 4682/4690 MiB. Generated-text md5 was `44dbfe6b` in every speed run. These are controlled relative measurements, not warm-cache absolute production numbers; the reduced 8K cache budget slows both arms.
+
+### Dispatch note
+
+The original dynamic chunk selection was dead: an unset `INKWELL_ATTNSPLIT_CHUNK` became zero and was immediately clamped to 32. The validated production configuration at 1K-12K is therefore chunk 32. The dispatcher now makes that explicit up to n_kv 16384 and uses 256 above that point so `INKWELL_ATTN_MAX_SPLIT=512` does not disable split at long context. Explicit `INKWELL_ATTNSPLIT_CHUNK` remains an override.
+
+### Verdict
+
+Noise gate **passed**: split is uniformly closer to fp64, old-vs-split end-to-end divergence is within the exact-reorder noise floor, and top-1 is unchanged for 256/256 positions at 4K. Decode is faster in every interleaved pair at both 4K and 8K. ctx512 generated-text md5 remains **`5cbe8e06`**. `INKWELL_ATTNSPLIT_MIN` is therefore lowered to **320**. Build rc0, **61 warnings** (limit 64). `cargo test --workspace` is not a valid gate here because the pre-existing `crates/inkwell-gguf/examples/embdcheck.rs` example does not link `inkwell_ggml` (unrelated compile error).

@@ -302,12 +302,22 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let t0 = Instant::now();
     let mut pos = 0i64;
     let mut logits = Vec::new();
-    for &id in &ids[..ids.len() - 1] {
-        logits = r.step(id, pos);
-        pos += 1;
+    if let Some(state) = std::env::var_os("INKWELL_STATE_LOAD") {
+        r.load_state(&state.to_string_lossy());
+        pos = ids.len() as i64 - 1;
+        eprintln!("state loaded; skipped encode of {} tok", ids.len() - 1);
+    } else {
+        for &id in &ids[..ids.len() - 1] {
+            logits = r.step(id, pos);
+            pos += 1;
+        }
+        eprintln!("encode {} tok in {:?}", ids.len() - 1, t0.elapsed());
+        eprintln!("prompt-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]);
     }
-    eprintln!("encode {} tok in {:?}", ids.len() - 1, t0.elapsed());
-    eprintln!("prompt-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]);
+    if let Some(state) = std::env::var_os("INKWELL_STATE_SAVE") {
+        r.save_state(&state.to_string_lossy());
+        eprintln!("state saved");
+    }
     // last prompt token → first generated
     let t1 = Instant::now();
     let mut id = ids[ids.len() - 1];
