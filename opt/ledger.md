@@ -1870,3 +1870,7 @@ Branch `t3/host-latency`, based on master `79cd1e1` (same code as ledger-only `4
 - Re-validated on master 16adb17 (merge 561d038): CTL 31.885 vs CAND 30.041 ms/tok median (−1.843), 16/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB.
 - Host RAM cost: 883 MiB pinned BF16 embed table (MemAvailable −918 MiB). Killswitches INKWELL_NO_PIPESTEP / INKWELL_NO_ONEH2D / INKWELL_NO_EMBED_WARM.
 - Post-merge master fab1ac7 (ctrlbatch + host), 3 runs: 29.711 / 29.899 / 29.619 ms/tok, md5 5cbe8e06 x3, peak 5,032 MiB, 62 warnings.
+
+## Queue (orchestrator, 2026-11-25 night) — studies done, awaiting SWE slots
+- Graph rebuild at KV buckets: study 8f82e2b (t3/kv-bucket-graph-rebuild-study). +12.4 ms per 64-tok boundary (0.19 ms/tok amortised), multi-graph cache ruled out (26 MiB/graph set). Top design: device-scalar n_kv, ~0.32–0.40 ms/tok incl. padded-KV waste. Killswitch INKWELL_NO_DYN_NKV.
+- Expert GEMV floor: study 5f5efbe (t3/expert-gemv-instruction-floor). ~1.0–1.4 ms/tok exact headroom: uint4 4-tile interleave (−0.61), M=16 2-col/warp K2 (−0.58), R=2 blocking (−0.44).
