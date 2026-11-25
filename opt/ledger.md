@@ -1811,3 +1811,44 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 - K1.5/K2 loop: 247 → 225 instr per 32 weights (7.719 → 7.031/w). K2.5–K4: 248/249 (+1 vs before).
 - A/B (16 pairs, ctl,cand,cand,ctl, one flock; CTL = master 60f1cfe): CTL median 32.368 vs CAND **31.890 ms/tok** (−0.478), **15/16 wins**, md5 5cbe8e06 on every run, peak 5,034 MiB. Accepted.
 - Master check after merge: ctx512 md5 5cbe8e06 in 2 runs; generated cubin 270a4be4 (1,319,312 bytes); build 62 warnings.
+
+## 2026-11-25 — dense fused CH2 gemv_sf (branch t3/ch2-dense-sf): ACCEPTED, default ON
+
+Branch `t3/ch2-dense-sf`, based on `376e449`, ports the validated sm_61 CH2 pipeline to the dense fused EXL3 GEMV `inkwell_exl3_gemv_sf` through the driver-loaded clone `inkwell_exl3_gemv_sf_ch2`. Main implementation/audit commits: `a8d97a5`, `6c9c540`, `fa317da`; correctness repair `511ab4b`; post-acceptance default flip `9aa2927`.
+
+**Audit.** The inkling dense projection set has 24 layers and two recurrent passes per token. Distinct dense matrices by K: K3 = 48 (`wq_du` + `gate_attn`), K3.5 = 72 (`wk_dv` + `wv_dv` + `wo_ud`), K4 = 1 (unembed), K5 = 24 (`wr_du`). Per-token invocations: K3 96, K3.5 144, K4 1, K5 48. Shapes: `wq_du`/`gate_attn` K2304xN3072; `wk_dv`/`wv_dv` K2304xN1024; `wo_ud` K3072xN2304; unembed K2304xN201088; `wr_du` K2304xN384. Shipped scalar loop audit, using the same instruction classification as the expert audit:
+
+| loop | instr/32w | instr/weight | core | extract | LDG | LDS | addr/loop | ctl |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| K2.5 (unused here) | 293 | 9.156 | 192 | 36 | 12 | 8 | 28 | 6 |
+| K1.5 (unused here) | 269 | 8.406 | 192 | 32 | 8 | 8 | 20 | 3 |
+| K2 (unused here) | 269 | 8.406 | 192 | 32 | 8 | 8 | 20 | 3 |
+| K3.5 | 304 | 9.500 | 192 | 36 | 12 | 8 | 28 | 7 |
+| K3 | 302 | 9.438 | 192 | 36 | 12 | 8 | 28 | 7 |
+| K4 | 305 | 9.531 | 192 | 32 | 12 | 8 | 28 | 6 |
+| K5 | 305 | 9.531 | 192 | 36 | 12 | 8 | 28 | 4 |
+
+The dense K3/K3.5/K4 NOP-less CH2 loops are 232 instructions per 32 weights (**7.250/w**), with SHF 36, LDG 4, LDS 8, SHFL 8, XMAD 64, IDP 32, FFMA 32, and zero NOPs. K5 deliberately remains the shipped core because the unpaired K5 CH2 path is not exact. The pw16 layout remains unused because the bitwise requirement preserves the shipped scalar reduction/layout.
+
+**Transforms and exactness.** The dense clone uses the exact 2-XMAD high-half product (`w*0xd12d + ((w*0x83dc)<<16)`), the exact integer byte sum and I2F form, unchanged FP accumulation order, CH2 ring windows, donor-lane geometry, and SHFL where proven. CPU proofs passed: view cases 1,120,000; high-half product cases 20,000; TOP32 rotate views 320,000; tile-level GEMV exactness 280; TOP32 donor cases 64; generic donor lanes K2.5/K3/K3.5/K4 (256 donor cases, 24,576 stream cases). The runtime startup self-test compares the driver kernel bitwise against the shipped kernel for K3, K3.5, K4, and the unchanged K5 fallback before enabling.
+
+**Build design.** `build_nopless.py` now validates the dense kernel in the same fail-closed cubin as the expert: pinned CuAssembler `96a9f72baf00f40b9b299653fcef8d3e2b4a3d49` plus the two local patches; patched-source fingerprint `(fake=583, lp=587, words=2198, hi_d12d=588)`; three dense loops with shape `(232 instructions, 36 SHF, 4 LDG)`; zero NOPs; corrected EXIT/COOP metadata; dense `REG:40`, `SHARED:12848`, zero stack/local spills. Generated cubin sha256 `d0c95bd0d5afc97c82b6baf216995d8aee9a28d181c81d8d26da8e827adc719e`, **1,362,896 bytes**. Release build rc 0, **62 warnings** (limit 64). Final release binary sha256 `d4613b22d54185223cc6b80c281a5e3feb2b1f99f1af36cf9c48c1f1c06e791f`. Killswitch: `INKWELL_NO_CH2DENSE=1`; `INKWELL_CH2DENSE=0` also opts out after the default flip.
+
+**Dead end and root cause.** The first dense artifact was bitwise-correct for K3.5/K4 but wrong for K3 (`badbits=3072/3072`, maxabs `1.22e3`) and absurdly fast (`0.0060 ms` versus `0.0338 ms`), so it was invalid. The first mitigation commit `3431c43` excluded K3, but further inspection showed the stream was not the cause. CuAssembler represents `.nv.constant2` jump tables as opaque bytes; deleting NOPs shifted case labels, while the BRX table entries stayed at their old absolute addresses. kk=6/K3 is table-index 0 and its target follows the K3.5 loop, so dispatch entered `0x158` bytes late. CuAssembler's `.nv.info` indirect-target list is label-based and correct after reassembly, so `511ab4b` uses it as the authoritative old→new mapping, rewrites only those constant-bank entries, verifies the full constant bank byte-for-byte, and fails closed on any mismatch. K3 was restored. This repair is also required for correctness independent of performance.
+
+**Isolated GPU gate.** `dense_sf_drv_perk`, production shapes and nky, min-of-31, all bitwise exact:
+
+| case | bad bits | ref ms | cand ms | ref/cand |
+|---|---:|---:|---:|---:|
+| K3 / gate | 0/3072 | 0.0328 | 0.0284 | **1.1558x** |
+| K3.5 / wo | 0/2304 | 0.0379 | 0.0317 | **1.1935x** |
+| K4 / unembed | 0/201088 | 1.7375 | 1.4374 | **1.2087x** |
+| K5 / wr fallback | 0/384 | 0.0119 | 0.0120 | 0.9893x |
+
+K5 is the unchanged fallback; the small ratio difference is noise. Before the indirect-table repair the runtime correctly failed closed with `ch2dense: disabled: bitwise self-test failed`; after the repair the ctx512 smoke logged `ch2dense: enabled cubin=1362896 bytes selftest=0.34 ms`. Startup self-test cost: **0.34 ms**.
+
+**End-to-end exactness gates.** Feature-on ctx512 run exited 0, generated-text md5 **`5cbe8e06`**, decode `2.034917125 s` for 64 tokens (31.796 ms/tok despite the misleading log label). Eight-step full-logit dumps with the feature on and off both exited 0, were 6,401,888 bytes each, and compared byte-identical (`cmp` rc 0). The graph-enabled run completed normally.
+
+**End-to-end A/B.** `~/.cache/inkwell-ab/ab_rw.sh`, CTL `/home/ash/.cache/inkwell-ab/ctl-376e449/inkwell`, CAND this branch with `INKWELL_CH2DENSE=1`, 16 interleaved neighbour pairs in order ctl,cand,cand,ctl inside one `nice -n 19 flock /tmp/inkwell-gpu.lock`. CTL median **32.5345 ms/tok**; CAND median **31.290 ms/tok** (**−1.2445 ms/tok**); candidate won **16/16** pairs. Every run md5 was `5cbe8e06`; peak VRAM was **5,034 MiB** (limit 5,080); script rc 0. Per-pair candidate-minus-control deltas (ms/tok): `-1.302 -1.223 -3.282 -0.396 -2.319 -1.346 -1.559 -1.055 -1.154 -1.227 -1.132 -0.942 -1.688 -1.149 -0.177 -0.862`. Acceptance criteria were met, so the default was flipped on in separate commit `9aa2927`.
+
+**Follow-up, not implemented.** `inkwell_exl3_gemv_sf` still uses static `__shared__ float xs[3072]` (12,848 B), capping occupancy at 30 CTAs; the 36-CTA `wo_ud` and similar dense matrices therefore run in two waves. Dynamically sizing shared memory to the actual K is predicted to save another 0.2–0.5 ms/tok bit-exactly and should be investigated separately.
