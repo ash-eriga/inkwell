@@ -1949,3 +1949,4 @@ K5 is the unchanged fallback; the small ratio difference is noise. Before the in
 - Child A/B vs 376e449: −1.2445 ms, 16/16. Includes fail-closed repair of .nv.constant2 indirect-branch tables after NOP deletion (511ab4b).
 - Re-validated merged onto 54dc27f (74527c7), CTL frozen 54dc27f: CTL 29.480 vs CAND 28.267 ms/tok (−1.212), 16/16, md5 5cbe8e06 all runs, peak 5,032 MiB. Self-test 0.41 ms.
 - Killswitch INKWELL_NO_CH2DENSE=1. Follow-up: dynamic smem for gemv_sf xs[] (2-wave tail on 36-CTA wo_ud), predicted −0.2–0.5 ms.
+- Post-merge master e03df94, 3 runs: 30.075 / 34.351 / 28.961 ms/tok, md5 5cbe8e06 x3, ch2dense enabled x3, peak 5,032 MiB, 62 warnings. Run 2 outlier: desktop GPU processes (t3code/electron) active; A/B pairs are the reference.
