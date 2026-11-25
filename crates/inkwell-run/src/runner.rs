@@ -2954,25 +2954,12 @@ impl Runner {
             }
             let ext = self.cfg.rel_extent as i64;
             let rf = dst.add(offs[4]) as *mut i32;
-            let nf_write = if s.dyn_nkv { nfr } else { s.cap_full };
-            for j in 0..nf_write {
-                rf.add(j as usize).write((nfr - 1 - j).min(ext) as i32);
-            }
-            if !s.dyn_nkv {
-                for j in nfr..s.cap_full { rf.add(j as usize).write(0); }
+            for j in 0..s.cap_full {
+                rf.add(j as usize).write(if j < nfr { (nfr - 1 - j).min(ext) as i32 } else { 0 });
             }
             let rs = dst.add(offs[5]) as *mut i32;
-            if s.dyn_nkv {
-                for j in 0..nsr {
-                    rs.add(j as usize).write(self.swa_rel_pos(pos, j));
-                }
-            } else {
-                for j in 0..s.n_kv_swa_pad {
-                    rs.add(j as usize).write(if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 });
-                }
-            }
-            if !s.dyn_nkv {
-                for j in nsr..s.cap_swa { rs.add(j as usize).write(0); }
+            for j in 0..s.cap_swa {
+                rs.add(j as usize).write(if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 });
             }
             if s.dyn_nkv {
                 if self.swa_oracle {
