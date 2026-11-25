@@ -51,7 +51,29 @@ for addr, op, full in ins:
         im = re.findall(r",\s*0x([0-9a-f]+),", f)
         if im:
             shifts.append(int(im[0], 16))
-    rows.append((lo, addr, SHIFT_K.get(frozenset(shifts), "low-K"), body))
+    name = SHIFT_K.get(frozenset(shifts))
+    if name is None:
+        # The low-K extraction lowering has no unique funnel-immediate set.
+        # Use the ring stride computation immediately before the loop instead:
+        # 48/64/80/128 bytes for K1.5/K2/K2.5/K4 (the last as a shift by 7).
+        pre = [f for a, _o, f in ins if lo - 0x200 <= a < lo]
+        if any("SHF.L.U64" in f and "0x7" in f for f in pre):
+            name = "K4"
+        elif any("SHF.L.U64" in f and "0x6" in f for f in pre):
+            name = "K2"
+        elif any("0xa0" in f for f in pre):
+            name = "K5"
+        elif any("0x70" in f for f in pre):
+            name = "K3.5"
+        elif any("0x60" in f for f in pre):
+            name = "K3"
+        elif any("0x50" in f for f in pre):
+            name = "K2.5"
+        elif any("0x30" in f for f in pre):
+            name = "K1.5"
+        else:
+            name = "unknown"
+    rows.append((lo, addr, name, body))
 
 print(f"{'K':6} {'total':>5} {'ins/w':>6} {'core':>4} {'extr':>4} {'ldg':>3} {'lds':>3} {'addr':>4} {'ctl':>3} {'range':>15}")
 for lo, hi, name, body in rows:
