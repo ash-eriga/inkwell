@@ -1644,3 +1644,151 @@ Noise gate **passed**: split is uniformly closer to fp64, old-vs-split end-to-en
 - Merged `t3/splitk-attn-noise-gate` (132fe6e): `INKWELL_ATTNSPLIT_MIN` defaults to 320; chunk 32 up to n_kv 16384, 256 above. The gate evidence is in the child's entry above: split-K is closer to fp64 than the old kernel in all 6 real cases (3.1–8.1×), and at 4K old-vs-split KLD is below the split32-vs-split64 noise floor (top-1 256/256, same text).
 - Master check after merge: ctx512 md5 5cbe8e06 (2 runs; decode 2.449 s and 2.606 s for 8 tokens on a busy host). Build: 61 warnings.
 - Also merged: KV state save/load (`INKWELL_STATE_SAVE` / `INKWELL_STATE_LOAD`) for long-context tests that skip the encode.
+
+## 2026-11-24 — Challenge-2 exact expert-GEMV core, emission and patching evidence: IN PROGRESS
+
+Branch `t3/ch2-expert-gemv-core`. Solver artifacts archived in `opt/kbench/ch2/` (`DESIGN.md`, `lane-maps.json`).
+
+**ptxas emission.** Focused probes in `opt/kbench/ch2/emit.cu` retried algebraic forms, split/merged `mul.wide.u16` asm, immediate constants, volatile boundaries, direct `0x83dc0000` multiplication, PRMT/zero-packed halves, and ptxas `-O1/-O2/-O3`. Stock ptxas never emitted the required two-instruction product. The best direct forms still emitted either (a) three XMADs (`lo*0xd12d`, `lo*0x83dc`, `XMAD.PSL q,1,t`) or (b) a redundant low-half XMAD before the useful `XMAD.PSL`. Explicit zero-packing was worse (an extra `XMAD.PSL.CLO`). This independently confirms the earlier Round-2 emission failure.
+
+**Binary rewriting prototype.** `opt/kbench/ch2/patch_sass.py` rewrites the compiler-emitted triple
+
+```text
+LP    XMAD   t, U.H?, 0xd12d, RZ
+LOW   XMAD   p, U,    0x83dc, t
+HIGH  XMAD.PSL p, U.H1, 0x83dc, p
+```
+
+by changing LOW in place to `XMAD p, U.H1, 0xd12d, RZ` (immediate bits 20..35, r8 `.H1` bit 53, r39 addend RZ=0xff) and replacing LP with Pascal NOP `0x50b0000000070f00`. Patched disassembly shows exactly the useful pair `XMAD U.H1,0xd12d` + `XMAD.PSL U.H1,0x83dc` before IDP/FADD. In `inkwell_exl3_gemv_moe_s`: 463 product sites, 467 retired low-product instructions, 2,258 machine words rewritten (duplicate unrolled encodings), zero non-PSL `0x83dc` XMADs remain. The rewritten production kernel remains at 40 registers/thread and 0 spills.
+
+**Important limitation.** The retired LP instructions remain as NOPs because sm_61 control-word/instruction packing makes deletion a full SASS reassembly problem. Thus the abstract non-NOP cost falls, but the issued-instruction stream still contains one patched NOP per weight. Current patched-loop counts for the first six K cases are 8.719–8.844 issued instructions/weight including NOPs and 7.719–7.844 excluding NOPs, versus the shipped-model baseline 8.41–9.47. Any real gain must therefore come from pipe-pressure relief and/or extraction pairing, not from the nominal 2-XMAD count alone.
+
+**CPU exactness model.** `opt/kbench/ch2/test_cpu.py`: 1,120,000 randomized view extraction cases over every K and 20,000 product/bytesum cases pass. It verifies `ch2_view` against the shipped low-aligned window extraction and verifies that the patched high-half product is exactly `(0x83DCD12D*w) mod 2^32` with the IDP bias producing exact integer `s`.
+
+GPU validation and performance measurements are pending behind the shared `/tmp/inkwell-gpu.lock`.
+**Standalone per-K measurement, magic-FADD patched variant.** `opt/kbench/ch2/ch2_perk` compares the shipped stream core (`pw16=0`) with the patched CH2 branch on distinct MoE slots, min-of-31 interleaved timing. Bitwise output was exact for K=1.5 through K=4 (`badbits=0/9216`, maxabs 0), but K=5 failed (`badbits=4608/9216`, maxabs 153); the failure is isolated to the unpaired K5 path and is not yet root-caused. Measured MoE gate/up and down speedups (old/new, larger is better):
+
+| K | gu | dn | reading |
+|---|---:|---:|---|
+| 1.5 | 0.887x | 0.889x | about 11% slower |
+| 2.0 | 0.902x | 0.899x | about 10% slower |
+| 2.5 | 0.994x | 0.990x | neutral |
+| 3.0 | 1.011x | 1.005x | neutral |
+| 3.5 | 1.023x | 1.012x | slight gain |
+| 4.0 | 1.000x | 1.000x | neutral |
+
+This confirms the Round-2 warning: magic FADD exactness does not translate into speed on sm_61 because it uses the saturated main ALU pipe, while the patched NOP still occupies the instruction stream. Since K1.5/K2 dominate expert work, this variant is not acceptable.
+
+**Final branch state.** The conversion defaults to exact I2F rather than magic FADD (`CH2_USE_MAGIC_FADD` preserves the solver form for experiments). This is still exact integer `s`; it is not an approximation. The broken K5 CH2 path is gated out (`kk != 10`) so the runtime cannot silently produce wrong K5 expert output; K5 uses the shipped core. Thus the branch is a correctness-safe prototype, not an accepted implementation of the all-K challenge design. The solver lane maps/pairing have not been ported; the current prototype keeps the shipped consecutive-lane mapping and changes only the exact scalar core. No end-to-end A/B was run because the isolated dominant-K measurements already fail the performance gate and the shared GPU lock remained occupied by foreign long-running validation jobs. Build after the final state: rc0, 62 warnings (limit 64), patched production object has zero remaining non-PSL `0x83dc` XMADs.
+
+## 2026-11-24 — Challenge-2 sm_61 SASS reassembly/NOP deletion probe: GPU-BLOCKED, NO-GO FOR PRODUCTION YET
+
+Branch `t3/sass-reasm-probe`, based on 05f28e0. Probe artifacts/scripts: `opt/kbench/ch2/reasm_*.py`, `reasm_drv_perk.cc`, `reasm_pipeline.sh`, `cuasm-96a9f72-local.patch`.
+
+**Toolchain evaluated.** CuAssembler (cloudcores) pinned to upstream commit `96a9f72baf00f40b9b299653fcef8d3e2b4a3d49`, Python venv `sympy==1.14.0`, `pyelftools==0.32`, `mpmath==1.3.0`, CUDA 12.6 `nvdisasm/cuobjdump`. The upstream sm_61 repository is present but sparse; it could not assemble the production cubin until it was augmented from the cubin's own `cuobjdump -sass` stream (102,660 instruction samples; four new encoding facts, about 36 s). One upstream bug had to be patched locally: `hasattr(self, '__mCuInsAsmRepos')` does not name-mangle, so a custom repository was always discarded when `.__elf_flags` was parsed. maxas-family tools were not a viable alternative for this task because maxas targets Maxwell/sm_50, not Pascal/sm_61.
+
+**Round trip, full cubin: not byte-identical.** The extracted production `kernels_unpatched.1.sm_61.cubin` is 1,319,664 bytes, sha256 `45855f8a144da25920f1c007ccf488e4b31c57848d70e9fced8b19c55cb2ae71`. CuAssembler reassembly is 1,322,768 bytes, sha256 `22403c4719d2cfe39155ed9d84e82684ba377dd44ba39dbd7b4d773291105088`. It has the same 490 section names; 368 sections are byte-identical, 49 text sections differ in size, and 73 same-sized sections differ in content. Main causes: CuAssembler counts tail padding in many `.text` section sizes (usually +32/+64 bytes), changing downstream ELF offsets (`e_shoff` 0x13a790 -> 0x13b3b0, `e_phoff` 0x142210 -> 0x142e30); `.nv.info` indirect-branch target entries are rewritten and some branch-instruction addresses move backwards by 8 bytes to control-word boundaries; one non-target text section differs in two control bytes because two predicated ISCADD instructions carry reuse bits not displayed by nvdisasm. Importantly, the target `.text._Z23inkwell_exl3_gemv_moe_s...` section round-trips byte-identically (137,728/137,728 bytes, zero differing bytes), although its `.nv.info` indirect-branch metadata does not.
+
+**NOP deletion and reassembly.** Existing `patch_sass.py` was applied to the extracted cubin (`fake=463 lp=466 words=2167`). The six patched main loops were disassembled, 32 retired-XMAD NOPs per K were deleted for K=1.5/2/2.5/3/3.5/4 (192 total), and their stall/yield/wait-bar information was carried forward conservatively (stall distributed forward if one control word could not hold it; producer scoreboard fields were absent and caused a hard fail if encountered). Reassembled `cuobjdump` loop counts are exactly: K1.5-K3.5 247 instructions/32 weights = 7.719 instr/weight with 0 NOPs; K4 248/32 = 7.750 with 0 NOPs. This matches the prior non-NOP abstract count and removes one issued instruction per weight versus the patched-with-NOP kernel.
+
+**GPU validation/timing.** Not completed. A driver-API harness (`reasm_drv_perk.cc`) was built and queued exactly as required under `nice -n 19 flock /tmp/inkwell-gpu.lock`, but `/tmp/inkwell-gpu.lock` remained continuously held by foreign long-running jobs, with two more foreign jobs already queued ahead/around the probe. The queued probe was cancelled rather than adding more pressure. Therefore there is no bitwise correctness table and no measured per-K timing table in this run. Static instruction-count reduction is exactly 1.000 issued instruction/weight for every K tested: 8.719 -> 7.719 for K1.5/K2/K2.5/K3/K3.5 and 8.750 -> 7.750 for K4 (an 11.4-11.5% issue-count upper bound, not a measured speedup).
+
+**Verdict.** **NO-GO for writing the full challenge-2 loop in SASS or integrating this into the build yet.** Reasons: (1) full-cubin round trip is not byte-identical; (2) CuAssembler needs a local correctness patch plus augmentation from the input cubin before it can assemble the production kernel; (3) ELF padding/layout and `.nv.info` indirect-branch metadata are not reproduced faithfully; (4) the NOP-deleted cubin has not been loaded or bitwise-validated on the GPU. The positive result is narrower but real: the target kernel's text section round-trips byte-identically, CuAssembler can represent labels/branch fixups well enough to physically delete 192 NOPs, and the resulting disassembly has the intended 7.719-7.750 instructions/weight with zero NOPs. A future conditional go would require fixing/vendoring the assembler defects, a fail-closed target-section/metadata comparison, and the missing GPU bitwise/timing gate.
+
+## 2026-11-24 — Challenge-2 SASS NOP-deletion GPU gate: BITWISE FAIL, NOT ACCEPTED
+
+Branch `t3/sass-reasm-gpu-gate`, based on `8bf3991`. Regenerated artifacts with the now-executable `opt/kbench/ch2/reasm_pipeline.sh` under `~/.cache/inkwell-sass-reasm/out/`; the pipeline was independently rerun end-to-end and reproduced the same hashes. Unpatched `45855f8a…`, patched-with-NOPs `25dc4bcf…`, patched-NOP-deleted `fb190b1e…` (full hashes in `opt/kbench/ch2/reasm_gpu_gate_results.txt`). The first queued harness attempt failed before CUDA initialization because `libcudart.so.12` was not on the runtime loader path; the harness and pipeline now link `libcudart_static`, and the measurement below used that binary.
+
+Method: all three cubins were loaded with `cuModuleLoadData` by `opt/kbench/ch2/reasm_drv_perk.cc`; K=1.5/2/2.5/3/3.5/4 only (K5 remains on the shipped core). Inputs and MoE shapes match `ch2_perk.cu` (8 slots, gate/up tk=144/tn=72 and down tk=72/tn=144, x quantized in 1/512 steps) and the default exact I2F conversion. Correctness used nky=1. Timing used nky=2, memset+kernel, rotating three-way interleaving, min-of-31.
+
+**Bitwise.** Patched-with-NOPs was bit-identical to the unpatched shipped core at every K and shape (`badbits=0`, `maxabs=0`). NOP-deleted was **not** correct:
+
+| K | gate/up badbits/N, maxabs | down badbits/N, maxabs |
+|---|---|---|
+| 1.5 | 7480/9216, 56.3 | 13224/18432, 44.3 |
+| 2.0 | 9216/9216, 85.2 | 18432/18432, 59.5 |
+| 2.5 | 7928/9216, 56.3 | 13632/18432, 39.6 |
+| 3.0 | 7976/9216, 60 | 14584/18432, 46.6 |
+| 3.5 | 8280/9216, 64.5 | 15400/18432, 49.9 |
+| 4.0 | 9216/9216, 361 | 18432/18432, 271 |
+
+**Timing.** Times are ms; ratios greater than 1 are speedups. `u/n` is unpatched/patched-with-NOPs, `u/d` unpatched/NOP-deleted, and `n/d` patched-with-NOPs/NOP-deleted.
+
+| K | shape | unpatched | with NOPs | NOP-deleted | u/n | u/d | n/d |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1.5 | gu | 0.0797 | 0.0829 | 0.0734 | 0.961 | 1.086 | 1.129 |
+| 1.5 | dn | 0.0819 | 0.0859 | 0.0778 | 0.954 | 1.053 | 1.104 |
+| 2.0 | gu | 0.0799 | 0.0836 | 0.0764 | 0.955 | 1.045 | 1.094 |
+| 2.0 | dn | 0.0819 | 0.0847 | 0.0786 | 0.967 | 1.043 | 1.078 |
+| 2.5 | gu | 0.0900 | 0.0849 | 0.0737 | 1.059 | 1.220 | 1.152 |
+| 2.5 | dn | 0.0916 | 0.0867 | 0.0788 | 1.057 | 1.162 | 1.099 |
+| 3.0 | gu | 0.0907 | 0.0850 | 0.0746 | 1.067 | 1.216 | 1.139 |
+| 3.0 | dn | 0.0932 | 0.0870 | 0.0795 | 1.071 | 1.172 | 1.095 |
+| 3.5 | gu | 0.0928 | 0.0850 | 0.0768 | 1.092 | 1.209 | 1.107 |
+| 3.5 | dn | 0.0952 | 0.0876 | 0.0808 | 1.086 | 1.179 | 1.085 |
+| 4.0 | gu | 0.0891 | 0.0847 | 0.0796 | 1.052 | 1.119 | 1.064 |
+| 4.0 | dn | 0.0911 | 0.0866 | 0.0824 | 1.053 | 1.106 | 1.050 |
+
+`cuobjdump -sass` on the exact timed NOP-deleted cubin (`fb190b1e…`) confirms zero NOPs and 247 instructions/32 weights for K1.5–K3.5 = **7.719 instr/weight**, and 248/32 for K4 = **7.750 instr/weight**. The corresponding patched-with-NOPs loops are 8.719/8.750 instr/weight. After filtering NOPs and normalizing branch targets, the visible non-NOP instruction streams of the patched-with-NOPs and NOP-deleted loops are identical for all six K cases.
+
+**Reading.** Deleting one instruction per weight does produce a real measured per-K gain in this harness: at K1.5 the NOP-deleted kernel is 12.9%/10.4% faster than patched-with-NOPs (gu/dn) and 8.6%/5.3% faster than the shipped unpatched core; at K2 the gains are 9.4%/7.8% over patched-with-NOPs and 4.5%/4.3% over unpatched. Those are the dominant expert-work cases. However, the measured NOP-deleted kernel is bitwise wrong everywhere, so this is **not an accepted optimization** and no runtime integration is justified. Since the visible arithmetic instruction sequence is unchanged, the failure is isolated to the reassembled control/scheduling/metadata or encoding details rather than the intended scalar math. The positive result is narrower: patching with NOPs is bitwise correct, physical deletion is mechanically possible and fast, but the current conservative control-carry reassembly does not preserve correctness.
+
+## 2026-11-25 — Challenge-2 SASS NOP-deletion root cause fixed: bitwise PASS, conditional build-step GO
+
+Branch `t3/sass-reasm-bisect`, based on `50d2ecd`. Fixed artifacts under `~/.cache/inkwell-sass-reasm/out/`: unpatched `45855f8a…`, patched-with-NOPs `25dc4bcf…`, fixed NOP-deleted `07ef9b14db171dc248af865064effbb9b0760033e2a242af0c58d4559907b49f` (1,320,720 bytes). Full harness output is in `opt/kbench/ch2/reasm_gpu_gate_results.txt`.
+
+**No-deletion bisect.** A no-deletion CuAssembler round trip of the patched-with-NOPs cubin (`bab26f66…`) was bitwise correct on the GPU for all six K values and both shapes. Its target `.text` is not byte-identical: 170 bytes / 161 qwords differ, but every differing qword is a control qword, zero instruction payload words differ, and every differing bit is a hidden low reuse bit (bit 17/38/59) attached to a patched NOP. Those bits are invisible because `patch_sass.py` rewrote the instructions to NOP in place and nvdisasm does not print `.reuse` on NOPs. The target `.nv.info` differences are confined to `EIATTR_INDIRECT_BRANCH_TARGETS` label reconstruction. Thus the leading hypothesis—that CuAssembler encoded the rewritten `XMAD .H1, immediate, RZ` instruction word incorrectly—was rejected: the instruction words are exact, and the no-delete round trip executes exactly.
+
+**Root cause.** The NOP-deletion transformer carried stall/yield forward onto the first surviving instruction. On Pascal the 4-bit stall field belongs to the instruction that has just issued and controls the gap before the next instruction. Moving it forward therefore puts the delay after the dependent consumer instead of before it. A clean K=2 site is patched `.text` `0x177b8`: `XMAD R24,R37.H1.reuse,0xd12d,RZ` produces R24; one deleted NOP carries S05; `0x177d8` `XMAD.PSL R24,R37.H1,0x83dc,R24` consumes it. A linear issue+stall spacing model gives 9 cycles in the patched kernel, 8 cycles with backward transfer, and only 3 cycles with the original forward transfer; XMAD fixed latency is about 6 cycles. In the final layout the exact field is the first control slot's stall bits `[3:0]` in control qword `0x17660`: forward `0x081fd400fec00711` has stall 1, fixed backward `0x081fd400fe200716` has stall 6.
+
+A nearest-producer scan found six forward-critical XMAD windows with spacing original/back/forward: K2 `0x177b8` 9/8/3, K2 `0x17bd0` 10/9/5, K4 `0x20e28` 8/7/2, K4 `0x20eb8` 8/7/2, K4 `0x212f0` 10/8/4, K4 `0x215b0` 11/8/4. This explains why K2 and K4 were 100% bad in the original NOP-deleted gate. For contrast, the correct patched loops already contain IDP→I2F dependences at spacing 3, so the smaller IDP spacings produced by deletion are not inherently unsafe.
+
+**Controlled experiment.** Two NOP-deleted cubins were built with identical target `.nv.info` and identical instruction payload words. The forward-stall control (`630370e4…`) and backward-stall fix (`07ef9b14…`) are the same size and differ in exactly 280 bytes, all in target `.text` control qwords (148 control qwords, zero instruction qwords). Backward was bitwise exact for every K/shape (rc 0). Forward remained massively wrong (rc 2): K2 and K4 were 100% bad in both shapes, with the same kind of damage as the original failure. This isolates the stall-direction field as the executable root cause.
+
+**Metadata fix.** CuAssembler's `CuNVInfo.updateNVInfoFromDict` also discarded regenerated values: when an offset attribute was present in the update dictionary it appended the old value rather than `d[attr]`, and non-autogen `*OFFSETS` attributes were kept before the update branch could run. After NOP deletion this left `EIATTR_EXIT_INSTR_OFFSETS` and `EIATTR_COOP_GROUP_INSTR_OFFSETS` at stale pre-deletion addresses. `cuasm-96a9f72-local.patch` now contains the corrected update logic (verified with `git apply --check` against pristine `96a9f72`) in addition to the pre-existing repository-selection patch. In the fixed cubin the final three EXIT offsets are `135160/135536/135608`, matching the actual `0x20ff8/0x21170/0x211b8` EXIT instructions; S2R offsets are unchanged because all precede the deletion ranges. All indirect-branch-target entries also precede the deletion ranges, so their CuAssembler control-word-boundary reconstruction artefact is not deletion-dependent. The metadata bug is a real reassembly defect and is fixed, but the controlled forward/back experiment shows it was not the measured arithmetic root cause.
+
+**Transformer fix.** `reasm_remove_loop_nops.py` now pre-marks all 192 deleted NOPs, moves wait masks forward to the next surviving instruction, and moves stall/yield backward to the previous surviving instruction. It deliberately does not re-add the deleted issue slots; that is the intended speedup. Six wait masks are preserved. Two K4 backward sums saturate at the 4-bit maximum (`wanted 17/16`, stored 15), still far above the XMAD latency. No branch labels intervene in any of the 157 deleted NOP runs.
+
+**Bitwise after fix.** All six K values and both MoE shapes were exact for both patched-with-NOPs and fixed NOP-deleted kernels:
+
+| K | gate/up badbits, maxabs | down badbits, maxabs |
+|---|---|---|
+| 1.5 | 0/9216, 0 | 0/18432, 0 |
+| 2.0 | 0/9216, 0 | 0/18432, 0 |
+| 2.5 | 0/9216, 0 | 0/18432, 0 |
+| 3.0 | 0/9216, 0 | 0/18432, 0 |
+| 3.5 | 0/9216, 0 | 0/18432, 0 |
+| 4.0 | 0/9216, 0 | 0/18432, 0 |
+
+**Timing after fix.** Same harness as before: nky=2, memset+kernel, rotating three-way interleaving, min-of-31. Times are ms; ratios greater than 1 are speedups.
+
+| K | shape | unpatched | with NOPs | NOP-deleted | u/n | u/d | n/d |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1.5 | gu | 0.0816 | 0.0850 | 0.0775 | 0.960 | 1.053 | 1.097 |
+| 1.5 | dn | 0.0829 | 0.0870 | 0.0788 | 0.953 | 1.052 | 1.104 |
+| 2.0 | gu | 0.0814 | 0.0850 | 0.0768 | 0.958 | 1.060 | 1.107 |
+| 2.0 | dn | 0.0835 | 0.0868 | 0.0797 | 0.962 | 1.047 | 1.089 |
+| 2.5 | gu | 0.0910 | 0.0850 | 0.0784 | 1.071 | 1.161 | 1.084 |
+| 2.5 | dn | 0.0932 | 0.0879 | 0.0809 | 1.060 | 1.152 | 1.087 |
+| 3.0 | gu | 0.0908 | 0.0850 | 0.0778 | 1.069 | 1.167 | 1.092 |
+| 3.0 | dn | 0.0939 | 0.0870 | 0.0809 | 1.079 | 1.161 | 1.076 |
+| 3.5 | gu | 0.0930 | 0.0850 | 0.0788 | 1.094 | 1.179 | 1.078 |
+| 3.5 | dn | 0.0952 | 0.0881 | 0.0819 | 1.081 | 1.163 | 1.075 |
+| 4.0 | gu | 0.0901 | 0.0848 | 0.0806 | 1.063 | 1.118 | 1.052 |
+| 4.0 | dn | 0.0917 | 0.0870 | 0.0819 | 1.053 | 1.119 | 1.063 |
+
+**Reading and verdict.** The fixed NOP-deleted kernel is bitwise exact and 5.2–10.7% faster than patched-with-NOPs in this harness, or 4.7–17.9% faster than the unpatched shipped core. For the dominant K1.5/K2 cases the net gain over unpatched is 4.7–6.0%. `cuobjdump` confirms 7.719 instructions/weight for K1.5–K3.5 and 7.750 for K4, zero NOPs. **Conditional GO** for a fail-closed offline build step: it may emit this artifact only if it verifies the patched-with-NOPs baseline byte-for-byte, the zero-NOP/instruction-count shape, regenerated EXIT/COOP offsets, and the full GPU bitwise gate. **NO-GO** for unconditional runtime integration or for trusting CuAssembler without that gate: CuAssembler remains an external sparsely maintained tool, the full-cubin round trip is not byte-identical, hidden reuse state is not representable on NOPs, and indirect-branch-target label reconstruction still has control-word-boundary artefacts.
+
+### CH2 NOP-less production integration — ACCEPTED, default ON
+
+Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the validated sm_61 SASS-reassembled CH2 expert GEMV as an optional driver-API kernel (`40de564`) and then enabled it by default after the acceptance gate (`3c02652`).
+
+**Build design.** `crates/inkwell-cuda/build.rs` first compiles the ordinary ptxas kernel object untouched. It then runs `opt/kbench/ch2/build_nopless.py` on a copy of the cubin extracted from that exact object: exact-I2F byte patch, CuAssembler disassembly, deletion of the 192 loop NOPs with the backward stall transfer, reassembly with the production repository, and NVInfo EXIT/COOP correction. The generator verifies the pinned CuAssembler commit `96a9f72baf00f40b9b299653fcef8d3e2b4a3d49` plus both local patches, the patched-with-NOPs pattern counts, zero NOPs in all six target loops, 7.719 instructions/weight for K1.5–K3.5 and 7.750 for K4, exact EXIT/SHFL metadata targets, `REG:40`, `SHARED:9248`, and zero stack/local spills. The generated cubin is embedded as a byte range in the static kernel library; it is written only after every check passes. If CuAssembler or its venv is absent the build prints one note and embeds an empty range; any generation or validation failure likewise emits no artifact. Either way the build succeeds and uses the normal ptxas kernel. Discovery is `INKWELL_CUASM_ROOT`/`CUASMROOT` or `~/.cache/inkwell-sass-reasm/CuAssembler`, and `INKWELL_CUASM_PYTHON`/`VENVPY` or `~/.cache/inkwell-sass-reasm/cuasm-venv/bin/python`.
+
+**Runtime.** At MoE staging warmup the runtime loads the embedded cubin with `cuModuleLoadData`, resolves `_Z23inkwell_exl3_gemv_moe_sPKmS0_PKiPKfS4_iPfiiiiiiiS2_ii`, and runs a one-time bitwise comparison against the runtime-linked shipped core on one small deterministic input for K1.5, K2, K2.5, K3, K3.5, and K4. K5 is unchanged because the optimized core excludes `kk=10`. Failure to load, launch, or match exactly disables the feature with one log line and falls back to the runtime-linked kernel. `INKWELL_NO_CH2NOPLESS=1` is the killswitch. Before acceptance `INKWELL_CH2NOPLESS=1` was the opt-in; after acceptance the feature is on unless the killswitch is present. Production launches use `cuLaunchKernel` on the caller's stream through a shared dispatcher and fall back synchronously if the driver launch itself errors.
+
+**Artifact and startup.** Generated cubin `sha256=e84eaf7fa18990bd395c5a6080876b0f6628d49cea7971140d50edae6cdb9bce`, `1,320,720` bytes. Observed startup self-test cost: 5.04 ms in the ctx512 run and 5.17 ms in the logits-dump run. Log: `ch2nopless: enabled cubin=1320720 bytes selftest=5.04 ms` / `5.17 ms`.
+
+**Correctness and graph/VRAM gate.** Under `GGML_PASCAL_GRAPHS=1`, `INKWELL_MAX_CTX=512`, cache K20, MoE v2/nky2, and the shared GPU lock, the feature-on run exited 0 and generated-text md5 was `5cbe8e06`. Eight-step full-logit dumps with the feature on and off compared byte-identical (`cmp` rc 0). The graph-enabled run completed normally, so the driver-API launch remained capture-compatible. Peak process VRAM in every A/B run was 5,034 MiB, below the 5,080 MiB ctx512 requirement. Release build rc 0; warning count 62 (limit 64; master baseline 61).
+
+**End-to-end A/B.** `~/.cache/inkwell-ab/ab_rw.sh`, CTL `/home/ash/inkwell/target/release/inkwell`, CAND this branch with the feature enabled, 16 pairs in order ctl,cand,cand,ctl inside one `nice -n 19 flock /tmp/inkwell-gpu.lock`. CTL median **38.658 ms/tok**; CAND median **37.063 ms/tok**; candidate won **15/16** pairs; every run md5 was `5cbe8e06`; peak was 5,034 MiB; script rc 0. Per-pair candidate-minus-control deltas (ms/tok): `-1.838 -1.882 -0.835 -1.690 -1.058 -1.365 -1.599 -1.378 -1.720 -0.455 -1.827 -1.802 -1.727 -1.791 -2.048 +1.030`. Acceptance criteria were met (median faster, ≥12 wins, exact md5), so the default was flipped on in the separate commit `3c02652`.

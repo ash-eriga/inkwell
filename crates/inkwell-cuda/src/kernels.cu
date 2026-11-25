@@ -3,6 +3,11 @@
 // fusion comes later per the autotuning ledger.
 
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <time.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "exl3_gemv_v2.cuh"
@@ -2479,8 +2484,6 @@ static inline int ink_pw16_mask() {
     if (m < 0) m = (getenv("INKWELL_PW16") && !getenv("INKWELL_NO_PW16")) ? PW16_KMASK : 0;   // default OFF until E2E A/B passes
     return m;
 }
-
-
 // "stream-decode" dense single-token gemv (same design as inkwell_exl3_gemv_moe_s):
 // one warp per 16-wide tile column, 256 threads = 8 warps = 8 tile columns;
 // lane t owns 8 consecutive ring windows at compile-time offsets, 3 __ldg words
@@ -3190,6 +3193,70 @@ template <int D> __device__ __forceinline__ uint32_t sgemv_win(uint32_t hi, uint
     if constexpr (D <= 16) return hi >> (16 - D);
     else return __funnelshift_r(lo, hi, 48 - D);
 }
+// Same stream position aligned to the TOP 16 bits. The low half is don't-care:
+// the patched CH2 product consumes only XMAD's selected high half.
+template <int D> __device__ __forceinline__ uint32_t ch2_view(uint32_t hi, uint32_t lo) {
+    if constexpr (D == 0) return hi;
+    else if constexpr (D < 32) return __funnelshift_l(lo, hi, D);
+    else if constexpr (D == 32) return lo;
+    else return lo << (D - 32);
+}
+// ptxas cannot select the high-half XMAD.PSL form directly. It emits the full
+// low+high decomposition of U*0x83dc; the build-time SASS patcher retires the
+// low-half XMAD, leaving exactly ((U.H1*0x83dc)<<16) + U.H1*0xd12d.
+__device__ __forceinline__ uint32_t ch2_mul16_hi(uint32_t U) {
+    uint32_t t;
+    asm("{\n\t.reg .u16 lo, hi;\n\tmov.b32 {lo, hi}, %1;\n\tmul.wide.u16 %0, hi, 0xd12d;\n\t}"
+        : "=r"(t) : "r"(U));
+    return U * 0x83dcu + t;
+}
+__device__ __forceinline__ float ch2_bs_f32(uint32_t p) {
+#ifdef CH2_USE_MAGIC_FADD
+    const uint32_t bits = __dp4a(p, 0x01010101u, 0x4B000000u);
+    return __uint_as_float(bits) - 8388608.f;
+#else
+    // Same exact integer s, but uses the otherwise idle conversion pipe.
+    // On sm_61 the magic-FADD form competes for the saturated main ALU pipe.
+    return (float)(int)__dp4a(p, 0x01010101u, 0u);
+#endif
+}
+template <int KA, int H>
+__device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
+                                        int tk_lo, int tk_hi, const float* __restrict__ xs,
+                                        float& a0, float& a1) {
+    constexpr int NW = 8 * KA + 4 * H;
+    const int t = threadIdx.x & 31;
+    const int R = 32 * NW;
+    int B = (H ? (8 * t + 1) * KA + ((8 * t + 1) >> 1) : (8 * t + 1) * KA) - 16;
+    if (B < 0) B += R;
+    const int w0 = B >> 5, o = B & 31;
+    const int w1 = (w0 + 1 == NW) ? 0 : w0 + 1;
+    const int w2 = (w1 + 1 == NW) ? 0 : w1 + 1;
+    const int r0 = 2 * (t & 3);
+    const size_t stride = (size_t)tn * NW;
+    const uint32_t* p = tb + (size_t)tn_i * NW;
+#pragma unroll 4
+    for (int a = tk_lo; a < tk_hi; ++a) {
+        const uint32_t* q = p + (size_t)a * stride;
+        const int kb = a * 16 + r0;
+        const uint32_t W0 = __ldg(q + w0), W1 = __ldg(q + w1), W2 = __ldg(q + w2);
+        const uint32_t hi = __funnelshift_l(W1, W0, o), lo = __funnelshift_l(W2, W1, o);
+        uint32_t pp[8];
+#define SG_D(j) ((j) * KA + H * (((j) + 1) >> 1))
+        pp[0] = ch2_mul16_hi(ch2_view<SG_D(0)>(hi, lo)); pp[1] = ch2_mul16_hi(ch2_view<SG_D(1)>(hi, lo));
+        pp[2] = ch2_mul16_hi(ch2_view<SG_D(2)>(hi, lo)); pp[3] = ch2_mul16_hi(ch2_view<SG_D(3)>(hi, lo));
+        pp[4] = ch2_mul16_hi(ch2_view<SG_D(4)>(hi, lo)); pp[5] = ch2_mul16_hi(ch2_view<SG_D(5)>(hi, lo));
+        pp[6] = ch2_mul16_hi(ch2_view<SG_D(6)>(hi, lo)); pp[7] = ch2_mul16_hi(ch2_view<SG_D(7)>(hi, lo));
+#undef SG_D
+        const float2 xa = *(const float2*)&xs[kb], xc = *(const float2*)&xs[kb + 8];
+        float f[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) f[j] = ch2_bs_f32(pp[j]);
+        a0 = fmaf(xa.x, f[0], a0); a0 = fmaf(xa.y, f[1], a0); a0 = fmaf(xc.x, f[2], a0); a0 = fmaf(xc.y, f[3], a0);
+        a1 = fmaf(xa.x, f[4], a1); a1 = fmaf(xa.y, f[5], a1); a1 = fmaf(xc.x, f[6], a1); a1 = fmaf(xc.y, f[7], a1);
+    }
+}
+
 template <int KA, int H>
 __device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
                                           int tk_lo, int tk_hi, const float* __restrict__ xs,
@@ -3252,6 +3319,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     const uint32_t* tb = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff), hk = (int)((d[3] >> 8) & 1);
     const int kk = ka * 2 + hk;
+    const bool ch2 = (pw16 & (1 << 30)) != 0 && kk != 10;
     const bool pw = (pw16 >> kk) & 1;
     __shared__ __align__(16) float xs[SGEMV_MAXK];
     __shared__ float red[8];
@@ -3270,6 +3338,33 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     float sx = 0.f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) sx += red[i];
+    if (ch2) {
+        const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
+        if (tn_i >= tn) return;
+        float a0 = 0.f, a1 = 0.f;
+        switch (kk) {
+            case 3:  ch2_run<1, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 4:  ch2_run<2, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 5:  ch2_run<2, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 6:  ch2_run<3, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 7:  ch2_run<3, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 8:  ch2_run<4, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 10: ch2_run<5, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            default: __trap();
+        }
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+        const int lane = threadIdx.x & 31;
+        if ((lane & 3) == 0) {
+            const float KINV = __half2float(__ushort_as_half(0x1eee));
+            const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+            const float off = KOFF * sx;
+            float* dst = &t[(size_t)slot * n + zsel * tzoff + tn_i * 16 + (lane >> 2)];
+            const float v0 = fmaf(KINV, a0, off), v1 = fmaf(KINV, a1, off);
+            if (nky > 1) { atomicAdd(dst, v0); atomicAdd(dst + 8, v1); } else { dst[0] = v0; dst[8] = v1; }
+        }
+        return;
+    }
     if (pw) {
         const int part = threadIdx.x >> 7;
         const int t_in_blk = (threadIdx.x & 127) >> 4;
@@ -3328,7 +3423,189 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     }
 }
 
-__global__ void inkwell_exl3_had_out_moe(const uint64_t* __restrict__ descs,
+// ---- optional build-generated CH2 NOP-deleted module (driver API) ----
+extern "C" {
+extern const unsigned char ink_ch2nopless_cubin_start[];
+extern const unsigned char ink_ch2nopless_cubin_end[];
+}
+
+struct Ch2NpState {
+    CUmodule mod = nullptr;
+    CUfunction fn = nullptr;
+    int state = 0;   // 0 uninitialised, 1 enabled, 2 disabled/unavailable
+    size_t bytes = 0;
+    double selftest_ms = 0.0;
+};
+static Ch2NpState g_ch2np;
+
+static int ch2np_requested() {
+    if (getenv("INKWELL_NO_CH2NOPLESS")) return 0;
+    const char* e = getenv("INKWELL_CH2NOPLESS");
+    return e ? atoi(e) != 0 : 1;   // accepted; INKWELL_NO_CH2NOPLESS remains the killswitch
+}
+
+static CUresult ch2np_driver_launch(CUfunction f, dim3 grid,
+                                    const uint64_t* descs, const uint64_t* descs2,
+                                    const int* ids, const float* xh, const float* xh2, int xh2s,
+                                    float* t, int tslot, int tzoff,
+                                    int tk, int tn, int k, int n, int nky,
+                                    const int* missf, int skipmode, int pw16,
+                                    cudaStream_t stream) {
+    void* args[] = {&descs, &descs2, &ids, &xh, &xh2, &xh2s, &t, &tslot, &tzoff,
+                    &tk, &tn, &k, &n, &nky, &missf, &skipmode, &pw16};
+    return cuLaunchKernel(f, grid.x, grid.y, grid.z, 256, 1, 1, 0, (CUstream)stream, args, nullptr);
+}
+
+static uint32_t ch2np_rs = 777001u;
+static uint32_t ch2np_rnd() {
+    ch2np_rs ^= ch2np_rs << 13; ch2np_rs ^= ch2np_rs >> 17; ch2np_rs ^= ch2np_rs << 5;
+    return ch2np_rs;
+}
+
+// One small single-projection case per optimized K. The runtime-linked kernel
+// (pw16=0, shipped scalar core) is the reference; the module uses bit 30 (CH2).
+static bool ch2np_selftest(CUfunction f) {
+    constexpr int TK = 16, TN = 16, K = TK * 16, N = TN * 16;
+    constexpr size_t MAXW = (size_t)TK * TN * 40;
+    uint32_t* trel = nullptr;
+    uint64_t* desc = nullptr;
+    int* ids = nullptr;
+    float* x = nullptr;
+    float* out_ref = nullptr;
+    float* out_new = nullptr;
+    bool ok = false;
+    uint32_t hw[MAXW];
+    float hx[K], ha[N], hb[N];
+    const int cases[6][2] = {{1,1},{2,0},{2,1},{3,0},{3,1},{4,0}};
+
+    if (cudaMalloc((void**)&trel, MAXW * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&desc, 4 * 8) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&ids, 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&x, K * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&out_ref, N * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&out_new, N * 4) != cudaSuccess) goto done;
+
+    for (int i = 0; i < K; ++i) hx[i] = ((int)(ch2np_rnd() % 2001) - 1000) / 512.f;
+    if (cudaMemcpy(x, hx, K * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+    {
+        int hi = 0;
+        if (cudaMemcpy(ids, &hi, 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+    }
+
+    for (int ci = 0; ci < 6; ++ci) {
+        const int ka = cases[ci][0], hk = cases[ci][1];
+        {
+            const int nw = 8 * ka + 4 * hk;
+            const size_t words = (size_t)TK * TN * nw;
+            for (size_t i = 0; i < words; ++i) hw[i] = ch2np_rnd();
+            if (cudaMemcpy(trel, hw, words * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+            const uint64_t hd[4] = {(uint64_t)(uintptr_t)trel, 0, 0, (uint64_t)(ka | (hk << 8))};
+            if (cudaMemcpy(desc, hd, sizeof hd, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+            if (cudaMemset(out_ref, 0, N * 4) != cudaSuccess) goto done;
+            if (cudaMemset(out_new, 0, N * 4) != cudaSuccess) goto done;
+
+            dim3 grid((TN + 7) / 8, 1, 1);
+            inkwell_exl3_gemv_moe_s<<<grid, 256, 0, nullptr>>>(desc, nullptr, ids, x, nullptr, 0,
+                out_ref, N, 0, TK, TN, K, N, 1, nullptr, 0, 0);
+            CUresult cr = ch2np_driver_launch(f, grid, desc, nullptr, ids, x, nullptr, 0,
+                out_new, N, 0, TK, TN, K, N, 1, nullptr, 0, 1 << 30, nullptr);
+            if (cr != CUDA_SUCCESS) goto done;
+            if (cudaDeviceSynchronize() != cudaSuccess) goto done;
+            if (cudaMemcpy(ha, out_ref, N * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+            if (cudaMemcpy(hb, out_new, N * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+            if (memcmp(ha, hb, N * 4) != 0) goto done;
+        }
+    }
+    ok = cudaGetLastError() == cudaSuccess;
+done:
+    if (trel) cudaFree(trel);
+    if (desc) cudaFree(desc);
+    if (ids) cudaFree(ids);
+    if (x) cudaFree(x);
+    if (out_ref) cudaFree(out_ref);
+    if (out_new) cudaFree(out_new);
+    return ok;
+}
+
+extern "C" int ink_ch2nopless_startup() {
+    if (g_ch2np.state) return g_ch2np.state == 1;
+    g_ch2np.state = 2;
+    if (!ch2np_requested()) return 0;
+    const size_t bytes = (size_t)(ink_ch2nopless_cubin_end - ink_ch2nopless_cubin_start);
+    if (bytes == 0) return 0;
+
+    cudaFree(0);   // ensure the runtime primary context exists before module load
+    cuInit(0);
+    CUresult r = cuModuleLoadData(&g_ch2np.mod, (const void*)ink_ch2nopless_cubin_start);
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "ch2nopless: disabled: cuModuleLoadData error %d\n", (int)r);
+        return 0;
+    }
+    static const char* name = "_Z23inkwell_exl3_gemv_moe_sPKmS0_PKiPKfS4_iPfiiiiiiiS2_ii";
+    r = cuModuleGetFunction(&g_ch2np.fn, g_ch2np.mod, name);
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "ch2nopless: disabled: cuModuleGetFunction error %d\n", (int)r);
+        cuModuleUnload(g_ch2np.mod);
+        g_ch2np.mod = nullptr;
+        return 0;
+    }
+    timespec ts0{}, ts1{};
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    const bool exact = ch2np_selftest(g_ch2np.fn);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    g_ch2np.selftest_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
+    g_ch2np.bytes = bytes;
+    if (!exact) {
+        fprintf(stderr, "ch2nopless: disabled: bitwise self-test failed\n");
+        cuModuleUnload(g_ch2np.mod);
+        g_ch2np.mod = nullptr;
+        g_ch2np.fn = nullptr;
+        return 0;
+    }
+    g_ch2np.state = 1;
+    fprintf(stderr, "ch2nopless: enabled cubin=%zu bytes selftest=%.2f ms\n", bytes, g_ch2np.selftest_ms);
+    return 1;
+}
+
+extern "C" int ink_ch2nopless_enabled() { return g_ch2np.state == 1; }
+
+static bool ch2np_try_launch(dim3 grid, cudaStream_t st,
+                             const uint64_t* descs, const uint64_t* descs2,
+                             const int* ids, const float* xh, const float* xh2, int xh2s,
+                             float* t, int tslot, int tzoff,
+                             int tk, int tn, int k, int n, int nky,
+                             const int* missf, int skipmode, int pw16) {
+    if (g_ch2np.state == 0) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(st, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone)
+            ink_ch2nopless_startup();
+    }
+    if (g_ch2np.state != 1) return false;
+    const CUresult r = ch2np_driver_launch(g_ch2np.fn, grid, descs, descs2, ids, xh, xh2, xh2s,
+        t, tslot, tzoff, tk, tn, k, n, nky, missf, skipmode, pw16 | (1 << 30), st);
+    if (r == CUDA_SUCCESS) return true;
+    fprintf(stderr, "ch2nopless: disabled: cuLaunchKernel error %d\n", (int)r);
+    g_ch2np.state = 2;
+    return false;
+}
+
+// Shared dispatcher: use the validated module when present, otherwise the
+// runtime-linked kernel with the shipped scalar core (bit 30 clear).
+static void launch_moe_s(dim3 grid, cudaStream_t st,
+                         const uint64_t* descs, const uint64_t* descs2,
+                         const int* ids, const float* xh, const float* xh2, int xh2s,
+                         float* t, int tslot, int tzoff,
+                         int tk, int tn, int k, int n, int nky,
+                         const int* missf, int skipmode) {
+    const int pw = ink_pw16_mask();
+    if (ch2np_try_launch(grid, st, descs, descs2, ids, xh, xh2, xh2s, t, tslot, tzoff,
+                         tk, tn, k, n, nky, missf, skipmode, pw)) return;
+    inkwell_exl3_gemv_moe_s<<<grid, 256, 0, st>>>(descs, descs2, ids, xh, xh2, xh2s,
+        t, tslot, tzoff, tk, tn, k, n, nky, missf, skipmode, pw);
+}
+
+__global__ void inkwell_exl3_had_out_moe
+(const uint64_t* __restrict__ descs,
                                          const uint64_t* __restrict__ descs2,
                                          const int* __restrict__ ids,
                                          const float* __restrict__ t,
@@ -3979,8 +4256,8 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     // GU stays fp32 (int8-x loses ~10%/window here) -> no GU quants
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
-        inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0, ink_pw16_mask());
+        launch_moe_s(gg, st, G, U, ids, xh, (const float*)gu, 2 * NG,
+                        (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, nullptr, 0,
         nullptr, nullptr, nullptr, nullptr);   // GU stays fp32: int8-x loses ~10%/window
@@ -4005,8 +4282,8 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8, xqs8, KD);
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
-        inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, ink_pw16_mask());
+        launch_moe_s(gd, st, D, nullptr, ids, xh, nullptr, 0,
+                        dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, nullptr, nullptr);
@@ -4117,9 +4394,9 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     // GU stays fp32
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
-        inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 1, ink_pw16_mask());
+        launch_moe_s(gg, st, G, U, ids, xh, (const float*)gu, 2 * NG,
+                        (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
+                        (const int*)miss, 1);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1,
         nullptr, nullptr, nullptr, nullptr);
@@ -4136,9 +4413,9 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                                 (const int*)miss, 2, nullptr, nullptr);
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
-        inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 2, ink_pw16_mask());
+        launch_moe_s(gg, st, G, U, ids, xh, (const float*)gu, 2 * NG,
+                        (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
+                        (const int*)miss, 2);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2,
         nullptr, nullptr, nullptr, nullptr);
@@ -4162,8 +4439,8 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8c, xqs8c, KD);
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
-        inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, ink_pw16_mask());
+        launch_moe_s(gd, st, D, nullptr, ids, xh, nullptr, 0,
+                        dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0);
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, nullptr, nullptr);

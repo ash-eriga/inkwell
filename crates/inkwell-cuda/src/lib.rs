@@ -80,6 +80,7 @@ extern "C" {
         hist: *const i32, tag: *const i32, bank: *mut c_void, ptag: *mut i32, pready: *mut i32,
         pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void);
     fn ink_launch_exl3_copy8(src: *const c_void, dst: *mut c_void, stream: *mut c_void);
+    fn ink_ch2nopless_startup() -> i32;
     fn ink_launch_exl3_stage(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, staging: *mut c_void, sg: *mut c_void, su: *mut c_void, sd: *mut c_void, stream: *mut c_void);
     fn ink_launch_draft_mix(f: *const f32, a: *const f32, w: *const f32, o: *mut f32, rows: i32, tstride: i32, ch: i32, eps: f32, s: *mut c_void);
     fn ink_launch_draft_rms(x: *const f32, res: *const f32, w: *const f32, o: *mut f32, ro: *mut f32, n: i32, ch: i32, eps: f32, s: *mut c_void);
@@ -931,6 +932,12 @@ pub unsafe fn exl3_gemv_mz_async(trel: &[*const c_void], suh: &[*const c_void], 
     k: &[i64], n: &[i64], ka: &[i64], halfk: &[i64]) {
     unsafe { ink_launch_exl3_gemv_mz(trel.as_ptr(), suh.as_ptr(), svh.as_ptr(), x.as_ptr(),
         y, ystride, scr.as_ptr().cast(), k.as_ptr(), n.as_ptr(), ka.as_ptr(), halfk.as_ptr(), trel.len() as i32, stream()) };
+}
+
+/// Run the one-time CH2 NOP-less module load and bitwise self-test.
+#[must_use]
+pub fn ch2nopless_startup() -> i32 {
+    unsafe { ink_ch2nopless_startup() }
 }
 
 pub unsafe fn exl3_moe_async(dg: *const c_void, du: *const c_void, dd: *const c_void,

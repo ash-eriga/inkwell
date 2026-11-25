@@ -1,0 +1,73 @@
+ptxas info    : 4 bytes gmem, 8 bytes cmem[4]
+ptxas info    : Compiling entry function '_Z6k_emitILi17EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi17EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 44 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi16EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi16EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 44 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi15EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi15EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi14EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi14EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 48 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi13EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi13EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 47 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi12EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi12EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 47 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi11EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi11EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi10EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi10EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi9EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi9EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi8EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi8EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi7EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi7EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 24 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi6EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi6EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 24 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi5EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi5EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi4EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi4EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi3EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi3EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi2EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi2EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 19 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi1EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi1EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 47 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
+ptxas info    : Compiling entry function '_Z6k_emitILi0EEvPKjPKfPfi' for 'sm_61'
+ptxas info    : Function properties for _Z6k_emitILi0EEvPKjPKfPfi
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 47 registers, used 0 barriers, 348 bytes cmem[0], 12 bytes cmem[2]
