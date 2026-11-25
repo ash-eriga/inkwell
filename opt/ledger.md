@@ -1566,3 +1566,11 @@ Verdict: **do not enable as a production exactness-preserving path yet**. It is 
   - Lane-map bijection; (k,n) and start positions; hi/lo extraction on 200 random rings per K; ≤2 four-word chunks per lane.
 - Gap in their cost model: lane-uniform register selection. With per-lane base words, the ring-word index varies across lanes on 6/8 slots for K=1.5 and 6–7/8 for odd K. K=2 and K=4 are uniform. The fix is a lane-aligned stream, about +2 SHF and +1 LDG per tile. Their x-layout assumption A-X is unproven.
 - Corrected estimate: E ≈ 6.5 with A-X, ≈ 7.05 without. They claim 6.28; today's E is 8.81.
+
+## 2026-11-24 — challenge 2 port prototype (05f28e0, branch t3/ch2-expert-gemv-core): not merged
+
+- ptxas never emits the exact 2-XMAD product; it always emits 3 XMADs. The prototype rewrites the cubin at build time (`opt/kbench/ch2/patch_sass.py` via build.rs; killswitch `INKWELL_NO_CH2CORE=1`): 463 PSL sites, 40 regs, 0 spills.
+- The retired XMAD becomes a NOP, so the issue count does not drop: 8.72–8.84 instr/weight with NOPs, 7.72–7.84 if the NOPs could be removed.
+- The magic-FADD variant (F6) is bitwise exact for K1.5–4 but slower than I2F on the dominant Ks. Per-K speed (new/old): K1.5 0.887×, K2 0.90×, K2.5 ~0.99×, K3 1.01×, K3.5 1.02×, K4 1.00×. K5 is wrong (4608/9216 bad) and is gated back to the shipped core.
+- The lane maps (paired views) were not ported. The final I2F build has no GPU validation (no md5, no A/B).
+- Next: a feasibility probe on t3/sass-reasm-probe — sm_61 SASS reassembly that deletes the NOPs, with a byte-identical round trip, per-K bitwise checks and timing. Go/no-go for a SASS-level challenge-2 loop.
