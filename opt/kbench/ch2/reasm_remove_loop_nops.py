@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Delete patched-CH2 NOPs from the six K=1.5..4 gemv loops in cuasm text.
 
-The retired XMAD NOPs carry no scoreboard dependencies in the input.  Their
-stall/yield bits are transferred to the next surviving instruction so removing
-an instruction cannot reduce the scheduled spacing before a dependent consumer.
+The retired XMAD NOPs carry no scoreboard dependencies in the input.  On
+Pascal, stall/yield bits belong to the instruction that has just issued and
+control the gap before the following instruction.  They are therefore
+transferred backward to the previous surviving instruction.  Wait masks gate
+the instruction carrying them, so they are transferred forward to the next
+surviving instruction.
 """
 import re
 import sys
@@ -49,10 +52,9 @@ def parse_ctrl(c):
 def fmt_ctrl(parts):
     return 'B' + parts[0] + ':R' + parts[1] + ':W' + parts[2] + ':' + parts[3] + ':S' + f'{parts[4]:02d}'
 
-removed = []
-carry = None
 counts = {name: 0 for _, _, name in RANGES}
 remove_lines = set()
+nop_ctrls = {}
 
 def merge_wait(dst, src):
     if src == '------':
@@ -69,46 +71,98 @@ def merge_wait(dst, src):
             raise SystemExit(f'cannot merge distinct wait barriers {dst} + {src}')
     return ''.join(out)
 
-# carry = [stall, yield, waitbar]; barriers are OR-merged into the next survivor.
-# Stall is distributed forward if one instruction cannot hold all of it.
+def set_ctrl(i, c):
+    m = ins_re.match(lines[i])
+    old = m.group('ctrl')
+    lines[i] = lines[i].replace(f'[{old}]', f'[{fmt_ctrl(c)}]', 1)
+
+# Mark every deletion before transferring controls.  Besides making consecutive
+# NOP runs explicit, this prevents a wait mask from being moved onto another NOP
+# that is itself about to be deleted.
 for idx, (i, addr, body) in enumerate(entries):
     inside = next((name for lo, hi, name in RANGES if lo <= addr <= hi), None)
-    is_nop = inside is not None and body == 'NOP ;'
-    if is_nop:
-        c = parse_ctrl(ins_re.match(lines[i]).group('ctrl'))
-        if c[1] != '-' or c[2] != '-':
-            raise SystemExit(f'NOP at {addr:x} has producer scoreboard control {c}; refusing')
-        if carry is None:
-            carry = [0, False, '------']
-        carry[0] += c[4]
-        carry[1] |= (c[3] == 'Y')
-        carry[2] = merge_wait(carry[2], c[0])
-        remove_lines.add(i)
-        counts[inside] += 1
+    if inside is None or body != 'NOP ;':
         continue
-    if carry is not None and inside is not None:
-        m = ins_re.match(lines[i])
-        c = parse_ctrl(m.group('ctrl'))
-        c[0] = merge_wait(c[0], carry[2])
-        if carry[1]:
-            c[3] = 'Y'
-        room = 15 - c[4]
-        take = min(room, carry[0])
-        c[4] += take
-        carry[0] -= take
-        if carry[0] == 0:
-            carry = None
-        else:
-            # Yield/wait were already transferred.  Keep only the remaining stall.
-            carry[1] = False
-            carry[2] = '------'
-        old = m.group('ctrl')
-        lines[i] = lines[i].replace(f'[{old}]', f'[{fmt_ctrl(c)}]', 1)
+    c = parse_ctrl(ins_re.match(lines[i]).group('ctrl'))
+    if c[1] != '-' or c[2] != '-':
+        raise SystemExit(f'NOP at {addr:x} has producer scoreboard control {c}; refusing')
+    remove_lines.add(i)
+    nop_ctrls[i] = c
+    counts[inside] += 1
 
-if carry is not None:
-    raise SystemExit('trailing NOP carry at end of loop; not implemented')
+# Wait masks gate issue of the instruction carrying them.  Move them onto the
+# next surviving instruction, ORing all masks from a consecutive NOP run.
+forward_waits = {}
+for idx, (i, addr, body) in enumerate(entries):
+    if i not in remove_lines:
+        continue
+    c = nop_ctrls[i]
+    if c[0] == '------':
+        continue
+    j = idx + 1
+    while j < len(entries) and entries[j][0] in remove_lines:
+        j += 1
+    if j >= len(entries):
+        raise SystemExit('trailing NOP wait at end of section; not implemented')
+    target = entries[j][0]
+    forward_waits[target] = merge_wait(forward_waits.get(target, '------'), c[0])
+
+for i, wait in forward_waits.items():
+    c = parse_ctrl(ins_re.match(lines[i]).group('ctrl'))
+    c[0] = merge_wait(c[0], wait)
+    set_ctrl(i, c)
+
+# Stall and yield have the opposite directionality: they belong to the
+# instruction just issued and control the gap before the next instruction.
+# Add each NOP run's stalls to the previous surviving instruction.  Do not add
+# the deleted issue slot itself; that would give up the intended speedup.  This
+# preserves all explicit stall cycles before the next survivor, while still
+# reducing producer/consumer spacing by the number of retired NOP issue slots.
+saturated = []
+idx = 0
+while idx < len(entries):
+    i, addr, body = entries[idx]
+    if i in remove_lines:
+        idx += 1
+        continue
+    j = idx + 1
+    stalls = 0
+    yield_seen = False
+    while j < len(entries) and entries[j][0] in remove_lines:
+        nc = nop_ctrls[entries[j][0]]
+        stalls += nc[4]
+        yield_seen |= (nc[3] == 'Y')
+        j += 1
+    if j != idx + 1:
+        c = parse_ctrl(ins_re.match(lines[i]).group('ctrl'))
+        wanted = c[4] + stalls
+        c[4] = min(15, wanted)
+        if c[4] != wanted:
+            saturated.append((addr, wanted))
+        if yield_seen:
+            c[3] = 'Y'
+        set_ctrl(i, c)
+    idx = j
+
+# Every deleted NOP must have been covered by the survivor scan above.  A NOP
+# at the start of the section has no previous instruction that can carry its
+# stall, so reject that layout rather than silently dropping control state.
+covered = set()
+idx = 0
+while idx < len(entries):
+    if entries[idx][0] in remove_lines:
+        idx += 1
+        continue
+    j = idx + 1
+    while j < len(entries) and entries[j][0] in remove_lines:
+        covered.add(entries[j][0])
+        j += 1
+    idx = j
+if covered != remove_lines:
+    raise SystemExit('leading deleted NOP has no previous surviving instruction')
 if sorted(counts.values()) != [32] * 6:
     raise SystemExit(f'unexpected NOP counts {counts}')
 out = [line for i, line in enumerate(lines) if i not in remove_lines]
 open(outp, 'w').write(''.join(out))
-print('removed', counts, 'total', sum(counts.values()), 'lines', len(remove_lines))
+print('removed', counts, 'total', sum(counts.values()), 'lines', len(remove_lines),
+      'forward_waits', len(forward_waits), 'saturated', saturated)

@@ -10,3 +10,23 @@
                  or (self.__mCuInsAsmRepos.getSMVersion() != self.m_Arch) ):
  
                  CuAsmLogger.logSubroutine('Setting CuInsAsmRepos to default dict...')
+--- a/CuAsm/CuNVInfo.py
++++ b/CuAsm/CuNVInfo.py
+@@ -75,12 +75,12 @@
+         
+         new_attr_list = []
+         for attr, val in self.m_AttrList:
+-            if attr not in self.__mEIATTR_AutoGen and attr not in self.__mEIATTR_MaunalGen: # kept as is
++            if attr in d: # updated autogen/manual/offset-label attributes
++                new_attr_list.append((attr, d[attr]))
++                del d[attr] 
++
++            elif attr not in self.__mEIATTR_AutoGen and attr not in self.__mEIATTR_MaunalGen: # kept as is
+                 new_attr_list.append((attr, val))
+-
+-            elif attr in d: # autogen/manual gen attributes, updated and remove from appended list
+-                new_attr_list.append((attr, val))
+-                del d[attr] 
+ 
+             else: # attr in AutoGen but not in d, which means it's deleted
+                 pass
