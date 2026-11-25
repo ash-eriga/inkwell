@@ -1644,3 +1644,39 @@ Noise gate **passed**: split is uniformly closer to fp64, old-vs-split end-to-en
 - Merged `t3/splitk-attn-noise-gate` (132fe6e): `INKWELL_ATTNSPLIT_MIN` defaults to 320; chunk 32 up to n_kv 16384, 256 above. The gate evidence is in the child's entry above: split-K is closer to fp64 than the old kernel in all 6 real cases (3.1–8.1×), and at 4K old-vs-split KLD is below the split32-vs-split64 noise floor (top-1 256/256, same text).
 - Master check after merge: ctx512 md5 5cbe8e06 (2 runs; decode 2.449 s and 2.606 s for 8 tokens on a busy host). Build: 61 warnings.
 - Also merged: KV state save/load (`INKWELL_STATE_SAVE` / `INKWELL_STATE_LOAD`) for long-context tests that skip the encode.
+
+## 2026-11-24 — Challenge-2 exact expert-GEMV core, emission and patching evidence: IN PROGRESS
+
+Branch `t3/ch2-expert-gemv-core`. Solver artifacts archived in `opt/kbench/ch2/` (`DESIGN.md`, `lane-maps.json`).
+
+**ptxas emission.** Focused probes in `opt/kbench/ch2/emit.cu` retried algebraic forms, split/merged `mul.wide.u16` asm, immediate constants, volatile boundaries, direct `0x83dc0000` multiplication, PRMT/zero-packed halves, and ptxas `-O1/-O2/-O3`. Stock ptxas never emitted the required two-instruction product. The best direct forms still emitted either (a) three XMADs (`lo*0xd12d`, `lo*0x83dc`, `XMAD.PSL q,1,t`) or (b) a redundant low-half XMAD before the useful `XMAD.PSL`. Explicit zero-packing was worse (an extra `XMAD.PSL.CLO`). This independently confirms the earlier Round-2 emission failure.
+
+**Binary rewriting prototype.** `opt/kbench/ch2/patch_sass.py` rewrites the compiler-emitted triple
+
+```text
+LP    XMAD   t, U.H?, 0xd12d, RZ
+LOW   XMAD   p, U,    0x83dc, t
+HIGH  XMAD.PSL p, U.H1, 0x83dc, p
+```
+
+by changing LOW in place to `XMAD p, U.H1, 0xd12d, RZ` (immediate bits 20..35, r8 `.H1` bit 53, r39 addend RZ=0xff) and replacing LP with Pascal NOP `0x50b0000000070f00`. Patched disassembly shows exactly the useful pair `XMAD U.H1,0xd12d` + `XMAD.PSL U.H1,0x83dc` before IDP/FADD. In `inkwell_exl3_gemv_moe_s`: 463 product sites, 467 retired low-product instructions, 2,258 machine words rewritten (duplicate unrolled encodings), zero non-PSL `0x83dc` XMADs remain. The rewritten production kernel remains at 40 registers/thread and 0 spills.
+
+**Important limitation.** The retired LP instructions remain as NOPs because sm_61 control-word/instruction packing makes deletion a full SASS reassembly problem. Thus the abstract non-NOP cost falls, but the issued-instruction stream still contains one patched NOP per weight. Current patched-loop counts for the first six K cases are 8.719–8.844 issued instructions/weight including NOPs and 7.719–7.844 excluding NOPs, versus the shipped-model baseline 8.41–9.47. Any real gain must therefore come from pipe-pressure relief and/or extraction pairing, not from the nominal 2-XMAD count alone.
+
+**CPU exactness model.** `opt/kbench/ch2/test_cpu.py`: 1,120,000 randomized view extraction cases over every K and 20,000 product/bytesum cases pass. It verifies `ch2_view` against the shipped low-aligned window extraction and verifies that the patched high-half product is exactly `(0x83DCD12D*w) mod 2^32` with the IDP bias producing exact integer `s`.
+
+GPU validation and performance measurements are pending behind the shared `/tmp/inkwell-gpu.lock`.
+**Standalone per-K measurement, magic-FADD patched variant.** `opt/kbench/ch2/ch2_perk` compares the shipped stream core (`pw16=0`) with the patched CH2 branch on distinct MoE slots, min-of-31 interleaved timing. Bitwise output was exact for K=1.5 through K=4 (`badbits=0/9216`, maxabs 0), but K=5 failed (`badbits=4608/9216`, maxabs 153); the failure is isolated to the unpaired K5 path and is not yet root-caused. Measured MoE gate/up and down speedups (old/new, larger is better):
+
+| K | gu | dn | reading |
+|---|---:|---:|---|
+| 1.5 | 0.887x | 0.889x | about 11% slower |
+| 2.0 | 0.902x | 0.899x | about 10% slower |
+| 2.5 | 0.994x | 0.990x | neutral |
+| 3.0 | 1.011x | 1.005x | neutral |
+| 3.5 | 1.023x | 1.012x | slight gain |
+| 4.0 | 1.000x | 1.000x | neutral |
+
+This confirms the Round-2 warning: magic FADD exactness does not translate into speed on sm_61 because it uses the saturated main ALU pipe, while the patched NOP still occupies the instruction stream. Since K1.5/K2 dominate expert work, this variant is not acceptable.
+
+**Final branch state.** The conversion defaults to exact I2F rather than magic FADD (`CH2_USE_MAGIC_FADD` preserves the solver form for experiments). This is still exact integer `s`; it is not an approximation. The broken K5 CH2 path is gated out (`kk != 10`) so the runtime cannot silently produce wrong K5 expert output; K5 uses the shipped core. Thus the branch is a correctness-safe prototype, not an accepted implementation of the all-K challenge design. The solver lane maps/pairing have not been ported; the current prototype keeps the shipped consecutive-lane mapping and changes only the exact scalar core. No end-to-end A/B was run because the isolated dominant-K measurements already fail the performance gate and the shared GPU lock remained occupied by foreign long-running validation jobs. Build after the final state: rc0, 62 warnings (limit 64), patched production object has zero remaining non-PSL `0x83dc` XMADs.

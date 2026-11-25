@@ -2479,6 +2479,11 @@ static inline int ink_pw16_mask() {
     if (m < 0) m = (getenv("INKWELL_PW16") && !getenv("INKWELL_NO_PW16")) ? PW16_KMASK : 0;   // default OFF until E2E A/B passes
     return m;
 }
+static inline int ink_ch2_bit() {
+    static int m = -1;
+    if (m < 0) m = getenv("INKWELL_NO_CH2CORE") ? 0 : (1 << 30);
+    return m;
+}
 
 
 // "stream-decode" dense single-token gemv (same design as inkwell_exl3_gemv_moe_s):
@@ -2926,13 +2931,13 @@ static void exl3_gemv_tail(const void* trel, const void* svh, float* y,
             dim3 gsz((unsigned)nb, (unsigned)nky, 1);
             inkwell_exl3_gemv_sf<<<gsz, 256, 0, (cudaStream_t)stream>>>(
                 (const uint32_t*)trel, scratch /* xh */, (const uint16_t*)svh,
-                y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk, ink_pw16_mask());
+                y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk, (ink_pw16_mask() | ink_ch2_bit()));
             return;
           } }
         if (nky > 1) cudaMemsetAsync(scratch + k, 0, (size_t)nky * n * 4, (cudaStream_t)stream);
         dim3 gsz((unsigned)nb, (unsigned)nky, 1);
         inkwell_exl3_gemv_s<<<gsz, 256, 0, (cudaStream_t)stream>>>(
-            (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk, ink_pw16_mask());
+            (const uint32_t*)trel, scratch, scratch + k, tk, tn, (int)ka, (int)halfk, (ink_pw16_mask() | ink_ch2_bit()));
         inkwell_exl3_had_out<<<(unsigned)(n / 128), 128, 512, (cudaStream_t)stream>>>(
             scratch + k, (const uint16_t*)svh, y, (int)n, nky, (int)n);
         return;
@@ -3190,6 +3195,70 @@ template <int D> __device__ __forceinline__ uint32_t sgemv_win(uint32_t hi, uint
     if constexpr (D <= 16) return hi >> (16 - D);
     else return __funnelshift_r(lo, hi, 48 - D);
 }
+// Same stream position aligned to the TOP 16 bits. The low half is don't-care:
+// the patched CH2 product consumes only XMAD's selected high half.
+template <int D> __device__ __forceinline__ uint32_t ch2_view(uint32_t hi, uint32_t lo) {
+    if constexpr (D == 0) return hi;
+    else if constexpr (D < 32) return __funnelshift_l(lo, hi, D);
+    else if constexpr (D == 32) return lo;
+    else return lo << (D - 32);
+}
+// ptxas cannot select the high-half XMAD.PSL form directly. It emits the full
+// low+high decomposition of U*0x83dc; the build-time SASS patcher retires the
+// low-half XMAD, leaving exactly ((U.H1*0x83dc)<<16) + U.H1*0xd12d.
+__device__ __forceinline__ uint32_t ch2_mul16_hi(uint32_t U) {
+    uint32_t t;
+    asm("{\n\t.reg .u16 lo, hi;\n\tmov.b32 {lo, hi}, %1;\n\tmul.wide.u16 %0, hi, 0xd12d;\n\t}"
+        : "=r"(t) : "r"(U));
+    return U * 0x83dcu + t;
+}
+__device__ __forceinline__ float ch2_bs_f32(uint32_t p) {
+#ifdef CH2_USE_MAGIC_FADD
+    const uint32_t bits = __dp4a(p, 0x01010101u, 0x4B000000u);
+    return __uint_as_float(bits) - 8388608.f;
+#else
+    // Same exact integer s, but uses the otherwise idle conversion pipe.
+    // On sm_61 the magic-FADD form competes for the saturated main ALU pipe.
+    return (float)(int)__dp4a(p, 0x01010101u, 0u);
+#endif
+}
+template <int KA, int H>
+__device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
+                                        int tk_lo, int tk_hi, const float* __restrict__ xs,
+                                        float& a0, float& a1) {
+    constexpr int NW = 8 * KA + 4 * H;
+    const int t = threadIdx.x & 31;
+    const int R = 32 * NW;
+    int B = (H ? (8 * t + 1) * KA + ((8 * t + 1) >> 1) : (8 * t + 1) * KA) - 16;
+    if (B < 0) B += R;
+    const int w0 = B >> 5, o = B & 31;
+    const int w1 = (w0 + 1 == NW) ? 0 : w0 + 1;
+    const int w2 = (w1 + 1 == NW) ? 0 : w1 + 1;
+    const int r0 = 2 * (t & 3);
+    const size_t stride = (size_t)tn * NW;
+    const uint32_t* p = tb + (size_t)tn_i * NW;
+#pragma unroll 4
+    for (int a = tk_lo; a < tk_hi; ++a) {
+        const uint32_t* q = p + (size_t)a * stride;
+        const int kb = a * 16 + r0;
+        const uint32_t W0 = __ldg(q + w0), W1 = __ldg(q + w1), W2 = __ldg(q + w2);
+        const uint32_t hi = __funnelshift_l(W1, W0, o), lo = __funnelshift_l(W2, W1, o);
+        uint32_t pp[8];
+#define SG_D(j) ((j) * KA + H * (((j) + 1) >> 1))
+        pp[0] = ch2_mul16_hi(ch2_view<SG_D(0)>(hi, lo)); pp[1] = ch2_mul16_hi(ch2_view<SG_D(1)>(hi, lo));
+        pp[2] = ch2_mul16_hi(ch2_view<SG_D(2)>(hi, lo)); pp[3] = ch2_mul16_hi(ch2_view<SG_D(3)>(hi, lo));
+        pp[4] = ch2_mul16_hi(ch2_view<SG_D(4)>(hi, lo)); pp[5] = ch2_mul16_hi(ch2_view<SG_D(5)>(hi, lo));
+        pp[6] = ch2_mul16_hi(ch2_view<SG_D(6)>(hi, lo)); pp[7] = ch2_mul16_hi(ch2_view<SG_D(7)>(hi, lo));
+#undef SG_D
+        const float2 xa = *(const float2*)&xs[kb], xc = *(const float2*)&xs[kb + 8];
+        float f[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) f[j] = ch2_bs_f32(pp[j]);
+        a0 = fmaf(xa.x, f[0], a0); a0 = fmaf(xa.y, f[1], a0); a0 = fmaf(xc.x, f[2], a0); a0 = fmaf(xc.y, f[3], a0);
+        a1 = fmaf(xa.x, f[4], a1); a1 = fmaf(xa.y, f[5], a1); a1 = fmaf(xc.x, f[6], a1); a1 = fmaf(xc.y, f[7], a1);
+    }
+}
+
 template <int KA, int H>
 __device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
                                           int tk_lo, int tk_hi, const float* __restrict__ xs,
@@ -3252,6 +3321,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     const uint32_t* tb = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff), hk = (int)((d[3] >> 8) & 1);
     const int kk = ka * 2 + hk;
+    const bool ch2 = (pw16 & (1 << 30)) != 0 && kk != 10;
     const bool pw = (pw16 >> kk) & 1;
     __shared__ __align__(16) float xs[SGEMV_MAXK];
     __shared__ float red[8];
@@ -3270,6 +3340,33 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     float sx = 0.f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) sx += red[i];
+    if (ch2) {
+        const int tn_i = blockIdx.x * 8 + (threadIdx.x >> 5);
+        if (tn_i >= tn) return;
+        float a0 = 0.f, a1 = 0.f;
+        switch (kk) {
+            case 3:  ch2_run<1, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 4:  ch2_run<2, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 5:  ch2_run<2, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 6:  ch2_run<3, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 7:  ch2_run<3, 1>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 8:  ch2_run<4, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 10: ch2_run<5, 0>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            default: __trap();
+        }
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+        const int lane = threadIdx.x & 31;
+        if ((lane & 3) == 0) {
+            const float KINV = __half2float(__ushort_as_half(0x1eee));
+            const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+            const float off = KOFF * sx;
+            float* dst = &t[(size_t)slot * n + zsel * tzoff + tn_i * 16 + (lane >> 2)];
+            const float v0 = fmaf(KINV, a0, off), v1 = fmaf(KINV, a1, off);
+            if (nky > 1) { atomicAdd(dst, v0); atomicAdd(dst + 8, v1); } else { dst[0] = v0; dst[8] = v1; }
+        }
+        return;
+    }
     if (pw) {
         const int part = threadIdx.x >> 7;
         const int t_in_blk = (threadIdx.x & 127) >> 4;
@@ -3980,7 +4077,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
-                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0, ink_pw16_mask());
+                                                   (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s, nullptr, 0, (ink_pw16_mask() | ink_ch2_bit()));
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, nullptr, 0,
         nullptr, nullptr, nullptr, nullptr);   // GU stays fp32: int8-x loses ~10%/window
@@ -4006,7 +4103,7 @@ extern "C" void ink_launch_exl3_moe(const void* descs_g, const void* descs_u, co
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
         inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, ink_pw16_mask());
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, (ink_pw16_mask() | ink_ch2_bit()));
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8 : nullptr, d4 ? xqs8 : nullptr, nullptr, nullptr);
@@ -4119,7 +4216,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                                    (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 1, ink_pw16_mask());
+                                                   (const int*)miss, 1, (ink_pw16_mask() | ink_ch2_bit()));
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 1,
         nullptr, nullptr, nullptr, nullptr);
@@ -4138,7 +4235,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         inkwell_exl3_gemv_moe_s<<<gg, 256, 0, st>>>(G, U, ids, xh, (const float*)gu, 2 * NG,
                                                    (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky_s,
-                                                   (const int*)miss, 2, ink_pw16_mask());
+                                                   (const int*)miss, 2, (ink_pw16_mask() | ink_ch2_bit()));
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(NG / 64, nslots, 2), 256, 0, st>>>(G, U, ids, e8, xh,
         (float*)gu, 2 * NG, (float*)dn, ND, NG, KG / 16, NG / 16, nullptr, (const int*)miss, 2,
         nullptr, nullptr, nullptr, nullptr);
@@ -4163,7 +4260,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
         inkwell_exl3_gemv_moe_s<<<gd, 256, 0, st>>>(D, nullptr, ids, xh, nullptr, 0,
-                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, ink_pw16_mask());
+                                                   dn, ND, 0, KD / 16, ND / 16, KD, ND, nky_s, nullptr, 0, (ink_pw16_mask() | ink_ch2_bit()));
     } else if (v2_ok) exl3v2::gemv_moe_n<2><<<dim3(ND / 64, nslots, 1), 256, 0, st>>>(D, nullptr, ids, e8, xh,
         nullptr, 0, (float*)dn, ND, 0, KD / 16, ND / 16, nullptr, nullptr, 0,
         d4 ? xq8c : nullptr, d4 ? xqs8c : nullptr, nullptr, nullptr);

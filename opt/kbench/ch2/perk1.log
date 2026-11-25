@@ -1,0 +1,40 @@
+K    moe gu old->new %        moe dn old->new %        dense old->new %        
+  exact K=1.5 badbits=0/9216 maxabs=0
+  dbg K=1.5 sh=0 old=0.082ms new=0.092ms speedup=0.887
+  dbg K=1.5 sh=1 old=0.082ms new=0.092ms speedup=0.889
+  dbg K=1.5 sh=2 old=0.015ms new=0.016ms speedup=0.937
+1.5  gu=-11.3%  dn=-11.1%  dense=-6.3%
+
+  exact K=2.0 badbits=0/9216 maxabs=0
+  dbg K=2.0 sh=0 old=0.082ms new=0.091ms speedup=0.902
+  dbg K=2.0 sh=1 old=0.082ms new=0.091ms speedup=0.899
+  dbg K=2.0 sh=2 old=0.015ms new=0.015ms speedup=1.006
+2.0  gu=-9.8%  dn=-10.1%  dense=+0.6%
+
+  exact K=2.5 badbits=0/9216 maxabs=0
+  dbg K=2.5 sh=0 old=0.092ms new=0.092ms speedup=0.994
+  dbg K=2.5 sh=1 old=0.090ms new=0.091ms speedup=0.990
+  dbg K=2.5 sh=2 old=0.016ms new=0.016ms speedup=1.000
+2.5  gu=-0.6%  dn=-1.0%  dense=+0.0%
+
+  exact K=3.0 badbits=0/9216 maxabs=0
+  dbg K=3.0 sh=0 old=0.091ms new=0.090ms speedup=1.011
+  dbg K=3.0 sh=1 old=0.091ms new=0.091ms speedup=1.005
+  dbg K=3.0 sh=2 old=0.016ms new=0.016ms speedup=1.000
+3.0  gu=+1.1%  dn=+0.5%  dense=+0.0%
+
+  exact K=3.5 badbits=0/9216 maxabs=0
+  dbg K=3.5 sh=0 old=0.093ms new=0.091ms speedup=1.023
+  dbg K=3.5 sh=1 old=0.092ms new=0.091ms speedup=1.012
+  dbg K=3.5 sh=2 old=0.017ms new=0.017ms speedup=0.987
+3.5  gu=+2.3%  dn=+1.2%  dense=-1.3%
+
+  exact K=4.0 badbits=0/9216 maxabs=0
+  dbg K=4.0 sh=0 old=0.090ms new=0.090ms speedup=1.000
+  dbg K=4.0 sh=1 old=0.090ms new=0.090ms speedup=1.000
+  dbg K=4.0 sh=2 old=0.016ms new=0.015ms speedup=1.035
+4.0  gu=+0.0%  dn=+0.0%  dense=+3.5%
+
+  exact K=5.0 badbits=4608/9216 maxabs=153
+CH2 exactness FAIL
+rc=2

@@ -23,6 +23,17 @@ fn main() {
         .status()
         .expect("nvcc");
     assert!(status.success(), "nvcc failed");
+    {
+        let status = Command::new("python3")
+            .args([
+                "../../opt/kbench/ch2/patch_sass.py",
+                &obj,
+                &cuda.join("bin/cuobjdump").to_string_lossy(),
+            ])
+            .status()
+            .expect("ch2 sass patcher");
+        assert!(status.success(), "ch2 sass patcher failed");
+    }
     let lib = format!("{out}/libinkwell_kernels.a");
     let status = Command::new("ar")
         .args(["rcs", &lib, &obj])
