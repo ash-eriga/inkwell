@@ -3310,9 +3310,10 @@ __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn,
 #undef SG_D
 }
 
-// Dense fused GEMV variant whose K=3/3.5/4 streams use the CH2 core.
-// It is loaded only from the patched build-time module; K=5 deliberately keeps
-// the shipped stream core because the unpaired K5 CH2 path is not exact.
+// Dense fused GEMV variant whose K=3.5/4 streams use the CH2 core.
+// It is loaded only from the patched build-time module; K=3 and K=5 keep
+// the shipped stream core. K5 is unpaired, and the K3 dense reassembly is
+// not accepted because its production-shape bitwise gate failed.
 __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf_ch2(
                                        const uint32_t* __restrict__ trel,
                                        const float* __restrict__ xh,
@@ -3376,7 +3377,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf_ch2(
             case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-            case 6:  ch2_run<3, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 6:  sgemv_run<3, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 7:  ch2_run<3, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 8:  ch2_run<4, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 10: sgemv_run<5, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;

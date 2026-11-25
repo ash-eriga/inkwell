@@ -80,8 +80,8 @@ SHIFT_SETS = {
     frozenset((2, 3, 5, 6, 8, 9, 11)): 'K1.5',
     frozenset((2, 4, 6, 8, 10, 12, 14)): 'K2',
     frozenset((3, 5, 8, 10, 13, 15, 18)): 'K2.5',
-    frozenset((4, 7, 11, 14, 18, 21, 25)): 'K3',
-    frozenset((3, 6, 9, 12, 15, 18, 21)): 'K3.5',
+    frozenset((4, 7, 11, 14, 18, 21, 25)): 'K3.5',
+    frozenset((3, 6, 9, 12, 15, 18, 21)): 'K3',
     frozenset((4, 8, 12, 16, 20, 24, 28)): 'K4',
 }
 # Per-K loop shape without NOPs: (instructions, SHF, LDG). K2.5-K4 get their other
@@ -94,7 +94,7 @@ LOOP_SHAPE = {
 # The dense fused epilogue/prologue changes the surrounding register schedule;
 # its donor-lane CH2 loops are one instruction shorter than the expert loops.
 DENSE_LOOP_SHAPE = {
-    'K3': (232, 36, 4), 'K3.5': (232, 36, 4), 'K4': (232, 36, 4),
+    'K3.5': (232, 36, 4), 'K4': (232, 36, 4),
 }
 
 def require_loop_shape(rows, nops, shape=LOOP_SHAPE, label='CH2'):
@@ -253,7 +253,7 @@ def generate(obj, outcubin, workdir, cuda_home):
     shutil.copyfile(unpatched, patched)
     pout = run([str(venvpy), str(ch2 / 'patch_sass.py'), str(patched), str(cuobj)], workdir, workdir / 'patch.log', env, capture=True)
     pm = re.search(r'fake=(\d+) lp=(\d+) words=(\d+) hi_d12d=(\d+)', pout)
-    if not pm or tuple(map(int, pm.groups())) != (583, 587, 2198, 588):
+    if not pm or tuple(map(int, pm.groups())) != (543, 547, 1968, 548):
         raise Ch2Fail('patched-with-NOPs baseline pattern mismatch: ' + (pout.strip() or 'no patch output'))
     sassp = run([str(cuobj), '-sass', str(patched)], workdir, workdir / 'patched.sass.stdout', env, capture=True)
     (workdir / 'kernels_patched_nops.sass').write_text(sassp)
@@ -264,7 +264,7 @@ def generate(obj, outcubin, workdir, cuda_home):
         workdir, workdir / 'cuasm_disassemble.log', env)
     run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges.json', 'gemv_moe_s', '6'],
         workdir, workdir / 'loop_ranges.log', env)
-    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges_dense.json', 'gemv_sf_ch2', '3'],
+    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges_dense.json', 'gemv_sf_ch2', '2'],
         workdir, workdir / 'loop_ranges_dense.log', env)
     run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_patched_nops.cuasm', 'kernels_moe_nopless.cuasm', 'loop_ranges.json'],
         workdir, workdir / 'remove_nops.log', env)
