@@ -2054,3 +2054,4 @@ Single-run decode at 4K: master 43.599 ms/tok vs fixed 48.663 ms/tok. The master
 - Result: ctl_med 29.009, cand_med 29.044 ms/tok (delta +0.035, within noise). Wins 9/16. md5 5cbe8e06 on all 32 runs. Peak 5,032 MiB.
 - Verdict: MERGED as a correctness fix. Short context costs nothing; without the fix, output past 1K is garbage ("||||" at 4K). Killswitch `INKWELL_SWA_LEGACY_MIN=1`.
 - Open: 4K speed (48.66 vs 43.60 ms/tok single run) is not comparable, because master's 4K output is garbage. It needs a proper 4K A/B against a correct baseline.
+- Post-merge check on master ed6f659 (release build, 59 warnings), ctx512: md5 5cbe8e06 ×3; 28.97 / 28.40 / 29.86 ms/tok.
