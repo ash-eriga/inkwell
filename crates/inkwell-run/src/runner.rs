@@ -4132,3 +4132,328 @@ unsafe extern "C" fn dense_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, 
         }
     }
 }
+
+// ============ chunked prefill driver (phase 2, direct row-major CUDA path) ============
+
+#[derive(Debug)]
+struct PfArena {
+    buf: inkwell_cuda::DevBuf,
+    c: usize,
+    off: HashMap<&'static str, usize>,
+    bytes: usize,
+}
+
+impl PfArena {
+    fn new(c: usize) -> Self {
+        let mut off = HashMap::new();
+        let mut o = 0usize;
+        let mut put = |name: &'static str, bytes: usize, off: &mut HashMap<&'static str, usize>, o: &mut usize| {
+            *o = (*o + 255) & !255;
+            off.insert(name, *o);
+            *o += bytes;
+        };
+        let h = c * 2304 * 4;
+        for name in ["cur","x0","x1","x2","cat","ctrlg","ctrlf","fcur","moe_out","tmp0","tmp1","tmp2","head","prelude","bankout","cn","cm","cg"] {
+            put(name, h, &mut off, &mut o);
+        }
+        for name in ["blk0","blk1","blk2","blk3","bank","mixbuf","msgbuf"] {
+            put(name, h * 4, &mut off, &mut o);
+        }
+        put("q", c * 3072 * 4, &mut off, &mut o);
+        put("gate", c * 3072 * 4, &mut off, &mut o);
+        put("attn", c * 3072 * 4, &mut off, &mut o);
+        put("wo", c * 2304 * 4, &mut off, &mut o);
+        put("k", c * 1024 * 4, &mut off, &mut o);
+        put("v", c * 1024 * 4, &mut off, &mut o);
+        put("r", c * 384 * 4, &mut off, &mut o);
+        put("kout", c * 1024 * 4, &mut off, &mut o);
+        put("ksnap", c * 1024 * 2, &mut off, &mut o);
+        put("vsnap", c * 1024 * 2, &mut off, &mut o);
+        put("vout", c * 1024 * 4, &mut off, &mut o);
+        put("woout", c * 2304 * 4, &mut off, &mut o);
+        put("ffnout", c * 2304 * 4, &mut off, &mut o);
+        put("kdyn", c * 32 * 4, &mut off, &mut o);
+        put("vdyn", c * 32 * 4, &mut off, &mut o);
+        put("sink", c * 24 * 4, &mut off, &mut o);
+        put("router", c * 128 * 4, &mut off, &mut o);
+        put("ids", c * 8 * 4, &mut off, &mut o);
+        put("wts", c * 8 * 4, &mut off, &mut o);
+        put("tokids", c * 4, &mut off, &mut o);
+        put("rel", 24 * 1025 * 16 * 4, &mut off, &mut o);
+        put("sort", c * 8 * 8 * 4 + 8192, &mut off, &mut o);
+        let p = c * 8;
+        put("moews", p * 14976 * 4 + p * 4 + 256, &mut off, &mut o);
+        put("scratch", c * (3072 + 3072) * 4, &mut off, &mut o);
+        put("logits", 201024 * 4 + 256, &mut off, &mut o);
+        let bytes = o;
+        Self { buf: inkwell_cuda::DevBuf::new_bytes(bytes), c, off, bytes }
+    }
+    fn ptr(&self, name: &'static str) -> *mut f32 {
+        unsafe { self.buf.dev_ptr().cast::<u8>().add(self.off[name]).cast() }
+    }
+}
+
+fn tdata(x: Ptr) -> *mut f32 { unsafe { inkwell_ggml::ink_tensor_data(x.0).cast() } }
+fn ttype(x: Ptr) -> i32 { unsafe { inkwell_ggml::ink_tensor_type(x.0) } }
+fn pf_copy(dst: *mut f32, src: *const f32, bytes: usize) {
+    unsafe { inkwell_cuda::memcpy_d2d_async(dst.cast(), src.cast(), bytes) };
+}
+fn pf_exl3(e: &Exl3W, x: *const f32, y: *mut f32, c: usize, scratch: *mut f32) {
+    unsafe {
+        inkwell_cuda::exl3_gemm_smem_async(e.trel.dev_ptr().cast_const(), e.suh.dev_ptr().cast_const(),
+            e.svh.dev_ptr().cast_const(), x, y, c as i32, e.k, e.n, e.ka, e.halfk, scratch);
+    }
+}
+
+impl Runner {
+    fn pf_norm(&self, x: *mut f32, w: Ptr, rows: usize, n: usize) {
+        unsafe { inkwell_cuda::pf_rmsnorm_async(x, tdata(w).cast_const(), rows as i32, n as i32, 1e-6) };
+    }
+    fn pf_dense(&self, x: *const f32, w: Ptr, y: *mut f32, c: usize, n: usize, k: usize) {
+        let bf = i32::from(ttype(w) == BF16);
+        unsafe { inkwell_cuda::pf_dense_gemm_async(x, tdata(w).cast(), y, c as i32, n as i32, k as i32, bf) };
+    }
+    fn pf_mix_run(&self, states: &[*const f32], query: Ptr, out: *mut f32, c: usize, qcols: usize) {
+        let mut ps = [std::ptr::null::<std::ffi::c_void>(); 8];
+        for (i, s) in states.iter().enumerate() { ps[i] = (*s).cast(); }
+        unsafe {
+            inkwell_cuda::pf_mix_async(ps.as_ptr(), states.len() as i32, tdata(query).cast_const(),
+                out, c as i32, 2304, qcols as i32, 1.0 / (2304f32).sqrt(), 1e-6);
+        }
+    }
+    #[expect(clippy::too_many_arguments)]
+    fn pf_control(&self, a: &PfArena, cur: *mut f32, msg: *const f32, l: &L, ctrl: usize) {
+        let c = a.c;
+        let (n, h) = (2304usize, c * 2304);
+        let (x0, x1, cat, gate, gain, forget) =
+            (a.ptr("cn"), a.ptr("cm"), a.ptr("cat"), a.ptr("cg"), a.ptr("ctrlg"), a.ptr("ctrlf"));
+        pf_copy(x0, cur, h * 4);
+        pf_copy(x1, msg, h * 4);
+        unsafe {
+            inkwell_cuda::pf_rmsnorm_async(x0, std::ptr::null(), c as i32, n as i32, 1e-6);
+            inkwell_cuda::pf_rmsnorm_async(x1, std::ptr::null(), c as i32, n as i32, 1e-6);
+            for j in 0..c {
+                inkwell_cuda::memcpy_d2d_async(cat.add(j * 2 * n).cast(), x0.add(j * n).cast_const().cast(), n * 4);
+                inkwell_cuda::memcpy_d2d_async(cat.add(j * 2 * n + n).cast(), x1.add(j * n).cast_const().cast(), n * 4);
+            }
+        }
+        self.pf_dense(cat.cast_const(), l.ctrl_down[ctrl].expect("ctrl_down"), gate, c, 64, 2 * n);
+        let (gp, fp) = if let Some(gfcat) = l.ctrl_gf_cat[ctrl] {
+            self.pf_dense(gate.cast_const(), gfcat, gain, c, 2 * n, 64);
+            (gain, unsafe { gain.add(c * n) })
+        } else {
+            self.pf_dense(gate.cast_const(), l.ctrl_gain[ctrl].expect("ctrl_gain"), gain, c, n, 64);
+            self.pf_dense(gate.cast_const(), l.ctrl_forget[ctrl].expect("ctrl_forget"), forget, c, n, 64);
+            (gain, forget)
+        };
+        unsafe { inkwell_cuda::pf_ctrl_apply_async(gp, fp, cur, msg, (h) as i64) };
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn pf_layer(&self, a: &PfArena, il: usize, ip: usize, slot: usize, pass: usize,
+        blocks: &mut Vec<usize>, cur_name: &'static str, messages: bool, pos0: i64) {
+        let c = a.c;
+        let l = &self.layers[il];
+        let is_swa = self.is_swa_layer(il);
+        let n = 2304usize;
+        let hbytes = c * n * 4;
+        let cur = a.ptr(cur_name);
+        let inp_sa = a.ptr("tmp2");
+        pf_copy(inp_sa, cur, hbytes);
+
+        // Residual-stack attention queries (q/k/v input selectors).
+        let mut inputs = [cur, cur, cur];
+        if let Some(rq) = l.attn_res_query {
+            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([cur.cast_const()]).collect();
+            self.pf_mix_run(&states, rq, a.ptr("mixbuf"), c, if is_swa {1} else {3});
+            inputs = [a.ptr("mixbuf"), unsafe{a.ptr("mixbuf").add(c*n)}, unsafe{a.ptr("mixbuf").add(2*c*n)}];
+        }
+        // Loop-pass controller messages. The message tensor rows are materialized by mixbuf.
+        if messages {
+            let states: Vec<*const f32> = [a.ptr("bank").cast_const(), a.ptr("tmp1").cast_const()].into_iter().collect();
+            self.pf_mix_run(&states, l.msg_query.expect("msg_query"), a.ptr("msgbuf"), c, 4);
+            for j in 0..3 {
+                let dst = a.ptr(match j {0=>"x0",1=>"x1",_=>"x2"});
+                pf_copy(dst, inputs[j], hbytes);
+                self.pf_control(a, dst, unsafe{a.ptr("msgbuf").add(j*c*n)}.cast_const(), l, j);
+                inputs[j] = dst;
+            }
+        }
+        let (x0,x1,x2) = (a.ptr("x0"),a.ptr("x1"),a.ptr("x2"));
+        if is_swa && messages {
+            for (z,x) in [x0,x1,x2].into_iter().enumerate() { let _=z; self.pf_norm(x, l.attn_norm.expect("attn_norm"), c, n); inputs = match z {0=>[x,x1,x2],1=>[x0,x,x2],_=>[x0,x1,x]}; }
+        } else if is_swa {
+            pf_copy(x0, inputs[0], hbytes);
+            self.pf_norm(x0, l.attn_norm.expect("attn_norm"), c, n);
+            inputs = [x0,x0,x0];
+        } else {
+            for (j,x) in [x0,x1,x2].into_iter().enumerate() {
+                pf_copy(x, inputs[j], hbytes);
+                self.pf_norm(x, [l.attn_q_inp_norm,l.attn_k_inp_norm,l.attn_v_inp_norm][j].expect("full norm"), c, n);
+                inputs[j] = x;
+            }
+        }
+
+        let (q,gate,r,kbuf,vbuf,scratch) = (a.ptr("q"),a.ptr("gate"),a.ptr("r"),a.ptr("k"),a.ptr("v"),a.ptr("scratch"));
+        for (key,x,y) in [("wq",inputs[0],q),("gate",inputs[0],gate),("rel",inputs[0],r),("wk",inputs[1],kbuf),("wv",inputs[2],vbuf)] {
+            let e = &*self.exl3_w[l.exl3[key]];
+            pf_exl3(e, x.cast_const(), y, c, scratch);
+        }
+        if !is_swa {
+            self.pf_dense(inputs[1].cast_const(), l.attn_k_conv_proj.expect("kcp"), a.ptr("kdyn"), c, 32, n);
+            self.pf_dense(inputs[2].cast_const(), l.attn_v_conv_proj.expect("vcp"), a.ptr("vdyn"), c, 32, n);
+        }
+        let scale_static = 1.0 / 5f32.sqrt();
+        let scale_dyn = 1.0 / 3f32.sqrt();
+        let conv_state = unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0).cast::<f32>() };
+        unsafe {
+            inkwell_cuda::conv_prefill_async(kbuf.cast_const(), conv_state, 0, tdata(l.attn_k_conv.expect("kconv")).cast_const(),
+                if is_swa {std::ptr::null()} else {a.ptr("kdyn").cast_const()}, c as i32, 1024, if is_swa {0} else {8}, if is_swa {scale_static} else {scale_dyn}, a.ptr("kout"));
+            inkwell_cuda::conv_prefill_async(vbuf.cast_const(), conv_state, 1024, tdata(l.attn_v_conv.expect("vconv")).cast_const(),
+                if is_swa {std::ptr::null()} else {a.ptr("vdyn").cast_const()}, c as i32, 1024, if is_swa {0} else {8}, if is_swa {scale_static} else {scale_dyn}, a.ptr("vout"));
+            inkwell_cuda::pf_clip_async(q, tdata(l.attn_q_clip.expect("qclip")).cast_const(), c as i32, 24, 128, self.cfg.qk_clip);
+            inkwell_cuda::pf_clip_async(a.ptr("kout"), std::ptr::null(), c as i32, 8, 128, self.cfg.qk_clip);
+            inkwell_cuda::pf_rmsnorm_async(a.ptr("vout"), std::ptr::null(), c as i32 * 8, 128, 1e-6);
+            inkwell_cuda::pf_clip_async(r, tdata(l.attn_rel_clip.expect("rclip")).cast_const(), c as i32, 24, 16, self.cfg.rel_clip);
+        }
+        if !is_swa {
+            unsafe { inkwell_cuda::pf_tau_qr_async(q, r, c as i32, self.cfg.log_scale_alpha, self.cfg.log_scale_floor as f32, pos0 as i32) };
+        }
+        self.pf_dense(inputs[0].cast_const(), l.attn_sink_proj.expect("sink"), a.ptr("sink"), c, 24, n);
+        unsafe {
+            inkwell_cuda::pf_expand_rel_async(tdata(l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias")).cast_const(), a.ptr("rel"));
+            let kd = inkwell_ggml::ink_tensor_data(self.k_arena[slot].0);
+            let vd = inkwell_ggml::ink_tensor_data(self.v_arena[slot].0);
+            let cap = if is_swa { self.swa_capacity() } else { self.max_ctx };
+            let swa = if is_swa { self.swa as i32 } else { 0 };
+            let (snap_start, snap_len) = if is_swa {
+                let start = (pos0 - self.swa).max(0) as i32;
+                let end = pos0 as i32 + c as i32 - swa;
+                (start, (end - start).max(0))
+            } else { (0, 0) };
+            if snap_len > 0 {
+                inkwell_cuda::pf_snapshot_kv_async(kd.cast_const(), vd.cast_const(), a.ptr("ksnap").cast(), a.ptr("vsnap").cast(),
+                    snap_start, snap_len, cap as i32, swa);
+            }
+            inkwell_cuda::pf_write_kv_async(a.ptr("kout").cast_const(), a.ptr("vout").cast_const(), kd, vd, c as i32, pos0 as i32, cap as i32, swa);
+            inkwell_cuda::flash_prefill_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+                a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), c as i32, pos0 as i32,
+                cap as i32, swa, 1.0 / (128f32).sqrt(), a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            inkwell_cuda::pf_mul_sigmoid_async(a.ptr("attn"), gate.cast_const(), (c * 3072) as i64);
+        }
+        let ewo = &*self.exl3_w[l.exl3["wo"]];
+        pf_exl3(ewo, a.ptr("attn").cast_const(), a.ptr("wo"), c, scratch);
+        unsafe {
+            inkwell_cuda::conv_prefill_async(a.ptr("wo").cast_const(), conv_state, 2048, tdata(l.attn_post_conv.expect("postconv")).cast_const(),
+                std::ptr::null(), c as i32, 2304, 0, scale_static, a.ptr("woout"));
+        }
+        if ip % (self.cfg.attn_res_block_size as usize) == 0 {
+            let bi = blocks.len().min(3);
+            pf_copy(a.ptr(match bi {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}), inp_sa, hbytes);
+            blocks.push(bi);
+            pf_copy(cur, a.ptr("woout"), hbytes);
+        } else {
+            unsafe { inkwell_cuda::pf_add_async(a.ptr("woout"), inp_sa, (c*n) as i64) };
+            pf_copy(cur, a.ptr("woout"), hbytes);
+        }
+        // FFN input mix/control/norm.
+        let fcur = a.ptr("fcur");
+        if let Some(fq) = l.ffn_res_query {
+            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([cur.cast_const()]).collect();
+            self.pf_mix_run(&states, fq, fcur, c, 1);
+        } else { pf_copy(fcur, cur, hbytes); }
+        if messages {
+            self.pf_control(a, fcur, unsafe{a.ptr("msgbuf").add(3*c*n)}.cast_const(), l, 3);
+        }
+        self.pf_norm(fcur, l.ffn_norm.expect("ffn_norm"), c, n);
+        self.pf_dense(fcur.cast_const(), l.ffn_gate_inp.expect("gate"), a.ptr("router"), c, 128, n);
+        unsafe {
+            inkwell_cuda::pf_router8_async(a.ptr("router").cast_const(), tdata(l.ffn_exp_probs_b.expect("pb")).cast_const(), c as i32,
+                self.cfg.expert_weights_scale, 6.103515625e-5, a.ptr("ids").cast(), a.ptr("wts"));
+        }
+        let p = c * 8;
+        let so = a.ptr("sort");
+        let (eo, stok, sslot, sw, inv, te, ts, tc, tn) = unsafe {
+            (so.cast::<i32>(), so.add(129).cast::<i32>(), so.add(129+p).cast::<i32>(), so.add(129+2*p).cast::<f32>().cast::<i32>(),
+             so.add(129+3*p).cast::<i32>(), so.add(129+4*p).cast::<i32>(), so.add(129+5*p).cast::<i32>(), so.add(129+6*p).cast::<i32>(), so.add(129+7*p).cast::<i32>())
+        };
+        let mi = l.moe_exl3.expect("moe exl3");
+        let m = &self.moe_args_exl3[mi];
+        unsafe {
+            inkwell_cuda::exl3_moe_group_sort_async(a.ptr("ids").cast(), a.ptr("wts").cast(), c as i32,
+                eo, stok, sslot, sw.cast(), inv, te, ts, tc, tn);
+            inkwell_cuda::exl3_moe_grouped_gemm_async(m.descs_g.dev(), m.descs_u.dev(), m.descs_d.dev(),
+                fcur.cast_const(), c as i32, stok, te, ts, tc, tn, sw.cast(), inv,
+                a.ptr("moews"), a.ptr("moe_out"));
+            inkwell_cuda::conv_prefill_async(a.ptr("moe_out").cast_const(), conv_state, 2048 + 2304,
+                tdata(l.ffn_post_conv.expect("fpc")).cast_const(), std::ptr::null(), c as i32, 2304, 0, scale_static, a.ptr("ffnout"));
+            inkwell_cuda::pf_add_async(a.ptr("ffnout"), cur, (c*n) as i64);
+        }
+        pf_copy(cur, a.ptr("ffnout"), hbytes);
+    }
+
+    /// Encode token ids in chunks through the batched prefill path. Returns the
+    /// final row's unpadded logits. State writes match serial teacher forcing.
+    pub fn prefill_chunked(&mut self, ids: &[u32], pos0: i64) -> Vec<f32> {
+        let cmax = std::env::var("INKWELL_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64).clamp(1, 512);
+        let mut a = PfArena::new(cmax);
+        eprintln!("prefill arena: {} MiB chunk={cmax}", a.bytes >> 20);
+        let mut pos = pos0;
+        let mut out_logits = Vec::new();
+        for chunk in ids.chunks(cmax) {
+            let c = chunk.len();
+            a.c = c;
+            let host_ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
+            unsafe {
+                inkwell_cuda::memcpy_h2d_async(a.ptr("tokids").cast(), host_ids.as_ptr().cast(), c*4);
+                inkwell_cuda::pf_embed_async(self.embd_src.0.cast(), a.ptr("tokids").cast(), a.ptr("cur"), c as i32, 2304, self.embd_src.2 as i64);
+                inkwell_cuda::pf_rmsnorm_async(a.ptr("cur"), tdata(self.tok_norm).cast_const(), c as i32, 2304, 1e-6);
+            }
+            let mut blocks: Vec<usize> = Vec::new();
+            let mut vi = 0usize;
+            for il in 0..6 {
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos);
+                vi += 1;
+            }
+            pf_copy(a.ptr("prelude"), a.ptr("cur"), c*2304*4);
+            let prelude_blocks = blocks.clone();
+            for pass in 0..3 {
+                if pass > 0 {
+                    // The loop message bank is the layer-12 residual checkpoint of the
+                    // previous pass; bank_out is that pass's final loop output.
+                    pf_copy(a.ptr("bank"), a.ptr("blk2"), c*2304*4);
+                    pf_copy(a.ptr("bankout"), a.ptr("cur"), c*2304*4);
+                    pf_copy(a.ptr("cur"), a.ptr("prelude"), c*2304*4);
+                    blocks = prelude_blocks.clone();
+                    pf_copy(a.ptr("tmp1"), a.ptr("bankout"), c*2304*4);
+                }
+                for ip in 6..18 {
+                    self.pf_layer(&a, ip, ip, self.visits[vi].1, pass, &mut blocks, "cur", pass > 0, pos);
+                    vi += 1;
+                }
+            }
+            for il in 18..24 {
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos);
+                vi += 1;
+            }
+            // final mix + norm; compute lm_head only for the last row.
+            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([a.ptr("cur").cast_const()]).collect();
+            self.pf_mix_run(&states, self.output_res_query, a.ptr("head"), c, 1);
+            self.pf_norm(a.ptr("head"), self.output_norm, c, 2304);
+            let last = unsafe { a.ptr("head").add((c-1)*2304) };
+            if let Some(oi) = self.output_exl3 {
+                let e = &*self.exl3_w[oi];
+                pf_exl3(e, last.cast_const(), a.ptr("logits"), 1, a.ptr("scratch"));
+                let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
+                unsafe { inkwell_cuda::memcpy_d2h_sync(logits.as_mut_ptr().cast(), a.ptr("logits").cast_const().cast(), logits.len()*4) };
+                if self.cfg.softcap != 0.0 {
+                    for x in &mut logits { *x = (*x / self.cfg.softcap).tanh() * self.cfg.softcap; }
+                }
+                out_logits = logits;
+            }
+            pos += c as i64;
+        }
+        inkwell_cuda::DevBuf::sync();
+        out_logits
+    }
+}

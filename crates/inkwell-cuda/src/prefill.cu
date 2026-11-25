@@ -873,7 +873,8 @@ extern "C" __global__ void __launch_bounds__(128) inkwell_flash_prefill_gqa3(
         const __half* __restrict__ K, const __half* __restrict__ V,
         const float* __restrict__ Q, const float* __restrict__ r,
         const float* __restrict__ rel_w, const float* __restrict__ sinks,
-        float* __restrict__ out, int C, int pos0, int kv_cap, int swa_win, float scale) {
+        float* __restrict__ out, int C, int pos0, int kv_cap, int swa_win, float scale,
+        const __half* __restrict__ KS, const __half* __restrict__ VS, int snap_start, int snap_len) {
     // Register-tiled flash attention.  One CTA owns BQ=32 queries for one KV
     // head and reuses every BK=32 K/V tile for the three GQA query heads.
     // QK uses a 4x4 register tile on 64 threads (two shared-memory loads per
@@ -923,7 +924,10 @@ extern "C" __global__ void __launch_bounds__(128) inkwell_flash_prefill_gqa3(
                 const int kr = idx >> 5, d = (idx & 31) * 4;
                 const int logical = k0 + kr;
                 const int slot = (swa_win > 0) ? (logical % swa_win) : logical;
-                const uint2 packed = *(const uint2*)(Kh + (size_t)slot * 128 + d);
+                const bool osnap = KS && logical >= snap_start && logical < snap_start + snap_len;
+                const __half* kbase = osnap ? KS + (size_t)hk * snap_len * 128 : Kh;
+                const size_t krow = osnap ? (size_t)(logical - snap_start) : (size_t)slot;
+                const uint2 packed = *(const uint2*)(kbase + krow * 128 + d);
                 KVh[d][kr] = __ushort_as_half((unsigned short)(packed.x & 0xffffu));
                 KVh[d + 1][kr] = __ushort_as_half((unsigned short)(packed.x >> 16));
                 KVh[d + 2][kr] = __ushort_as_half((unsigned short)(packed.y & 0xffffu));
@@ -1027,7 +1031,10 @@ extern "C" __global__ void __launch_bounds__(128) inkwell_flash_prefill_gqa3(
                 const int kr = idx >> 5, d = (idx & 31) * 4;
                 const int logical = k0 + kr;
                 const int slot = (swa_win > 0) ? (logical % swa_win) : logical;
-                const uint2 packed = *(const uint2*)(Vh + (size_t)slot * 128 + d);
+                const bool vsnap = VS && logical >= snap_start && logical < snap_start + snap_len;
+                const __half* vbase = vsnap ? VS + (size_t)hk * snap_len * 128 : Vh;
+                const size_t vrow = vsnap ? (size_t)(logical - snap_start) : (size_t)slot;
+                const uint2 packed = *(const uint2*)(vbase + vrow * 128 + d);
                 KVh[d][kr] = __ushort_as_half((unsigned short)(packed.x & 0xffffu));
                 KVh[d + 1][kr] = __ushort_as_half((unsigned short)(packed.x >> 16));
                 KVh[d + 2][kr] = __ushort_as_half((unsigned short)(packed.y & 0xffffu));
@@ -1124,7 +1131,328 @@ extern "C" void ink_launch_flash_prefill_gqa3(const void* K, const void* V, cons
         int C, int pos0, int kv_cap, int swa_win, float scale, void* stream) {
     dim3 g((C + 31) / 32, 8);
     inkwell_flash_prefill_gqa3<<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)K,
-        (const __half*)V, Q, r, rel_w, sinks, out, C, pos0, kv_cap, swa_win, scale);
+        (const __half*)V, Q, r, rel_w, sinks, out, C, pos0, kv_cap, swa_win, scale,
+        nullptr, nullptr, 0, 0);
+}
+
+extern "C" void ink_launch_flash_prefill_gqa3_snap(const void* K, const void* V, const float* Q,
+        const float* r, const float* rel_w, const float* sinks, float* out,
+        int C, int pos0, int kv_cap, int swa_win, float scale,
+        const void* KS, const void* VS, int snap_start, int snap_len, void* stream) {
+    dim3 g((C + 31) / 32, 8);
+    inkwell_flash_prefill_gqa3<<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)K,
+        (const __half*)V, Q, r, rel_w, sinks, out, C, pos0, kv_cap, swa_win, scale,
+        (const __half*)KS, (const __half*)VS, snap_start, snap_len);
+}
+
+extern "C" __global__ void inkwell_pf_snapshot_kv(const void* __restrict__ kd,
+        const void* __restrict__ vd, void* __restrict__ ks, void* __restrict__ vs,
+        int snap_start, int snap_len, int cap, int swa) {
+    const int row = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= snap_len || i >= 1024) return;
+    const int h = i >> 7, d = i & 127;
+    const int logical = snap_start + row;
+    const int slot = logical % swa;
+    const size_t src = ((size_t)h * cap + slot) * 128 + d;
+    const size_t dst = ((size_t)h * snap_len + row) * 128 + d;
+    ((__half*)ks)[dst] = ((const __half*)kd)[src];
+    ((__half*)vs)[dst] = ((const __half*)vd)[src];
+}
+
+extern "C" void ink_launch_pf_snapshot_kv(const void* kd, const void* vd, void* ks, void* vs,
+        int snap_start, int snap_len, int cap, int swa, void* stream) {
+    dim3 g(4, snap_len);
+    inkwell_pf_snapshot_kv<<<g, 256, 0, (cudaStream_t)stream>>>(kd, vd, ks, vs,
+        snap_start, snap_len, cap, swa);
+}
+
+
+// ---------------- Phase-2 driver glue kernels ----------------
+// All row-major activations are [C,n] with token rows contiguous.
+
+extern "C" __global__ void inkwell_pf_embed_bf16(const uint16_t* __restrict__ embd,
+        const int* __restrict__ ids, float* __restrict__ out, int C, int n, long long stride_bytes) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= C || i >= n) return;
+    const uint16_t* row = (const uint16_t*)((const char*)embd + (size_t)ids[t] * (size_t)stride_bytes);
+    out[(size_t)t * n + i] = __uint_as_float((uint32_t)row[i] << 16);
+}
+
+extern "C" void ink_launch_pf_embed_bf16(const void* embd, const int* ids, float* out,
+        int C, int n, long long stride_bytes, void* stream) {
+    dim3 g((n + 255) / 256, C);
+    inkwell_pf_embed_bf16<<<g, 256, 0, (cudaStream_t)stream>>>((const uint16_t*)embd, ids, out, C, n, stride_bytes);
+}
+
+extern "C" __global__ void inkwell_pf_rmsnorm(float* __restrict__ x,
+        const float* __restrict__ w, int rows, int n, float eps) {
+    __shared__ float sm[256];
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    float ss = 0.f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = x[(size_t)row * n + i];
+        ss = fmaf(v, v, ss);
+    }
+    sm[tid] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    const float inv = 1.f / sqrtf(sm[0] / (float)n + eps);
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[(size_t)row * n + i] * inv;
+        if (w) v *= w[i];
+        x[(size_t)row * n + i] = v;
+    }
+}
+
+extern "C" void ink_launch_pf_rmsnorm(float* x, const float* w, int rows, int n,
+        float eps, void* stream) {
+    inkwell_pf_rmsnorm<<<rows, 256, 0, (cudaStream_t)stream>>>(x, w, rows, n, eps);
+}
+
+extern "C" __global__ void inkwell_pf_clip_heads(float* __restrict__ x,
+        const float* __restrict__ scale, int C, int heads, int d, float thr) {
+    __shared__ float sm[128];
+    const int row = blockIdx.x; // C*heads rows
+    const int tid = threadIdx.x;
+    float* xr = x + (size_t)row * d;
+    const float* sr = scale ? scale + (size_t)(row % heads) * d : nullptr;
+    float ss = 0.f;
+    for (int i = tid; i < d; i += blockDim.x) {
+        const float v = xr[i] * (sr ? sr[i] : 1.f);
+        ss = fmaf(v, v, ss);
+    }
+    sm[tid] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    const float norm = sqrtf(sm[0]) + 1e-6f;
+    const float f = fminf(1.f, thr / norm);
+    for (int i = tid; i < d; i += blockDim.x) xr[i] = xr[i] * (sr ? sr[i] : 1.f) * f;
+    (void)C;
+}
+
+extern "C" void ink_launch_pf_clip_heads(float* x, const float* scale, int C, int heads,
+        int d, float thr, void* stream) {
+    inkwell_pf_clip_heads<<<C * heads, 128, 0, (cudaStream_t)stream>>>(x, scale, C, heads, d, thr);
+}
+
+extern "C" __global__ void inkwell_pf_add(float* __restrict__ x, const float* __restrict__ y, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
+extern "C" void ink_launch_pf_add(float* x, const float* y, long long n, void* stream) {
+    inkwell_pf_add<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, y, n);
+}
+
+extern "C" __global__ void inkwell_pf_mul_sigmoid(float* __restrict__ x, const float* __restrict__ gate, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= 1.f / (1.f + expf(-gate[i]));
+}
+
+extern "C" void ink_launch_pf_mul_sigmoid(float* x, const float* gate, long long n, void* stream) {
+    inkwell_pf_mul_sigmoid<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, gate, n);
+}
+
+extern "C" __global__ void inkwell_pf_tau_qr(float* __restrict__ q, float* __restrict__ r,
+        int C, float log_alpha, float log_floor, int pos0) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const float tau = logf(fmaxf((float)(pos0 + t + 1) / log_floor, 1.f)) * log_alpha + 1.f;
+    if (i < 3072) q[(size_t)t * 3072 + i] *= tau;
+    if (i < 384) r[(size_t)t * 384 + i] *= tau;
+}
+
+extern "C" void ink_launch_pf_tau_qr(float* q, float* r, int C, float log_alpha,
+        float log_floor, int pos0, void* stream) {
+    dim3 g(12, C);
+    inkwell_pf_tau_qr<<<g, 256, 0, (cudaStream_t)stream>>>(q, r, C, log_alpha, log_floor, pos0);
+}
+
+// Small/medium row-major GEMM for dense BF16 control, router, sink, and conv-projection weights.
+// x [M,K] f32, w [N,K] bf16 or f32 row-major, y [M,N] f32.
+extern "C" __global__ void inkwell_pf_dense_gemm(const float* __restrict__ x,
+        const void* __restrict__ w, float* __restrict__ y, int M, int N, int K, int w_is_bf16) {
+    constexpr int TM = 16, TN = 16, TK = 16;
+    __shared__ float xs[TM][TK + 1];
+    __shared__ float ws[TN][TK + 1];
+    const int tx = threadIdx.x & 15;
+    const int ty = threadIdx.x >> 4;
+    const int row = blockIdx.y * TM + ty;
+    const int col = blockIdx.x * TN + tx;
+    float acc = 0.f;
+    for (int k0 = 0; k0 < K; k0 += TK) {
+        const int kk = k0 + tx;
+        xs[ty][tx] = (row < M && kk < K) ? x[(size_t)row * K + kk] : 0.f;
+        const int wr = blockIdx.x * TN + ty;
+        if (wr < N && kk < K) {
+            if (w_is_bf16) {
+                const uint16_t v = ((const uint16_t*)w)[(size_t)wr * K + kk];
+                ws[ty][tx] = __uint_as_float((uint32_t)v << 16);
+            } else {
+                ws[ty][tx] = ((const float*)w)[(size_t)wr * K + kk];
+            }
+        } else ws[ty][tx] = 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int z = 0; z < TK; ++z) acc = fmaf(xs[ty][z], ws[tx][z], acc);
+        __syncthreads();
+    }
+    if (row < M && col < N) y[(size_t)row * N + col] = acc;
+}
+
+extern "C" void ink_launch_pf_dense_gemm(const float* x, const void* w, float* y,
+        int M, int N, int K, int w_is_bf16, void* stream) {
+    dim3 g((N + 15) / 16, (M + 15) / 16);
+    inkwell_pf_dense_gemm<<<g, 256, 0, (cudaStream_t)stream>>>(x, w, y, M, N, K, w_is_bf16);
+}
+
+extern "C" __global__ void inkwell_pf_ctrl_apply(const float* __restrict__ gain,
+        const float* __restrict__ forget, float* __restrict__ cur,
+        const float* __restrict__ msg, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float g = tanhf(gain[i]);
+        const float f = tanhf(forget[i]);
+        cur[i] = (1.f - f) * cur[i] + g * msg[i];
+    }
+}
+
+extern "C" void ink_launch_pf_ctrl_apply(const float* gain, const float* forget,
+        float* cur, const float* msg, long long n, void* stream) {
+    inkwell_pf_ctrl_apply<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(gain, forget, cur, msg, n);
+}
+
+extern "C" __global__ void inkwell_pf_router8(const float* __restrict__ logits,
+        const float* __restrict__ bias, int C, float wscale, float wfloor,
+        int* __restrict__ ids, float* __restrict__ weights) {
+    if (threadIdx.x != 0) return;
+    const int t = blockIdx.x;
+    if (t >= C) return;
+    float prob[128];
+    bool used[128];
+    for (int e = 0; e < 128; ++e) {
+        const float z = logits[(size_t)t * 128 + e];
+        prob[e] = 1.f / (1.f + expf(-z));
+        used[e] = false;
+    }
+    float sum = 0.f;
+    int idv[8];
+    for (int j = 0; j < 8; ++j) {
+        int best = -1;
+        float bs = -1e30f;
+        for (int e = 0; e < 128; ++e) {
+            if (!used[e] && prob[e] + bias[e] > bs) { bs = prob[e] + bias[e]; best = e; }
+        }
+        used[best] = true;
+        idv[j] = best;
+        sum += prob[best];
+    }
+    sum = fmaxf(sum, wfloor);
+    for (int j = 0; j < 8; ++j) {
+        ids[t * 8 + j] = idv[j];
+        weights[t * 8 + j] = prob[idv[j]] / sum * wscale;
+    }
+}
+
+extern "C" void ink_launch_pf_router8(const float* logits, const float* bias, int C,
+        float wscale, float wfloor, int* ids, float* weights, void* stream) {
+    inkwell_pf_router8<<<C, 32, 0, (cudaStream_t)stream>>>(logits, bias, C, wscale, wfloor, ids, weights);
+}
+
+extern "C" __global__ void inkwell_pf_write_kv(const float* __restrict__ k,
+        const float* __restrict__ v, void* __restrict__ kd, void* __restrict__ vd,
+        int C, int pos0, int cap, int swa) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x; // h*128+d
+    if (t >= C || i >= 1024) return;
+    const int h = i >> 7, d = i & 127;
+    const int logical = pos0 + t;
+    const int slot = swa > 0 ? logical % swa : logical;
+    if (slot >= cap) return;
+    const size_t dst = ((size_t)h * cap + slot) * 128 + d;
+    const size_t src = (size_t)t * 1024 + i;
+    ((__half*)kd)[dst] = __float2half_rn(k[src]);
+    ((__half*)vd)[dst] = __float2half_rn(v[src]);
+}
+
+extern "C" void ink_launch_pf_write_kv(const float* k, const float* v, void* kd, void* vd,
+        int C, int pos0, int cap, int swa, void* stream) {
+    dim3 g(4, C);
+    inkwell_pf_write_kv<<<g, 256, 0, (cudaStream_t)stream>>>(k, v, kd, vd, C, pos0, cap, swa);
+}
+
+extern "C" __global__ void inkwell_pf_expand_rel(const float* __restrict__ src,
+        float* __restrict__ dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 1025 * 16) return;
+    for (int h = 0; h < 24; ++h) dst[(size_t)h * 1025 * 16 + i] = src[i];
+}
+
+extern "C" void ink_launch_pf_expand_rel(const float* src, float* dst, void* stream) {
+    inkwell_pf_expand_rel<<<(1025 * 16 + 255) / 256, 256, 0, (cudaStream_t)stream>>>(src, dst);
+}
+
+// Depth-stack mix. states[j] are [C,n]; query rows are qcols contiguous n-vectors.
+// Output layout is [qcol][C][n]. scores are softmax over rows of RMS-normalized states.
+struct PfMixStates { const float* p[8]; };
+
+extern "C" __global__ void inkwell_pf_mix(PfMixStates states,
+        int rows, const float* __restrict__ query, float* __restrict__ out,
+        int C, int n, int qcols, float scale, float eps) {
+    __shared__ float ss[8];
+    __shared__ float sc[8];
+    __shared__ float mx, den;
+    const int tq = blockIdx.x;
+    const int t = tq % C;
+    const int qc = tq / C;
+    if (qc >= qcols) return;
+    if (threadIdx.x == 0) {
+        const float* q = query + (size_t)qc * n;
+        float m = -1e30f;
+        for (int j = 0; j < rows; ++j) {
+            const float* x = states.p[j] + (size_t)t * n;
+            float ns = 0.f, dot = 0.f;
+            for (int i = 0; i < n; ++i) {
+                const float v = x[i];
+                ns = fmaf(v, v, ns);
+            }
+            const float inv = 1.f / sqrtf(ns / (float)n + eps);
+            for (int i = 0; i < n; ++i) dot = fmaf(x[i] * inv, q[i], dot);
+            sc[j] = dot * scale;
+            ss[j] = inv;
+            m = fmaxf(m, sc[j]);
+        }
+        mx = m;
+        float ds = 0.f;
+        for (int j = 0; j < rows; ++j) ds += expf(sc[j] - m);
+        den = ds;
+    }
+    __syncthreads();
+    const float m = mx, ds = den;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j < rows; ++j) {
+            const float p = expf(sc[j] - m) / ds;
+            acc = fmaf(p, states.p[j][(size_t)t * n + i] * ss[j], acc);
+        }
+        out[((size_t)qc * C + t) * n + i] = acc;
+    }
+}
+
+extern "C" void ink_launch_pf_mix(const void* const* states, int rows, const float* query,
+        float* out, int C, int n, int qcols, float scale, float eps, void* stream) {
+    PfMixStates tmp{};
+    for (int i = 0; i < rows && i < 8; ++i) tmp.p[i] = (const float*)states[i];
+    inkwell_pf_mix<<<C * qcols, 256, 0, (cudaStream_t)stream>>>(tmp, rows, query, out, C, n, qcols, scale, eps);
 }
 
 // Phase-2 H2D staging-ring contract (stub in Phase 1):

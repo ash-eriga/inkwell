@@ -1337,3 +1337,143 @@ pub unsafe fn flash_prefill_gqa3_async(k: *const c_void, v: *const c_void, q: *c
     unsafe { ink_launch_flash_prefill_gqa3(k, v, q, r, rel_w, sinks, out, c, pos0, kv_cap,
         swa_win, scale, stream()) };
 }
+
+extern "C" {
+    fn ink_launch_pf_embed_bf16(embd: *const c_void, ids: *const i32, out: *mut f32,
+        c: i32, n: i32, stride_bytes: i64, stream: *mut c_void);
+    fn ink_launch_pf_rmsnorm(x: *mut f32, w: *const f32, rows: i32, n: i32, eps: f32, stream: *mut c_void);
+    fn ink_launch_pf_clip_heads(x: *mut f32, scale: *const f32, c: i32, heads: i32, d: i32, thr: f32, stream: *mut c_void);
+    fn ink_launch_pf_add(x: *mut f32, y: *const f32, n: i64, stream: *mut c_void);
+    fn ink_launch_pf_mul_sigmoid(x: *mut f32, gate: *const f32, n: i64, stream: *mut c_void);
+    fn ink_launch_pf_tau_qr(q: *mut f32, r: *mut f32, c: i32, log_alpha: f32, log_floor: f32, pos0: i32, stream: *mut c_void);
+    fn ink_launch_pf_dense_gemm(x: *const f32, w: *const c_void, y: *mut f32,
+        m: i32, n: i32, k: i32, w_is_bf16: i32, stream: *mut c_void);
+    fn ink_launch_pf_ctrl_apply(gain: *const f32, forget: *const f32, cur: *mut f32, msg: *const f32, n: i64, stream: *mut c_void);
+    fn ink_launch_pf_router8(logits: *const f32, bias: *const f32, c: i32,
+        wscale: f32, wfloor: f32, ids: *mut i32, weights: *mut f32, stream: *mut c_void);
+    fn ink_launch_pf_write_kv(k: *const f32, v: *const f32, kd: *mut c_void, vd: *mut c_void,
+        c: i32, pos0: i32, cap: i32, swa: i32, stream: *mut c_void);
+    fn ink_launch_pf_expand_rel(src: *const f32, dst: *mut f32, stream: *mut c_void);
+    fn ink_launch_pf_mix(states: *const *const c_void, rows: i32, query: *const f32,
+        out: *mut f32, c: i32, n: i32, qcols: i32, scale: f32, eps: f32, stream: *mut c_void);
+}
+
+/// Prefill dense EXL3 GEMM on the current stream.
+///
+/// # Safety
+/// Raw device pointers must be valid and correctly shaped.
+pub unsafe fn pf_exl3_gemm_async(trel: *const c_void, suh: *const c_void, svh: *const c_void,
+    x: *const f32, y: *mut f32, m: usize, k: usize, n: usize, ka: usize, halfk: bool,
+    scratch: *mut f32) {
+    unsafe { ink_launch_exl3_gemm_smem(trel, suh, svh, x, y, m as i32, k as i64, n as i64,
+        ka as i64, i64::from(halfk), scratch, stream()) };
+}
+
+/// Prefill MoE counting sort.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pf_moe_sort_async(ids: *const i32, weights: *const f32, c: usize,
+    expert_offsets: *mut i32, sorted_token: *mut i32, sorted_slot: *mut i32,
+    sorted_weight: *mut f32, inverse_row: *mut i32, tile_expert: *mut i32,
+    tile_start: *mut i32, tile_count: *mut i32, tile_n: *mut i32) {
+    unsafe { ink_launch_exl3_moe_group_sort(ids, weights, c as i32, expert_offsets, sorted_token,
+        sorted_slot, sorted_weight, inverse_row, tile_expert, tile_start, tile_count, tile_n, stream()) };
+}
+
+/// Grouped prefill MoE pipeline.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pf_moe_grouped_async(descs_g: *const c_void, descs_u: *const c_void,
+    descs_d: *const c_void, x: *const f32, c: usize, sorted_token: *const i32,
+    tile_expert: *const i32, tile_start: *const i32, tile_count: *const i32,
+    tile_n: *const i32, sorted_weight: *const f32, inverse_row: *const i32,
+    workspace: *mut f32, out: *mut f32) {
+    unsafe { ink_launch_exl3_moe_grouped_gemm(descs_g, descs_u, descs_d, x, c as i32,
+        sorted_token, tile_expert, tile_start, tile_count, tile_n, sorted_weight,
+        inverse_row, workspace, out, stream()) };
+}
+
+/// Parallel causal convolution.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pf_conv_async(x: *const f32, state: *mut f32, region_off: i32,
+    w: *const f32, dyn_: *const f32, c: usize, ch: usize, n_heads: usize, scale: f32,
+    out: *mut f32) {
+    unsafe { ink_launch_conv_prefill(x, state, region_off, w, dyn_, c as i32, ch as i32,
+        n_heads as i32, scale, out, stream()) };
+}
+
+/// GQA-3 flash prefill attention.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pf_flash_async(k: *const c_void, v: *const c_void, q: *const f32,
+    r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+    c: usize, pos0: i64, kv_cap: i64, swa_win: i64, scale: f32) {
+    unsafe { ink_launch_flash_prefill_gqa3(k, v, q, r, rel_w, sinks, out, c as i32,
+        pos0 as i32, kv_cap as i32, swa_win as i32, scale, stream()) };
+}
+
+macro_rules! pfwrap {
+    ($name:ident, $launch:ident, $($arg:ident : $ty:ty),*) => {
+        /// Prefill driver glue kernel.
+        ///
+        /// # Safety
+        /// Raw device pointers must be valid.
+        pub unsafe fn $name($($arg: $ty),*) {
+            unsafe { $launch($($arg),*, stream()) };
+        }
+    };
+}
+pfwrap!(pf_embed_async, ink_launch_pf_embed_bf16, embd: *const c_void, ids: *const i32, out: *mut f32, c: i32, n: i32, stride_bytes: i64);
+pfwrap!(pf_rmsnorm_async, ink_launch_pf_rmsnorm, x: *mut f32, w: *const f32, rows: i32, n: i32, eps: f32);
+pfwrap!(pf_clip_async, ink_launch_pf_clip_heads, x: *mut f32, scale: *const f32, c: i32, heads: i32, d: i32, thr: f32);
+pfwrap!(pf_add_async, ink_launch_pf_add, x: *mut f32, y: *const f32, n: i64);
+pfwrap!(pf_mul_sigmoid_async, ink_launch_pf_mul_sigmoid, x: *mut f32, gate: *const f32, n: i64);
+pfwrap!(pf_tau_qr_async, ink_launch_pf_tau_qr, q: *mut f32, r: *mut f32, c: i32, log_alpha: f32, log_floor: f32, pos0: i32);
+pfwrap!(pf_dense_gemm_async, ink_launch_pf_dense_gemm, x: *const f32, w: *const c_void, y: *mut f32, m: i32, n: i32, k: i32, w_is_bf16: i32);
+pfwrap!(pf_ctrl_apply_async, ink_launch_pf_ctrl_apply, gain: *const f32, forget: *const f32, cur: *mut f32, msg: *const f32, n: i64);
+pfwrap!(pf_router8_async, ink_launch_pf_router8, logits: *const f32, bias: *const f32, c: i32, wscale: f32, wfloor: f32, ids: *mut i32, weights: *mut f32);
+pfwrap!(pf_write_kv_async, ink_launch_pf_write_kv, k: *const f32, v: *const f32, kd: *mut c_void, vd: *mut c_void, c: i32, pos0: i32, cap: i32, swa: i32);
+pfwrap!(pf_expand_rel_async, ink_launch_pf_expand_rel, src: *const f32, dst: *mut f32);
+pfwrap!(pf_mix_async, ink_launch_pf_mix, states: *const *const c_void, rows: i32, query: *const f32, out: *mut f32, c: i32, n: i32, qcols: i32, scale: f32, eps: f32);
+
+extern "C" {
+    fn ink_launch_flash_prefill_gqa3_snap(k: *const c_void, v: *const c_void, q: *const f32,
+        r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+        c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32,
+        ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32, stream: *mut c_void);
+    fn ink_launch_pf_snapshot_kv(kd: *const c_void, vd: *const c_void, ks: *mut c_void, vs: *mut c_void,
+        snap_start: i32, snap_len: i32, cap: i32, swa: i32, stream: *mut c_void);
+}
+
+/// Flash prefill attention with a snapshot of ring rows overwritten by this chunk.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_prefill_gqa3_snap_async(k: *const c_void, v: *const c_void, q: *const f32,
+    r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+    c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32,
+    ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32) {
+    unsafe {
+        ink_launch_flash_prefill_gqa3_snap(k, v, q, r, rel_w, sinks, out, c, pos0, kv_cap,
+            swa_win, scale, ks, vs, snap_start, snap_len, stream());
+    }
+}
+
+/// Snapshot SWA ring rows before a chunk overwrite.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+pub unsafe fn pf_snapshot_kv_async(kd: *const c_void, vd: *const c_void, ks: *mut c_void, vs: *mut c_void,
+    snap_start: i32, snap_len: i32, cap: i32, swa: i32) {
+    unsafe { ink_launch_pf_snapshot_kv(kd, vd, ks, vs, snap_start, snap_len, cap, swa, stream()) };
+}
