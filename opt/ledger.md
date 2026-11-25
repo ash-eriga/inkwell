@@ -1638,3 +1638,9 @@ The original dynamic chunk selection was dead: an unset `INKWELL_ATTNSPLIT_CHUNK
 ### Verdict
 
 Noise gate **passed**: split is uniformly closer to fp64, old-vs-split end-to-end divergence is within the exact-reorder noise floor, and top-1 is unchanged for 256/256 positions at 4K. Decode is faster in every interleaved pair at both 4K and 8K. ctx512 generated-text md5 remains **`5cbe8e06`**. `INKWELL_ATTNSPLIT_MIN` is therefore lowered to **320**. Build rc0, **61 warnings** (limit 64). `cargo test --workspace` is not a valid gate here because the pre-existing `crates/inkwell-gguf/examples/embdcheck.rs` example does not link `inkwell_ggml` (unrelated compile error).
+
+## 2026-11-25 — split-K threshold 320 merged (407c049), re-validated on master
+
+- Merged `t3/splitk-attn-noise-gate` (132fe6e): `INKWELL_ATTNSPLIT_MIN` defaults to 320; chunk 32 up to n_kv 16384, 256 above. The gate evidence is in the child's entry above: split-K is closer to fp64 than the old kernel in all 6 real cases (3.1–8.1×), and at 4K old-vs-split KLD is below the split32-vs-split64 noise floor (top-1 256/256, same text).
+- Master check after merge: ctx512 md5 5cbe8e06 (2 runs; decode 2.449 s and 2.606 s for 8 tokens on a busy host). Build: 61 warnings.
+- Also merged: KV state save/load (`INKWELL_STATE_SAVE` / `INKWELL_STATE_LOAD`) for long-context tests that skip the encode.
