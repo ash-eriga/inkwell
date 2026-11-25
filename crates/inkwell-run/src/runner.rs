@@ -4153,9 +4153,11 @@ impl PfArena {
             *o += bytes;
         };
         let h = c * 2304 * 4;
-        for name in ["cur","x0","x1","x2","cat","ctrlg","ctrlf","fcur","moe_out","tmp0","tmp1","tmp2","head","prelude","bankout","cn","cm","cg"] {
+        for name in ["cur","x0","x1","x2","ctrlf","fcur","moe_out","tmp0","tmp1","tmp2","head","prelude","bankout","cn","cm","cg"] {
             put(name, h, &mut off, &mut o);
         }
+        put("cat", h * 2, &mut off, &mut o);
+        put("ctrlg", h * 2, &mut off, &mut o);
         for name in ["blk0","blk1","blk2","blk3","bank"] {
             put(name, h, &mut off, &mut o);
         }
