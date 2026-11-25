@@ -6101,16 +6101,22 @@ struct InkCtrlTriadIo {
     float* dst;
 };
 __device__ float inkwell_ctrl_gate_scratch[3 * 64];
+// Constant-offset select from a by-value param array: a runtime index
+// (blockIdx.y) into param space spills the struct to local memory on sm_61.
+template <typename T>
+__device__ __forceinline__ T ink_sel3(T const (&a)[3], int b) {
+    return b == 0 ? a[0] : (b == 1 ? a[1] : a[2]);
+}
 
 template <int R, int B>
 __global__ void inkwell_rms2down_nosmem_mr(InkCtrlRmsPtrs ps, int n, float eps) {
     __shared__ float s_sum[32];
     __shared__ float s_buf[R][32];
     const int b = (B == 1) ? 0 : blockIdx.y;
-    const float* __restrict__ x0 = ps.x0[b];
-    const float* __restrict__ x1 = ps.x1[b];
-    const __nv_bfloat16* __restrict__ w = ps.w[b];
-    float* __restrict__ dst = ps.dst[b];
+    const float* __restrict__ x0 = ink_sel3(ps.x0, b);
+    const float* __restrict__ x1 = ink_sel3(ps.x1, b);
+    const __nv_bfloat16* __restrict__ w = ink_sel3(ps.w, b);
+    float* __restrict__ dst = ink_sel3(ps.dst, b);
     if (!dst) dst = inkwell_ctrl_gate_scratch + b * 64;
 
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
@@ -6195,12 +6201,12 @@ __global__ void inkwell_rms2down_nosmem_mr(InkCtrlRmsPtrs ps, int n, float eps) 
 template <int B>
 __global__ void inkwell_gf_apply_batch(InkCtrlGfPtrs ps, int n, int fo) {
     const int b = (B == 1) ? 0 : blockIdx.y;
-    const __nv_bfloat16* __restrict__ x = ps.w[b];
-    const float* __restrict__ y = ps.y[b];
+    const __nv_bfloat16* __restrict__ x = ink_sel3(ps.w, b);
+    const float* __restrict__ y = ink_sel3(ps.y, b);
     if (!y) y = inkwell_ctrl_gate_scratch + b * 64;
-    const float* __restrict__ cur = ps.cur[b];
-    const float* __restrict__ msg = ps.msg[b];
-    float* __restrict__ dst = ps.dst[b];
+    const float* __restrict__ cur = ink_sel3(ps.cur, b);
+    const float* __restrict__ msg = ink_sel3(ps.msg, b);
+    float* __restrict__ dst = ink_sel3(ps.dst, b);
 
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int i = blockIdx.x * 8 + w;
@@ -6324,7 +6330,7 @@ extern "C" void ink_launch_rms2down(const float* x0, const float* x1,
         const void* w, int w_is_bf16, float* dst, int n, int nrows,
         float eps, void* stream) {
     static int no_ctrlbatch = -1;
-    if (no_ctrlbatch < 0) no_ctrlbatch = (getenv("INKWELL_CTRLBATCH") && !getenv("INKWELL_NO_CTRLBATCH")) ? 0 : 1;
+    if (no_ctrlbatch < 0) no_ctrlbatch = getenv("INKWELL_NO_CTRLBATCH") ? 1 : 0;
     if (w_is_bf16 && !no_ctrlbatch && n == 2304 && nrows % 4 == 0) {
         InkCtrlRmsPtrs ps{};
         ps.x0[0] = x0;

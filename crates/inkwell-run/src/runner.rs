@@ -1828,7 +1828,7 @@ impl Runner {
     /// Batch the three attention controllers into one custom op when their
     /// BF16 concatenated gain/forget layout exactly matches gf_apply.
     fn control_triad(&self, inputs: [Ptr; 3], msgs: [Ptr; 3], l: &L) -> Option<[Ptr; 3]> {
-        if std::env::var_os("INKWELL_CTRLBATCH").is_none() || std::env::var_os("INKWELL_NO_CTRLBATCH").is_some() { return None; }
+        if std::env::var_os("INKWELL_NO_CTRLBATCH").is_some() { return None; }
         let c = self.cur_ctx;
         let n = t::ne(inputs[0], 0);
         if n != 2304 { return None; }
