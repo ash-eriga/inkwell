@@ -2,6 +2,7 @@
 //! ggml-cuda kernels under it. See `PORTING.md` for the recipe.
 #![expect(missing_docs, reason = "scaffold in progress")]
 
+pub mod head_dump;
 pub mod moe;
 pub mod ops;
 pub mod draft;

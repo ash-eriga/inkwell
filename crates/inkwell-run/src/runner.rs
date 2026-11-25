@@ -127,6 +127,8 @@ struct StepCache {
     graph: Ptr,
     /// final tensor read back for logits (`cur` at graph end)
     out: Ptr,
+    /// normalised hidden state entering the output head
+    head_in: Ptr,
     /// device offsets of the 9 input tensors inside `in_buf` + span bytes
     in_offs: [usize; 9],
     in_span: usize,
@@ -2025,6 +2027,10 @@ impl Runner {
     /// # Panics
     /// On graph/alloc/compute failure.
     pub fn step(&mut self, id: u32, pos: i64) -> Vec<f32> {
+        self.step_impl(id, pos, false)
+    }
+
+    fn step_impl(&mut self, id: u32, pos: i64, dump_selection: bool) -> Vec<f32> {
         let tb0 = std::time::Instant::now();
         // per-visit max n_kv this step, padded to a multiple of 64 so tensor
         // shapes stay constant across steps (CUDA-graph replayable). The
@@ -2043,6 +2049,10 @@ impl Runner {
                 if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
                     let logits = self.step_cached(id, pos, &gc);
                     self.step_gcache = Some(gc);
+                    if dump_selection && crate::head_dump::enabled() {
+                        let token = host_argmax(&logits);
+                        self.dump_head_record(pos, token, gc.head_in, gc.out, Some(&logits));
+                    }
                     return logits;
                 }
             }
@@ -2156,6 +2166,7 @@ impl Runner {
         cur = t::reshape2(c, self.mix(&blocks, cur, self.output_res_query), n_embd, 1);
         cur = self.norm(cur, self.output_norm);
         self.dump("result_norm", cur);
+        let head_in = cur;
         let own_head = self.out_head.is_some();
         if !own_head {
             cur = if let Some(oi) = self.output_exl3 {
@@ -2201,10 +2212,14 @@ impl Runner {
         }
         if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
         let logits = self.read_logits(cur, prof);
+        if dump_selection && crate::head_dump::enabled() {
+            let token = host_argmax(&logits);
+            self.dump_head_record(pos, token, head_in, cur, Some(&logits));
+        }
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         if caching {
             // keep ctx + cgraph + sched split + instantiated CUDA graph alive
-            self.step_gcache = Some(StepCache { step, graph: g, out: cur, in_offs, in_span: o });
+            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o });
         } else {
             // release the cached split plan so the next step's graph gets re-allocated
             unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
@@ -2328,6 +2343,34 @@ impl Runner {
         logits
     }
 
+    fn read_dump_logits(&self, out: Ptr) -> Vec<f32> {
+        let nv = self.cfg.vocab_unpadded as usize;
+        if let Some((_, _, y_dev)) = self.out_head.as_ref() {
+            let all = y_dev.read();
+            all[..nv].to_vec()
+        } else {
+            let mut logits = vec![0f32; nv];
+            unsafe { t::get(out, logits.as_mut_ptr().cast(), 0, nv * 4) };
+            logits
+        }
+    }
+
+    fn dump_head_record(&self, pos: i64, token: u32, head_in: Ptr, out: Ptr, logits: Option<&[f32]>) {
+        if !crate::head_dump::enabled() { return; }
+        let ne = self.cfg.n_embd as usize;
+        let mut x = vec![0f32; ne];
+        unsafe { t::get(head_in, x.as_mut_ptr().cast(), 0, ne * 4) };
+        let owned_logits;
+        let logits = if let Some(logits) = logits {
+            logits
+        } else {
+            owned_logits = self.read_dump_logits(out);
+            &owned_logits
+        };
+        crate::head_dump::write_record(
+            u32::try_from(pos).expect("dump step fits u32"), token, &x, logits);
+    }
+
     /// Lazily create the pinned/device side buffers of the `step_id` path.
     fn sid_bufs(&mut self) -> &mut SidBufs {
         if self.sid.is_none() {
@@ -2446,7 +2489,7 @@ impl Runner {
     pub fn step_id(&mut self, id: u32, pos: i64) -> u32 {
         static NO_GA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *NO_GA.get_or_init(|| std::env::var_os("INKWELL_NO_GARGMAX").is_some()) {
-            return host_argmax(&self.step(id, pos));
+            return host_argmax(&self.step_impl(id, pos, true));
         }
         static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none()) {
@@ -2461,7 +2504,7 @@ impl Runner {
                 self.step_gcache = Some(gc);
             }
         }
-        host_argmax(&self.step(id, pos))
+        host_argmax(&self.step_impl(id, pos, true))
     }
 
     /// Gcache-hit step returning the greedy id (see [`Self::step_id`]).
@@ -2478,7 +2521,9 @@ impl Runner {
                 assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, gc.graph.0), 0, "sched compute");
                 self.dump_all();
             }
-            return self.read_argmax(gc);
+            let token = self.read_argmax(gc);
+            self.dump_head_record(pos, token, gc.head_in, gc.out, None);
+            return token;
         }
         let tb0 = std::time::Instant::now();
         let sp = self.sid_parts();
@@ -2544,10 +2589,14 @@ impl Runner {
         if self.out_head.is_some() {
             // own-head needs host launches: sync then take the slow read path
             unsafe { inkwell_cuda::DevBuf::sync() };
-            return self.read_argmax(gc);
+            let token = self.read_argmax(gc);
+            self.dump_head_record(pos, token, gc.head_in, gc.out, None);
+            return token;
         }
         unsafe { inkwell_cuda::event_sync(sp.ev) };
-        unsafe { *(sp.out as *const u32) }
+        let token = unsafe { *(sp.out as *const u32) };
+        self.dump_head_record(pos, token, gc.head_in, gc.out, None);
+        token
     }
 }
 

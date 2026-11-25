@@ -85,3 +85,27 @@ Directions, none of them known to work:
   - The window extraction and decode are given in `opt/MATH_CHALLENGE.md` §2.
   - Ring index i maps to tile position (r, c): with tt = i >> 3 and j = i & 7, r = (tt & 3)·2 + (j & 1) + ((j & 2) ? 8 : 0), and c = (tt >> 2) + ((j & 4) ? 8 : 0). Here r indexes k (input) and c indexes n (output). Source: `opt/kbench/exl3_math/test_cpu.cpp`.
 - **Real hidden states.** Several thousand final x vectors (fp32) from greedy decoding of varied prompts: prose, code, technical, factual and Portuguese. Each comes with the GPU's chosen token and its top-16 logits, so the dequantiser can be checked.
+
+### Head-dump binary format
+`INKWELL_DUMP_HEAD=<path>` creates or truncates `<path>` and writes one fixed-size record for the last prompt step and for every serial decode step whose logits select a token. When the variable is unset the runner does not perform the dump readbacks. All integer and floating-point fields are little-endian; fp32 fields are their IEEE-754 bit patterns.
+
+Header (24 bytes):
+
+| offset | type | value |
+|---:|---|---|
+| 0 | byte[8] | ASCII `INKWHEAD` |
+| 8 | u32 | format version = 1 |
+| 12 | u32 | x dimension = 2304 |
+| 16 | u32 | unpadded vocabulary = 200058 |
+| 20 | f32 | softcap = 30.0 |
+
+Each record is 9,352 bytes and starts at offset 24:
+
+| offset | type | meaning |
+|---:|---|---|
+| 0 | u32 | absolute position `pos` of the input token processed by this step |
+| 4 | u32 | token id chosen greedily from this step's logits |
+| 8 | f32[2304] | x, the normalised final hidden state entering the output head, before `suh` and the input Hadamard |
+| 9224 | 16 × (u32, f32) | top-16 post-softcap logits as `(token index, logit)`, sorted by descending logit |
+
+`opt/tools/head_dump_check.py` validates the header, record size, finite x values, top-1 agreement and descending top-16 order.
