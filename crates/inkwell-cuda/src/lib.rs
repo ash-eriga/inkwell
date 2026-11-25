@@ -81,6 +81,7 @@ extern "C" {
         pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void);
     fn ink_launch_exl3_copy8(src: *const c_void, dst: *mut c_void, stream: *mut c_void);
     fn ink_ch2nopless_startup() -> i32;
+    fn ink_ch2dense_startup() -> i32;
     fn ink_launch_exl3_stage(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, staging: *mut c_void, sg: *mut c_void, su: *mut c_void, sd: *mut c_void, stream: *mut c_void);
     fn ink_launch_draft_mix(f: *const f32, a: *const f32, w: *const f32, o: *mut f32, rows: i32, tstride: i32, ch: i32, eps: f32, s: *mut c_void);
     fn ink_launch_draft_rms(x: *const f32, res: *const f32, w: *const f32, o: *mut f32, ro: *mut f32, n: i32, ch: i32, eps: f32, s: *mut c_void);
@@ -938,6 +939,11 @@ pub unsafe fn exl3_gemv_mz_async(trel: &[*const c_void], suh: &[*const c_void], 
 #[must_use]
 pub fn ch2nopless_startup() -> i32 {
     unsafe { ink_ch2nopless_startup() }
+}
+
+/// Initialize and bitwise-test the optional dense CH2 module.
+pub fn ch2dense_startup() -> i32 {
+    unsafe { ink_ch2dense_startup() }
 }
 
 pub unsafe fn exl3_moe_async(dg: *const c_void, du: *const c_void, dd: *const c_void,

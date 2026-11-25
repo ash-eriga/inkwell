@@ -14,6 +14,8 @@ import sys
 
 inp, outp = sys.argv[1], sys.argv[2]
 TARGET = '.text._Z23inkwell_exl3_gemv_moe_s'
+if len(sys.argv) > 5:
+    TARGET = sys.argv[5]
 # Inclusive patched-cubin byte-address ranges from count_loops.py for K1.5..K4.
 RANGES = [
     (0x15778, 0x16310, 'K1.5'), (0x17640, 0x181d8, 'K2'),
@@ -57,9 +59,9 @@ def read_entries():
         out.append((i, addr, body))
     return out
 
-mov_mode = len(sys.argv) > 4 and sys.argv[4] == 'mov'
-if len(sys.argv) > 4 and not mov_mode:
+if len(sys.argv) > 4 and sys.argv[4] not in ('mov', '-'):
     raise SystemExit(f'unknown option {sys.argv[4]}')
+mov_mode = len(sys.argv) > 4 and sys.argv[4] == 'mov'
 entries = read_entries()
 drop_ctrl = set()
 if mov_mode:
@@ -202,7 +204,7 @@ while idx < len(entries):
 if covered != remove_lines:
     raise SystemExit('leading deleted NOP has no previous surviving instruction')
 expected_nops = 34 if mov_mode else 32
-if sorted(counts.values()) != [expected_nops] * 6:
+if sorted(counts.values()) != [expected_nops] * len(RANGES):
     raise SystemExit(f'unexpected NOP counts {counts}')
 out = [line for i, line in enumerate(lines) if i not in remove_lines]
 open(outp, 'w').write(''.join(out))

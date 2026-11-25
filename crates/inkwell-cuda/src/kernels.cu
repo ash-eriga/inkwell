@@ -2910,6 +2910,10 @@ extern "C" void ink_launch_exl3_dp4a_dbg(const void* trel, const float* xh,
 
 // everything after had_in (xh already in scratch[0..k)) — factored out so the
 // mz path can merge the per-projection had_ins upstream of the stream fork.
+static bool ch2dense_try_launch(dim3 grid, cudaStream_t stream,
+                                const uint32_t* trel, const float* xh, const uint16_t* svh,
+                                float* y, float* t, int* ctr,
+                                int tk, int tn, int ka, int halfk, int pw16);
 static void exl3_gemv_tail(const void* trel, const void* svh, float* y,
                            long long k, long long n, long long ka, long long halfk,
                            float* scratch, void* stream) {
@@ -2927,9 +2931,13 @@ static void exl3_gemv_tail(const void* trel, const void* svh, float* y,
         { static int no_f = -1; if (no_f < 0) { const char* e = getenv("INKWELL_NO_SGEMV_FUSE"); no_f = e ? atoi(e) : 0; }
           if (!no_f && (n % 16) == 0 && (nky == 1 || nb <= 512)) {
             dim3 gsz((unsigned)nb, (unsigned)nky, 1);
+            const int pwm = ink_pw16_mask();
+            if (ch2dense_try_launch(gsz, (cudaStream_t)stream,
+                    (const uint32_t*)trel, scratch /* xh */, (const uint16_t*)svh,
+                    y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk, pwm)) return;
             inkwell_exl3_gemv_sf<<<gsz, 256, 0, (cudaStream_t)stream>>>(
                 (const uint32_t*)trel, scratch /* xh */, (const uint16_t*)svh,
-                y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk, ink_pw16_mask());
+                y, scratch + k, (int*)(scratch + k + 8 * n), tk, tn, (int)ka, (int)halfk, pwm);
             return;
           } }
         if (nky > 1) cudaMemsetAsync(scratch + k, 0, (size_t)nky * n * 4, (cudaStream_t)stream);
@@ -3302,6 +3310,141 @@ __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn,
 #undef SG_D
 }
 
+// Dense fused GEMV variant whose K=3/3.5/4 streams use the CH2 core.
+// It is loaded only from the patched build-time module; K=5 deliberately keeps
+// the shipped stream core because the unpaired K5 CH2 path is not exact.
+__global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf_ch2(
+                                       const uint32_t* __restrict__ trel,
+                                       const float* __restrict__ xh,
+                                       const uint16_t* __restrict__ svh,
+                                       float* __restrict__ y,
+                                       float* __restrict__ t,
+                                       int* __restrict__ ctr,
+                                       int tk, int tn, int ka, int halfk, int pw16) {
+    const int n = tn * 16;
+    const int tkc = (tk + gridDim.y - 1) / gridDim.y;
+    const int tk_lo = blockIdx.y * tkc;
+    const int tk_hi = min(tk_lo + tkc, tk);
+    const int kk = ka * 2 + halfk;
+    constexpr bool pw = false;   // validated driver module: shipped scalar layout only
+    (void)pw16;
+    __shared__ __align__(16) float xs[SGEMV_DENSE_MAXK];
+    __shared__ float red[8];
+    __shared__ unsigned int ticket;
+    __shared__ float strip[128];
+    const int e_lo = tk_lo * 16, e_hi = tk_hi * 16;
+    // prologue: stage this block's k-range of x and its Sigma_x (pw16 permutes lanes)
+    float sxl = 0.f;
+    for (int e = e_lo + threadIdx.x; e < e_hi; e += 256) {
+        const float v = xh[e];
+        sxl += v;
+        if (pw) { const int r = e & 15; xs[(e & ~15) + ((r & 4) ? 8 : 0) + ((r & 8) ? 4 : 0) + (r & 3)] = v; }
+        else xs[e] = v;
+    }
+#pragma unroll
+    for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sxl;
+    __syncthreads();
+    float sx = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sx += red[i];
+    const int part = threadIdx.x >> 7;
+    const int t_in_blk = (threadIdx.x & 127) >> 4;
+    const int sub = threadIdx.x & 15;
+    const int tn_i = blockIdx.x * 8 + (pw ? t_in_blk : (threadIdx.x >> 5));
+    const bool live = tn_i < tn;
+    float a0 = 0.f, a1 = 0.f;
+    if (pw) {
+        const int span = tk_hi - tk_lo;
+        const int a_lo = tk_lo + ((part * span) >> 1);
+        const int a_hi = tk_lo + (((part + 1) * span) >> 1);
+        if (live && span > 0) {
+            switch (kk) {
+                case 3:  pw16_run<1, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 4:  pw16_run<2, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 5:  pw16_run<2, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 6:  pw16_run<3, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 7:  pw16_run<3, 1>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 8:  pw16_run<4, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                case 10: pw16_run<5, 0>(trel, tn, tn_i, a_lo, a_hi, xs, a0, a1); break;
+                default: __trap();
+            }
+        }
+        pw16_reduce(part, t_in_blk, sub, live, xs, a0, a1);
+    } else if (tk_hi > tk_lo && tn_i < tn) {
+        switch (kk) {
+            case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 6:  ch2_run<3, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 7:  ch2_run<3, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 8:  ch2_run<4, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 10: sgemv_run<5, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            default: __trap();
+        }
+    }
+    if (!pw) {
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+    }
+    const int lane = threadIdx.x & 31;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = pw ? PW16_KOFFC
+                          : 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    const float off = KOFF * sx;
+    const bool wr = live && (pw ? (part == 0 && (sub & 1) == 0) : ((lane & 3) == 0));
+    const int scol = (pw ? t_in_blk : (threadIdx.x >> 5)) * 16 + (pw ? (sub >> 1) : (lane >> 2));
+    if (gridDim.y == 1) {
+        // single-k-block: strip lives in smem only; zero first so columns
+        // >= n contribute 0 to the butterfly exactly like had_out's v=0.
+        if (threadIdx.x < 128) strip[threadIdx.x] = 0.f;
+        __syncthreads();
+        if (wr) {
+            strip[scol]     = fmaf(KINV, a0, off);
+            strip[scol + 8] = fmaf(KINV, a1, off);
+        }
+        __syncthreads();
+    } else {
+        if (wr) {
+            float* dst = &t[(size_t)blockIdx.y * n + blockIdx.x * 128 + scol];
+            dst[0] = fmaf(KINV, a0, off); dst[8] = fmaf(KINV, a1, off);
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) ticket = atomicAdd(&ctr[blockIdx.x], 1u);
+        __syncthreads();
+        if (ticket != gridDim.y - 1) return;   // not last: done
+        __threadfence();
+        if (threadIdx.x == 0) ctr[blockIdx.x] = 0;   // self-reset for next launch
+        const int c = blockIdx.x * 128 + threadIdx.x;
+        if (threadIdx.x < 128) {
+            float v = 0.f;
+            if (c < n) for (int z = 0; z < (int)gridDim.y; ++z) v += __ldcg(&t[(size_t)z * n + c]);   // L2: written by other blocks
+            strip[threadIdx.x] = v;
+        }
+        __syncthreads();
+    }
+    // shared epilogue: strip[128] = partial sums -> H128 * svh -> y (had_out
+    // clone). Only the last block per strip (or every block when nky==1)
+    // reaches this; barriers stay uniform across all 256 threads.
+    {
+        const int c = blockIdx.x * 128 + threadIdx.x;
+        const bool live = threadIdx.x < 128;
+        for (int s = 1; s < 128; s <<= 1) {
+            const float u = !live ? 0.f
+                          : (threadIdx.x & s) ? strip[threadIdx.x - s] - strip[threadIdx.x]
+                                              : strip[threadIdx.x] + strip[threadIdx.x + s];
+            __syncthreads();
+            if (live) strip[threadIdx.x] = u;
+            __syncthreads();
+        }
+        if (live && c < n) y[c] = strip[threadIdx.x] * 0.08838834764831845f
+                                * __half2float(__ushort_as_half(svh[c]));
+    }
+}
+
+
+
 template <int KA, int H>
 __device__ __forceinline__ void sgemv_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
                                           int tk_lo, int tk_hi, const float* __restrict__ xs,
@@ -3647,6 +3790,143 @@ static void launch_moe_s(dim3 grid, cudaStream_t st,
                          tk, tn, k, n, nky, missf, skipmode, pw)) return;
     inkwell_exl3_gemv_moe_s<<<grid, 256, 0, st>>>(descs, descs2, ids, xh, xh2, xh2s,
         t, tslot, tzoff, tk, tn, k, n, nky, missf, skipmode, pw);
+}
+
+
+// ---- optional dense CH2 driver-API module ----
+struct Ch2DenseState {
+    CUmodule mod = nullptr;
+    CUfunction fn = nullptr;
+    int state = 0;
+    size_t bytes = 0;
+    double selftest_ms = 0.0;
+};
+static Ch2DenseState g_ch2dense;
+
+static int ch2dense_requested() {
+    if (getenv("INKWELL_NO_CH2DENSE")) return 0;
+    const char* e = getenv("INKWELL_CH2DENSE");
+    return e ? atoi(e) != 0 : 0;   // opt-in until the acceptance gate passes
+}
+
+static CUresult ch2dense_driver_launch(CUfunction f, dim3 grid,
+                                       const uint32_t* trel, const float* xh, const uint16_t* svh,
+                                       float* y, float* t, int* ctr,
+                                       int tk, int tn, int ka, int halfk, int pw16,
+                                       cudaStream_t stream) {
+    void* args[] = {&trel, &xh, &svh, &y, &t, &ctr, &tk, &tn, &ka, &halfk, &pw16};
+    return cuLaunchKernel(f, grid.x, grid.y, grid.z, 256, 1, 1, 0, (CUstream)stream, args, nullptr);
+}
+
+// Bitwise startup gate for every dense K in the model.  K=5 intentionally
+// exercises the shipped fallback inside the module as well as the dispatch.
+static bool ch2dense_selftest(CUfunction f) {
+    constexpr int TK = 16, TN = 16, K = TK * 16, N = TN * 16;
+    constexpr size_t MAXW = (size_t)TK * TN * 40;
+    uint32_t* trel = nullptr;
+    float *xh = nullptr, *yr = nullptr, *yn = nullptr, *t = nullptr;
+    uint16_t* svh = nullptr;
+    int* ctr = nullptr;
+    bool ok = false;
+    uint32_t hw[MAXW];
+    float hx[K], ha[N], hb[N];
+    uint16_t hs[N];
+    const int cases[4][2] = {{3,0},{3,1},{4,0},{5,0}};
+    if (cudaMalloc((void**)&trel, MAXW * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&xh, K * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&svh, N * 2) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&yr, N * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&yn, N * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&t, N * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&ctr, 512 * 4) != cudaSuccess) goto done;
+    for (int i = 0; i < K; ++i) hx[i] = ((int)(ch2np_rnd() % 2001) - 1000) / 512.f;
+    for (int i = 0; i < N; ++i) hs[i] = (uint16_t)(0x3c00 + (ch2np_rnd() & 63));
+    if (cudaMemcpy(xh, hx, K * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+    if (cudaMemcpy(svh, hs, N * 2, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+    if (cudaMemset(ctr, 0, 512 * 4) != cudaSuccess) goto done;
+    for (int ci = 0; ci < 4; ++ci) {
+        const int ka = cases[ci][0], hk = cases[ci][1];
+        const int nw = 8 * ka + 4 * hk;
+        const size_t words = (size_t)TK * TN * nw;
+        for (size_t i = 0; i < words; ++i) hw[i] = ch2np_rnd();
+        if (cudaMemcpy(trel, hw, words * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+        dim3 grid((TN + 7) / 8, 1, 1);
+        inkwell_exl3_gemv_sf<<<grid, 256, 0, nullptr>>>(trel, xh, svh, yr, t, ctr, TK, TN, ka, hk, 0);
+        CUresult cr = ch2dense_driver_launch(f, grid, trel, xh, svh, yn, t, ctr, TK, TN, ka, hk, 0, nullptr);
+        if (cr != CUDA_SUCCESS) goto done;
+        if (cudaDeviceSynchronize() != cudaSuccess) goto done;
+        if (cudaMemcpy(ha, yr, N * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+        if (cudaMemcpy(hb, yn, N * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+        if (memcmp(ha, hb, N * 4) != 0) goto done;
+    }
+    ok = cudaGetLastError() == cudaSuccess;
+done:
+    if (trel) cudaFree(trel);
+    if (xh) cudaFree(xh);
+    if (svh) cudaFree(svh);
+    if (yr) cudaFree(yr);
+    if (yn) cudaFree(yn);
+    if (t) cudaFree(t);
+    if (ctr) cudaFree(ctr);
+    return ok;
+}
+
+extern "C" int ink_ch2dense_startup() {
+    if (g_ch2dense.state) return g_ch2dense.state == 1;
+    g_ch2dense.state = 2;
+    if (!ch2dense_requested()) return 0;
+    const size_t bytes = (size_t)(ink_ch2nopless_cubin_end - ink_ch2nopless_cubin_start);
+    if (bytes == 0) return 0;
+    cudaFree(0);
+    cuInit(0);
+    CUresult r = cuModuleLoadData(&g_ch2dense.mod, (const void*)ink_ch2nopless_cubin_start);
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "ch2dense: disabled: cuModuleLoadData error %d\n", (int)r);
+        return 0;
+    }
+    static const char* name = "_Z24inkwell_exl3_gemv_sf_ch2PKjPKfPKtPfS5_Piiiiii";
+    r = cuModuleGetFunction(&g_ch2dense.fn, g_ch2dense.mod, name);
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "ch2dense: disabled: cuModuleGetFunction error %d\n", (int)r);
+        cuModuleUnload(g_ch2dense.mod);
+        g_ch2dense.mod = nullptr;
+        return 0;
+    }
+    timespec ts0{}, ts1{};
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    const bool exact = ch2dense_selftest(g_ch2dense.fn);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    g_ch2dense.selftest_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
+    g_ch2dense.bytes = bytes;
+    if (!exact) {
+        fprintf(stderr, "ch2dense: disabled: bitwise self-test failed\n");
+        cuModuleUnload(g_ch2dense.mod);
+        g_ch2dense.mod = nullptr;
+        g_ch2dense.fn = nullptr;
+        return 0;
+    }
+    g_ch2dense.state = 1;
+    fprintf(stderr, "ch2dense: enabled cubin=%zu bytes selftest=%.2f ms\n", bytes, g_ch2dense.selftest_ms);
+    return 1;
+}
+
+static bool ch2dense_try_launch(dim3 grid, cudaStream_t stream,
+                                const uint32_t* trel, const float* xh, const uint16_t* svh,
+                                float* y, float* t, int* ctr,
+                                int tk, int tn, int ka, int halfk, int pw16) {
+    if (pw16) return false;   // the validated module implements the shipped unpermuted layout
+    if (g_ch2dense.state == 0) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone)
+            ink_ch2dense_startup();
+    }
+    if (g_ch2dense.state != 1) return false;
+    const CUresult r = ch2dense_driver_launch(g_ch2dense.fn, grid, trel, xh, svh, y, t, ctr,
+        tk, tn, ka, halfk, pw16, stream);
+    if (r == CUDA_SUCCESS) return true;
+    fprintf(stderr, "ch2dense: disabled: cuLaunchKernel error %d\n", (int)r);
+    g_ch2dense.state = 2;
+    return false;
 }
 
 __global__ void inkwell_exl3_had_out_moe

@@ -15,7 +15,9 @@ SHIFT_SETS = {
 }
 
 text = open(sys.argv[1]).read()
-chunk = next(c for c in re.split(r"\n\s*Function : ", text)[1:] if "gemv_moe_s" in c.split("\n")[0])
+target_name = sys.argv[3] if len(sys.argv) > 3 else "gemv_moe_s"
+expected = int(sys.argv[4]) if len(sys.argv) > 4 else 6
+chunk = next(c for c in re.split(r"\n\s*Function : ", text)[1:] if target_name in c.split("\n")[0])
 ins = []
 for a, o in re.findall(r"/\*([0-9a-f]{4,})\*/\s+(.*?);", chunk):
     full = o.strip()
@@ -51,7 +53,7 @@ for addr, op, full in ins:
         "instructions": len(body),
     })
 
-if len(rows) != 6 or len({(r["start"], r["end"]) for r in rows}) != 6:
-    raise SystemExit(f"expected six distinct patched CH2 loops, got {rows}")
+if len(rows) != expected or len({(r["start"], r["end"]) for r in rows}) != expected:
+    raise SystemExit(f"expected {expected} distinct patched CH2 loops in {target_name}, got {rows}")
 json.dump(rows, open(sys.argv[2], "w"), indent=2)
 print(" ".join(f"{r['k']}:{r['start']:x}-{r['end']:x}" for r in rows))
