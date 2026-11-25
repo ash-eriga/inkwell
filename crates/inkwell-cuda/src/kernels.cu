@@ -3496,55 +3496,97 @@ __device__ __forceinline__ int ch2_generic_donor(int t, int step) {
     }
     return (t + d) & 31;
 }
-template <int KA, int H>
-__device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
-                                        int tk_lo, int tk_hi, const float* __restrict__ xs,
-                                        float& a0, float& a1) {
+template <int KA, int H, int TN>
+__device__ __forceinline__ void ch2_run_impl(const uint32_t* __restrict__ tb, int tn, int tn_i,
+                                             int tk_lo, int tk_hi, const float* __restrict__ xs,
+                                             float& a0, float& a1) {
     constexpr int NW = 8 * KA + 4 * H;
     const int t = threadIdx.x & 31;
     const int R = 32 * NW;
     int B = (H ? (8 * t + 1) * KA + ((8 * t + 1) >> 1) : (8 * t + 1) * KA) - 16;
     if (B < 0) B += R;
     const int w0 = B >> 5, o = B & 31;
-    const int r0 = 2 * (t & 3);
-    const size_t stride = (size_t)tn * NW;
+    const size_t stride = (size_t)(TN ? TN : tn) * NW;
     const uint32_t* p = tb + (size_t)tn_i * NW;
 #define SG_D(j) ((j) * KA + H * (((j) + 1) >> 1))
 #define CH2_ACCUM8() do { \
-        const float2 xa = *(const float2*)&xs[kb], xc = *(const float2*)&xs[kb + 8]; \
+        const float4 xv = *(const float4*)&xs[kb]; \
         float f[8]; \
         _Pragma("unroll") \
         for (int j = 0; j < 8; ++j) f[j] = ch2_bs_f32(pp[j]); \
-        a0 = fmaf(xa.x, f[0], a0); a0 = fmaf(xa.y, f[1], a0); a0 = fmaf(xc.x, f[2], a0); a0 = fmaf(xc.y, f[3], a0); \
-        a1 = fmaf(xa.x, f[4], a1); a1 = fmaf(xa.y, f[5], a1); a1 = fmaf(xc.x, f[6], a1); a1 = fmaf(xc.y, f[7], a1); \
+        a0 = fmaf(xv.x, f[0], a0); a0 = fmaf(xv.y, f[1], a0); a0 = fmaf(xv.z, f[2], a0); a0 = fmaf(xv.w, f[3], a0); \
+        a1 = fmaf(xv.x, f[4], a1); a1 = fmaf(xv.y, f[5], a1); a1 = fmaf(xv.z, f[6], a1); a1 = fmaf(xv.w, f[7], a1); \
     } while (0)
     constexpr bool TOP32 = (7 * KA + 4 * H) < 16;
     if constexpr (TOP32) {
-        const int shfl_w1 = (KA == 2) ? (t + 2) & 31 : (((t & 7) == 1 ? t + 1 : t + 3) & 31);
+        if constexpr (KA == 2 && H == 0) {
+            const int shfl_w1 = (t + 2) & 31;
+            const uint32_t sel3 = (o == 2) ? 0x2100u : 0x0700u;
+            const uint32_t sel7 = ((t & 1) == 0) ? 0x7600u : 0x1000u;
+#pragma unroll 4
+            for (int a = tk_lo; a < tk_hi; ++a) {
+                const uint32_t* q = p + (size_t)a * stride;
+                const int kb = a * 16 + (t & 3) * 4;
+                const uint32_t W0 = __ldg(q + w0);
+                const uint32_t W1 = __shfl_sync(0xffffffffu, W0, shfl_w1);
+                const uint32_t hi = __funnelshift_l(W1, W0, o);
+                uint32_t pp[8];
+                pp[0] = ch2_mul16_hi(hi); pp[1] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(1)));
+                pp[2] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(2))); pp[3] = ch2_mul16_hi(__byte_perm(W0, W1, sel3));
+                pp[4] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(4))); pp[5] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(5)));
+                pp[6] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(6))); pp[7] = ch2_mul16_hi(__byte_perm(W0, W1, sel7));
+                CH2_ACCUM8();
+            }
+        } else {
+            const int shfl_w1 = ((t & 7) == 1 ? t + 1 : t + 3) & 31;
+#pragma unroll 4
+            for (int a = tk_lo; a < tk_hi; ++a) {
+                const uint32_t* q = p + (size_t)a * stride;
+                const int kb = a * 16 + (t & 3) * 4;
+                const uint32_t W0 = __ldg(q + w0);
+                const uint32_t W1 = __shfl_sync(0xffffffffu, W0, shfl_w1);
+                const uint32_t hi = __funnelshift_l(W1, W0, o);
+                uint32_t pp[8];
+                pp[0] = ch2_mul16_hi(hi); pp[1] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(1)));
+                pp[2] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(2))); pp[3] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(3)));
+                pp[4] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(4))); pp[5] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(5)));
+                pp[6] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(6))); pp[7] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(7)));
+                CH2_ACCUM8();
+            }
+        }
+    } else if constexpr (KA == 4 && H == 0) {
+        const int shfl_w1 = (t + 1) & 31;
 #pragma unroll 4
         for (int a = tk_lo; a < tk_hi; ++a) {
             const uint32_t* q = p + (size_t)a * stride;
-            const int kb = a * 16 + r0;
+            const int kb = a * 16 + (t & 3) * 4;
             const uint32_t W0 = __ldg(q + w0);
             const uint32_t W1 = __shfl_sync(0xffffffffu, W0, shfl_w1);
-            const uint32_t hi = __funnelshift_l(W1, W0, o);
+            const uint32_t u04 = __funnelshift_l(W1, W0, 20);
+            const uint32_t u26 = __funnelshift_l(W1, W0, 28);
+            const uint32_t p15 = __byte_perm(W0, W1, 0x0765u);
             uint32_t pp[8];
-            pp[0] = ch2_mul16_hi(hi); pp[1] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(1)));
-            pp[2] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(2))); pp[3] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(3)));
-            pp[4] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(4))); pp[5] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(5)));
-            pp[6] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(6))); pp[7] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(7)));
+            pp[0] = ch2_mul16_hi(u04);
+            pp[1] = ch2_mul16_hi(p15);
+            pp[2] = ch2_mul16_hi(u26);
+            pp[3] = ch2_mul16_hi(W1);
+            pp[4] = ch2_mul16_hi(__byte_perm(u04, 0u, 0x1000u));
+            pp[5] = ch2_mul16_hi(__byte_perm(p15, 0u, 0x1000u));
+            pp[6] = ch2_mul16_hi(__byte_perm(u26, 0u, 0x1000u));
+            pp[7] = ch2_mul16_hi(__byte_perm(W1, 0u, 0x1000u));
             CH2_ACCUM8();
         }
     } else {
         const int shfl_w1 = ch2_generic_donor<KA, H>(t, 1);
-        const int shfl_w2 = ch2_generic_donor<KA, H>(t, 2);
+        constexpr bool NEEDS_W2 = (KA == 3 && H == 1);
+        const int shfl_w2 = NEEDS_W2 ? ch2_generic_donor<KA, H>(t, 2) : 0;
 #pragma unroll 4
         for (int a = tk_lo; a < tk_hi; ++a) {
             const uint32_t* q = p + (size_t)a * stride;
-            const int kb = a * 16 + r0;
+            const int kb = a * 16 + (t & 3) * 4;
             const uint32_t W0 = __ldg(q + w0);
             const uint32_t W1 = __shfl_sync(0xffffffffu, W0, shfl_w1);
-            const uint32_t W2 = __shfl_sync(0xffffffffu, W0, shfl_w2);
+            const uint32_t W2 = NEEDS_W2 ? __shfl_sync(0xffffffffu, W0, shfl_w2) : W1;
             const uint32_t hi = __funnelshift_l(W1, W0, o), lo = __funnelshift_l(W2, W1, o);
             uint32_t pp[8];
             pp[0] = ch2_mul16_hi(ch2_view<SG_D(0)>(hi, lo)); pp[1] = ch2_mul16_hi(ch2_view<SG_D(1)>(hi, lo));
@@ -3556,6 +3598,17 @@ __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn,
     }
 #undef CH2_ACCUM8
 #undef SG_D
+}
+
+template <int KA, int H>
+__device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
+                                        int tk_lo, int tk_hi, const float* __restrict__ xs,
+                                        float& a0, float& a1) {
+    if (tn == 72) {
+        ch2_run_impl<KA, H, 72>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1);
+    } else {
+        ch2_run_impl<KA, H, 144>(tb, tn, tn_i, tk_lo, tk_hi, xs, a0, a1);
+    }
 }
 
 // Dense fused GEMV variant whose K=3/3.5/4 streams use the CH2 core.
@@ -3587,6 +3640,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf_ch2(
         const float v = xh[e];
         sxl += v;
         if (pw) { const int r = e & 15; xs[(e & ~15) + ((r & 4) ? 8 : 0) + ((r & 8) ? 4 : 0) + (r & 3)] = v; }
+        else if (kk >= 6 && kk != 10) { const int r = e & 15; xs[(e & ~15) + ((r & 7) >> 1) * 4 + (r & 1) + ((r & 8) ? 2 : 0)] = v; }
         else xs[e] = v;
     }
 #pragma unroll
@@ -3624,9 +3678,9 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf_ch2(
             case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-            case 6:  ch2_run<3, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-            case 7:  ch2_run<3, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
-            case 8:  ch2_run<4, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 6:  ch2_run_impl<3, 0, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 7:  ch2_run_impl<3, 1, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 8:  ch2_run_impl<4, 0, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             case 10: sgemv_run<5, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
             default: __trap();
         }
@@ -3755,7 +3809,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
     const uint32_t* tb = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff), hk = (int)((d[3] >> 8) & 1);
     const int kk = ka * 2 + hk;
-    const bool ch2 = (pw16 & (1 << 30)) != 0 && kk != 10;
+    const bool ch2 = (pw16 & (1 << 30)) != 0 && kk != 10 && (tn == 72 || tn == 144);
     const bool pw = (pw16 >> kk) & 1;
     __shared__ __align__(16) float xs[SGEMV_MAXK];
     __shared__ float red[8];
@@ -3765,6 +3819,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
         const float v = xg[e];
         sxl += v;
         if (pw) { const int r = e & 15; xs[(e & ~15) + ((r & 4) ? 8 : 0) + ((r & 8) ? 4 : 0) + (r & 3)] = v; }
+        else if (ch2) { const int r = e & 15; xs[(e & ~15) + ((r & 7) >> 1) * 4 + (r & 1) + ((r & 8) ? 2 : 0)] = v; }
         else xs[e] = v;
     }
 #pragma unroll
@@ -3876,8 +3931,9 @@ static Ch2NpState g_ch2np;
 
 static int ch2np_requested() {
     if (getenv("INKWELL_NO_CH2NOPLESS")) return 0;
+    if (getenv("INKWELL_NO_CH3B")) return 0;
     const char* e = getenv("INKWELL_CH2NOPLESS");
-    return e ? atoi(e) != 0 : 1;   // accepted; INKWELL_NO_CH2NOPLESS remains the killswitch
+    return e ? atoi(e) != 0 : 1;   // accepted; the NO_* variables remain killswitches
 }
 
 static CUresult ch2np_driver_launch(CUfunction f, dim3 grid,
@@ -3901,28 +3957,31 @@ static uint32_t ch2np_rnd() {
 // One small single-projection case per optimized K. The runtime-linked kernel
 // (pw16=0, shipped scalar core) is the reference; the module uses bit 30 (CH2).
 static bool ch2np_selftest(CUfunction f) {
-    constexpr int TK = 16, TN = 16, K = TK * 16, N = TN * 16;
-    constexpr size_t MAXW = (size_t)TK * TN * 40;
+    constexpr int KMAX = 144 * 16, NMAX = 144 * 16;
+    constexpr size_t MAXW = (size_t)144 * 72 * 40;
     uint32_t* trel = nullptr;
     uint64_t* desc = nullptr;
     int* ids = nullptr;
     float* x = nullptr;
     float* out_ref = nullptr;
     float* out_new = nullptr;
+    uint32_t* hw = nullptr;
     bool ok = false;
-    uint32_t hw[MAXW];
-    float hx[K], ha[N], hb[N];
+    float hx[KMAX], ha[NMAX], hb[NMAX];
     const int cases[6][2] = {{1,1},{2,0},{2,1},{3,0},{3,1},{4,0}};
+    const int shapes[2][2] = {{144,72},{72,144}};
 
+    hw = (uint32_t*)malloc(MAXW * 4);
+    if (!hw) goto done;
     if (cudaMalloc((void**)&trel, MAXW * 4) != cudaSuccess) goto done;
     if (cudaMalloc((void**)&desc, 4 * 8) != cudaSuccess) goto done;
     if (cudaMalloc((void**)&ids, 4) != cudaSuccess) goto done;
-    if (cudaMalloc((void**)&x, K * 4) != cudaSuccess) goto done;
-    if (cudaMalloc((void**)&out_ref, N * 4) != cudaSuccess) goto done;
-    if (cudaMalloc((void**)&out_new, N * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&x, KMAX * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&out_ref, NMAX * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&out_new, NMAX * 4) != cudaSuccess) goto done;
 
-    for (int i = 0; i < K; ++i) hx[i] = ((int)(ch2np_rnd() % 2001) - 1000) / 512.f;
-    if (cudaMemcpy(x, hx, K * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+    for (int i = 0; i < KMAX; ++i) hx[i] = ((int)(ch2np_rnd() % 2001) - 1000) / 512.f;
+    if (cudaMemcpy(x, hx, KMAX * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
     {
         int hi = 0;
         if (cudaMemcpy(ids, &hi, 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
@@ -3930,30 +3989,33 @@ static bool ch2np_selftest(CUfunction f) {
 
     for (int ci = 0; ci < 6; ++ci) {
         const int ka = cases[ci][0], hk = cases[ci][1];
-        {
+        for (int si = 0; si < 2; ++si) {
+            const int tk = shapes[si][0], tn = shapes[si][1];
+            const int k = tk * 16, n = tn * 16;
             const int nw = 8 * ka + 4 * hk;
-            const size_t words = (size_t)TK * TN * nw;
+            const size_t words = (size_t)tk * tn * nw;
             for (size_t i = 0; i < words; ++i) hw[i] = ch2np_rnd();
             if (cudaMemcpy(trel, hw, words * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
             const uint64_t hd[4] = {(uint64_t)(uintptr_t)trel, 0, 0, (uint64_t)(ka | (hk << 8))};
             if (cudaMemcpy(desc, hd, sizeof hd, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
-            if (cudaMemset(out_ref, 0, N * 4) != cudaSuccess) goto done;
-            if (cudaMemset(out_new, 0, N * 4) != cudaSuccess) goto done;
+            if (cudaMemset(out_ref, 0, n * 4) != cudaSuccess) goto done;
+            if (cudaMemset(out_new, 0, n * 4) != cudaSuccess) goto done;
 
-            dim3 grid((TN + 7) / 8, 1, 1);
+            dim3 grid((tn + 7) / 8, 1, 1);
             inkwell_exl3_gemv_moe_s<<<grid, 256, 0, nullptr>>>(desc, nullptr, ids, x, nullptr, 0,
-                out_ref, N, 0, TK, TN, K, N, 1, nullptr, 0, 0);
+                out_ref, n, 0, tk, tn, k, n, 1, nullptr, 0, 0);
             CUresult cr = ch2np_driver_launch(f, grid, desc, nullptr, ids, x, nullptr, 0,
-                out_new, N, 0, TK, TN, K, N, 1, nullptr, 0, 1 << 30, nullptr);
+                out_new, n, 0, tk, tn, k, n, 1, nullptr, 0, 1 << 30, nullptr);
             if (cr != CUDA_SUCCESS) goto done;
             if (cudaDeviceSynchronize() != cudaSuccess) goto done;
-            if (cudaMemcpy(ha, out_ref, N * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
-            if (cudaMemcpy(hb, out_new, N * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
-            if (memcmp(ha, hb, N * 4) != 0) goto done;
+            if (cudaMemcpy(ha, out_ref, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+            if (cudaMemcpy(hb, out_new, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+            if (memcmp(ha, hb, n * 4) != 0) goto done;
         }
     }
     ok = cudaGetLastError() == cudaSuccess;
 done:
+    free(hw);
     if (trel) cudaFree(trel);
     if (desc) cudaFree(desc);
     if (ids) cudaFree(ids);
@@ -4053,6 +4115,7 @@ static Ch2DenseState g_ch2dense;
 
 static int ch2dense_requested() {
     if (getenv("INKWELL_NO_CH2DENSE")) return 0;
+    if (getenv("INKWELL_NO_CH3B")) return 0;
     const char* e = getenv("INKWELL_CH2DENSE");
     return e ? atoi(e) != 0 : 1;   // accepted; INKWELL_CH2DENSE=0 still opts out
 }

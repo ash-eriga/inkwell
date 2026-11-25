@@ -67,7 +67,7 @@ drop_ctrl = set()
 if mov_mode:
     mov_re = re.compile(r'MOV R(\d+), R(\d+) ;')
     ldg_re = re.compile(r'LDG(?:\.[A-Z0-9]+)* R(\d+), \[R(\d+)\] ;')
-    converted = {name: 0 for _, _, name in RANGES}
+    converted = {f'{name}:{lo:x}': 0 for lo, _hi, name in RANGES}
     for lo, hi, name in RANGES:
         inner = [(idx, i, addr, body) for idx, (i, addr, body) in enumerate(entries) if lo <= addr <= hi]
         if len(inner) < 3:
@@ -89,12 +89,12 @@ if mov_mode:
             lines[i] = re.sub(r'MOV\s+R\d+,\s+R\d+\s*;', 'NOP ;', lines[i], count=1)
             drop_ctrl.add(i)
         lines[i2] = lines[i2].replace(f'[R{d0}]', f'[R{s0}]', 1)
-        converted[name] = 2
-    if sorted(converted.values()) != [2] * 6:
+        converted[f'{name}:{lo:x}'] = 2
+    if sorted(converted.values()) != [2] * len(RANGES):
         raise SystemExit(f'unexpected MOV conversion counts {converted}')
     entries = read_entries()
 
-counts = {name: 0 for _, _, name in RANGES}
+counts = [0] * len(RANGES)
 remove_lines = set()
 nop_ctrls = {}
 
@@ -122,7 +122,7 @@ def set_ctrl(i, c):
 # NOP runs explicit, this prevents a wait mask from being moved onto another NOP
 # that is itself about to be deleted.
 for idx, (i, addr, body) in enumerate(entries):
-    inside = next((name for lo, hi, name in RANGES if lo <= addr <= hi), None)
+    inside = next((ri for ri, (lo, hi, _name) in enumerate(RANGES) if lo <= addr <= hi), None)
     if inside is None or body != 'NOP ;':
         continue
     c = parse_ctrl(ins_re.match(lines[i]).group('ctrl'))
@@ -204,9 +204,9 @@ while idx < len(entries):
 if covered != remove_lines:
     raise SystemExit('leading deleted NOP has no previous surviving instruction')
 expected_nops = 34 if mov_mode else 32
-if sorted(counts.values()) != [expected_nops] * len(RANGES):
+if sorted(counts) != [expected_nops] * len(RANGES):
     raise SystemExit(f'unexpected NOP counts {counts}')
 out = [line for i, line in enumerate(lines) if i not in remove_lines]
 open(outp, 'w').write(''.join(out))
-print('removed', counts, 'total', sum(counts.values()), 'lines', len(remove_lines),
+print('removed', counts, 'total', sum(counts), 'lines', len(remove_lines),
       'forward_waits', len(forward_waits), 'saturated', saturated, 'drop_ctrl', len(drop_ctrl))
