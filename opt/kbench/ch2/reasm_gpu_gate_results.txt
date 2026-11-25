@@ -1,0 +1,64 @@
+Challenge-2 SASS reassembly GPU gate results
+artifacts:
+45855f8a144da25920f1c007ccf488e4b31c57848d70e9fced8b19c55cb2ae71  /home/ash/.cache/inkwell-sass-reasm/out/kernels_unpatched.sm_61.cubin
+25dc4bcff8adc32238ce81ef1935ac16c2374746d892cbc4061db3691e3b20a3  /home/ash/.cache/inkwell-sass-reasm/out/kernels_patched_nops.sm_61.cubin
+fb190b1e8216136da888e43289b6bc1593e6e22719f3bf999a32815756d42869  /home/ash/.cache/inkwell-sass-reasm/out/kernels_patched_nopless.sm_61.cubin
+
+cuobjdump loop counts, patched with NOPs:
+K      start    end  ins noNOP NOP PSL XMAD SHF IDP FADD FFMA LDS LDG  ins/w noNOP/w
+K1.5   15778  16310  279   247  32  32   64  36  32    0   32   8  12  8.719   7.719
+K2     17640  181d8  279   247  32  32   64  36  32    0   32   8  12  8.719   7.719
+K2.5   196b8  1a250  279   247  32  32   64  36  32    0   32   8  12  8.719   7.719
+K3     1b780  1c318  279   247  32  32   64  36  32    0   32   8  12  8.719   7.719
+K3.5   1d7f0  1e388  279   247  32  32   64  36  32    0   32   8  12  8.719   7.719
+K4     20c00  217a8  280   248  32  32   64  36  32    0   32   8  12  8.750   7.750
+
+cuobjdump loop counts, patched NOP-deleted (timed cubin):
+K      start    end  ins noNOP NOP PSL XMAD SHF IDP FADD FFMA LDS LDG  ins/w noNOP/w
+K1.5   15778  161b8  247   247   0  32   64  36  32    0   32   8  12  7.719   7.719
+K2     174f0  17f30  247   247   0  32   64  36  32    0   32   8  12  7.719   7.719
+K2.5   19410  19e50  247   247   0  32   64  36  32    0   32   8  12  7.719   7.719
+K3     1b380  1bdc8  247   247   0  32   64  36  32    0   32   8  12  7.719   7.719
+K3.5   1d298  1dcd8  247   247   0  32   64  36  32    0   32   8  12  7.719   7.719
+K4     20558  20fa8  248   248   0  32   64  36  32    0   32   8  12  7.750   7.750
+
+harness output (full.rc=2 because NOP-deleted outputs mismatch):
+bitwise K=1.5 shape=gu variant=nops badbits=0/9216 maxabs=0
+bitwise K=1.5 shape=gu variant=nopless badbits=7480/9216 maxabs=56.3
+timing K=1.5 shape=gu unpatched_ms=0.0797 nops_ms=0.0829 nopless_ms=0.0734 unpatched/nops=0.9614 unpatched/nopless=1.0858 nops/nopless=1.1294
+bitwise K=1.5 shape=dn variant=nops badbits=0/18432 maxabs=0
+bitwise K=1.5 shape=dn variant=nopless badbits=13224/18432 maxabs=44.3
+timing K=1.5 shape=dn unpatched_ms=0.0819 nops_ms=0.0859 nopless_ms=0.0778 unpatched/nops=0.9538 unpatched/nopless=1.0531 nops/nopless=1.1041
+bitwise K=2.0 shape=gu variant=nops badbits=0/9216 maxabs=0
+bitwise K=2.0 shape=gu variant=nopless badbits=9216/9216 maxabs=85.2
+timing K=2.0 shape=gu unpatched_ms=0.0799 nops_ms=0.0836 nopless_ms=0.0764 unpatched/nops=0.9552 unpatched/nopless=1.0448 nops/nopless=1.0938
+bitwise K=2.0 shape=dn variant=nops badbits=0/18432 maxabs=0
+bitwise K=2.0 shape=dn variant=nopless badbits=18432/18432 maxabs=59.5
+timing K=2.0 shape=dn unpatched_ms=0.0819 nops_ms=0.0847 nopless_ms=0.0786 unpatched/nops=0.9671 unpatched/nopless=1.0428 nops/nopless=1.0782
+bitwise K=2.5 shape=gu variant=nops badbits=0/9216 maxabs=0
+bitwise K=2.5 shape=gu variant=nopless badbits=7928/9216 maxabs=56.3
+timing K=2.5 shape=gu unpatched_ms=0.0900 nops_ms=0.0849 nopless_ms=0.0737 unpatched/nops=1.0592 unpatched/nopless=1.2201 nops/nopless=1.1519
+bitwise K=2.5 shape=dn variant=nops badbits=0/18432 maxabs=0
+bitwise K=2.5 shape=dn variant=nopless badbits=13632/18432 maxabs=39.6
+timing K=2.5 shape=dn unpatched_ms=0.0916 nops_ms=0.0867 nopless_ms=0.0788 unpatched/nops=1.0569 unpatched/nopless=1.1615 nops/nopless=1.0990
+bitwise K=3.0 shape=gu variant=nops badbits=0/9216 maxabs=0
+bitwise K=3.0 shape=gu variant=nopless badbits=7976/9216 maxabs=60
+timing K=3.0 shape=gu unpatched_ms=0.0907 nops_ms=0.0850 nopless_ms=0.0746 unpatched/nops=1.0674 unpatched/nopless=1.2157 nops/nopless=1.1389
+bitwise K=3.0 shape=dn variant=nops badbits=0/18432 maxabs=0
+bitwise K=3.0 shape=dn variant=nopless badbits=14584/18432 maxabs=46.6
+timing K=3.0 shape=dn unpatched_ms=0.0932 nops_ms=0.0870 nopless_ms=0.0795 unpatched/nops=1.0706 unpatched/nopless=1.1718 nops/nopless=1.0946
+bitwise K=3.5 shape=gu variant=nops badbits=0/9216 maxabs=0
+bitwise K=3.5 shape=gu variant=nopless badbits=8280/9216 maxabs=64.5
+timing K=3.5 shape=gu unpatched_ms=0.0928 nops_ms=0.0850 nopless_ms=0.0768 unpatched/nops=1.0922 unpatched/nopless=1.2087 nops/nopless=1.1067
+bitwise K=3.5 shape=dn variant=nops badbits=0/18432 maxabs=0
+bitwise K=3.5 shape=dn variant=nopless badbits=15400/18432 maxabs=49.9
+timing K=3.5 shape=dn unpatched_ms=0.0952 nops_ms=0.0876 nopless_ms=0.0808 unpatched/nops=1.0862 unpatched/nopless=1.1787 nops/nopless=1.0852
+bitwise K=4.0 shape=gu variant=nops badbits=0/9216 maxabs=0
+bitwise K=4.0 shape=gu variant=nopless badbits=9216/9216 maxabs=361
+timing K=4.0 shape=gu unpatched_ms=0.0891 nops_ms=0.0847 nopless_ms=0.0796 unpatched/nops=1.0518 unpatched/nopless=1.1185 nops/nopless=1.0635
+bitwise K=4.0 shape=dn variant=nops badbits=0/18432 maxabs=0
+bitwise K=4.0 shape=dn variant=nopless badbits=18432/18432 maxabs=271
+timing K=4.0 shape=dn unpatched_ms=0.0911 nops_ms=0.0866 nopless_ms=0.0824 unpatched/nops=1.0529 unpatched/nopless=1.1056 nops/nopless=1.0501
+
+visible instruction streams after filtering NOPs: identical for all six loops (branch targets normalized)
+initial harness attempt failure: libcudart.so.12 missing before CUDA init; fixed by linking libcudart_static

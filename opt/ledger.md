@@ -1694,3 +1694,41 @@ Branch `t3/sass-reasm-probe`, based on 05f28e0. Probe artifacts/scripts: `opt/kb
 **GPU validation/timing.** Not completed. A driver-API harness (`reasm_drv_perk.cc`) was built and queued exactly as required under `nice -n 19 flock /tmp/inkwell-gpu.lock`, but `/tmp/inkwell-gpu.lock` remained continuously held by foreign long-running jobs, with two more foreign jobs already queued ahead/around the probe. The queued probe was cancelled rather than adding more pressure. Therefore there is no bitwise correctness table and no measured per-K timing table in this run. Static instruction-count reduction is exactly 1.000 issued instruction/weight for every K tested: 8.719 -> 7.719 for K1.5/K2/K2.5/K3/K3.5 and 8.750 -> 7.750 for K4 (an 11.4-11.5% issue-count upper bound, not a measured speedup).
 
 **Verdict.** **NO-GO for writing the full challenge-2 loop in SASS or integrating this into the build yet.** Reasons: (1) full-cubin round trip is not byte-identical; (2) CuAssembler needs a local correctness patch plus augmentation from the input cubin before it can assemble the production kernel; (3) ELF padding/layout and `.nv.info` indirect-branch metadata are not reproduced faithfully; (4) the NOP-deleted cubin has not been loaded or bitwise-validated on the GPU. The positive result is narrower but real: the target kernel's text section round-trips byte-identically, CuAssembler can represent labels/branch fixups well enough to physically delete 192 NOPs, and the resulting disassembly has the intended 7.719-7.750 instructions/weight with zero NOPs. A future conditional go would require fixing/vendoring the assembler defects, a fail-closed target-section/metadata comparison, and the missing GPU bitwise/timing gate.
+
+## 2026-11-24 — Challenge-2 SASS NOP-deletion GPU gate: BITWISE FAIL, NOT ACCEPTED
+
+Branch `t3/sass-reasm-gpu-gate`, based on `8bf3991`. Regenerated artifacts with the now-executable `opt/kbench/ch2/reasm_pipeline.sh` under `~/.cache/inkwell-sass-reasm/out/`; the pipeline was independently rerun end-to-end and reproduced the same hashes. Unpatched `45855f8a…`, patched-with-NOPs `25dc4bcf…`, patched-NOP-deleted `fb190b1e…` (full hashes in `opt/kbench/ch2/reasm_gpu_gate_results.txt`). The first queued harness attempt failed before CUDA initialization because `libcudart.so.12` was not on the runtime loader path; the harness and pipeline now link `libcudart_static`, and the measurement below used that binary.
+
+Method: all three cubins were loaded with `cuModuleLoadData` by `opt/kbench/ch2/reasm_drv_perk.cc`; K=1.5/2/2.5/3/3.5/4 only (K5 remains on the shipped core). Inputs and MoE shapes match `ch2_perk.cu` (8 slots, gate/up tk=144/tn=72 and down tk=72/tn=144, x quantized in 1/512 steps) and the default exact I2F conversion. Correctness used nky=1. Timing used nky=2, memset+kernel, rotating three-way interleaving, min-of-31.
+
+**Bitwise.** Patched-with-NOPs was bit-identical to the unpatched shipped core at every K and shape (`badbits=0`, `maxabs=0`). NOP-deleted was **not** correct:
+
+| K | gate/up badbits/N, maxabs | down badbits/N, maxabs |
+|---|---|---|
+| 1.5 | 7480/9216, 56.3 | 13224/18432, 44.3 |
+| 2.0 | 9216/9216, 85.2 | 18432/18432, 59.5 |
+| 2.5 | 7928/9216, 56.3 | 13632/18432, 39.6 |
+| 3.0 | 7976/9216, 60 | 14584/18432, 46.6 |
+| 3.5 | 8280/9216, 64.5 | 15400/18432, 49.9 |
+| 4.0 | 9216/9216, 361 | 18432/18432, 271 |
+
+**Timing.** Times are ms; ratios greater than 1 are speedups. `u/n` is unpatched/patched-with-NOPs, `u/d` unpatched/NOP-deleted, and `n/d` patched-with-NOPs/NOP-deleted.
+
+| K | shape | unpatched | with NOPs | NOP-deleted | u/n | u/d | n/d |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1.5 | gu | 0.0797 | 0.0829 | 0.0734 | 0.961 | 1.086 | 1.129 |
+| 1.5 | dn | 0.0819 | 0.0859 | 0.0778 | 0.954 | 1.053 | 1.104 |
+| 2.0 | gu | 0.0799 | 0.0836 | 0.0764 | 0.955 | 1.045 | 1.094 |
+| 2.0 | dn | 0.0819 | 0.0847 | 0.0786 | 0.967 | 1.043 | 1.078 |
+| 2.5 | gu | 0.0900 | 0.0849 | 0.0737 | 1.059 | 1.220 | 1.152 |
+| 2.5 | dn | 0.0916 | 0.0867 | 0.0788 | 1.057 | 1.162 | 1.099 |
+| 3.0 | gu | 0.0907 | 0.0850 | 0.0746 | 1.067 | 1.216 | 1.139 |
+| 3.0 | dn | 0.0932 | 0.0870 | 0.0795 | 1.071 | 1.172 | 1.095 |
+| 3.5 | gu | 0.0928 | 0.0850 | 0.0768 | 1.092 | 1.209 | 1.107 |
+| 3.5 | dn | 0.0952 | 0.0876 | 0.0808 | 1.086 | 1.179 | 1.085 |
+| 4.0 | gu | 0.0891 | 0.0847 | 0.0796 | 1.052 | 1.119 | 1.064 |
+| 4.0 | dn | 0.0911 | 0.0866 | 0.0824 | 1.053 | 1.106 | 1.050 |
+
+`cuobjdump -sass` on the exact timed NOP-deleted cubin (`fb190b1e…`) confirms zero NOPs and 247 instructions/32 weights for K1.5–K3.5 = **7.719 instr/weight**, and 248/32 for K4 = **7.750 instr/weight**. The corresponding patched-with-NOPs loops are 8.719/8.750 instr/weight. After filtering NOPs and normalizing branch targets, the visible non-NOP instruction streams of the patched-with-NOPs and NOP-deleted loops are identical for all six K cases.
+
+**Reading.** Deleting one instruction per weight does produce a real measured per-K gain in this harness: at K1.5 the NOP-deleted kernel is 12.9%/10.4% faster than patched-with-NOPs (gu/dn) and 8.6%/5.3% faster than the shipped unpatched core; at K2 the gains are 9.4%/7.8% over patched-with-NOPs and 4.5%/4.3% over unpatched. Those are the dominant expert-work cases. However, the measured NOP-deleted kernel is bitwise wrong everywhere, so this is **not an accepted optimization** and no runtime integration is justified. Since the visible arithmetic instruction sequence is unchanged, the failure is isolated to the reassembled control/scheduling/metadata or encoding details rather than the intended scalar math. The positive result is narrower: patching with NOPs is bitwise correct, physical deletion is mechanically possible and fast, but the current conservative control-carry reassembly does not preserve correctness.
