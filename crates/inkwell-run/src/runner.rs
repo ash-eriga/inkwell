@@ -1588,8 +1588,32 @@ impl Runner {
         unsafe { (*self.dump_list.get()).push((name.to_string(), t0)); }
     }
     fn dump_list_get(&self) -> &Vec<(String, Ptr)> { unsafe { &*self.dump_list.get() } }
+    fn dump_attn_bin(&self, name: String, t0: Ptr) {
+        if std::env::var_os("INKWELL_ATTN_DUMP_DIR").is_none() { return; }
+        t::output(t0);
+        unsafe { (*self.dump_list.get()).push((name, t0)); }
+    }
     fn dump_all(&self) {
         for (name, t0) in unsafe { &*self.dump_list.get() } {
+            if name.starts_with("attn_pos") {
+                let Some(dir) = std::env::var_os("INKWELL_ATTN_DUMP_DIR") else { continue };
+                let nbytes = t::nbytes(*t0);
+                let mut v = vec![0u8; nbytes];
+                unsafe { t::get(*t0, v.as_mut_ptr().cast(), 0, nbytes) };
+                let mut it = name.split('_');
+                let _ = it.next();
+                let pos = it.next().and_then(|x| x.strip_prefix("pos")?.parse::<i64>().ok()).unwrap_or(0);
+                let kind = it.next().unwrap_or("x");
+                let nkv = pos + 1;
+                let ext = if kind == "k" || kind == "v" { "f16" } else { "f32" };
+                let outdir = std::path::Path::new(&dir).join(nkv.to_string());
+                let _ = std::fs::create_dir_all(&outdir);
+                if let Ok(mut f) = std::fs::File::create(outdir.join(format!("{kind}.{ext}"))) {
+                    use std::io::Write as _;
+                    let _ = f.write_all(&v);
+                }
+                continue;
+            }
             let n = t::ne(*t0,0)*t::ne(*t0,1)*t::ne(*t0,2)*t::ne(*t0,3);
             let mut v = vec![0f32; n as usize];
             unsafe { t::get(*t0, v.as_mut_ptr().cast(), 0, (n*4) as usize) };
@@ -2062,6 +2086,14 @@ impl Runner {
         let q3 = t::permute(c, q, 0, 2, 1, 3); // [hd, 1, nh]
         let kq_mask = if is_swa { step.mask_swa } else { step.mask_full };
         let v_view = t::view3(c, v_upd, hd, n_kv, hkv, t::nb(v_upd, 1), t::nb(v_upd, 2), 0);
+        let pow2_ctx = (step.pos_val + 1) & step.pos_val == 0;
+        if il == 5 && !is_swa && pow2_ctx && (1024..=32768).contains(&(step.pos_val + 1)) {
+            self.dump_attn_bin(format!("attn_pos{}_k", step.pos_val), t::cont(c, k_view));
+            self.dump_attn_bin(format!("attn_pos{}_v", step.pos_val), t::cont(c, v_view));
+            self.dump_attn_bin(format!("attn_pos{}_q", step.pos_val), q);
+            self.dump_attn_bin(format!("attn_pos{}_bias", step.pos_val), kq_b);
+            self.dump_attn_bin(format!("attn_pos{}_mask", step.pos_val), kq_mask);
+        }
         let out = t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh); // [hd*nh, 1]
 
         let mut cur = out;

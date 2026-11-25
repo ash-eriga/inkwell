@@ -325,19 +325,29 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     // INKWELL_STEPDBG: per-token stepwall/gen/top5/poststep prints (they cost
     // ~0.5ms of unbuffered stderr + scans on the token boundary); default off.
     let stepdbg = std::env::var_os("INKWELL_STEPDBG").is_some() || vtest8;
+    let mut logit_dump = std::env::var_os("INKWELL_LOGIT_DUMP")
+        .map(|path| std::fs::File::create(path).expect("logit dump file"));
+    let dump_logits = logit_dump.is_some();
     for g in 0..n_gen {
         if vtest8 { hist_snaps.push_back(r.snapshot_conv()); }
         let ts = Instant::now();
         let (best, fed_id);
-        if stepdbg {
+        if stepdbg || dump_logits {
             logits = r.step(id, pos);
-            eprintln!("stepwall={:.1}ms", ts.elapsed().as_secs_f64()*1e3);
+            if stepdbg { eprintln!("stepwall={:.1}ms", ts.elapsed().as_secs_f64()*1e3); }
             let ta = Instant::now();
             best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
             fed_id = id;
-            if g == 0 { eprintln!("gen0-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]); }
-            eprintln!("gen {g}: id={id} next={best} top5={:?}", top(&logits, 5));
-            eprintln!("poststep={:.1}ms", ta.elapsed().as_secs_f64()*1e3);
+            if let Some(f) = &mut logit_dump {
+                use std::io::Write as _;
+                f.write_all(&(logits.len() as u32).to_le_bytes()).expect("logit dump write");
+                for x in &logits { f.write_all(&x.to_le_bytes()).expect("logit dump write"); }
+            }
+            if stepdbg {
+                if g == 0 { eprintln!("gen0-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]); }
+                eprintln!("gen {g}: id={id} next={best} top5={:?}", top(&logits, 5));
+                eprintln!("poststep={:.1}ms", ta.elapsed().as_secs_f64()*1e3);
+            }
         } else {
             best = r.step_id(id, pos) as usize;
             fed_id = id;
