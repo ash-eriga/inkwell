@@ -3235,36 +3235,49 @@ __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn,
     const int r0 = 2 * (t & 3);
     const size_t stride = (size_t)tn * NW;
     const uint32_t* p = tb + (size_t)tn_i * NW;
-#pragma unroll 4
-    for (int a = tk_lo; a < tk_hi; ++a) {
-        const uint32_t* q = p + (size_t)a * stride;
-        const int kb = a * 16 + r0;
-        uint32_t pp[8];
 #define SG_D(j) ((j) * KA + H * (((j) + 1) >> 1))
-        constexpr bool TOP32 = (7 * KA + 4 * H) < 16;
-        if constexpr (TOP32) {
-            const uint32_t W0 = __ldg(q + w0), W1 = __ldg(q + w1);
+#define CH2_ACCUM8() do { \
+        const float2 xa = *(const float2*)&xs[kb], xc = *(const float2*)&xs[kb + 8]; \
+        float f[8]; \
+        _Pragma("unroll") \
+        for (int j = 0; j < 8; ++j) f[j] = ch2_bs_f32(pp[j]); \
+        a0 = fmaf(xa.x, f[0], a0); a0 = fmaf(xa.y, f[1], a0); a0 = fmaf(xc.x, f[2], a0); a0 = fmaf(xc.y, f[3], a0); \
+        a1 = fmaf(xa.x, f[4], a1); a1 = fmaf(xa.y, f[5], a1); a1 = fmaf(xc.x, f[6], a1); a1 = fmaf(xc.y, f[7], a1); \
+    } while (0)
+    constexpr bool TOP32 = (7 * KA + 4 * H) < 16;
+    if constexpr (TOP32) {
+        const int shfl_w1 = (KA == 2) ? (t + 2) & 31 : (((t & 7) == 1 ? t + 1 : t + 3) & 31);
+#pragma unroll 4
+        for (int a = tk_lo; a < tk_hi; ++a) {
+            const uint32_t* q = p + (size_t)a * stride;
+            const int kb = a * 16 + r0;
+            const uint32_t W0 = __ldg(q + w0);
+            const uint32_t W1 = __shfl_sync(0xffffffffu, W0, shfl_w1);
             const uint32_t hi = __funnelshift_l(W1, W0, o);
+            uint32_t pp[8];
             pp[0] = ch2_mul16_hi(hi); pp[1] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(1)));
             pp[2] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(2))); pp[3] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(3)));
             pp[4] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(4))); pp[5] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(5)));
             pp[6] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(6))); pp[7] = ch2_mul16_hi(__funnelshift_l(hi, hi, SG_D(7)));
-        } else {
+            CH2_ACCUM8();
+        }
+    } else {
+#pragma unroll 4
+        for (int a = tk_lo; a < tk_hi; ++a) {
+            const uint32_t* q = p + (size_t)a * stride;
+            const int kb = a * 16 + r0;
             const uint32_t W0 = __ldg(q + w0), W1 = __ldg(q + w1), W2 = __ldg(q + w2);
             const uint32_t hi = __funnelshift_l(W1, W0, o), lo = __funnelshift_l(W2, W1, o);
+            uint32_t pp[8];
             pp[0] = ch2_mul16_hi(ch2_view<SG_D(0)>(hi, lo)); pp[1] = ch2_mul16_hi(ch2_view<SG_D(1)>(hi, lo));
             pp[2] = ch2_mul16_hi(ch2_view<SG_D(2)>(hi, lo)); pp[3] = ch2_mul16_hi(ch2_view<SG_D(3)>(hi, lo));
             pp[4] = ch2_mul16_hi(ch2_view<SG_D(4)>(hi, lo)); pp[5] = ch2_mul16_hi(ch2_view<SG_D(5)>(hi, lo));
             pp[6] = ch2_mul16_hi(ch2_view<SG_D(6)>(hi, lo)); pp[7] = ch2_mul16_hi(ch2_view<SG_D(7)>(hi, lo));
+            CH2_ACCUM8();
         }
-#undef SG_D
-        const float2 xa = *(const float2*)&xs[kb], xc = *(const float2*)&xs[kb + 8];
-        float f[8];
-#pragma unroll
-        for (int j = 0; j < 8; ++j) f[j] = ch2_bs_f32(pp[j]);
-        a0 = fmaf(xa.x, f[0], a0); a0 = fmaf(xa.y, f[1], a0); a0 = fmaf(xc.x, f[2], a0); a0 = fmaf(xc.y, f[3], a0);
-        a1 = fmaf(xa.x, f[4], a1); a1 = fmaf(xa.y, f[5], a1); a1 = fmaf(xc.x, f[6], a1); a1 = fmaf(xc.y, f[7], a1);
     }
+#undef CH2_ACCUM8
+#undef SG_D
 }
 
 template <int KA, int H>

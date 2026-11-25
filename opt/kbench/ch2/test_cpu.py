@@ -116,6 +116,29 @@ def test_random_tiles():
     print(f"ch2 cpu tile GEMV exactness: cases={cases} PASS")
 
 
+def test_top32_shuffle_donors():
+    cases = 0
+    for ka, h in ((1, 1), (2, 0)):
+        nw = 8 * ka + 4 * h
+        rbits = 32 * nw
+        for lane in range(32):
+            base = (8 * lane + 1) * ka + ((8 * lane + 1) >> 1 if h else 0) - 16
+            if base < 0:
+                base += rbits
+            w0 = base >> 5
+            if ka == 2:
+                donor = (lane + 2) & 31
+            else:
+                donor = ((lane + 1) if (lane & 7) == 1 else (lane + 3)) & 31
+            dbase = (8 * donor + 1) * ka + ((8 * donor + 1) >> 1 if h else 0) - 16
+            if dbase < 0:
+                dbase += rbits
+            if (dbase >> 5) != (w0 + 1) % nw:
+                raise SystemExit(f"shuffle donor mismatch ka={ka} h={h} lane={lane}")
+            cases += 1
+    print(f"ch2 top32 shuffle donors: cases={cases} PASS")
+
+
 def main():
     rng = random.Random(20250308)
     nview = nprod = 0
@@ -143,6 +166,7 @@ def main():
     print(f"ch2 cpu exactness: view_cases={nview} product_cases={nprod} PASS")
     test_top32_rotate_views()
     test_random_tiles()
+    test_top32_shuffle_donors()
 
 
 if __name__ == "__main__":
