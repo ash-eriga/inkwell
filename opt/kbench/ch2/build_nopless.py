@@ -85,9 +85,9 @@ SHIFT_SETS = {
     frozenset((4, 8, 12, 16, 20, 24, 28)): 'K4',
 }
 # Per-K loop shape without NOPs: (instructions, SHF, LDG). K1.5/K2 use the TOP32
-# two-word stream (one fewer LDG per tile and no lo funnel shift).
+# two-word stream with W1 from a donor lane via SHFL.IDX (one LDG stream, no lo shift).
 LOOP_SHAPE = {
-    'K1.5': (233, 32, 8), 'K2': (233, 32, 8),
+    'K1.5': (225, 32, 4), 'K2': (225, 32, 4),
     'K2.5': (248, 36, 12), 'K3': (248, 36, 12), 'K3.5': (248, 36, 12), 'K4': (249, 36, 12),
 }
 
@@ -248,7 +248,7 @@ def generate(obj, outcubin, workdir, cuda_home):
     shutil.copyfile(unpatched, patched)
     pout = run([str(venvpy), str(ch2 / 'patch_sass.py'), str(patched), str(cuobj)], workdir, workdir / 'patch.log', env, capture=True)
     pm = re.search(r'fake=(\d+) lp=(\d+) words=(\d+) hi_d12d=(\d+)', pout)
-    if not pm or tuple(map(int, pm.groups())) != (463, 465, 1646, 470):
+    if not pm or tuple(map(int, pm.groups())) != (463, 465, 1806, 470):
         raise Ch2Fail('patched-with-NOPs baseline pattern mismatch: ' + (pout.strip() or 'no patch output'))
     sassp = run([str(cuobj), '-sass', str(patched)], workdir, workdir / 'patched.sass.stdout', env, capture=True)
     (workdir / 'kernels_patched_nops.sass').write_text(sassp)
