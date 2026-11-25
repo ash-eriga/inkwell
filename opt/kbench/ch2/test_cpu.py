@@ -60,6 +60,37 @@ def ring_window(words, start):
     return v
 
 
+def test_top32_rotate_views():
+    rng = random.Random(661177)
+    cases = 0
+    for _ in range(20000):
+        hi = rng.getrandbits(32)
+        lo = rng.getrandbits(32)
+        for ka, h in ((1, 1), (2, 0)):
+            for j in range(8):
+                d = j * ka + h * ((j + 1) >> 1)
+                rot = ((hi << d) | (hi >> ((32 - d) & 31))) & MASK
+                if (rot >> 16) != (ch2_view(d, hi, lo) >> 16):
+                    raise SystemExit(f"top32 rotate mismatch ka={ka} h={h} j={j}")
+                cases += 1
+    print(f"ch2 top32 rotate views: cases={cases} PASS")
+
+
+def test_ch2_xvec_permutation():
+    perm = [4 * ((r & 7) >> 1) + (r & 1) + (2 if r & 8 else 0) for r in range(16)]
+    if sorted(perm) != list(range(16)):
+        raise SystemExit("xvec permutation is not a bijection")
+    for t3 in range(4):
+        r0 = 2 * t3
+        got = [None] * 4
+        for r, p in enumerate(perm):
+            if p >= 4 * t3 and p < 4 * t3 + 4:
+                got[p - 4 * t3] = r
+        if got != [r0, r0 + 1, r0 + 8, r0 + 9]:
+            raise SystemExit(f"xvec group mismatch t3={t3}: {got}")
+    print("ch2 xvec permutation: groups=4 PASS")
+
+
 def test_random_tiles():
     rng = random.Random(918273)
     cases = 0
@@ -125,6 +156,8 @@ def main():
             raise SystemExit("bytesum mismatch")
         nprod += 1
     print(f"ch2 cpu exactness: view_cases={nview} product_cases={nprod} PASS")
+    test_top32_rotate_views()
+    test_ch2_xvec_permutation()
     test_random_tiles()
 
 

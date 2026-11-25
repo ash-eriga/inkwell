@@ -8,6 +8,7 @@ transferred backward to the previous surviving instruction.  Wait masks gate
 the instruction carrying them, so they are transferred forward to the next
 surviving instruction.
 """
+import json
 import re
 import sys
 
@@ -19,6 +20,8 @@ RANGES = [
     (0x196b8, 0x1a250, 'K2.5'), (0x1b780, 0x1c318, 'K3'),
     (0x1d7f0, 0x1e388, 'K3.5'), (0x20c00, 0x217a8, 'K4'),
 ]
+if len(sys.argv) > 3:
+    RANGES = [(r['start'], r['end'], r['k']) for r in json.load(open(sys.argv[3]))]
 ins_re = re.compile(r'^(?P<prefix>\s*\[(?P<ctrl>[^\]]+)\])(?P<rest>.*?/\*(?P<addr>[0-9a-f]{4,})\*/\s*(?P<ins>.*)$)')
 lines = open(inp).read().splitlines(keepends=True)
 # Locate target text section end.

@@ -34,12 +34,13 @@ cp kernels_unpatched.sm_61.cubin kernels_patched_nops.sm_61.cubin
 python3 "$CH2/patch_sass.py" kernels_patched_nops.sm_61.cubin "$CUOBJ"
 "$CUOBJ" -sass kernels_patched_nops.sm_61.cubin > kernels_patched_nops.sass
 python3 "$CH2/count_loops.py" kernels_patched_nops.sass > count_patched_nops.txt
+python3 "$CH2/reasm_loop_ranges.py" kernels_patched_nops.sass loop_ranges.json > loop_ranges.txt
 PATH="$CUDA/bin:$PATH" PYTHONPATH="$CUASMROOT" \
   "$VENVPY" "$CUASMROOT/bin/cuasm.py" kernels_patched_nops.sm_61.cubin \
   -o kernels_patched_nops.cuasm
 
 # 4. Delete the 32 retired-XMAD NOPs in each main K=1.5..4 loop.
-python3 "$CH2/reasm_remove_loop_nops.py" kernels_patched_nops.cuasm kernels_nopless.cuasm
+python3 "$CH2/reasm_remove_loop_nops.py" kernels_patched_nops.cuasm kernels_nopless.cuasm loop_ranges.json
 
 # 5. Assemble with the augmented repository and count the timed cubin's loops.
 PYTHONPATH="$CUASMROOT" "$VENVPY" \
