@@ -15,7 +15,7 @@ SHIFT_SETS = {
 CLASS = {
     "LDG": "load-global", "LDS": "load-shared", "SHF": "extract", "SHL": "extract",
     "PRMT": "extract", "LOP3": "extract", "XMAD": "product", "IDP": "bytesum",
-    "I2F": "convert", "FADD": "convert", "FFMA": "accumulate",
+    "I2F": "convert", "FADD": "convert", "FFMA": "accumulate", "SHFL": "shuffle",
     "IADD": "address/loop", "IADD32I": "address/loop", "ISETP": "address/loop",
     "BRA": "address/loop", "DEPBAR": "control", "NOP": "nop", "MOV": "other",
 }
@@ -58,7 +58,7 @@ for row in rows:
 if len(out) != 6:
     raise SystemExit(f"expected six CH2 loops, got {[(hex(r[0]), hex(r[1])) for r in out]}")
 
-print(f"{'K':5} {'total':>5} {'core':>4} {'extr':>4} {'ldg':>3} {'lds':>3} {'addr':>4} {'ctl':>3} {'oth':>3} {'ins/w':>6}")
+print(f"{'K':5} {'total':>5} {'core':>4} {'extr':>4} {'ldg':>3} {'lds':>3} {'shfl':>4} {'addr':>4} {'ctl':>3} {'oth':>3} {'ins/w':>6}")
 for lo, hi, name, body in out:
     cls = Counter(CLASS.get(o, "other") for _, o, _ in body)
     core = cls["product"] + cls["bytesum"] + cls["convert"] + cls["accumulate"]
