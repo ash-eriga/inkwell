@@ -1268,31 +1268,34 @@ extern "C" void ink_launch_pf_rmsnorm(float* x, const float* w, int rows, int n,
 
 extern "C" __global__ void inkwell_pf_clip_heads(float* __restrict__ x,
         const float* __restrict__ scale, int C, int heads, int d, float thr) {
-    __shared__ float sm[128];
+    __shared__ float sm[16];
     const int row = blockIdx.x; // C*heads rows
     const int tid = threadIdx.x;
     float* xr = x + (size_t)row * d;
     const float* sr = scale ? scale + (size_t)(row % heads) * d : nullptr;
-    float ss = 0.f;
-    for (int i = tid; i < d; i += blockDim.x) {
-        const float v = xr[i] * (sr ? sr[i] : 1.f);
-        ss = fmaf(v, v, ss);
+    float cv = 0.f;
+    if (tid < d) {
+        cv = xr[tid];
+        if (sr) cv *= sr[tid];
     }
-    sm[tid] = ss;
+    float v = cv * cv;
+    for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    if ((tid & 31) == 0) sm[tid >> 5] = v;
     __syncthreads();
-    for (int s = blockDim.x / 2; s; s >>= 1) {
-        if (tid < s) sm[tid] += sm[tid + s];
-        __syncthreads();
+    if (tid == 0) {
+        float nsum = sm[0];
+        for (int j = 1; j < 8; ++j) nsum += sm[j];
+        sm[8] = fminf(1.f, thr / (sqrtf(nsum) + 1e-6f));
     }
-    const float norm = sqrtf(sm[0]) + 1e-6f;
-    const float f = fminf(1.f, thr / norm);
-    for (int i = tid; i < d; i += blockDim.x) xr[i] = xr[i] * (sr ? sr[i] : 1.f) * f;
+    __syncthreads();
+    const float f = sm[8];
+    if (tid < d) xr[tid] = cv * f;
     (void)C;
 }
 
 extern "C" void ink_launch_pf_clip_heads(float* x, const float* scale, int C, int heads,
         int d, float thr, void* stream) {
-    inkwell_pf_clip_heads<<<C * heads, 128, 0, (cudaStream_t)stream>>>(x, scale, C, heads, d, thr);
+    inkwell_pf_clip_heads<<<C * heads, 256, 0, (cudaStream_t)stream>>>(x, scale, C, heads, d, thr);
 }
 
 extern "C" __global__ void inkwell_pf_add(float* __restrict__ x, const float* __restrict__ y, long long n) {
@@ -1540,7 +1543,7 @@ extern "C" __global__ void inkwell_pf_router8(const float* __restrict__ logits,
     bool used[128];
     for (int e = 0; e < 128; ++e) {
         const float z = logits[(size_t)t * 128 + e];
-        prob[e] = 1.f / (1.f + expf(-z));
+        prob[e] = 1.f / (1.f + __expf(-z));
         used[e] = false;
     }
     float sum = 0.f;
@@ -1556,9 +1559,10 @@ extern "C" __global__ void inkwell_pf_router8(const float* __restrict__ logits,
         sum += prob[best];
     }
     sum = fmaxf(sum, wfloor);
+    const float inv = wscale / sum;
     for (int j = 0; j < 8; ++j) {
         ids[t * 8 + j] = idv[j];
-        weights[t * 8 + j] = prob[idv[j]] / sum * wscale;
+        weights[t * 8 + j] = prob[idv[j]] * inv;
     }
 }
 
