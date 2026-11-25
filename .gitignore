@@ -12,3 +12,6 @@ opt/splitk-gate/artifacts/
 opt/splitk-gate/bin/
 __pycache__/
 *.pyc
+
+opt/kbench/kslot_gold
+opt/kbench/kslot_replay

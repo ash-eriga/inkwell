@@ -1821,3 +1821,19 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 ## 7afd673 — ccopy bulk grid 2 parts per (slot, proj) — ACCEPTED, merged (32dd91d)
 - A/B 16 pairs vs pre-ccopy master: CTL 32.311 vs CAND 31.696 ms/tok median (−0.615), 15/16 wins, md5 5cbe8e06 all runs.
 - Post-merge master (donor + ccopy) 3 runs: 32.139 / 31.662 / 31.502 ms/tok, md5 5cbe8e06 ×3. Killswitch-equivalent: INKWELL_CCOPY_PARTS=1.
+
+## 2026-11-24 — warp-parallel kslot resolve (worktree t3-dd0e9b83)
+
+- `inkwell_exl3_kslot_resolve_w`: one warp stages tags, slot offsets and the live free-list in shared memory. Hit lookup, first-fit, free-list shifts and victim min-count scans use warp ballots/reductions; miss processing remains in serial selection order. `INKWELL_NO_RESOLVE_WARP=1` restores the serial kernel; `kmax > 64` also takes the serial path.
+- Correctness: `opt/kbench/kslot_gold` compared every mutable state word after each of **22,004 calls** (4 edge, 11,000 random-valid, 11,000 real-trace): bit-identical. Mix: pf 2,137, force_direct 1,220, hm=null 1,111, pnexp 2,583, kmax>64 fallback 1,512. L16 microbench in the harness: serial 13.45 us, warp 6.05 us per launch.
+- nsys (`--cuda-graph-trace=node`, 1,224 launches): serial avg **67.10 us**, median 52.15 us, total 82.134 ms; warp avg **19.64 us**, median 17.15 us, total 24.042 ms. Kernel saving ≈58.1 ms/run ≈0.91 ms/token.
+- Final A/B on master 1218f58 (ctl = `INKWELL_NO_RESOLVE_WARP=1`, ctl,cand,cand,ctl ×8):
+  - ctl: 38.12 39.18 37.81 40.47 40.69 38.54 38.85 37.78 37.81 37.67 37.79 37.77 38.20 38.03 37.73 37.32 ms/tok
+  - cand: 37.18 37.42 37.24 39.80 39.47 39.34 41.08 37.54 38.02 36.92 36.45 37.52 36.95 36.64 37.30 37.07 ms/tok
+  - median ctl **37.92**, cand **37.36**, diff **−0.56 ms/tok**; pair wins **13/16**; md5 **5cbe8e06** on all 32 runs.
+- Verdict: **ACCEPTED** by the E2E bar. The median kernel time (17.15 us) is still above the stretch target of ~10–15 us. A shared-memory count-table variant was tested and reverted: it slowed the production kernel to 19.98 us avg/19.02 us median.
+- warnings 63; kernels.cu 5,237 lines. Implementation commits 74c8176 through 2e53abb on `t3/warp-parallel-kslot-resolve-1`.
+
+## t3/kslot-warp-retry — warp-parallel kslot resolve — ACCEPTED, merged
+- Retry of b28547b (earlier 11/16 on noisy host). A/B 16 pairs vs master 4e7e6d5: CTL 30.851 vs CAND 30.316 ms/tok median (−0.534), 15/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB.
+- Killswitch: INKWELL_NO_RESOLVE_WARP=1.

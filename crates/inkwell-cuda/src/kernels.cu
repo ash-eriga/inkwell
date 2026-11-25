@@ -3906,7 +3906,6 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
         ++cnt[e];
         int v = -1;
         for (int j = 0; j < k; ++j) if (tag[j] == e) { v = j; break; }
-        int m = 0;
         if (v < 0 && pf) {
             for (int p2 = 0; p2 < nslots; ++p2)
                 if (ptag[p2] == e) { v = EXL3_PF_BASE + p2; if (pf_hit) atomicAdd(pf_hit, 1); break; }
@@ -3953,7 +3952,10 @@ __global__ void inkwell_exl3_cache_resolve(const int* __restrict__ ids,
 // fl = free-extent list: fl[0]=n, then (base,len) i32 pairs sorted by base.
 #define KSLOT_GRAN 6912
 #define KSLOT_FLMAX 256  // > 3*64 max extents + 1
-__global__ void inkwell_exl3_kslot_resolve(const int* __restrict__ ids,
+// Serial reference body, shared by the legacy kernel and as the fallback
+// path of the warp variant (kmax or nslots beyond the shared tables).
+static __device__ __noinline__ void kslot_resolve_serial(
+        const int* __restrict__ ids,
         int* __restrict__ tag, uint64_t* __restrict__ soff,
         int* __restrict__ map, int* __restrict__ miss,
         int* __restrict__ cnt, int nslots, int kmax,
@@ -3961,7 +3963,6 @@ __global__ void inkwell_exl3_kslot_resolve(const int* __restrict__ ids,
         const int* __restrict__ ptag, const int* __restrict__ pready,
         int* __restrict__ pf_hit, const int* __restrict__ pnexp,
         int key_base, int force_direct, int* __restrict__ hm) {
-    if (threadIdx.x != 0) return;
     if (pnexp) nslots = *pnexp;
     const int pf = pready ? *pready : 0;
     unsigned long long claimed = 0;
@@ -4052,6 +4053,306 @@ __global__ void inkwell_exl3_kslot_resolve(const int* __restrict__ ids,
 #undef KS_FIT
 #undef KS_ALLOC
 #undef KS_FREE
+}
+
+__global__ void inkwell_exl3_kslot_resolve(const int* __restrict__ ids,
+        int* __restrict__ tag, uint64_t* __restrict__ soff,
+        int* __restrict__ map, int* __restrict__ miss,
+        int* __restrict__ cnt, int nslots, int kmax,
+        const int* __restrict__ gexp, int* __restrict__ fl,
+        const int* __restrict__ ptag, const int* __restrict__ pready,
+        int* __restrict__ pf_hit, const int* __restrict__ pnexp,
+        int key_base, int force_direct, int* __restrict__ hm) {
+    if (threadIdx.x != 0) return;
+    kslot_resolve_serial(ids, tag, soff, map, miss, cnt, nslots, kmax,
+        gexp, fl, ptag, pready, pf_hit, pnexp, key_base, force_direct, hm);
+}
+
+// Sorted-insert (base,len) into the free-extent list kept in shared memory,
+// applying the same single predecessor-merge then successor-merge as the
+// serial KS_FREE. Returns the new nfl. Called under uniform control flow.
+static __device__ int ks_free_w(int* flb, int* fln, int nfl, int base, int len) {
+    const int lane = threadIdx.x & 31;
+    int q = nfl;
+    for (int c = 0; c < nfl && q == nfl; c += 32) {
+        const int i = c + lane;
+        const unsigned m = __ballot_sync(0xffffffffu, i < nfl && flb[i] >= base);
+        if (m) q = c + __ffs(m) - 1;
+    }
+    // shift [q, nfl) up one — highest chunk first so a lane never reads an
+    // element a previous chunk already overwrote
+    if (nfl > q)
+        for (int d0 = q + 1 + ((nfl - q - 1) / 32) * 32; d0 >= q + 1; d0 -= 32) {
+            const int d = d0 + lane;
+            int rb = 0, rn = 0;
+            const bool act = d <= nfl;
+            if (act) { rb = flb[d - 1]; rn = fln[d - 1]; }
+            __syncwarp();
+            if (act) { flb[d] = rb; fln[d] = rn; }
+            __syncwarp();
+        }
+    if (lane == 0) { flb[q] = base; fln[q] = len; }
+    __syncwarp();
+    ++nfl;
+    if (q > 0 && flb[q - 1] + fln[q - 1] == flb[q]) {
+        if (lane == 0) fln[q - 1] += fln[q];
+        __syncwarp();
+        for (int r0 = q; r0 + 1 < nfl; r0 += 32) {
+            const int r = r0 + lane;
+            int rb = 0, rn = 0;
+            const bool act = r + 1 < nfl;
+            if (act) { rb = flb[r + 1]; rn = fln[r + 1]; }
+            __syncwarp();
+            if (act) { flb[r] = rb; fln[r] = rn; }
+            __syncwarp();
+        }
+        --nfl;
+        --q;
+    }
+    if (q + 1 < nfl && flb[q] + fln[q] == flb[q + 1]) {
+        if (lane == 0) fln[q] += fln[q + 1];
+        __syncwarp();
+        for (int r0 = q + 1; r0 + 1 < nfl; r0 += 32) {
+            const int r = r0 + lane;
+            int rb = 0, rn = 0;
+            const bool act = r + 1 < nfl;
+            if (act) { rb = flb[r + 1]; rn = fln[r + 1]; }
+            __syncwarp();
+            if (act) { flb[r] = rb; fln[r] = rn; }
+            __syncwarp();
+        }
+        --nfl;
+    }
+    return nfl;
+}
+
+// Warp-parallel kslot resolve: identical cache decisions and state to
+// kslot_resolve_serial. One warp stages tag/cnt/free-list/offsets in shared
+// memory; tag searches, first-fit, eviction argmin and free-list shifts are
+// ballots/reductions instead of serial global scans. KSLOT_WARP_KMAX bounds
+// the shared tables and the u64 claimed mask — widen with the tables if kmax
+// ever grows past 64. Anything larger (or a block bigger than a warp) takes
+// the serial path on thread 0.
+#define KSLOT_WARP_KMAX 64
+__global__ void inkwell_exl3_kslot_resolve_w(const int* __restrict__ ids,
+        int* __restrict__ tag, uint64_t* __restrict__ soff,
+        int* __restrict__ map, int* __restrict__ miss,
+        int* __restrict__ cnt, int nslots, int kmax,
+        const int* __restrict__ gexp, int* __restrict__ fl,
+        const int* __restrict__ ptag, const int* __restrict__ pready,
+        int* __restrict__ pf_hit, const int* __restrict__ pnexp,
+        int key_base, int force_direct, int* __restrict__ hm) {
+    const int lane = threadIdx.x & 31;
+    const int ns = pnexp ? *pnexp : nslots;
+    if (kmax > KSLOT_WARP_KMAX || ns > KSLOT_WARP_KMAX || threadIdx.x >= 32) {
+        if (threadIdx.x == 0)
+            kslot_resolve_serial(ids, tag, soff, map, miss, cnt, nslots, kmax,
+                gexp, fl, ptag, pready, pf_hit, pnexp, key_base, force_direct, hm);
+        return;
+    }
+    nslots = ns;
+    const int pf = pready ? *pready : 0;
+    __shared__ int st_tag[KSLOT_WARP_KMAX];
+    __shared__ int st_scnt[KSLOT_WARP_KMAX];
+    __shared__ int st_sg[3 * KSLOT_WARP_KMAX];   // soff in granules
+    __shared__ int st_fl[2 * KSLOT_FLMAX + 1];   // mirrors fl: n,bases,lens
+    __shared__ int st_ids[KSLOT_WARP_KMAX];
+    __shared__ int st_ptag[KSLOT_WARP_KMAX];
+    int* const st_flb = st_fl + 1;
+    int* const st_fln = st_fl + 1 + KSLOT_FLMAX;
+
+    for (int j = lane; j < kmax; j += 32) st_tag[j] = tag[j];
+    for (int i = lane; i < 3 * kmax; i += 32)
+        st_sg[i] = (int)(soff[i] / KSLOT_GRAN);
+    for (int s = lane; s < nslots; s += 32) st_ids[s] = ids[s];
+    if (pf)
+        for (int s = lane; s < nslots; s += 32) st_ptag[s] = ptag[s];
+    int nfl = fl[0];
+    int flhi = nfl;
+    for (int i = lane; i < nfl; i += 32) {
+        st_flb[i] = fl[1 + i];
+        st_fln[i] = fl[1 + KSLOT_FLMAX + i];
+    }
+    __syncwarp();
+
+    unsigned long long claimed = 0, missmask = 0;
+    int nhits = 0, nbank = 0, nreal = 0;
+    // Count increments are commutative and all complete before the first
+    // victim scan, so issue them across the warp instead of serially on lane 0.
+    for (int s = lane; s < nslots; s += 32)
+        atomicAdd(cnt + st_ids[s] + key_base, 1);
+    // pass 1: tag/bank hits. tag is read-only here, so each selection's
+    // first-match search is one ballot round per 32 slots — the lowest set
+    // lane reproduces the serial loop's break-on-first-match.
+    for (int s = 0; s < nslots; ++s) {
+        const int e = st_ids[s] + key_base;
+        int v = -1;
+        for (int c = 0; c < kmax && v < 0; c += 32) {
+            const int j = c + lane;
+            const unsigned m = __ballot_sync(0xffffffffu, j < kmax && st_tag[j] == e);
+            if (m) v = c + __ffs(m) - 1;
+        }
+        if (v < 0 && pf) {
+            for (int c = 0; c < nslots && v < 0; c += 32) {
+                const int p2 = c + lane;
+                const unsigned m =
+                    __ballot_sync(0xffffffffu, p2 < nslots && st_ptag[p2] == e);
+                if (m) { v = EXL3_PF_BASE + c + __ffs(m) - 1; ++nbank; }
+            }
+        }
+        if (lane == (s & 31)) {
+            if (v >= 0) { miss[s] = 0; map[s] = v; }
+            else        { miss[s] = 1; map[s] = -1; }
+        }
+        if (v >= 0) {
+            ++nhits;
+            if (v < kmax) claimed |= 1ULL << v;
+        } else {
+            missmask |= 1ULL << s;
+        }
+    }
+    __syncwarp();
+    // cnt is only updated in pass 1, so one snapshot covers every pass-2
+    // eviction scan (victims keep their call-start tag; reassigned slots are
+    // claimed and never scanned).
+    for (int j = lane; j < kmax; j += 32) {
+        const int t = st_tag[j];
+        st_scnt[j] = (t >= 0) ? atomicAdd(cnt + t, 0) : 0;
+    }
+    __syncwarp();
+
+    // pass 2: per miss, first free slot + 3 extents; evict global-least-used
+    // unclaimed residents until they fit; DIRECT when nothing is left.
+    for (int s = 0; s < nslots; ++s) {
+        if (!(missmask & (1ULL << s))) continue;
+        const int e = st_ids[s] + key_base;
+        int v = -1;
+        for (int c = 0; c < kmax && v < 0; c += 32) {
+            const int j = c + lane;
+            const unsigned m = __ballot_sync(0xffffffffu, j < kmax && st_tag[j] < 0);
+            if (m) v = c + __ffs(m) - 1;
+        }
+        int got[3];
+        int ng = 0;
+        for (;;) {
+            while (v >= 0 && ng < 3) {
+                const int need = gexp[st_ids[s] * 3 + ng];
+                int fi = -1;
+                for (int c = 0; c < nfl && fi < 0; c += 32) {
+                    const int q = c + lane;
+                    const unsigned m =
+                        __ballot_sync(0xffffffffu, q < nfl && st_fln[q] >= need);
+                    if (m) fi = c + __ffs(m) - 1;
+                }
+                if (fi < 0) break;
+                const int base = st_flb[fi];
+                __syncwarp();
+                if (lane == 0) { st_flb[fi] += need; st_fln[fi] -= need; }
+                __syncwarp();
+                if (st_fln[fi] == 0) {
+                    for (int q0 = fi; q0 + 1 < nfl; q0 += 32) {
+                        const int q = q0 + lane;
+                        int rb = 0, rn = 0;
+                        const bool act = q + 1 < nfl;
+                        if (act) { rb = st_flb[q + 1]; rn = st_fln[q + 1]; }
+                        __syncwarp();
+                        if (act) { st_flb[q] = rb; st_fln[q] = rn; }
+                        __syncwarp();
+                    }
+                    --nfl;
+                }
+                got[ng++] = base;
+            }
+            if (v >= 0 && ng == 3) break;
+            // lowest-cnt unclaimed resident; strict-< upward scan -> lowest
+            // j wins ties. Slots at cnt==INT_MAX can't win in the serial code
+            // either (c<bestc starts at 0x7fffffff), so they are ineligible.
+            int bestc = 0x7fffffff, bj = -1;
+            for (int c = 0; c < kmax; c += 32) {
+                const int j = c + lane;
+                const bool ok = j < kmax && !(claimed & (1ULL << j))
+                    && st_tag[j] >= 0 && st_scnt[j] < 0x7fffffff;
+                int cv = ok ? st_scnt[j] : 0x7fffffff;
+                for (int o = 16; o; o >>= 1)
+                    cv = min(cv, __shfl_xor_sync(0xffffffffu, cv, o));
+                const unsigned m = __ballot_sync(0xffffffffu, ok && st_scnt[j] == cv);
+                if (m) {
+                    const int cj = c + __ffs(m) - 1;
+                    if (cv < bestc || (cv == bestc && (bj < 0 || cj < bj))) {
+                        bestc = cv;
+                        bj = cj;
+                    }
+                }
+            }
+            if (bj < 0) break;
+            const int tv = st_tag[bj];
+            for (int p = 0; p < 3; ++p) {
+                flhi = max(flhi, nfl + 1);
+                nfl = ks_free_w(st_flb, st_fln, nfl,
+                                st_sg[bj * 3 + p], gexp[tv * 3 + p]);
+            }
+            if (lane == 0) st_tag[bj] = -1;
+            __syncwarp();
+            if (v < 0) v = bj;
+        }
+        if (v < 0 || ng < 3 || force_direct) {
+            while (ng > 0) {
+                --ng;
+                flhi = max(flhi, nfl + 1);
+                nfl = ks_free_w(st_flb, st_fln, nfl, got[ng],
+                                gexp[st_ids[s] * 3 + ng]);
+            }
+            if (lane == (s & 31)) map[s] = EXL3_DIRECT;
+            continue;
+        }
+        claimed |= 1ULL << v;
+        if (lane == 0) st_tag[v] = e;
+        if (lane < 3)
+            soff[v * 3 + lane] = (uint64_t)got[lane] * KSLOT_GRAN;
+        if (lane == (s & 31)) map[s] = v;
+        ++nreal;
+        __syncwarp();
+    }
+    // write state back. Free-list entries at or beyond flhi were never
+    // touched, so leaving them in place preserves even the serial stale tail.
+    for (int j = lane; j < kmax; j += 32) tag[j] = st_tag[j];
+    for (int i = lane; i < flhi; i += 32) {
+        fl[1 + i] = st_flb[i];
+        fl[1 + KSLOT_FLMAX + i] = st_fln[i];
+    }
+    if (lane == 0) {
+        fl[0] = nfl;
+        if (hm) { atomicAdd(hm, nhits); atomicAdd(hm + 1, nslots - nhits); }
+        if (pf_hit) {
+            if (nbank) atomicAdd(pf_hit, nbank);
+            if (nreal) atomicAdd(pf_hit + 1, nreal);
+        }
+    }
+}
+
+// Launch the kslot resolve: warp kernel by default (identical decisions),
+// serial kernel under INKWELL_NO_RESOLVE_WARP=1 or when kmax exceeds the
+// shared tables (the warp kernel would fall back anyway; skipping it saves
+// the redundant launch).
+static inline void launch_kslot_resolve(cudaStream_t st, const int* ids,
+        int* tag, uint64_t* soff, int* map, int* miss, int* cnt,
+        int nslots, int kmax, const int* gexp, int* fl, const int* ptag,
+        const int* pready, int* pf_hit, const int* pnexp, int key_base,
+        int* hm) {
+    static int no_warp = -1;
+    if (no_warp < 0) {
+        const char* e = getenv("INKWELL_NO_RESOLVE_WARP");
+        no_warp = (e && atoi(e)) ? 1 : 0;
+    }
+    const int fd = getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0;
+    if (!no_warp && kmax <= 64)
+        inkwell_exl3_kslot_resolve_w<<<1, 32, 0, st>>>(ids, tag, soff, map,
+            miss, cnt, nslots, kmax, gexp, fl, ptag, pready, pf_hit, pnexp,
+            key_base, fd, hm);
+    else
+        inkwell_exl3_kslot_resolve<<<1, 32, 0, st>>>(ids, tag, soff, map,
+            miss, cnt, nslots, kmax, gexp, fl, ptag, pready, pf_hit, pnexp,
+            key_base, fd, hm);
 }
 
 // Copy missing experts into their cache slots and (always) point the staged
@@ -4377,10 +4678,10 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     static int skip_cc = -1;
     if (skip_cc < 0) { const char* e = getenv("INKWELL_SKIP_CCOPY"); skip_cc = e ? atoi(e) : 0; }
     if (soff) {
-        inkwell_exl3_kslot_resolve<<<1, 32, 0, st>>>(ids,
+        launch_kslot_resolve(st, ids,
             (int*)tag, (uint64_t*)soff, (int*)map, (int*)miss, (int*)cnt, nslots, k,
-            gexp, fl, (const int*)ptag, (const int*)pready, pf_hit, nullptr, 0,
-            getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+            (const int*)gexp, (int*)fl, (const int*)ptag, (const int*)pready,
+            pf_hit, nullptr, 0, (int*)hm);
     } else {
         inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(ids,
             (int*)tag, (int*)map, (int*)miss, (int*)cnt, nslots, k,
@@ -4876,10 +5177,10 @@ extern "C" void ink_launch_exl3_moe_ntok(
     if (skip_cc < 0) { const char* e = getenv("INKWELL_SKIP_CCOPY"); skip_cc = e ? atoi(e) : 0; }
     if (cached) {
         if (soff) {
-            inkwell_exl3_kslot_resolve<<<1, 32, 0, st>>>(uids,
+            launch_kslot_resolve(st, uids,
                 tag, (uint64_t*)soff, map, miss, cnt, nexp, k,
                 gexp, fl, nullptr, nullptr, nullptr, unexp,
-                key_base, getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
+                key_base, hm);
         } else {
             inkwell_exl3_cache_resolve<<<1, 32, 0, st>>>(uids,
                 tag, map, miss, cnt, nexp, k, nullptr, nullptr, nullptr, unexp,
