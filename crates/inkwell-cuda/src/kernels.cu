@@ -3258,12 +3258,12 @@ __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn,
             pp[6] = ch2_mul16_hi(ch2_view<SG_D(6)>(hi, lo)); pp[7] = ch2_mul16_hi(ch2_view<SG_D(7)>(hi, lo));
         }
 #undef SG_D
-        const float4 xv = *(const float4*)&xs[a * 16 + (t & 3) * 4];
+        const float2 xa = *(const float2*)&xs[kb], xc = *(const float2*)&xs[kb + 8];
         float f[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) f[j] = ch2_bs_f32(pp[j]);
-        a0 = fmaf(xv.x, f[0], a0); a0 = fmaf(xv.y, f[1], a0); a0 = fmaf(xv.z, f[2], a0); a0 = fmaf(xv.w, f[3], a0);
-        a1 = fmaf(xv.x, f[4], a1); a1 = fmaf(xv.y, f[5], a1); a1 = fmaf(xv.z, f[6], a1); a1 = fmaf(xv.w, f[7], a1);
+        a0 = fmaf(xa.x, f[0], a0); a0 = fmaf(xa.y, f[1], a0); a0 = fmaf(xc.x, f[2], a0); a0 = fmaf(xc.y, f[3], a0);
+        a1 = fmaf(xa.x, f[4], a1); a1 = fmaf(xa.y, f[5], a1); a1 = fmaf(xc.x, f[6], a1); a1 = fmaf(xc.y, f[7], a1);
     }
 }
 
@@ -3339,7 +3339,6 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_moe_s(
         const float v = xg[e];
         sxl += v;
         if (pw) { const int r = e & 15; xs[(e & ~15) + ((r & 4) ? 8 : 0) + ((r & 8) ? 4 : 0) + (r & 3)] = v; }
-        else if (ch2) { const int r = e & 15; xs[(e & ~15) + 4 * ((r & 7) >> 1) + (r & 1) + ((r & 8) ? 2 : 0)] = v; }
         else xs[e] = v;
     }
 #pragma unroll

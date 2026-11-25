@@ -76,21 +76,6 @@ def test_top32_rotate_views():
     print(f"ch2 top32 rotate views: cases={cases} PASS")
 
 
-def test_ch2_xvec_permutation():
-    perm = [4 * ((r & 7) >> 1) + (r & 1) + (2 if r & 8 else 0) for r in range(16)]
-    if sorted(perm) != list(range(16)):
-        raise SystemExit("xvec permutation is not a bijection")
-    for t3 in range(4):
-        r0 = 2 * t3
-        got = [None] * 4
-        for r, p in enumerate(perm):
-            if p >= 4 * t3 and p < 4 * t3 + 4:
-                got[p - 4 * t3] = r
-        if got != [r0, r0 + 1, r0 + 8, r0 + 9]:
-            raise SystemExit(f"xvec group mismatch t3={t3}: {got}")
-    print("ch2 xvec permutation: groups=4 PASS")
-
-
 def test_random_tiles():
     rng = random.Random(918273)
     cases = 0
@@ -157,7 +142,6 @@ def main():
         nprod += 1
     print(f"ch2 cpu exactness: view_cases={nview} product_cases={nprod} PASS")
     test_top32_rotate_views()
-    test_ch2_xvec_permutation()
     test_random_tiles()
 
 
