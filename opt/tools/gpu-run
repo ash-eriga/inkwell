@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# gpu-run: fair (FIFO-per-priority) queue in front of the shared GPU lock.
+#
+#   gpu-run [-p high|normal|low] [-t tag] [--] cmd args...
+#   gpu-run -q            # show the queue
+#
+# high   = orchestrator validation / A/B
+# normal = agent gates, microbenchmarks, md5 checks (default)
+# low    = long studies (KLD sweeps, 4K+/32K runs)
+#
+# Jobs run in order (priority, then arrival). The head of the queue still takes
+# /tmp/inkwell-gpu.lock with flock, so legacy `flock /tmp/inkwell-gpu.lock` users
+# stay mutually exclusive with it. Every command runs under `nice -n 19`.
+set -u
+Q=${GPU_RUN_Q:-/tmp/inkwell-gpuq}
+LOCK=${GPU_RUN_LOCK:-/tmp/inkwell-gpu.lock}
+mkdir -p "$Q"
+
+if [ "${1:-}" = "-q" ]; then
+  now=$(date +%s)
+  for f in $(ls "$Q" 2>/dev/null | grep -v '^\.' | sort); do
+    IFS=- read -r pr seq pid <<<"$f"
+    kill -0 "$pid" 2>/dev/null || { rm -f "$Q/$f"; continue; }
+    st=$(stat -c %Y "$Q/$f"); tag=$(head -c 200 "$Q/$f")
+    printf '%s  prio=%s  pid=%s  wait=%ss  %s\n' "$seq" "$pr" "$pid" $((now-st)) "$tag"
+  done
+  exit 0
+fi
+
+prio=1; tag=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) case "$2" in high) prio=0;; normal) prio=1;; low) prio=2;;
+          *) echo "gpu-run: bad priority $2" >&2; exit 2;; esac; shift 2;;
+    -t) tag="$2"; shift 2;;
+    --) shift; break;;
+    *) break;;
+  esac
+done
+[ $# -gt 0 ] || { echo "usage: gpu-run [-p high|normal|low] [-t tag] [--] cmd..." >&2; exit 2; }
+
+seq=$(flock "$Q/.seq.lock" bash -c 'n=$(( $(cat "$0/.seq" 2>/dev/null || echo 0) + 1 )); echo $n > "$0/.seq"; printf %08d $n' "$Q")
+ticket="$Q/$prio-$seq-$$"
+printf '%s %s' "${tag:-$(basename "$1")}" "$(pwd)" > "$ticket"
+trap 'rm -f "$ticket"' EXIT
+trap 'rm -f "$ticket"; exit 143' INT TERM HUP
+
+# Wait until this ticket is the first live one.
+while :; do
+  head=""
+  for f in $(ls "$Q" | grep -v '^\.' | sort); do
+    pid=${f##*-}
+    if kill -0 "$pid" 2>/dev/null; then head=$f; break; fi
+    rm -f "$Q/$f"
+  done
+  [ -e "$ticket" ] || { echo "gpu-run: ticket vanished" >&2; exit 1; }
+  [ "$head" = "$(basename "$ticket")" ] && break
+  sleep 1
+done
+
+flock "$LOCK" nice -n 19 "$@"
+rc=$?
+exit $rc
