@@ -1556,3 +1556,13 @@ Verdict: **do not enable as a production exactness-preserving path yet**. It is 
 - Orchestrator change on top of the child's work: `INKWELL_ATTNSPLIT_MIN` now defaults to **12097** (was 320). The old one-block kernel fails at n_kv ≥ 12,160 (shared memory); 12,096 is the last validated length. Below the threshold the output is bit-identical to master; above it the old kernel could not run at all.
 - Reason: the end-to-end exactness gate at 8K failed (max_abs 2.337 on logits, top-1 16/16), so split-K is not yet shown to be numeric noise where the old kernel works. Lowering the default needs that demonstration.
 - Check on master 9a70b74 + this branch: ctx512 md5 5cbe8e06 (2 runs; decode 2.653 s and 2.227 s for 8 tokens). Build: 62 warnings.
+
+## 2026-11-24 — challenge 2 deliverable: verified locally (Lean + CPU); port delegated
+
+- Lean gate on this machine: Lean v4.37.0-rc1 with Mathlib aad247f. `lake build` succeeds (18,311 jobs). No `sorry`; the only match is a comment. `#print axioms` on the 14 main theorems shows only propext, Classical.choice and Quot.sound, or no axioms. The extraction and program chain does not use native_decide or bv_decide.
+- Independent CPU check (orchestrator script, outside the package): all of these pass.
+  - The 2-XMAD identity, exhaustive over 2^16.
+  - F6 (IDP with accumulator 0x4B000000, then FADD −2^23) for all 913 values of s.
+  - Lane-map bijection; (k,n) and start positions; hi/lo extraction on 200 random rings per K; ≤2 four-word chunks per lane.
+- Gap in their cost model: lane-uniform register selection. With per-lane base words, the ring-word index varies across lanes on 6/8 slots for K=1.5 and 6–7/8 for odd K. K=2 and K=4 are uniform. The fix is a lane-aligned stream, about +2 SHF and +1 LDG per tile. Their x-layout assumption A-X is unproven.
+- Corrected estimate: E ≈ 6.5 with A-X, ≈ 7.05 without. They claim 6.28; today's E is 8.81.
