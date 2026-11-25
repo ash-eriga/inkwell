@@ -1518,3 +1518,12 @@ Measured with `opt/kbench/isa_rates`. Results are pairs per cycle per SM for 1:1
 | I2F + SHFL | 0.67 | partial contention |
 
 IADD3 and LOP32I ran alone: IADD3 at 1.94 per cycle (half rate), LOP32I at full rate.
+
+## 2026-11-24 — warp-parallel kslot resolve, re-validation on master: NOT ACCEPTED (11/16)
+
+- Control: master 74eeeb6. Candidate: `t3/warp-parallel-kslot-resolve-1` b28547b, rebased on 74eeeb6.
+- Interleaved A/B, 16 pairs (ctl,cand,cand,ctl), one flock. Env: `GGML_PASCAL_GRAPHS=1 INKWELL_MAX_CTX=512 INKWELL_CACHE_MARGIN_MB=10 INKWELL_EXL3_CACHE_K=20 INKWELL_MOE_V2=1 INKWELL_MOE_NKY=2`.
+- Median ctl 35.617 ms, cand 34.929 ms (−0.69 ms). Candidate wins 11/16; the gate is 12/16. md5 5cbe8e06 in all 32 runs. Peak 5,034 MiB both.
+- Per-pair Δ (cand − ctl, ms): −4.57 0.98 −0.64 −0.66 −0.77 −1.65 0.31 −0.69 −1.79 1.70 −5.70 −1.22 −0.88 1.74 −3.76 0.62.
+- Noisy host: the machine had rebooted 6 min before (run 1 cold), and another agent's CPU jobs held load average ~4.5. The child had measured −0.56 ms.
+- Decision: not merged. Re-run on a quiet host before deciding again.
