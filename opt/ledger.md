@@ -1902,3 +1902,4 @@ Branch `t3/host-latency`, based on master `79cd1e1` (same code as ledger-only `4
 - Attempt 1 (child, vs master 16adb17-era): −0.162 ms, 11/16 — failed pair gate.
 - Attempt 2 (orchestrator, merged onto fab1ac7, CTL frozen fab1ac7): CTL 29.735 vs CAND 29.418 ms/tok (−0.317), 14/16, md5 5cbe8e06 all runs, peak 5,032 MiB. Combined 25/32.
 - Killswitch INKWELL_NO_ATTN_GQA_EXACT=1.
+- Post-merge master 54dc27f, 3 runs: 29.589 / 29.312 / 29.654 ms/tok, md5 5cbe8e06 x3, peak 5,032 MiB, 62 warnings.
