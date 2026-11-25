@@ -5,7 +5,8 @@ import struct, sys
 from pathlib import Path
 
 srcp, dstp = sys.argv[1:3]
-max_ctx = 4352
+max_ctx = int(sys.argv[3]) if len(sys.argv) > 3 else 4352
+next_pos = int(sys.argv[4]) if len(sys.argv) > 4 else 4095
 swa = 1024
 hd = 128
 hkv = 8
@@ -50,9 +51,9 @@ for group in range(2):
             x[:] = src
         else:
             assert len(src) == ring_len
-            # Snapshot was saved after positions 0..4094. Copy every ring row
-            # still relevant to the next window into its linear oracle slot.
-            for p in range(3072, 4095):
+            # Copy every ring row still relevant to the next window into its linear
+            # oracle slot. The snapshot contains positions through next_pos-1.
+            for p in range(next_pos - swa + 1, next_pos):
                 jr = p % swa
                 for h in range(hkv):
                     so = (h * swa + jr) * row
