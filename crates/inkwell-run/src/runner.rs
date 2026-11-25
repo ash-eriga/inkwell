@@ -4153,7 +4153,7 @@ impl PfArena {
             *o += bytes;
         };
         let h = c * 2304 * 4;
-        for name in ["cur","x0","x1","x2","ctrlf","fcur","moe_out","tmp0","tmp1","tmp2","head","prelude","bankout","cn","cm","cg"] {
+        for name in ["cur","x0","x1","x2","fcur","moe_out","tmp2","head","prelude","bankout","cn","cm","cg"] {
             put(name, h, &mut off, &mut o);
         }
         put("cat", h * 2, &mut off, &mut o);
@@ -4229,8 +4229,8 @@ impl Runner {
     fn pf_control(&self, a: &PfArena, cur: *mut f32, msg: *const f32, l: &L, ctrl: usize) {
         let c = a.c;
         let (n, h) = (2304usize, c * 2304);
-        let (x0, x1, cat, gate, gain, forget) =
-            (a.ptr("cn"), a.ptr("cm"), a.ptr("cat"), a.ptr("cg"), a.ptr("ctrlg"), a.ptr("ctrlf"));
+        let (x0, x1, cat, gate, gain) =
+            (a.ptr("cn"), a.ptr("cm"), a.ptr("cat"), a.ptr("cg"), a.ptr("ctrlg"));
         pf_copy(x0, cur, h * 4);
         pf_copy(x1, msg, h * 4);
         unsafe {
@@ -4247,8 +4247,8 @@ impl Runner {
             (gain, unsafe { gain.add(c * n) })
         } else {
             self.pf_dense(gate.cast_const(), l.ctrl_gain[ctrl].expect("ctrl_gain"), gain, c, n, 64);
-            self.pf_dense(gate.cast_const(), l.ctrl_forget[ctrl].expect("ctrl_forget"), forget, c, n, 64);
-            (gain, forget)
+            self.pf_dense(gate.cast_const(), l.ctrl_forget[ctrl].expect("ctrl_forget"), unsafe{gain.add(c*n)}, c, n, 64);
+            (gain, unsafe{gain.add(c*n)})
         };
         unsafe { inkwell_cuda::pf_ctrl_apply_async(gp, fp, cur, msg, (h) as i64) };
     }
@@ -4274,7 +4274,7 @@ impl Runner {
         }
         // Loop-pass controller messages. The message tensor rows are materialized by mixbuf.
         if messages {
-            let states: Vec<*const f32> = [a.ptr("bank").cast_const(), a.ptr("tmp1").cast_const()].into_iter().collect();
+            let states: Vec<*const f32> = [a.ptr("bank").cast_const(), a.ptr("bankout").cast_const()].into_iter().collect();
             self.pf_mix_run(&states, l.msg_query.expect("msg_query"), a.ptr("msgbuf"), c, 4);
             for j in 0..3 {
                 let dst = a.ptr(match j {0=>"x0",1=>"x1",_=>"x2"});
@@ -4430,7 +4430,6 @@ impl Runner {
                     pf_copy(a.ptr("bankout"), a.ptr("cur"), c*2304*4);
                     pf_copy(a.ptr("cur"), a.ptr("prelude"), c*2304*4);
                     blocks = prelude_blocks.clone();
-                    pf_copy(a.ptr("tmp1"), a.ptr("bankout"), c*2304*4);
                 }
                 for ip in 6..18 {
                     self.pf_layer(&a, ip, ip, self.visits[vi].1, pass, &mut blocks, "cur", pass > 0, pos);
