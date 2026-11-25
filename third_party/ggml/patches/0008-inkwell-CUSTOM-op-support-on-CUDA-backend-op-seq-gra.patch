@@ -1,0 +1,145 @@
+From 5a994566b41c418f3531883561a4bf7bd9e67f25 Mon Sep 17 00:00:00 2001
+From: ash-eriga <347392360+ash-eriga@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 08:50:41 -0300
+Subject: [PATCH 8/8] inkwell: CUSTOM op support on CUDA backend + op-seq graph
+ key + stream shim (reconstructed)
+
+---
+ examples/eval-callback/eval-callback.cpp | 12 +++++---
+ ggml/include/ggml-cuda.h                 |  1 +
+ ggml/src/ggml-backend.cpp                |  1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu          | 39 ++++++++++++++++++++++--
+ 4 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/examples/eval-callback/eval-callback.cpp b/examples/eval-callback/eval-callback.cpp
+index 703ce13..77ee565 100644
+--- a/examples/eval-callback/eval-callback.cpp
++++ b/examples/eval-callback/eval-callback.cpp
+@@ -26,10 +26,14 @@ static bool run(llama_context * ctx, const common_params & params) {
+         LOG_INF("  %d\n", tokens[i]);
+     }
+ 
+-    common_batch batch = common_batch_get_one(ctx, tokens);
+-    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+-        LOG_ERR("%s : failed to eval\n", __func__);
+-        return false;
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        std::vector<llama_token> one = { tokens[i] };
++        common_batch batch = common_batch_get_one(ctx, one);
++        LOG_INF("===== process token %zu id=%d =====", i, tokens[i]);
++        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
++            LOG_ERR("%s : failed to eval\n", __func__);
++            return false;
++        }
+     }
+ 
+     return true;
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81ee..9165346 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -33,6 +33,7 @@ GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backen
+ // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(void);
+ 
++GGML_BACKEND_API void * ggml_backend_cuda_stream(ggml_backend_t backend);
+ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
+ GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
+ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d598ca3..edaa1c9 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2114,6 +2114,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     }
+ 
+     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
++        if (getenv("INKWELL_CPY_DEBUG")) fprintf(stderr, "INCPY %s n=%ld\n", input->name, (long)ggml_nbytes(input));
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6ef3b7e..f06e873 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3030,6 +3030,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_LOG:
+             ggml_cuda_op_log(ctx, dst);
+             break;
++        case GGML_OP_CUSTOM: {
++            // Inkwell: the callback launches CUDA kernels itself.
++            struct ggml_custom_op_params p;
++            memcpy(&p, dst->op_params, sizeof(p));
++            p.fun(dst, 0, 1, p.userdata);
++        }   break;
+         case GGML_OP_NONE:
+         case GGML_OP_RESHAPE:
+         case GGML_OP_VIEW:
+@@ -3344,7 +3350,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ }
+ 
+ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return cgraph->nodes[0];
++    // Inkwell: graph nodes are freshly allocated every step, so the pointer of
++    // the first node changes every call. Key on the op sequence instead so the
++    // cached cudaGraph is reused across decode steps.
++    static uint64_t key_pool[64];
++    uint64_t h = 1469598103934665603ull ^ (uint64_t) cgraph->n_nodes;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * n = cgraph->nodes[i];
++        uint64_t v = (uint64_t) n->op * 131071u + (uint64_t) n->type;
++        for (int s = 0; s < GGML_MAX_SRC && n->src[s]; s++) v += 4099u;
++        h = (h ^ v) * 1099511628211ull;
++    }
++    return &key_pool[h % 64];
+ }
+ 
+ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+@@ -3373,6 +3390,17 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_cuda_graph::node_properties prop = {};
+         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
++        // src/view_src are pointers to freshly-built tensor objects each
++        // step; their DATA ptrs and shapes are compared separately below,
++        // so exclude identity pointers from the node memcmp.
++        memset(prop.node.src, 0, sizeof(prop.node.src));
++        prop.node.view_src = nullptr;
++        // leaf names encode the step index; userdata is a host pointer
++        // baked into captured kernel args already — exclude both.
++        memset(prop.node.name, 0, sizeof(prop.node.name));
++        if (prop.node.op == GGML_OP_CUSTOM) {
++            memset(prop.node.op_params + (sizeof(void*) + sizeof(int32_t)) / sizeof(int32_t), 0, sizeof(void*));
++        }
+ 
+         for (int j = 0; j < GGML_MAX_SRC; ++j) {
+             if (cgraph->nodes[i]->src[j]) {
+@@ -5571,7 +5599,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    if (graph->is_enabled() && std::getenv("GGML_PASCAL_GRAPHS") != nullptr) {
+         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
+         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
+         const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
+@@ -6887,6 +6915,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return true;
+ #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+ 
++        case GGML_OP_CUSTOM:
++            return true;
+         default:
+             return false;
+     }
+@@ -7182,3 +7212,8 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+ }
+ 
+ GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
++
++void * ggml_backend_cuda_stream(ggml_backend_t backend) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    return (void *) cuda_ctx->stream();
++}
+-- 
+2.56.1
+

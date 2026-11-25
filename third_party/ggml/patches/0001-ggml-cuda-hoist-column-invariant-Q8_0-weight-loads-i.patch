@@ -1,0 +1,118 @@
+From 8f261c8a34a4f559989962004bd42d05f56522c8 Mon Sep 17 00:00:00 2001
+From: ash-eriga <347392360+ash-eriga@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:05:31 -0300
+Subject: [PATCH 1/8] ggml-cuda: hoist column-invariant Q8_0 weight loads in
+ mmvq for ncols_dst > 1
+
+Split vec_dot_q8_0_q8_1 into load/apply so each (kbx,row) weight block's
+ints and scale are read once from L1/L2 then reused across all dst
+columns instead of once per column. Measured on GTX 1060 (sm_61):
+MUL_MAT q8_0 4096x14336 n=4: -6.3%, n=8: -3.9% (approaching the ~81
+GB/s device copy ceiling). n=1 and n=5 unchanged.
+---
+ ggml/src/ggml-cuda/mmvq.cu     | 43 +++++++++++++++++++++++++++++-----
+ ggml/src/ggml-cuda/vecdotq.cuh | 30 ++++++++++++++++++++++++
+ 2 files changed, 67 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6f10428..3d4cbba 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -839,16 +839,47 @@ static __global__ void mul_mat_vec_q(
+         }
+ #endif
+ 
+-#pragma unroll
+-        for (int j = 0; j < ncols_dst; ++j) {
++        if constexpr (type == GGML_TYPE_Q8_0 && ncols_dst > 1) {
++            // Hoist the column-invariant weight block out of the j loop: on
++            // pre-tensor-core archs each re-read of the q8_0 block per dst
++            // column costs real L1/L2 bandwidth.
++            int   vv[rows_per_cuda_block][VDR_Q8_0_Q8_1_MMVQ];
++            half  vd[rows_per_cuda_block];
++            int   vg[rows_per_cuda_block][VDR_Q8_0_Q8_1_MMVQ];
++            half  dg[rows_per_cuda_block];
+ #pragma unroll
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+-                tmp[j][i] += vec_dot_q_cuda(
+-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                vec_dot_q8_0_load_v(vx, kbx_offset + i*stride_row_x + kbx, kqs, vv[i], vd[i]);
+                 if constexpr (has_fusion) {
+                     if (use_gate) {
+-                        tmp_gate[j][i] += vec_dot_q_cuda(
+-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                        vec_dot_q8_0_load_v(vgate, kbx_offset + i*stride_row_x + kbx, kqs, vg[i], dg[i]);
++                    }
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++                for (int i = 0; i < rows_per_cuda_block; ++i) {
++                    tmp[j][i] += vec_dot_q8_0_apply(vv[i], vd[i], &y[j*stride_col_y + kby], kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[j][i] += vec_dot_q8_0_apply(vg[i], dg[i], &y[j*stride_col_y + kby], kqs);
++                        }
++                    }
++                }
++            }
++        } else {
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++                for (int i = 0; i < rows_per_cuda_block; ++i) {
++                    tmp[j][i] += vec_dot_q_cuda(
++                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[j][i] += vec_dot_q_cuda(
++                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++                        }
+                     }
+                 }
+             }
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index d5ff93b..5d37cb6 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -891,6 +891,36 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
+     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+ }
+ 
++// Split variant for mmvq with ncols_dst > 1: the caller loads the weight ints
++// and scale once per (kbx, row), then applies them to every dst column. Saves
++// ncols_dst-1 redundant reads of the same q8_0 block through L1/L2.
++static __device__ __forceinline__ void vec_dot_q8_0_load_v(
++    const void * __restrict__ vbq, const int & kbx, const int & iqs,
++    int v[VDR_Q8_0_Q8_1_MMVQ], half & d) {
++
++    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
++
++#pragma unroll
++    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
++        v[i] = get_int_b2(bq8_0->qs, iqs + i);
++    }
++    d = bq8_0->d;
++}
++
++static __device__ __forceinline__ float vec_dot_q8_0_apply(
++    const int v[VDR_Q8_0_Q8_1_MMVQ], const half & d8_0,
++    const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
++
++    int u[VDR_Q8_0_Q8_1_MMVQ];
++
++#pragma unroll
++    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
++        u[i] = get_int_b4(bq8_1->qs, iqs + i);
++    }
++
++    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, d8_0, __low2half(bq8_1->ds));
++}
++
+ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+-- 
+2.56.1
+

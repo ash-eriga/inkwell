@@ -2,14 +2,20 @@
 use std::process::Command;
 
 fn main() {
-    let ggml_inc = "/home/ash/lfm-gtx1060-bench/src-v2/ggml/include";
-    let ggml_src = "/home/ash/lfm-gtx1060-bench/src-v2/ggml/src";
-    let libdir = "/home/ash/lfm-gtx1060-bench/build-inkwell-dp4a/bin";
-    let cxx = "/home/ash/.local/share/mise/installs/conda-gxx-linux-64/13.4.0/bin/x86_64-conda-linux-gnu-g++";
+    // Overridable for other build hosts (see third_party/ggml/README.md).
+    let env = |k: &str, d: &str| {
+        println!("cargo:rerun-if-env-changed={k}");
+        std::env::var(k).unwrap_or_else(|_| d.to_string())
+    };
+    let root = env("INKWELL_GGML_SRC", "/home/ash/lfm-gtx1060-bench/src-v2");
+    let ggml_inc = format!("{root}/ggml/include");
+    let ggml_src = format!("{root}/ggml/src");
+    let libdir = env("INKWELL_GGML_LIB", "/home/ash/lfm-gtx1060-bench/build-inkwell-dp4a/bin");
+    let cxx = env("INKWELL_CXX", "/home/ash/.local/share/mise/installs/conda-gxx-linux-64/13.4.0/bin/x86_64-conda-linux-gnu-g++");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
 
     println!("cargo:rerun-if-changed=shim.cpp");
-    let status = Command::new(cxx)
+    let status = Command::new(&cxx)
         .args([
             "-O2", "-std=c++17", "-fPIC",
             &format!("-I{ggml_inc}"), &format!("-I{ggml_src}"),

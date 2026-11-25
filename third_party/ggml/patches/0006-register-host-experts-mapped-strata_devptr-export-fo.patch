@@ -1,0 +1,67 @@
+From 0aedf48eb5d96d3d25ac19ecf16a0436fa6ee3a2 Mon Sep 17 00:00:00 2001
+From: ash-eriga <347392360+ash-eriga@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:13:17 -0300
+Subject: [PATCH 6/8] register host experts mapped + strata_devptr export for
+ zero-copy GEMV
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 13 ++++++++++++-
+ src/llama-moe-cache.cpp         |  4 ++--
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 60a1711..6ef3b7e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6114,7 +6114,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
+     }
+ 
+ #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+-    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
++    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+     if (err != cudaSuccess) {
+         // clear the error
+         (void)cudaGetLastError();
+@@ -6169,6 +6169,14 @@ bool ggml_backend_cuda_strata_copy_mark(ggml_backend_t backend, int which) {
+     return cudaEventRecord(ch.ev[which & 1], ch.stream) == cudaSuccess;
+ }
+ 
++// device-accessible pointer for a cudaHostRegister'ed host buffer (mapped)
++void * ggml_backend_cuda_strata_devptr(ggml_backend_t backend, void * host_ptr) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    cudaSetDevice(cuda_ctx->device);
++    void * dev = nullptr;
++    return cudaHostGetDevicePointer(&dev, host_ptr, 0) == cudaSuccess ? dev : nullptr;
++}
++
+ // make the backend's compute stream wait on event `which` (0/1)
+ bool ggml_backend_cuda_strata_copy_wait(ggml_backend_t backend, int which) {
+     ggml_cuda_strata_copy_channel & ch = ggml_cuda_strata_copy_channel_get(backend);
+@@ -7079,6 +7087,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_strata_copy_wait") == 0) {
+         return (void *)ggml_backend_cuda_strata_copy_wait;
+     }
++    if (strcmp(name, "ggml_backend_strata_devptr") == 0) {
++        return (void *)ggml_backend_cuda_strata_devptr;
++    }
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 384c765..2d64e95 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1048,8 +1048,8 @@ struct llama_moe_cache::impl {
+         if (bytes_prefetch > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: prefetched = %.2f MiB\n", bytes_prefetch/1024.0/1024.0);
+         }
+-        if (t_calls > 0 && getenv("LLAMA_MOE_CACHE_TIME") != nullptr) {
+-            LLAMA_LOG_INFO("llama_moe_cache: copy() %lld calls: sync %.1f ms, plan %.1f ms, upload-issue %.1f ms\n",
++        if (t_calls > 0) {
++            fprintf(stderr, "llama_moe_cache: copy() %lld calls: sync %.1f ms, plan %.1f ms, upload-issue %.1f ms\n",
+                 (long long) t_calls, t_sync/1e6, t_plan/1e6, t_upload/1e6);
+         }
+         if (stats_copy.hits > 0) {
+-- 
+2.56.1
+

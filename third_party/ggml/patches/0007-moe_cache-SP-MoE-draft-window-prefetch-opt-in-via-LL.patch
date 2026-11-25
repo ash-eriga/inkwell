@@ -1,0 +1,73 @@
+From 49eb9d34a1415f3c9095d717ff73b705dbe34846 Mon Sep 17 00:00:00 2001
+From: ash-eriga <347392360+ash-eriga@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 10:46:42 -0300
+Subject: [PATCH 7/8] moe_cache: SP-MoE draft-window prefetch (opt-in via
+ LLAMA_MOE_CACHE_STRATA)
+
+Prefetch the early layers' predicted experts on the copy stream during the
+drafting stage, when PCIe is idle. Bounded by LLAMA_MOE_CACHE_DPF_MIB (48) and
+LLAMA_MOE_CACHE_DPF_LAYERS (12). Measured on GTX 1060 (IQ2_XXS, mc3700):
+48MiB/12L -> 36.3 t/s, 16MiB/4L -> 38.9 t/s, off -> 41.6 t/s.
+Prefetch loses at all budgets: at 57% coverage every prefetch evicts a
+potentially needed cold expert (thrash). Kept opt-in.
+---
+ src/llama-moe-cache.cpp | 38 +++++++++++++++++++++++++-------------
+ 1 file changed, 25 insertions(+), 13 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 2d64e95..3c530c4 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -996,24 +996,36 @@ struct llama_moe_cache::impl {
+             strata.wait(backend, 1);
+         }
+ 
+-        // STRATA-style prefetch: upload the NEXT cached layer's predicted experts on the
+-        // copy stream while the rest of this layer runs; event 1 is waited on next call
++        // SP-MoE-style draft-window prefetch: at the LAST cached layer of this pass,
++        // prefetch the EARLY cached layers' predicted experts on the copy stream.
++        // The uploads then run during the next drafting stage, while PCIe is otherwise
++        // idle. Bounded by a byte budget (~draft duration x effective bandwidth) and a
++        // cutoff layer count, so prefetches cannot thrash the cache or starve on-demand
++        // loads. Event 1 is waited on by the next copy() before slots are consumed.
+         static const bool no_prefetch = getenv("LLAMA_MOE_CACHE_NO_PREFETCH") != nullptr;
+-        if (strata.h2d != nullptr && !no_prefetch && !prev_sel.empty()) {
+-            int32_t il_next = -1;
+-            for (size_t i = 0; i + 1 < g.layers.size(); ++i) {
+-                if (g.layers[i] == il) {
+-                    il_next = g.layers[i + 1];
+-                    break;
++        if (strata.h2d != nullptr && !no_prefetch && !prev_sel.empty() &&
++            il == g.layers.back()) {
++            static const int64_t dpf_budget = [] {
++                const char * s = getenv("LLAMA_MOE_CACHE_DPF_MIB");
++                return s != nullptr ? strtol(s, nullptr, 10) : 48; // MiB
++            }();
++            static const size_t dpf_layers = [] {
++                const char * s = getenv("LLAMA_MOE_CACHE_DPF_LAYERS");
++                return s != nullptr ? (size_t) strtoul(s, nullptr, 10) : 12;
++            }();
++            int64_t budget = dpf_budget*1024*1024;
++            for (size_t i = 0; i < dpf_layers && i < g.layers.size() && budget > 0; ++i) {
++                const int32_t pl = g.layers[i];
++                if (prev_sel[pl].empty()) {
++                    continue;
+                 }
+-            }
+-            if (il_next >= 0 && !prev_sel[il_next].empty()) {
+                 std::vector<moe_cache_lru::fill> pf;
+-                g.lru.prefetch(il_next, il, prev_sel[il_next].data(), prev_sel[il_next].size(), pf);
+-                size_t pf_bytes = 0;
++                g.lru.prefetch(pl, -1, prev_sel[pl].data(), prev_sel[pl].size(), pf);
+                 if (!pf.empty()) {
+-                    upload_fills(layers[il_next], g, pf, pf_bytes);
++                    size_t pf_bytes = 0;
++                    upload_fills(layers[pl], g, pf, pf_bytes);
+                     bytes_prefetch += pf_bytes;
++                    budget         -= (int64_t) pf_bytes;
+                 }
+             }
+             strata.mark(backend, 1);
+-- 
+2.56.1
+

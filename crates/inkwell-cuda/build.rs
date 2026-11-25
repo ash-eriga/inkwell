@@ -15,9 +15,16 @@ fn exists_or_env(envs: &[&str], default: &Path) -> PathBuf {
 }
 
 fn main() {
-    let cuda = Path::new("/home/ash/lfm-gtx1060-bench/cuda-12.6");
+    // Overridable for other build hosts (see third_party/ggml/README.md).
+    let env = |k: &str, d: &str| {
+        println!("cargo:rerun-if-env-changed={k}");
+        std::env::var(k).unwrap_or_else(|_| d.to_string())
+    };
+    let cuda_s = env("INKWELL_CUDA_HOME", "/home/ash/lfm-gtx1060-bench/cuda-12.6");
+    let gxx_s = env("INKWELL_CXX", "/home/ash/.local/share/mise/installs/conda-gxx-linux-64/13.4.0/bin/x86_64-conda-linux-gnu-g++");
+    let cuda = Path::new(&cuda_s);
     let nvcc = cuda.join("bin/nvcc");
-    let gxx = Path::new("/home/ash/.local/share/mise/installs/conda-gxx-linux-64/13.4.0/bin/x86_64-conda-linux-gnu-g++");
+    let gxx = Path::new(&gxx_s);
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let outdir = Path::new(&out);
     let src = Path::new("src/kernels.cu");

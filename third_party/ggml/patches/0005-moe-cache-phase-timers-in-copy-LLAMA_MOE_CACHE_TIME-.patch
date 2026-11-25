@@ -1,0 +1,80 @@
+From 8b2705bc547ce3440eea5f2233b638de7fac0f26 Mon Sep 17 00:00:00 2001
+From: ash-eriga <347392360+ash-eriga@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 09:54:46 -0300
+Subject: [PATCH 5/8] moe-cache: phase timers in copy()
+ (LLAMA_MOE_CACHE_TIME=1)
+
+---
+ src/llama-moe-cache.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 9995051..384c765 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -14,6 +14,7 @@
+ #include <cstring>
+ #include <stdexcept>
+ #include <unordered_map>
++#include <chrono>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -459,6 +460,8 @@ struct llama_moe_cache::impl {
+     // used to predict this ubatch's experts one layer ahead (indexed by model layer)
+     std::vector<std::vector<int32_t>> prev_sel;
+     size_t bytes_prefetch = 0; // uploaded by speculative prefetches (STRATA-style)
++    // copy() phase timers (ns, aggregate) - LLAMA_MOE_CACHE_TIME=1 to log
++    int64_t t_sync = 0, t_plan = 0, t_upload = 0, t_calls = 0;
+ 
+     float    cpu_share = 0.0f;
+     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
+@@ -896,9 +899,11 @@ struct llama_moe_cache::impl {
+ 
+         const int32_t n_used = (int32_t) sel->src[0]->ne[0];
+ 
++        auto tp0 = std::chrono::steady_clock::now();
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+         ggml_backend_synchronize(backend);
++        auto tp1 = std::chrono::steady_clock::now();
+ 
+         if (trace != nullptr) {
+             write_trace(il, n_used);
+@@ -912,6 +917,7 @@ struct llama_moe_cache::impl {
+             return (size_t) (acc >> 16);
+         };
+         size_t n_hit = 0;
++        auto tp2 = std::chrono::steady_clock::now();
+         if (!g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit)) {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+         }
+@@ -973,8 +979,14 @@ struct llama_moe_cache::impl {
+             }
+         };
+ 
++        auto tp3 = std::chrono::steady_clock::now();
+         size_t bytes = 0;
+         upload_fills(l, g, fills, bytes);
++        auto tp4 = std::chrono::steady_clock::now();
++        t_sync   += std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count();
++        t_plan   += std::chrono::duration_cast<std::chrono::nanoseconds>(tp3 - tp2).count();
++        t_upload += std::chrono::duration_cast<std::chrono::nanoseconds>(tp4 - tp3).count();
++        t_calls  += 1;
+ 
+         if (strata.h2d != nullptr) {
+             // make the compute stream see this layer's fills (event 0, just recorded)
+@@ -1036,6 +1048,10 @@ struct llama_moe_cache::impl {
+         if (bytes_prefetch > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: prefetched = %.2f MiB\n", bytes_prefetch/1024.0/1024.0);
+         }
++        if (t_calls > 0 && getenv("LLAMA_MOE_CACHE_TIME") != nullptr) {
++            LLAMA_LOG_INFO("llama_moe_cache: copy() %lld calls: sync %.1f ms, plan %.1f ms, upload-issue %.1f ms\n",
++                (long long) t_calls, t_sync/1e6, t_plan/1e6, t_upload/1e6);
++        }
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+         }
+-- 
+2.56.1
+

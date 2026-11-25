@@ -1,0 +1,50 @@
+From afc076b1f4afa4e4d9a3090fc12ed3968329e595 Mon Sep 17 00:00:00 2001
+From: ash-eriga <347392360+ash-eriga@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 01:35:17 -0300
+Subject: [PATCH 3/8] moe-cache: pin host expert weights via cudaHostRegister
+ for DMA uploads
+
+Pageable mmap H2D copies are staged through a bounce buffer (~300MB/s effective). Registering the host expert tensors with cudaHostRegister(Portable|ReadOnly) makes the async set copies real DMA. Gated by GGML_CUDA_REGISTER_HOST at runtime.
+
+Measured on GTX 1060 (IQ3_XXS 24B spec): all-GPU miss path 20.9->26.9 t/s; best pinned config 29.5 t/s (share 0.5, p_min 0.5).
+---
+ src/llama-moe-cache.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ba35af0..c186841 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -14,6 +14,7 @@
+ #include <cstring>
+ #include <stdexcept>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ namespace {
+@@ -561,6 +562,21 @@ struct llama_moe_cache::impl {
+                 layer & l = layers[il];
+                 l.ig      = (int32_t) ig;
+                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
++                // pin the host expert weights: uploads over pageable mmap memory are
++                // staged through a bounce buffer (~300 MB/s), pinned memory does real DMA
++                {
++                    static std::unordered_set<const void *> pinned;
++                    auto * register_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(
++                        ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[g.id].backend)),
++                        "ggml_backend_register_host_buffer");
++                    if (register_fn != nullptr) {
++                        for (const ggml_tensor * w : l.experts) {
++                            if (pinned.insert(w->data).second && !register_fn(w->data, ggml_nbytes(w))) {
++                                LLAMA_LOG_WARN("%s: could not pin %s (%zu bytes)\n", __func__, w->name, ggml_nbytes(w));
++                            }
++                        }
++                    }
++                }
+                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                     ggml_tensor * bank   = g.banks[ip];
+                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+-- 
+2.56.1
+
