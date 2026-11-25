@@ -1838,3 +1838,7 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 - Retry of b28547b (earlier 11/16 on noisy host). A/B 16 pairs vs master 4e7e6d5: CTL 30.851 vs CAND 30.316 ms/tok median (−0.534), 15/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB.
 - Killswitch: INKWELL_NO_RESOLVE_WARP=1.
 - Post-merge master dd6232a, 3 runs: 30.126 / 30.393 / 29.981 ms/tok, md5 5cbe8e06 x3, peak 5,034 MiB.
+
+## t3/ctrlbatch-sel3 — controller triad batching, spill fixed, default-on — ACCEPTED, merged
+- Root cause (study 4a7e58c): runtime blockIdx.y index into by-value param pointer arrays spilled them to local memory on sm_61 (rms2down_nosmem_mr<4,3> STACK 96, gf_apply_batch<3> STACK 120, ~849 MB/tok local traffic) — the +4.9 ms CTRLBATCH regression. ink_sel3 constant-offset select -> STACK 0 on all three kernels.
+- A/B 16 pairs vs master 16adb17: CTL 31.673 vs CAND 31.226 ms/tok median (−0.447), 13/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB. Killswitch INKWELL_NO_CTRLBATCH=1.
