@@ -1804,3 +1804,10 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 - Isolated GPU gate (orchestrator, `reasm_drv_perk`, ref = 45855f8a): bitwise exact for all six K values, gate/up and down. Against the current NOP-less kernel: K1.5 +6.7–6.9%, K2 +6.0–6.2%, K2.5/K3 +0.6–1.3%, K3.5 −0.3–0.5%, K4 −0.7–1.8%.
 - End-to-end A/B (16 pairs, ctl,cand,cand,ctl, one flock): CTL median 33.795 vs CAND 33.453 ms/tok (−0.34), **11/16 wins**, md5 5cbe8e06 on every run, peak 5,034 MiB. Below the ≥12/16 gate, so not merged.
 - Kept on its branch to be stacked with the round-2 hill-climb result and A/B'd again as a new candidate.
+
+## 2026-11-25 — TOP32 + neighbour-lane shuffle expert kernel merged (79cd1e1)
+
+- Candidate: branch `t3/ch2-top32-integrate` (0e6a474) = round-1 TOP32 (069a05c + c2a8df8) + round-2 donor-lane `SHFL.IDX` for W1 (51b3780 + 7e02786), plus the fail-closed build step changes: K-labelled loops, detected ranges, K1.5/K2 shape 225/32w with LDG 4, fingerprint (463, 465, 1806, 470). The target-kernel SASS is identical to the GPU-gated cubin a9d56a52, which is bitwise exact for all six K values, gate/up and down.
+- K1.5/K2 loop: 247 → 225 instr per 32 weights (7.719 → 7.031/w). K2.5–K4: 248/249 (+1 vs before).
+- A/B (16 pairs, ctl,cand,cand,ctl, one flock; CTL = master 60f1cfe): CTL median 32.368 vs CAND **31.890 ms/tok** (−0.478), **15/16 wins**, md5 5cbe8e06 on every run, peak 5,034 MiB. Accepted.
+- Master check after merge: ctx512 md5 5cbe8e06 in 2 runs; generated cubin 270a4be4 (1,319,312 bytes); build 62 warnings.
