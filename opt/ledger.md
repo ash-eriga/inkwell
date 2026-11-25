@@ -1993,3 +1993,13 @@ Raw: /tmp/prefill-study/results/{kbench,default_ctx512,vtest8_ctx512}.log. Only 
 - ctx512 default prompt: md5 5cbe8e06.
 - VTEST8 works in this probe binary, but the block verify is not bit-exact vs serial: j0–j7 max diff 2.5e-4 to 8.1e-4. It is also slow (8-token block 701 ms, 87.6 ms/tok) and OOMs in cudaGraphInstantiate at gen 8 with CACHE_MARGIN_MB=10.
 - Conclusion: batched MoE GEMM gives a 6–8× per-token gain at M=64 vs M=4. A real prefill path needs: batched expert GEMM over the token chunk, a faster flash-prefill attention, and graph memory headroom. Exactness vs serial must be gated (md5 of generated text after prefill, plus a KLD gate if float order changes).
+
+## t3/dyn-nkv — post-merge re-validation on master 9c735bd (scratch merge 5c3dc31) — NOT MERGED (gate miss)
+- Frozen CTL e03df94, 16 interleaved pairs: CTL 28.684 vs CAND 28.507 ms/tok (−0.178), wins **11/16** (gate ≥12), md5 5cbe8e06 all runs, peak 5,032 MiB.
+- Child result had been −0.331, 14/16 vs 731adf3. The run shared the host with queued delegate GPU jobs.
+- Exactness is proven (0 bit diffs, kbench). The feature's main value is long context: shape-invariant graphs, no rebuild except at pos=256. Decision: one retry on a quiet host, or gate it as a long-ctx feature (non-regression at 512 + measured win at 4K/32K).
+
+## Spec-decode study — final (bb1a8be, opt/studies/spec-decode-2026-11-25.md)
+- Supersedes the partial entry above. An oracle drafter (0 ms) still has a floor of 20.13 ms/tok at B=2. Real routing grows distinct experts 8.00→12.89/16.59/19.96 (B=2/3/4), so the ragged MoE verify costs 1.67/2.19/2.68×.
+- Best training-free drafter: int4-requantised mtp.safetensors (~120 MiB, 1.45 ms) + ragged B=2 verify, modelled at 25.48 ms/tok. Self-spec np1 costs 29.98 ms/tok (no gain).
+- ≤20 ms requires a trained ~30 MiB EAGLE-style drafter plus a bit-exact ragged B=2..4 verify (modelled 19.5–22 ms/tok). It also requires fixing the Runner::control() GGML_ASSERT regression.
