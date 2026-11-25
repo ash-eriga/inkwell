@@ -1944,3 +1944,8 @@ K5 is the unchanged fallback; the small ratio difference is noise. Before the in
 **End-to-end A/B.** `~/.cache/inkwell-ab/ab_rw.sh`, CTL `/home/ash/.cache/inkwell-ab/ctl-376e449/inkwell`, CAND this branch with `INKWELL_CH2DENSE=1`, 16 interleaved neighbour pairs in order ctl,cand,cand,ctl inside one `nice -n 19 flock /tmp/inkwell-gpu.lock`. CTL median **32.5345 ms/tok**; CAND median **31.290 ms/tok** (**−1.2445 ms/tok**); candidate won **16/16** pairs. Every run md5 was `5cbe8e06`; peak VRAM was **5,034 MiB** (limit 5,080); script rc 0. Per-pair candidate-minus-control deltas (ms/tok): `-1.302 -1.223 -3.282 -0.396 -2.319 -1.346 -1.559 -1.055 -1.154 -1.227 -1.132 -0.942 -1.688 -1.149 -0.177 -0.862`. Acceptance criteria were met, so the default was flipped on in separate commit `9aa2927`.
 
 **Follow-up, not implemented.** `inkwell_exl3_gemv_sf` still uses static `__shared__ float xs[3072]` (12,848 B), capping occupancy at 30 CTAs; the 36-CTA `wo_ud` and similar dense matrices therefore run in two waves. Dynamically sizing shared memory to the actual K is predicted to save another 0.2–0.5 ms/tok bit-exactly and should be investigated separately.
+
+## t3/ch2-dense-sf (6450a8b) — ch2 NOP-less pipeline on dense gemv_sf K3/K3.5/K4 — ACCEPTED, merged
+- Child A/B vs 376e449: −1.2445 ms, 16/16. Includes fail-closed repair of .nv.constant2 indirect-branch tables after NOP deletion (511ab4b).
+- Re-validated merged onto 54dc27f (74527c7), CTL frozen 54dc27f: CTL 29.480 vs CAND 28.267 ms/tok (−1.212), 16/16, md5 5cbe8e06 all runs, peak 5,032 MiB. Self-test 0.41 ms.
+- Killswitch INKWELL_NO_CH2DENSE=1. Follow-up: dynamic smem for gemv_sf xs[] (2-wave tail on 36-CTA wo_ud), predicted −0.2–0.5 ms.
