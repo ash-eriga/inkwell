@@ -63,25 +63,50 @@ def loop_rows(sass):
         if psl not in (32, 64):
             continue
         cnt = Counter(o for _, o, _ in body)
-        rows.append({'start': target, 'end': addr, 'n': len(body), 'psl': psl, 'cnt': cnt})
+        shifts = frozenset(int(im[0], 16) for _, o, full in body if o == 'SHF'
+                           for im in [re.findall(r",\s*0x([0-9a-f]+),", full)] if im)
+        rows.append({'start': target, 'end': addr, 'n': len(body), 'psl': psl, 'cnt': cnt,
+                     'k': SHIFT_SETS.get(shifts, 'unknown')})
     rows.sort(key=lambda x: (x['end'], -x['n']))
     dedup = []
     for r in rows:
         if dedup and dedup[-1]['end'] == r['end']:
             continue
         dedup.append(r)
-    return dedup[:7]
+    return dedup
+
+# K label by the set of SHF immediates in the loop (ptxas loop layout order is not source order).
+SHIFT_SETS = {
+    frozenset((2, 3, 5, 6, 8, 9, 11)): 'K1.5',
+    frozenset((2, 4, 6, 8, 10, 12, 14)): 'K2',
+    frozenset((3, 5, 8, 10, 13, 15, 18)): 'K2.5',
+    frozenset((4, 7, 11, 14, 18, 21, 25)): 'K3',
+    frozenset((3, 6, 9, 12, 15, 18, 21)): 'K3.5',
+    frozenset((4, 8, 12, 16, 20, 24, 28)): 'K4',
+}
+# Per-K loop shape without NOPs: (instructions, SHF, LDG). K1.5/K2 use the TOP32
+# two-word stream (one fewer LDG per tile and no lo funnel shift).
+LOOP_SHAPE = {
+    'K1.5': (233, 32, 8), 'K2': (233, 32, 8),
+    'K2.5': (248, 36, 12), 'K3': (248, 36, 12), 'K3.5': (248, 36, 12), 'K4': (249, 36, 12),
+}
 
 def require_loop_shape(rows, nops):
-    if len(rows) < 6:
-        raise Ch2Fail(f'expected six CH2 loops, found {len(rows)}')
-    expect_total = [279, 279, 279, 279, 279, 280] if nops else [247, 247, 247, 247, 247, 248]
-    names = ['K1.5', 'K2', 'K2.5', 'K3', 'K3.5', 'K4']
-    for i, (name, r) in enumerate(zip(names, rows[:6])):
+    by_k = {}
+    for r in rows:
+        if r['k'] in LOOP_SHAPE:
+            if r['k'] in by_k:
+                raise Ch2Fail(f"duplicate CH2 loop for {r['k']}")
+            by_k[r['k']] = r
+    if set(by_k) != set(LOOP_SHAPE):
+        raise Ch2Fail(f'expected six CH2 loops, found {sorted(by_k)}')
+    for name, (n, shf, ldg) in LOOP_SHAPE.items():
+        r = by_k[name]
         c = r['cnt']
-        if r['n'] != expect_total[i] or c['NOP'] != (32 if nops else 0):
-            raise Ch2Fail(f'{name} loop count mismatch: ins={r["n"]} NOP={c["NOP"]}')
-        for op, want in [('PSL', 32), ('XMAD', 64), ('SHF', 36), ('IDP', 32), ('FFMA', 32), ('LDS', 8), ('LDG', 12)]:
+        want_n = n + (32 if nops else 0)
+        if r['n'] != want_n or c['NOP'] != (32 if nops else 0):
+            raise Ch2Fail(f'{name} loop count mismatch: ins={r["n"]} NOP={c["NOP"]} (want {want_n})')
+        for op, want in [('PSL', 32), ('XMAD', 64), ('SHF', shf), ('IDP', 32), ('FFMA', 32), ('LDS', 8), ('LDG', ldg)]:
             got = r['psl'] if op == 'PSL' else c[op]
             if got != want:
                 raise Ch2Fail(f'{name} loop {op} count mismatch: {got} != {want}')
@@ -223,7 +248,7 @@ def generate(obj, outcubin, workdir, cuda_home):
     shutil.copyfile(unpatched, patched)
     pout = run([str(venvpy), str(ch2 / 'patch_sass.py'), str(patched), str(cuobj)], workdir, workdir / 'patch.log', env, capture=True)
     pm = re.search(r'fake=(\d+) lp=(\d+) words=(\d+) hi_d12d=(\d+)', pout)
-    if not pm or tuple(map(int, pm.groups())) != (463, 466, 2167, 469):
+    if not pm or tuple(map(int, pm.groups())) != (463, 465, 1646, 470):
         raise Ch2Fail('patched-with-NOPs baseline pattern mismatch: ' + (pout.strip() or 'no patch output'))
     sassp = run([str(cuobj), '-sass', str(patched)], workdir, workdir / 'patched.sass.stdout', env, capture=True)
     (workdir / 'kernels_patched_nops.sass').write_text(sassp)
@@ -231,7 +256,9 @@ def generate(obj, outcubin, workdir, cuda_home):
 
     run([str(venvpy), str(cuasm / 'bin/cuasm.py'), str(patched), '-o', 'kernels_patched_nops.cuasm'],
         workdir, workdir / 'cuasm_disassemble.log', env)
-    run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_patched_nops.cuasm', 'kernels_nopless.cuasm'],
+    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges.json'],
+        workdir, workdir / 'loop_ranges.log', env)
+    run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_patched_nops.cuasm', 'kernels_nopless.cuasm', 'loop_ranges.json'],
         workdir, workdir / 'remove_nops.log', env)
     nopless = workdir / 'kernels_patched_nopless.sm_61.cubin'
     run([str(venvpy), str(ch2 / 'reasm_assemble_with_repos.py'), 'kernels_nopless.cuasm', 'Repos.sm_61.production.txt', str(nopless)],
