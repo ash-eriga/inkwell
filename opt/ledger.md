@@ -1838,3 +1838,25 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 - Retry of b28547b (earlier 11/16 on noisy host). A/B 16 pairs vs master 4e7e6d5: CTL 30.851 vs CAND 30.316 ms/tok median (−0.534), 15/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB.
 - Killswitch: INKWELL_NO_RESOLVE_WARP=1.
 - Post-merge master dd6232a, 3 runs: 30.126 / 30.393 / 29.981 ms/tok, md5 5cbe8e06 x3, peak 5,034 MiB.
+
+## 2026-11-25 — exact GQA-3 shared-KV short-context attention (branch `t3/attn-gqa3`, `f2de4de`): NOT accepted, 11/16
+
+- Implementation: `inkwell_attn_decode_gqa3_exact`, grid `(hkv,1)x256`, one CTA per KV head. K/V rows are read once with `uint2`/`LDG.64`, Q with `float4` when aligned, K rows are tiled through shared memory, and each V row is tiled once then reused for all three query heads. The q·k lane order (`lane+32*t`), shuffle trees, softmax max/sum trees, `__expf`, and ascending-j per-output V accumulation reproduce `inkwell_attn_decode<true>` exactly. Dispatch requires `kv16 && nh == 3*hkv && hd == 128 && n_kv < INKWELL_ATTNSPLIT_MIN` plus 8-byte K/V alignment; `INKWELL_NO_ATTN_GQA_EXACT=1` is the killswitch. Commit `f2de4de`; release build rc 0, warnings **62** (limit 64).
+- Standalone exactness/performance harness: `opt/kbench/attn_gqa3/probe.cu`, random F16 K/V, random F32 Q/bias, trailing `-inf` masks for n>=32. Bitwise output diff count was **0/3072 outputs** for every case `{1,7,32,63,64,65,128,200,319}`.
+
+| n_kv | bit diffs | old us | new us | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 0 | 5.12 | 5.60 | 0.91x |
+| 7 | 0 | 5.82 | 5.73 | 1.02x |
+| 32 | 0 | 9.22 | 7.17 | 1.29x |
+| 63 | 0 | 14.34 | 9.22 | 1.56x |
+| 64 | 0 | 14.08 | 9.22 | 1.53x |
+| 65 | 0 | 14.34 | 9.70 | 1.48x |
+| 128 | 0 | 23.55 | 13.31 | 1.77x |
+| 200 | 0 | 34.37 | 19.33 | 1.78x |
+| 319 | 0 | 52.19 | 27.65 | 1.89x |
+
+- Variant note: row-staged K + split-chain V, tiled-K + split-chain V, tiled-K + all-three-head V, and streaming-K + all-three-head V were all bit-exact in the same harness. The integrated tiled-K/all-three-head V table above was the best normalized result at the time it was frozen; absolute probe times shifted with GPU clock/queue state, so cross-run variant comparisons were not used for acceptance.
+- ctx512 validation (3 runs, frozen candidate `91411f7e`): generated-text md5 **`5cbe8e06` every run**; decode 31.885 / 29.999 / 32.148 ms/tok; peak **5,034 MiB** every run (cap 5,080).
+- End-to-end A/B: `ab_rw.sh`, 16 neighbouring pairs in one `nice -n 19 flock /tmp/inkwell-gpu.lock`; CTL was frozen master `16adb17` (`ffd3eb28`), CAND the frozen candidate. `absum`: `runs ctl=16 cand=16 ctl_med=31.846 cand_med=31.684 delta=-0.162 wins=11/16 md5=['5cbe8e06'] peak=5034`. Per-pair candidate-minus-control ms/tok: `-0.181 +0.104 -0.334 -0.253 -0.147 +1.169 +0.463 -3.658 -0.617 -0.014 -0.057 -0.198 +1.133 -1.493 -1.541 +1.151`.
+- Verdict: **NOT accepted**. The median was 0.162 ms/tok faster and every md5/VRAM gate passed, but the candidate won only **11/16** pairs, below the required 12/16. Part 2 (`splitw` cleanup) was not attempted because the Part 1 acceptance gate failed.
