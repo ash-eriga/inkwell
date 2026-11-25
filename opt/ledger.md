@@ -2236,3 +2236,26 @@ Base `fb9180a`; branch `t3/prefill-chunked-encode-phase0-1`. Implements the seri
 - MoE group/sort/grouped GEMM: PASS, 0 bit diffs, 0.68 TFLOP/s on the realistic grouped shape; deterministic fused SiLU/weighted scatter pipeline PASS, 0 bit diffs.
 
 **Phase 2 requirements.** The kernels take caller-owned scratch and already valid device descriptors. The MoE H2D ring contract is documented at the end of `prefill.cu`: a 32 MiB device ring in two 16 MiB buffers, tile t+1 copied on the side stream, buffer reuse only after tile t−2 compute, descriptor rewriting to ring addresses, and events ordered before grouped GEMM. The driver must also preserve prompt-state ordering, use headed logits only for the final prompt row, handle ring wrap/SWA masks exactly, and solve CUDA-graph/activation memory headroom instead of relying on the current marginal 5,060 MiB peak.
+
+## t3/prefill-batched-kernel-speedup — batched prefill tile rewrite (in progress validation)
+
+Base `f3422c4`; branch `t3/prefill-batched-kernel-speedup`. Design notes: `opt/PREFILL_BATCHED_TILE_DESIGN.md`.
+
+**Implemented.** EXL3 prefill GEMM tiles are derived from the sm_61 shared-memory roofline. Dense M>32 uses a BM=64/BN=64, 128-thread, 4x8 register tile with strided conflict-free scalar shared loads; narrow-N dense shapes use BM=32/BN=64 4x4 tiles to recover output parallelism; ka=3 halfk dense wo keeps the higher-occupancy legacy tile because it measured faster there. The grouped MoE kernel keeps its public launch contract but maps even column CTAs over 128 columns and processes unpadded 32-row pieces, eliminating the half-tile padding at the realistic mean of 32 rows/expert. The reduction order for every output remains k-tile then r ascending; all final numbers below are bit-identical to the scalar references.
+
+**Rejected experiments.** Vectorized float4 weight loads were slower than conflict-free scalar strided loads (grouped 1.54 vs 1.69 TFLOP/s in the comparison run). Narrow-everything dense tiling was much worse (wq 1.04 vs 1.50). Flash head-split CTAs were neutral (0.89 vs 0.92), shared-FP32 K/V conversion was worse (0.63), and probability-vector/shared-tile variants were neutral to worse, so flash remains the Phase-1 schedule.
+
+**Final harness run** (`/tmp/prefill-final.log`, one run; shared GPU, expect several percent noise): OVERALL PASS, conv 0 bit diffs, MoE grouped/pipeline 0 bit diffs, flash max abs 1.583e-8/2.282e-8 SWA and 1.770e-8 full.
+
+| kernel, realistic M=64/C=512 shape | before TFLOP/s | after TFLOP/s |
+|---|---:|---:|
+| EXL3 MoE gu 2304x1152 | 0.74 | 0.97 |
+| EXL3 MoE dn 1152x2304 | 1.05 | 1.05 |
+| dense wq 2304x3072 | 0.89 | 1.37 |
+| dense wo 3072x2304 | 1.25 | 1.32 |
+| grouped MoE 512x8, ~32 rows/expert | 0.83 | 1.60 |
+| flash_prefill_gqa3 | 0.92 | 0.85 (unchanged kernel; run noise) |
+
+Earlier same-binary comparison measurements before final dispatch were grouped 1.69, gu 1.07, wq 1.50, dn 1.14, so the final row should be read as a conservative noisy sample rather than a regression in those paths. No FP32 reordering was accepted; no error-versus-FP64 relaxation is needed.
+
+**Interpretation.** Grouped MoE is no longer padding-bound and reaches the intended range. Dense narrow-N shapes are limited by the parallelism/arithmetic-intensity tradeoff: a 4x8 tile gives too few threads at N=1152, while 4x4 restores threads but lowers the shared-memory roof. Flash is now the limiting kernel. Its roofline is not DRAM (~98 FLOP/B); it is Pascal issue/occupancy: 168 registers, ~32 KiB smem, 3 CTAs/SM, redundant half-to-float conversions, and serialization around small K tiles. Tested occupancy/conversion trades either lowered occupancy or added enough register pressure to lose more than they saved.
