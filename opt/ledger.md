@@ -2284,3 +2284,8 @@ Earlier same-binary comparison measurements before final dispatch were grouped 1
 - Prefill m≥32: Q-A is capped by the same 128 MAC/SM-cycle roof as FP32 (112.8 at m=32, 123.8 at m=128). Q-B reaches 143.4 / 162.9 (roof 170.7). Ceiling: Q-A ~434–443 tok/s, Q-B ~535; 64K ~191 / ~209.
 - Byte-code bound: the best possible deterministic 1-byte weight code has RMSE 0.56% rms(z), above the ~0.5% the Q-A residual needs. Q-B cannot be repaired into Q-A by a better code.
 - Consequence: prefill stays FP32. The 140 tok/s target is ~3× below the FP32 roof, so kernel efficiency is what matters. Solution files stay on the Devbox (work/challenge4/solution/, SOLUTION.md sha256 85fe486f…a825).
+
+## t3/ccopy2-merge (c1e5880 = master f46f37f-line + t3/expert-copy-efficiency d8e8414) — brain re-validation — NOT MERGED (VRAM / gate miss)
+- Default (cache32 on), 3 runs: md5 5cbe8e06 ×3, 28.46 / 28.69 / 30.50 ms/tok, **peak 5,096 MiB > 5,080 cap**. Master prefill01 is 5,060; cache32 (reserve 96→64 MiB, 1,232 MiB table) plus the +28 MiB headless prompt graph no longer fit.
+- `INKWELL_NO_CACHE32=1`: peak 5,064. A/B 16 pairs vs ctl-master-f46f37f: ctl 28.490 vs cand 28.416 median (−0.075), **8/16**, one cand abort (`cudaGraphInstantiate` out of memory, run 30). The split-D copy + hit pipeline alone carry no measurable win; the −0.328 ms on 17c3b3c came from cache32.
+- Action: retry with cache32 after prefill phase 2 reclaims the headless-graph VRAM (phase-2 contract). The OOM in graph instantiate at 5,064 is a margin warning: whatever lands must keep instantiate headroom, not just steady-state peak.
