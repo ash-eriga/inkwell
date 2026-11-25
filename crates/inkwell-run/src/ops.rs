@@ -161,6 +161,15 @@ pub mod t {
                 args.as_mut_ptr(), 5, crate::runner::attn_cb_addr(), std::ptr::null_mut()))
         }
     }
+    /// Shape-invariant decode attention custom op; src[5] is the device n_kv scalar.
+    #[must_use]
+    pub fn attn_fused_dyn(c: Ptr, k_view: Ptr, v_view: Ptr, q3: Ptr, kq_b: Ptr, mask: Ptr, n_kv_dev: Ptr, hd: i64, nh: i64, userdata: *mut std::ffi::c_void) -> Ptr {
+        unsafe {
+            let mut args = [k_view.0, v_view.0, q3.0, kq_b.0, mask.0, n_kv_dev.0];
+            Ptr(inkwell_ggml::ink_custom_4d(c.0, 0, hd * nh, 1, 1, 1,
+                args.as_mut_ptr(), 6, crate::runner::attn_dyn_cb_addr(), userdata))
+        }
+    }
     op2!(mul, ink_mul);
     op2!(add, ink_add);
     op2!(sub, ink_sub);

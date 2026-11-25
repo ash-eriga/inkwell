@@ -65,6 +65,7 @@ extern "C" {
     fn ink_launch_mmvq_q8_0_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_q6_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_attn_decode(K: *const c_void, V: *const c_void, Q: *const f32, bias: *const f32, mask: *const f32, out: *mut f32, nh: i64, hkv: i64, n_kv: i64, hd: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, kv16: i32, stream: *mut c_void);
+    fn ink_launch_attn_decode_dyn(K: *const c_void, V: *const c_void, Q: *const f32, bias: *const f32, mask: *const f32, out: *mut f32, nh: i64, hkv: i64, d_nkv: *const i32, hd: i64, cap: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, kv16: i32, use_split: i32, allow_gqa: i32, chunk_len: i32, split_min: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_s_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q5_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
@@ -103,6 +104,7 @@ extern "C" {
     fn ink_launch_kv_sconv_batched(wk: *const c_void, wv: *const c_void, xk: *const f32, xv: *const f32,
         dk: *mut f32, dv: *mut f32, nrows: i32, ncols2: i32, stream: *mut c_void);
     fn ink_launch_relbias_gather(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, y: *mut f32, nkv: i32, nh: i32, ext: i32, stream: *mut c_void);
+    fn ink_launch_relbias_gather_dyn(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32, stream: *mut c_void);
     fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_exl3_gemv_mz(trel: *const *const c_void, suh: *const *const c_void, svh: *const *const c_void, x: *const *const f32, y: *mut f32, ystride: i64, scr: *const *mut f32, k: *const i64, n: *const i64, ka: *const i64, halfk: *const i64, nz: i32, stream: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
@@ -603,6 +605,16 @@ pub unsafe fn mmvq_iq2_s_moe_i8_async(wp: *const c_void, x: *const c_void, y: &m
 pub unsafe fn attn_decode_async(k: *const c_void, v: *const c_void, q: *const c_void, bias: *const c_void, mask: *const c_void, out: *mut f32, nh: i64, hkv: i64, n_kv: i64, hd: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, kv16: bool) {
     unsafe { ink_launch_attn_decode(k.cast(), v.cast(), q.cast(), bias.cast(), mask.cast(), out, nh, hkv, n_kv, hd, k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, i32::from(kv16), stream()) };
 }
+
+/// Dynamic-n_kv fused decode attention. The topology flags are fixed at graph
+/// build time; only the exact KV length is read from `d_nkv` on device.
+///
+/// # Safety
+/// All pointers are device pointers; strides are in elements.
+#[expect(clippy::too_many_arguments)]
+pub unsafe fn attn_decode_dyn_async(k: *const c_void, v: *const c_void, q: *const c_void, bias: *const c_void, mask: *const c_void, out: *mut f32, nh: i64, hkv: i64, d_nkv: *const i32, hd: i64, cap: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, kv16: bool, use_split: bool, allow_gqa: bool, chunk_len: i32, split_min: i64) {
+    unsafe { ink_launch_attn_decode_dyn(k.cast(), v.cast(), q.cast(), bias.cast(), mask.cast(), out, nh, hkv, d_nkv, hd, cap, k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, i32::from(kv16), i32::from(use_split), i32::from(allow_gqa), chunk_len, split_min, stream()) };
+}
 /// Single-tensor dense Q5_K GEMV (dp4a). Zeroes `y` internally.
 /// # Safety
 /// `w`/`x`/`y` are device pointers.
@@ -933,6 +945,15 @@ pub unsafe fn ctrl_triad_async(io: *const c_void, n: i32, eps: f32, fo: i32) {
 pub unsafe fn relbias_gather_async(mm: *const f32, sinks: *const f32, rel_pos: *const c_void,
     y: *mut f32, nkv: i32, nh: i32, ext: i32) {
     unsafe { ink_launch_relbias_gather(mm, sinks, rel_pos, y, nkv, nh, ext, stream()) };
+}
+
+/// Dynamic-n_kv rel-bias gather with fixed one-block-per-head grid.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+pub unsafe fn relbias_gather_dyn_async(mm: *const f32, sinks: *const f32, rel_pos: *const c_void,
+    d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32) {
+    unsafe { ink_launch_relbias_gather_dyn(mm, sinks, rel_pos, d_nkv, y, y_stride, nh, ext, stream()) };
 }
 /// Multi-projection EXL3 gemv: `nz` independent projections on parallel side streams.
 ///

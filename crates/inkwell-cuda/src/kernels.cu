@@ -1993,6 +1993,506 @@ __global__ void inkwell_attn_decode_reduce(const float* __restrict__ part, const
     }
 }
 
+
+// Dynamic-n_kv variants used by the shape-invariant decode graph.  The
+// bodies are copies of the static kernels above; only the trip count is read
+// from device memory at execution time.  Inactive fixed-grid split chunks
+// return before touching partials, and reduce recomputes the live chunk count.
+template<bool KV16>
+__global__ void inkwell_attn_decode_dyn(const void* __restrict__ K, const void* __restrict__ V,
+                                    const float* __restrict__ Q, const float* __restrict__ bias,
+                                    const float* __restrict__ mask, float* __restrict__ out,
+                                    int nh, int hkv, const int* __restrict__ d_nkv, int hd,
+                                    int k_s1, int k_s2, int v_s1, int v_s2,
+                                    int q_s2, int b_s2, float scale) {
+    const int n_kv = *d_nkv;
+    extern __shared__ float sm[];
+    float* scores = sm;
+    float* qs = sm + n_kv;
+    __shared__ float red[32];
+    const int h = blockIdx.x;
+    const int hk = h / (nh / hkv);
+    const int lane = threadIdx.x & 31;
+    const int nw = blockDim.x >> 5;
+    const int w = threadIdx.x >> 5;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) qs[d] = Q[d + h * q_s2];
+    __syncthreads();
+    const char* Kh = (const char*)K + (size_t)hk * k_s2;
+    for (int j = w; j < n_kv; j += nw) {
+        const char* kj = Kh + (size_t)j * k_s1;
+        float a = 0.f;
+        if (KV16) {
+            const __half* kjh = (const __half*)kj;
+            for (int d = lane; d < hd; d += 32) a += qs[d] * __half2float(kjh[d]);
+        } else {
+            const float* kjf = (const float*)kj;
+            for (int d = lane; d < hd; d += 32) a += qs[d] * kjf[d];
+        }
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
+        if (lane == 0) scores[j] = a;
+    }
+    __syncthreads();
+    float m = -1e30f;
+    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        const float s = scores[j] * scale + bias[j + h * b_s2] + mask[j];
+        scores[j] = s;
+        m = fmaxf(m, s);
+    }
+    m = fmaxf(m, mask[n_kv]); // zero-logit sink with its mask entry
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) red[w] = m;
+    __syncthreads();
+    if (w == 0) {
+        float mm = -1e30f;
+        for (int i = lane; i < nw; i += 32) mm = fmaxf(mm, red[i]);
+        for (int o = 16; o > 0; o >>= 1) mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, o));
+        if (lane == 0) red[0] = mm;
+    }
+    __syncthreads();
+    const float mx = red[0];
+    float den = 0.f;
+    for (int j = threadIdx.x; j < n_kv; j += blockDim.x) {
+        const float e = __expf(scores[j] - mx);
+        scores[j] = e;
+        den += e;
+    }
+    if (threadIdx.x == 0) den += __expf(mask[n_kv] - mx);
+    for (int o = 16; o > 0; o >>= 1) den += __shfl_xor_sync(0xffffffffu, den, o);
+    if (lane == 0) red[w] = den;
+    __syncthreads();
+    if (w == 0) {
+        float dd = 0.f;
+        for (int i = lane; i < nw; i += 32) dd += red[i];
+        for (int o = 16; o > 0; o >>= 1) dd += __shfl_xor_sync(0xffffffffu, dd, o);
+        if (lane == 0) red[0] = dd;
+    }
+    __syncthreads();
+    const float inv = 1.f / red[0];
+    const char* Vh = (const char*)V + (size_t)hk * v_s2;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float o = 0.f;
+        if (KV16) {
+            const __half* vh = (const __half*)Vh;
+            for (int j = 0; j < n_kv; ++j) o += scores[j] * __half2float(vh[(size_t)j * v_s1 / 2 + d]);
+        } else {
+            const float* vf = (const float*)Vh;
+            for (int j = 0; j < n_kv; ++j) o += scores[j] * vf[(size_t)j * v_s1 / 4 + d];
+        }
+        out[h * hd + d] = o * inv;
+    }
+}
+
+
+__global__ void inkwell_attn_decode_gqa3_exact_dyn(const void* __restrict__ K, const void* __restrict__ V,
+                                               const float* __restrict__ Q, const float* __restrict__ bias,
+                                               const float* __restrict__ mask, float* __restrict__ out,
+                                               const int* __restrict__ d_nkv, int k_s1, int k_s2, int v_s1, int v_s2,
+                                               int q_s2, int b_s2, float scale) {
+    const int n_kv = *d_nkv;
+    extern __shared__ float smg[];
+    float* scores = smg;
+    float* qs = smg + 3 * n_kv;
+    __shared__ float red[3][32];
+    __shared__ uint2 kvbuf[INKWELL_ATTN_GQA3_VTILE][32];
+    const int hk = blockIdx.x;
+    const int h0 = hk * 3;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int w = tid >> 5;
+
+    if ((((uintptr_t)Q) & 15) == 0 && (q_s2 & 3) == 0) {
+        for (int i = tid; i < 96; i += 256) {
+            const int g = i >> 5;
+            const int f = (i & 31) * 4;
+            const float4 qv = __ldg((const float4*)(Q + (size_t)(h0 + g) * q_s2 + f));
+            qs[g * 128 + f] = qv.x;
+            qs[g * 128 + f + 1] = qv.y;
+            qs[g * 128 + f + 2] = qv.z;
+            qs[g * 128 + f + 3] = qv.w;
+        }
+    } else {
+        for (int i = tid; i < 384; i += 256) {
+            const int g = i >> 7;
+            const int d = i & 127;
+            qs[i] = Q[(size_t)(h0 + g) * q_s2 + d];
+        }
+    }
+    __syncthreads();
+
+    const char* Kh = (const char*)K + (size_t)hk * k_s2;
+    const size_t kstep = (size_t)8 * k_s1;
+    for (int base = 0; base < n_kv; base += INKWELL_ATTN_GQA3_VTILE) {
+        const int cnt = min(INKWELL_ATTN_GQA3_VTILE, n_kv - base);
+        const char* kj = Kh + (size_t)(base + w) * k_s1;
+        for (int r = w; r < cnt; r += 8, kj += kstep) {
+            kvbuf[r][lane] = __ldcs((const uint2*)(kj + lane * 8));
+        }
+        __syncthreads();
+        for (int r = w; r < cnt; r += 8) {
+            const int j = base + r;
+            const __half* kh = (const __half*)kvbuf[r];
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int d = lane + 32 * t;
+                const float kv = __half2float(kh[d]);
+                a0 += qs[d] * kv;
+                a1 += qs[128 + d] * kv;
+                a2 += qs[256 + d] * kv;
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                a0 += __shfl_down_sync(0xffffffffu, a0, o);
+                a1 += __shfl_down_sync(0xffffffffu, a1, o);
+                a2 += __shfl_down_sync(0xffffffffu, a2, o);
+            }
+            if (lane == 0) {
+                scores[j] = a0;
+                scores[n_kv + j] = a1;
+                scores[2 * n_kv + j] = a2;
+            }
+        }
+        __syncthreads();
+    }
+
+    float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f;
+    for (int j = tid; j < n_kv; j += 256) {
+        const float mk = mask[j];
+        const float s0 = scores[j] * scale + bias[j + h0 * b_s2] + mk;
+        const float s1 = scores[n_kv + j] * scale + bias[j + (h0 + 1) * b_s2] + mk;
+        const float s2 = scores[2 * n_kv + j] * scale + bias[j + (h0 + 2) * b_s2] + mk;
+        scores[j] = s0;
+        scores[n_kv + j] = s1;
+        scores[2 * n_kv + j] = s2;
+        m0 = fmaxf(m0, s0);
+        m1 = fmaxf(m1, s1);
+        m2 = fmaxf(m2, s2);
+    }
+    const float msink = mask[n_kv];
+    m0 = fmaxf(m0, msink);
+    m1 = fmaxf(m1, msink);
+    m2 = fmaxf(m2, msink);
+    for (int o = 16; o > 0; o >>= 1) {
+        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, o));
+        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, o));
+        m2 = fmaxf(m2, __shfl_xor_sync(0xffffffffu, m2, o));
+    }
+    if (lane == 0) {
+        red[0][w] = m0;
+        red[1][w] = m1;
+        red[2][w] = m2;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float mm0 = -1e30f, mm1 = -1e30f, mm2 = -1e30f;
+        for (int i = lane; i < 8; i += 32) {
+            mm0 = fmaxf(mm0, red[0][i]);
+            mm1 = fmaxf(mm1, red[1][i]);
+            mm2 = fmaxf(mm2, red[2][i]);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            mm0 = fmaxf(mm0, __shfl_xor_sync(0xffffffffu, mm0, o));
+            mm1 = fmaxf(mm1, __shfl_xor_sync(0xffffffffu, mm1, o));
+            mm2 = fmaxf(mm2, __shfl_xor_sync(0xffffffffu, mm2, o));
+        }
+        if (lane == 0) {
+            red[0][0] = mm0;
+            red[1][0] = mm1;
+            red[2][0] = mm2;
+        }
+    }
+    __syncthreads();
+    const float mx0 = red[0][0], mx1 = red[1][0], mx2 = red[2][0];
+
+    float den0 = 0.f, den1 = 0.f, den2 = 0.f;
+    for (int j = tid; j < n_kv; j += 256) {
+        const float e0 = __expf(scores[j] - mx0);
+        const float e1 = __expf(scores[n_kv + j] - mx1);
+        const float e2 = __expf(scores[2 * n_kv + j] - mx2);
+        scores[j] = e0;
+        scores[n_kv + j] = e1;
+        scores[2 * n_kv + j] = e2;
+        den0 += e0;
+        den1 += e1;
+        den2 += e2;
+    }
+    if (tid == 0) {
+        den0 += __expf(msink - mx0);
+        den1 += __expf(msink - mx1);
+        den2 += __expf(msink - mx2);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        den0 += __shfl_xor_sync(0xffffffffu, den0, o);
+        den1 += __shfl_xor_sync(0xffffffffu, den1, o);
+        den2 += __shfl_xor_sync(0xffffffffu, den2, o);
+    }
+    if (lane == 0) {
+        red[0][w] = den0;
+        red[1][w] = den1;
+        red[2][w] = den2;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float dd0 = 0.f, dd1 = 0.f, dd2 = 0.f;
+        for (int i = lane; i < 8; i += 32) {
+            dd0 += red[0][i];
+            dd1 += red[1][i];
+            dd2 += red[2][i];
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            dd0 += __shfl_xor_sync(0xffffffffu, dd0, o);
+            dd1 += __shfl_xor_sync(0xffffffffu, dd1, o);
+            dd2 += __shfl_xor_sync(0xffffffffu, dd2, o);
+        }
+        if (lane == 0) {
+            red[0][0] = dd0;
+            red[1][0] = dd1;
+            red[2][0] = dd2;
+        }
+    }
+    __syncthreads();
+    const float inv0 = 1.f / red[0][0];
+    const float inv1 = 1.f / red[1][0];
+    const float inv2 = 1.f / red[2][0];
+
+    const int d = tid;
+    const float* score0 = scores;
+    const float* score1 = scores + n_kv;
+    const float* score2 = scores + 2 * n_kv;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    const char* Vh = (const char*)V + (size_t)hk * v_s2;
+    const size_t vstep = (size_t)8 * v_s1;
+    for (int base = 0; base < n_kv; base += INKWELL_ATTN_GQA3_VTILE) {
+        const int cnt = min(INKWELL_ATTN_GQA3_VTILE, n_kv - base);
+        const char* vj = Vh + (size_t)(base + w) * v_s1;
+        for (int r = w; r < cnt; r += 8, vj += vstep) {
+            kvbuf[r][lane] = __ldcs((const uint2*)(vj + lane * 8));
+        }
+        __syncthreads();
+        if (tid < 128) {
+            for (int r = 0; r < cnt; ++r) {
+                const int j = base + r;
+                const float vv = __half2float(((const __half*)kvbuf[r])[d]);
+                acc0 += score0[j] * vv;
+                acc1 += score1[j] * vv;
+                acc2 += score2[j] * vv;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 128) {
+        out[h0 * 128 + d] = acc0 * inv0;
+        out[(h0 + 1) * 128 + d] = acc1 * inv1;
+        out[(h0 + 2) * 128 + d] = acc2 * inv2;
+    }
+}
+
+template<bool KV16>
+__global__ void inkwell_attn_decode_splitw_dyn(const void* __restrict__ K, const void* __restrict__ V,
+                                           const float* __restrict__ Q, const float* __restrict__ bias,
+                                           const float* __restrict__ mask, float* __restrict__ part,
+                                           int nh, int hkv, const int* __restrict__ d_nkv, int hd,
+                                           int k_s1, int k_s2, int v_s1, int v_s2,
+                                           int q_s2, int b_s2, float scale,
+                                           int chunk_len, int qper, int nsub) {
+    extern __shared__ float sw[];
+    float* sacc = sw;
+    float* smm = sacc + INKWELL_ATTN_MAX_QG * 128;
+    float* sml = smm + INKWELL_ATTN_MAX_QG;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int w = tid >> 5;
+    const int nw = blockDim.x >> 5;
+    const int chunk = blockIdx.x;
+    const int hk = blockIdx.y / nsub;
+    const int sg = blockIdx.y - hk * nsub;
+    const int ratio = nh / hkv;
+    const int qrel0 = sg * qper;
+    const int gc = min(qper, ratio - qrel0);
+    const int qbase = hk * ratio + qrel0;
+    const int n_kv = *d_nkv;
+    const int j0 = chunk * chunk_len;
+    if (j0 >= n_kv) return;
+    const int j1 = min(n_kv, j0 + chunk_len);
+    const int d0 = lane * 4;
+    const char* Kh = (const char*)K + (size_t)hk * k_s2;
+    const char* Vh = (const char*)V + (size_t)hk * v_s2;
+
+    float qr[INKWELL_ATTN_MAX_QG][4] = {};
+    float acc[INKWELL_ATTN_MAX_QG][4] = {};
+    float mst[INKWELL_ATTN_MAX_QG], lst[INKWELL_ATTN_MAX_QG];
+    #pragma unroll
+    for (int g = 0; g < INKWELL_ATTN_MAX_QG; ++g) {
+        mst[g] = -1e30f;
+        lst[g] = 0.f;
+    }
+    for (int g = 0; g < gc; ++g) {
+        const float* qp = Q + (size_t)(qbase + g) * q_s2 + d0;
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) qr[g][f] = qp[f];
+    }
+
+    uint2 k16 = make_uint2(0, 0), v16 = make_uint2(0, 0);
+    uint2 kn16 = make_uint2(0, 0), vn16 = make_uint2(0, 0);
+    float4 k32 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 v32 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 kn32 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 vn32 = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (j0 + w < j1) {
+        const char* kj = Kh + (size_t)(j0 + w) * k_s1;
+        const char* vj = Vh + (size_t)(j0 + w) * v_s1;
+        if (KV16) {
+            k16 = __ldcs((const uint2*)(kj + lane * 8));
+            v16 = __ldcs((const uint2*)(vj + lane * 8));
+        } else {
+            k32 = __ldcs((const float4*)(kj + lane * 16));
+            v32 = __ldcs((const float4*)(vj + lane * 16));
+        }
+    }
+    for (int j = j0 + w; j < j1; j += nw) {
+        const int jn = j + nw;
+        if (jn < j1) {
+            const char* kj = Kh + (size_t)jn * k_s1;
+            const char* vj = Vh + (size_t)jn * v_s1;
+            if (KV16) {
+                kn16 = __ldcs((const uint2*)(kj + lane * 8));
+                vn16 = __ldcs((const uint2*)(vj + lane * 8));
+            } else {
+                kn32 = __ldcs((const float4*)(kj + lane * 16));
+                vn32 = __ldcs((const float4*)(vj + lane * 16));
+            }
+        }
+
+        float kval[4], vval[4];
+        if (KV16) {
+            const __half2 k01 = *(const __half2*)&k16.x;
+            const __half2 k23 = *(const __half2*)&k16.y;
+            const __half2 v01 = *(const __half2*)&v16.x;
+            const __half2 v23 = *(const __half2*)&v16.y;
+            kval[0] = __low2float(k01); kval[1] = __high2float(k01);
+            kval[2] = __low2float(k23); kval[3] = __high2float(k23);
+            vval[0] = __low2float(v01); vval[1] = __high2float(v01);
+            vval[2] = __low2float(v23); vval[3] = __high2float(v23);
+        } else {
+            kval[0] = k32.x; kval[1] = k32.y; kval[2] = k32.z; kval[3] = k32.w;
+            vval[0] = v32.x; vval[1] = v32.y; vval[2] = v32.z; vval[3] = v32.w;
+        }
+
+        float a[INKWELL_ATTN_MAX_QG] = {};
+        #pragma unroll
+        for (int g = 0; g < INKWELL_ATTN_MAX_QG; ++g) {
+            if (g < gc) a[g] = qr[g][0] * kval[0] + qr[g][1] * kval[1] + qr[g][2] * kval[2] + qr[g][3] * kval[3];
+        }
+        for (int g = 0; g < gc; ++g) {
+            for (int o = 16; o > 0; o >>= 1) a[g] += __shfl_xor_sync(0xffffffffu, a[g], o);
+        }
+        const float mk = mask[j];
+        #pragma unroll
+        for (int g = 0; g < INKWELL_ATTN_MAX_QG; ++g) {
+            if (g >= gc) continue;
+            const int h = qbase + g;
+            const float sc = a[g] * scale + bias[j + h * b_s2] + mk;
+            const float mold = mst[g];
+            if (sc > mold) {
+                const float c = __expf(mold - sc);
+                mst[g] = sc;
+                lst[g] = lst[g] * c + 1.f;
+                #pragma unroll
+                for (int f = 0; f < 4; ++f) acc[g][f] = acc[g][f] * c + vval[f];
+            } else {
+                const float p = __expf(sc - mold);
+                lst[g] += p;
+                #pragma unroll
+                for (int f = 0; f < 4; ++f) acc[g][f] += p * vval[f];
+            }
+        }
+        k16 = kn16;
+        v16 = vn16;
+        k32 = kn32;
+        v32 = vn32;
+    }
+
+    if (w == 0) {
+        #pragma unroll
+        for (int g = 0; g < INKWELL_ATTN_MAX_QG; ++g) {
+            if (g < gc) {
+                if (lane == 0) {
+                    smm[g] = mst[g];
+                    sml[g] = lst[g];
+                }
+                #pragma unroll
+                for (int f = 0; f < 4; ++f) sacc[g * 128 + d0 + f] = acc[g][f];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (w == 1) {
+        #pragma unroll
+        for (int g = 0; g < INKWELL_ATTN_MAX_QG; ++g) {
+            if (g >= gc) continue;
+            float* pb = part + ((size_t)chunk * nh + qbase + g) * (hd + 2);
+            const float mx = fmaxf(smm[g], mst[g]);
+            const float w0 = __expf(smm[g] - mx);
+            const float w1 = __expf(mst[g] - mx);
+            if (lane == 0) {
+                pb[0] = mx;
+                pb[1] = sml[g] * w0 + lst[g] * w1;
+            }
+            #pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                pb[2 + d0 + f] = sacc[g * 128 + d0 + f] * w0 + acc[g][f] * w1;
+            }
+        }
+    }
+}
+
+__global__ void inkwell_attn_decode_reduce_dyn(const float* __restrict__ part, const float* __restrict__ mask,
+                                           float* __restrict__ out, int nh, const int* __restrict__ d_nkv, int hd, int chunk_len) {
+    __shared__ float ws[INKWELL_ATTN_MAX_SPLIT];
+    __shared__ float red[128];
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int n_kv = *d_nkv;
+    const int nchunks = (n_kv + chunk_len - 1) / chunk_len;
+    float mc = -1e30f;
+    for (int c = tid; c < nchunks; c += 128) {
+        mc = fmaxf(mc, part[((size_t)c * nh + h) * (hd + 2)]);
+    }
+    red[tid] = mc;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    const float mx = fmaxf(red[0], mask[n_kv]);
+    __syncthreads();
+
+    float den = 0.f;
+    for (int c = tid; c < nchunks; c += 128) {
+        const float* pb = part + ((size_t)c * nh + h) * (hd + 2);
+        const float wc = __expf(pb[0] - mx);
+        ws[c] = wc;
+        den += pb[1] * wc;
+    }
+    red[tid] = den;
+    __syncthreads();
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    const float inv = 1.f / (red[0] + __expf(mask[n_kv] - mx));
+    for (int d = tid; d < hd; d += blockDim.x) {
+        float o = 0.f;
+        for (int c = 0; c < nchunks; ++c) {
+            const float* pb = part + ((size_t)c * nh + h) * (hd + 2);
+            o += pb[2 + d] * ws[c];
+        }
+        out[h * hd + d] = o * inv;
+    }
+}
+
+
 extern "C" void ink_launch_attn_decode_old(const void* K, const void* V, const void* Q,
                                            const void* bias, const void* mask, void* out,
                                            long long nh, long long hkv, long long n_kv, long long hd,
@@ -2114,6 +2614,115 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
     ink_launch_attn_decode_old(K, V, Q, bias, mask, out, nh, hkv, n_kv, hd,
         k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, kv16, stream);
 }
+
+// Launchers for the dynamic-n_kv kernels.  `cap` is the fixed KV-view length
+// baked into the graph; `d_nkv` is the exact unparsed length uploaded per token.
+extern "C" void ink_launch_attn_decode_old_dyn(const void* K, const void* V, const void* Q,
+                                               const void* bias, const void* mask, void* out,
+                                               long long nh, long long hkv, const int* d_nkv, long long hd,
+                                               long long k_s1, long long k_s2, long long v_s1, long long v_s2,
+                                               long long q_s2, long long b_s2, float scale, int kv16,
+                                               long long sm_cap, void* stream) {
+    const dim3 g((unsigned)nh), b(256);
+    const size_t sm = (size_t)(sm_cap + hd) * 4;
+    const cudaStream_t st = (cudaStream_t)stream;
+    if (kv16) {
+        inkwell_attn_decode_dyn<true><<<g, b, sm, st>>>(
+            K, V, (const float*)Q, (const float*)bias, (const float*)mask, (float*)out,
+            (int)nh, (int)hkv, d_nkv, (int)hd,
+            (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+    } else {
+        inkwell_attn_decode_dyn<false><<<g, b, sm, st>>>(
+            K, V, (const float*)Q, (const float*)bias, (const float*)mask, (float*)out,
+            (int)nh, (int)hkv, d_nkv, (int)hd,
+            (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+    }
+}
+
+extern "C" void ink_launch_attn_decode_gqa3_exact_dyn(const void* K, const void* V, const void* Q,
+                                                      const void* bias, const void* mask, void* out,
+                                                      long long hkv, const int* d_nkv,
+                                                      long long k_s1, long long k_s2, long long v_s1, long long v_s2,
+                                                      long long q_s2, long long b_s2, float scale,
+                                                      long long sm_cap, void* stream) {
+    const size_t sm = (size_t)(3 * sm_cap + 384) * 4;
+    inkwell_attn_decode_gqa3_exact_dyn<<<dim3((unsigned)hkv), 256, sm, (cudaStream_t)stream>>>(
+        K, V, (const float*)Q, (const float*)bias, (const float*)mask, (float*)out,
+        d_nkv, (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+}
+
+extern "C" int ink_launch_attn_decode_split_dyn(const void* K, const void* V, const void* Q,
+                                                const void* bias, const void* mask, void* out,
+                                                long long nh, long long hkv, const int* d_nkv, long long hd,
+                                                long long cap, long long k_s1, long long k_s2,
+                                                long long v_s1, long long v_s2, long long q_s2,
+                                                long long b_s2, float scale, int kv16,
+                                                int chunk_len, void* stream) {
+    const cudaStream_t st = (cudaStream_t)stream;
+    const int ratio = (int)(nh / hkv);
+    const int max_chunks = (int)((cap + chunk_len - 1) / chunk_len);
+    if (max_chunks > INKWELL_ATTN_MAX_SPLIT) return 0;
+    float* part = inkwell_attn_partbuf((size_t)INKWELL_ATTN_MAX_SPLIT * nh * (hd + 2));
+    if (!part) return 0;
+    const int qper = min(INKWELL_ATTN_MAX_QG, ratio);
+    const int nsub = (ratio + qper - 1) / qper;
+    const dim3 gp((unsigned)max_chunks, (unsigned)(hkv * nsub));
+    const size_t smw = (INKWELL_ATTN_MAX_QG * 128 + 2 * INKWELL_ATTN_MAX_QG) * 4;
+    if (kv16) {
+        inkwell_attn_decode_splitw_dyn<true><<<gp, dim3(64), smw, st>>>(
+            K, V, (const float*)Q, (const float*)bias, (const float*)mask, part,
+            (int)nh, (int)hkv, d_nkv, (int)hd,
+            (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale,
+            chunk_len, qper, nsub);
+    } else {
+        inkwell_attn_decode_splitw_dyn<false><<<gp, dim3(64), smw, st>>>(
+            K, V, (const float*)Q, (const float*)bias, (const float*)mask, part,
+            (int)nh, (int)hkv, d_nkv, (int)hd,
+            (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale,
+            chunk_len, qper, nsub);
+    }
+    inkwell_attn_decode_reduce_dyn<<<dim3((unsigned)nh), 128, 0, st>>>(
+        part, (const float*)mask, (float*)out, (int)nh, d_nkv, (int)hd, chunk_len);
+    return 1;
+}
+
+// Dynamic counterpart of ink_launch_attn_decode.  The host side supplies the
+// static topology decision (`use_split`, `allow_gqa`, `chunk_len`) because it
+// is baked into the CUDA graph; the exact trip count remains device-resident.
+extern "C" void ink_launch_attn_decode_dyn(const void* K, const void* V, const void* Q,
+                                           const void* bias, const void* mask, void* out,
+                                           long long nh, long long hkv, const int* d_nkv, long long hd,
+                                           long long cap, long long k_s1, long long k_s2,
+                                           long long v_s1, long long v_s2, long long q_s2,
+                                           long long b_s2, float scale, int kv16,
+                                           int use_split, int allow_gqa, int chunk_len,
+                                           long long split_min, void* stream) {
+    const int ratio = hkv > 0 ? (int)(nh / hkv) : 0;
+    const bool shape_ok = hkv > 0 && nh % hkv == 0 && ratio > 0 && hd == 128 &&
+        (kv16 ? (k_s1 % 8 == 0 && v_s1 % 16 == 0) : (k_s1 % 16 == 0 && v_s1 % 16 == 0));
+    if (use_split && shape_ok &&
+        ink_launch_attn_decode_split_dyn(K, V, Q, bias, mask, out, nh, hkv, d_nkv, hd,
+            cap, k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, kv16, chunk_len, stream)) {
+        return;
+    }
+    static int no_gqa_exact = -1;
+    if (no_gqa_exact < 0) no_gqa_exact = getenv("INKWELL_NO_ATTN_GQA_EXACT") ? 1 : 0;
+    const long long sm_cap = cap < split_min ? cap : split_min;
+    const size_t gqa_sm = (size_t)(3 * sm_cap + 384) * 4;
+    const bool gqa3_shape = kv16 && hkv > 0 && nh == 3 * hkv && hd == 128 &&
+        k_s1 % 8 == 0 && k_s2 % 8 == 0 && v_s1 % 8 == 0 && v_s2 % 8 == 0 &&
+        (((uintptr_t)K) & 7) == 0 && (((uintptr_t)V) & 7) == 0 &&
+        gqa_sm + 33152 <= 48 * 1024;
+    if (!use_split && allow_gqa && !no_gqa_exact && gqa3_shape) {
+        ink_launch_attn_decode_gqa3_exact_dyn(K, V, Q, bias, mask, out, hkv, d_nkv,
+            k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, sm_cap, stream);
+        return;
+    }
+    const long long fb_cap = (!use_split && allow_gqa) ? sm_cap : cap;
+    ink_launch_attn_decode_old_dyn(K, V, Q, bias, mask, out, nh, hkv, d_nkv, hd,
+        k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, kv16, fb_cap, stream);
+}
+
 
 // ===================== EXL3 trellis GEMV (sm_61, mul1 codebook) =====================
 // W = diag(suh) H What H diag(svh); y = svh . H (What^T-ish GEMV over decoded tiles).
@@ -6568,6 +7177,28 @@ extern "C" void ink_launch_relbias_gather(const float* mm, const float* sinks,
     const int t = nkv * nh;
     inkwell_relbias_gather<<<(t + 255) / 256, 256, 0, (cudaStream_t)stream>>>(
         mm, sinks, (const int*)rel_pos, y, nkv, nh, ext);
+}
+
+// Fixed-grid dynamic-n_kv variant: one block per head, output stride cap.
+__global__ void inkwell_relbias_gather_dyn(const float* __restrict__ mm,
+        const float* __restrict__ sinks, const int* __restrict__ rel_pos,
+        const int* __restrict__ d_nkv, float* __restrict__ y, int y_stride,
+        int nh, int ext) {
+    const int h = blockIdx.x;
+    if (h >= nh) return;
+    const int nkv = *d_nkv;
+    const float sh = sinks[h];
+    const float* mmh = mm + (size_t)h * ext;
+    float* yh = y + (size_t)h * y_stride;
+    for (int j = threadIdx.x; j < nkv; j += blockDim.x) {
+        yh[j] = __fsub_rn(mmh[rel_pos[j]], sh);
+    }
+}
+extern "C" void ink_launch_relbias_gather_dyn(const float* mm, const float* sinks,
+        const void* rel_pos, const int* d_nkv, float* y, int y_stride,
+        int nh, int ext, void* stream) {
+    inkwell_relbias_gather_dyn<<<dim3((unsigned)nh), 256, 0, (cudaStream_t)stream>>>(
+        mm, sinks, (const int*)rel_pos, d_nkv, y, y_stride, nh, ext);
 }
 
 // ---- ctrl gf_cat GEMV + ctrl_apply fusion (INKWELL_NO_GFAPPLY=1 disables) ----
