@@ -19,7 +19,6 @@ mod madv {
 
 use crate::ops::{t, Buf, Ptr, Rt};
 use inkwell_gguf::GgufFile;
-use inkwell_st as _st;
 use inkwell_core::InklingConfig;
 use std::collections::HashMap;
 

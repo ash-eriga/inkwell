@@ -2,19 +2,16 @@
 import json, struct, sys
 from pathlib import Path
 
-def load_shard(path):
-    b=Path(path).read_bytes()
-    hlen=struct.unpack('<Q',b[:8])[0]
-    hdr=json.loads(b[8:8+hlen])
-    return b,8+hlen,hdr
-
 def tensor(repo,name):
     idx=json.loads((Path(repo)/'model.safetensors.index.json').read_text())['weight_map']
     shard=idx[name]
-    b,base,hdr=load_shard(Path(repo)/shard)
-    e=hdr[name]
-    a,z=e['data_offsets']
-    return e['shape'],b[base+a:base+z]
+    with open(Path(repo)/shard,'rb') as f:
+        hlen=struct.unpack('<Q',f.read(8))[0]
+        hdr=json.loads(f.read(hlen))
+        e=hdr[name]
+        a,z=e['data_offsets']
+        f.seek(8+hlen+a)
+        return e['shape'],f.read(z-a)
 
 def bf16_to_f32_bytes(d):
     out=bytearray(len(d)*2)
