@@ -1973,3 +1973,23 @@ Worktree t3/spec-decode-feasibility-study (uncommitted diagnostic hooks `INKWELL
 
 - Existing paths are BROKEN on master: `INKWELL_VTEST8`, `INKWELL_SPEC=7` (n-gram) and `INKWELL_SPEC=mtp` all abort with `GGML_ASSERT(view_size + view_offs <= ggml_nbytes(view_src))` (ggml.c:1868). Probably a regression from the kslot/arena or NT-batch views.
 - Orchestrator estimate: np1 draft at 16.2 ms/tok is too expensive for a naive scheme. Drafting k=3 costs 48 ms and a full 4-token verify ≥40 ms, which is about 27–31 ms/tok and no gain. A viable path must reuse the draft's prelude + pass-1 work in the verify (LayerSkip-style shared prefix: only passes 2–3 + epilogue run batched). It must also amortise ccopy/expert streaming across the verified tokens.
+
+## Neon study: encode/prefill (batched prefill) — partial, child crashed (provider error); data recovered by orchestrator
+Raw: /tmp/prefill-study/results/{kbench,default_ctx512,vtest8_ctx512}.log. Only part A (kbench) and part B1 ran. Parts B2–D (512/2K/8K windows, nsys) did not run.
+- Current encode is serial and slower than decode: `encode 4 tok in 261 ms` (65 ms/tok) and 551 ms on a second run. Decode is ~29 ms/tok.
+- Batched EXL3 GEMM kbench (sm_61), µs per token:
+
+| shape | M=4 | M=16 | M=64 |
+|---|---|---|---|
+| MoE gu K2.0 | 39.8 | 16.8 | 5.6 |
+| MoE gu K3.0 | 36.4 | 16.6 | 6.0 |
+| MoE dn K2.5 | 24.5 | 12.5 | 4.35 |
+
+  Dense wq K3 and wo K3.5 sit at ~10–14 µs/tok for M 64–512, at ~1.0–1.4 TFLOP/s. Bit-exactness was checked only at M=16 (0 diffs). The other rows were not checked (-1).
+- Flash prefill attention kbench (nh24/hkv8/hd128, F16 KV): 0.19–0.24 TFLOP/s, far below the 1060's ~4.4 TFLOP/s FP32 peak.
+  - SWA costs 56–66 µs/tok.
+  - FULL attention cost grows linearly with position: 228 µs/tok at 4K, 1.79 ms/tok at 32K, 3.55 ms/tok at 65K.
+  - Implied 64K full-attn prefill at this kernel: ~115 s. The attention kernel needs a rewrite before 64K prefill is usable.
+- ctx512 default prompt: md5 5cbe8e06.
+- VTEST8 works in this probe binary, but the block verify is not bit-exact vs serial: j0–j7 max diff 2.5e-4 to 8.1e-4. It is also slow (8-token block 701 ms, 87.6 ms/tok) and OOMs in cudaGraphInstantiate at gen 8 with CACHE_MARGIN_MB=10.
+- Conclusion: batched MoE GEMM gives a 6–8× per-token gain at M=64 vs M=4. A real prefill path needs: batched expert GEMM over the token chunk, a faster flash-prefill attention, and graph memory headroom. Exactness vs serial must be gated (md5 of generated text after prefill, plus a KLD gate if float order changes).
