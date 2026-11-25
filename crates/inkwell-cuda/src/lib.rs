@@ -52,6 +52,7 @@ struct NvmlProcessInfo {
 
 extern "C" {
     fn ink_launch_dequant_iq2_xxs(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
+    fn ink_launch_pipe_resolve(am: *const u32, embd: *const c_void, row_stride: i64, idout: *mut i32, row: *mut f32, nblocks: i64, stream: *mut c_void);
     fn ink_launch_dequant_iq1_s(vx: *const c_void, y: *mut f32, nblocks: i64, stream: *mut c_void);
     fn ink_launch_mmvq_nvfp4(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_mmvq_iq1_s(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
@@ -707,6 +708,16 @@ pub unsafe fn memcpy_d2h_async(dst: *mut c_void, src: *const c_void, bytes: usiz
 pub unsafe fn memcpy_h2d_async(dst: *mut c_void, src: *const c_void, bytes: usize) {
     let rc = unsafe { cudaMemcpyAsync(dst, src, bytes, 1, stream()) };
     assert_eq!(rc, 0, "cudaMemcpyAsync HtoD");
+}
+
+/// Resolve token id + BF16 embedding row on device, ordered in the stream.
+///
+/// # Safety
+/// Raw device/zero-copy pointers must stay valid until the stream work runs.
+#[expect(clippy::cast_possible_wrap, reason = "dims < i64::MAX")]
+pub unsafe fn pipe_resolve_async(am: *const u32, embd: *const c_void, row_stride: usize,
+    idout: *mut i32, row: *mut f32, nblocks: usize) {
+    unsafe { ink_launch_pipe_resolve(am, embd, row_stride as i64, idout, row, nblocks as i64, stream()) };
 }
 /// # Safety
 /// `dst`/`src` device memory valid for `bytes`.

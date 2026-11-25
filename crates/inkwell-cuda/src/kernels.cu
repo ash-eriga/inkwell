@@ -152,6 +152,27 @@ extern "C" void ink_launch_dequant_iq2_xxs(const void* vx, float* y, long long n
     inkwell_dequant_iq2_xxs<<<(unsigned)nblocks, 32, 0, (cudaStream_t)stream>>>(vx, y, nblocks);
 }
 
+// Resolve the next decode token on device: copy the winning id into the graph
+// input and convert its BF16 embedding row to f32 from pinned weights.
+__global__ void inkwell_pipe_resolve(const unsigned* __restrict__ am,
+                                     const uint8_t* __restrict__ embd,
+                                     int64_t row_stride,
+                                     int* __restrict__ idout,
+                                     float* __restrict__ row) {
+    const unsigned id = am[0];
+    if (threadIdx.x == 0) idout[0] = (int)id;
+    const uint16_t* src = (const uint16_t*)(embd + (size_t)id * (size_t)row_stride);
+    for (int i = threadIdx.x; i < 2304; i += blockDim.x)
+        row[i] = __uint_as_float(((uint32_t)src[i]) << 16);
+}
+
+extern "C" void ink_launch_pipe_resolve(const unsigned* am, const void* embd,
+        long long row_stride, int* idout, float* row, long long nblocks, void* stream) {
+    (void)nblocks;
+    inkwell_pipe_resolve<<<1, 256, 0, (cudaStream_t)stream>>>(
+        am, (const uint8_t*)embd, row_stride, idout, row);
+}
+
 // ---------------- fused dequant+dot GEMV (own) --------------------------------
 // y[r] = sum_c dequant(W[r,c]) * x[c]; one warp per row.
 

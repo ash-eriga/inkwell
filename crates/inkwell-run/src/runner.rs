@@ -28,6 +28,18 @@ const F16: i32 = 1;
 const I32: i32 = 26;
 const BF16: i32 = 30;
 
+fn warm_file_pages(addr: *const u8, len: usize) {
+    if len == 0 { return; }
+    for off in (0..len).step_by(4096) {
+        unsafe { std::ptr::read_volatile(addr.add(off)) };
+    }
+    unsafe { std::ptr::read_volatile(addr.add(len - 1)) };
+}
+
+fn kv_bucket(n: i64, max: i64) -> i64 {
+    ((n + 63) & !63).min(max)
+}
+
 /// per-layer weight handles resolved by name
 #[derive(Debug, Default)]
 struct L {
@@ -92,7 +104,7 @@ pub struct Runner {
     cfg: InklingConfig,
     layers: Vec<L>,
     // globals
-    tok_embd: Ptr, embd_src: (*const u8, i32, usize), embd_row: Ptr, tok_norm: Ptr, output: Ptr, output_norm: Ptr, output_res_query: Ptr,
+    tok_embd: Ptr, embd_src: (*const u8, i32, usize), embd_dev: *mut std::ffi::c_void, embd_row: Ptr, tok_norm: Ptr, output: Ptr, output_norm: Ptr, output_res_query: Ptr,
     // own lm_head path: device ptr to output.weight + work buffers (Some iff type==IQ4_XS)
     out_head: Option<(inkwell_cuda::DevBuf, inkwell_cuda::DevBuf, inkwell_cuda::DevBuf)>,
     // per-visit KV arenas + conv states (visit → tensors)
@@ -132,6 +144,55 @@ struct StepCache {
     /// device offsets of the 9 input tensors inside `in_buf` + span bytes
     in_offs: [usize; 9],
     in_span: usize,
+    /// embedding row offset inside the packed input span (`usize::MAX` when unpacked)
+    embd_off: usize,
+}
+
+/// One cached-step host timing row, microseconds.
+#[derive(Default, Debug, Clone, Copy)]
+struct StepProfRow {
+    marshal: u64,
+    embd: u64,
+    h2d: u64,
+    prefetch: u64,
+    sched: u64,
+    tailq: u64,
+    premarshal: u64,
+    wait: u64,
+    total: u64,
+}
+
+static STEP_PROF_ROWS: std::sync::Mutex<Vec<StepProfRow>> = std::sync::Mutex::new(Vec::new());
+
+fn stepprof_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("INKWELL_STEPPROF").is_some())
+}
+
+fn stepprof_dur(a: std::time::Instant, b: std::time::Instant) -> u64 {
+    u64::try_from(b.duration_since(a).as_micros()).unwrap_or(u64::MAX)
+}
+
+fn stepprof_push(row: StepProfRow) {
+    STEP_PROF_ROWS.lock().expect("stepprof mutex").push(row);
+}
+
+/// Print aggregate cached-step host timings collected under `INKWELL_STEPPROF`.
+pub fn stepprof_dump() {
+    let rows = STEP_PROF_ROWS.lock().expect("stepprof mutex").clone();
+    if rows.is_empty() { return; }
+    eprintln!("STEPPROF rows={} us/token: field mean p50 p90 max", rows.len());
+    let fields: [(&str, fn(StepProfRow) -> u64); 9] = [
+        ("marshal", |r| r.marshal), ("embd", |r| r.embd), ("h2d", |r| r.h2d),
+        ("prefetch", |r| r.prefetch), ("sched", |r| r.sched), ("tailq", |r| r.tailq),
+        ("premarshal", |r| r.premarshal), ("wait", |r| r.wait), ("total", |r| r.total),
+    ];
+    for (name, get) in fields {
+        let mut v: Vec<u64> = rows.iter().map(|&r| get(r)).collect();
+        v.sort_unstable();
+        let mean = v.iter().sum::<u64>() as f64 / v.len() as f64;
+        eprintln!("STEPPROF {name:<10} {:.1} {} {} {}", mean, v[v.len() / 2], v[v.len() * 9 / 10], v[v.len() - 1]);
+    }
 }
 
 /// tensor dims (ne0..) of a gguf tensor
@@ -593,6 +654,7 @@ impl Runner {
         // layer → (gu pinned idx, dn pinned idx, gu stride, dn stride)
         let mut moe_w: HashMap<usize, (usize, usize, usize, usize)> = HashMap::new();
         let mut embd_src: (*const u8, i32, usize) = (std::ptr::null(), 0, 0);
+        let embd_dev = std::ptr::null_mut();
         for (name, ti, expert, to_f32, host_only) in plan {
             if host_only {
                 let src = unsafe { gg.mmap.as_ptr().add(gg.data_start as usize + ti.offset as usize) };
@@ -856,7 +918,7 @@ impl Runner {
             rt, sched, dev_buf, cpu_buf, w, pinned, expert_dev: Vec::new(), moe_args,
             exl3_w: Vec::new(), exl3_blk: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
             cfg: cfg.clone(), layers,
-            tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
+            tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits,
             n_full, step_gcache: None, sid: None,
         }
@@ -986,7 +1048,21 @@ impl Runner {
         }
 
         // ---- globals ----
-        let embd_src: (*const u8, i32, usize) = (dtp("model.llm.embed.weight").as_ptr(), -2, 2304 * 2);
+        let mut pinned: Vec<inkwell_cuda::PinnedBuf> = Vec::new();
+        let embd_bytes = dtp("model.llm.embed.weight");
+        let (embd_src, embd_dev): ((*const u8, i32, usize), *mut std::ffi::c_void) =
+            if std::env::var_os("INKWELL_NO_PIPESTEP").is_none() {
+                let pb = inkwell_cuda::host_alloc_mapped(embd_bytes.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(embd_bytes.as_ptr(), pb.host, embd_bytes.len());
+                    madv::dontneed(embd_bytes.as_ptr(), embd_bytes.len());
+                }
+                let r = ((pb.host.cast_const(), -2, 2304 * 2), pb.dev);
+                pinned.push(pb);
+                r
+            } else {
+                ((embd_bytes.as_ptr(), -2, 2304 * 2), std::ptr::null_mut())
+            };
         let tok_embd = Ptr(std::ptr::null_mut());
         let tok_norm = dense!("model.llm.embed_norm.weight");
         let output_norm = dense!("model.llm.norm.weight");
@@ -1065,7 +1141,6 @@ impl Runner {
 
         // ---- per-layer ----
         let mut layers = Vec::with_capacity(24);
-        let mut pinned: Vec<inkwell_cuda::PinnedBuf> = Vec::new();
         let mut pinned_bytes = 0usize;
         let mut expert_dev: Vec<inkwell_cuda::DevBuf> = Vec::new();
         let mut moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>> = Vec::new();
@@ -1538,6 +1613,9 @@ impl Runner {
                     cache_allocated >> 20, post_cache_used >> 20);
             }
         }
+        if embd_dev.is_null() && std::env::var_os("INKWELL_NO_EMBED_WARM").is_none() {
+            warm_file_pages(embd_src.0, embd_bytes.len());
+        }
         Self {
             sched_cpu: Some((sched, cpu)),
             conv_args: std::cell::UnsafeCell::new(Vec::new()),
@@ -1550,7 +1628,7 @@ impl Runner {
             w: HashMap::new(), pinned, expert_dev,
             moe_args: Vec::new(), exl3_w, exl3_blk, moe_args_exl3, output_exl3,
             cfg: cfg.clone(), layers,
-            tok_embd, embd_src, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
+            tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits, n_full,
             step_gcache: None, sid: None,
         }
@@ -2254,13 +2332,13 @@ impl Runner {
 
     fn step_impl(&mut self, id: u32, pos: i64, dump_selection: bool) -> Vec<f32> {
         let tb0 = std::time::Instant::now();
-        // per-visit max n_kv this step, padded to a multiple of 64 so tensor
+        // per-visit max n_kv this step, padded to a bucket multiple so tensor
         // shapes stay constant across steps (CUDA-graph replayable). The
         // -inf softmax masks cover the padding columns.
         let n_kv_full_raw = pos + 1;
         let n_kv_swa_raw = (pos + 1).min(self.swa);
-        let n_kv_full = ((n_kv_full_raw + 63) & !63).min(self.max_ctx);
-        let n_kv_swa = ((n_kv_swa_raw + 63) & !63).min(self.swa);
+        let n_kv_full = kv_bucket(n_kv_full_raw, self.max_ctx);
+        let n_kv_swa = kv_bucket(n_kv_swa_raw, self.swa);
 
         // Reuse the built ggml graph + sched splits + instantiated CUDA graph
         // while the shape signature is unchanged: only input data varies.
@@ -2325,6 +2403,16 @@ impl Runner {
             in_offs[i] = off;
             o = off + t::nbytes(*x);
         }
+        // Pack the embedding row after the small inputs so the cached fast path
+        // needs one HtoD copy per token. INKWELL_NO_ONEH2D keeps the old copy pair.
+        let embd_off = if std::env::var_os("INKWELL_NO_ONEH2D").is_none() {
+            let off = (o + 255) & !255;
+            buf.assign(self.embd_row, off);
+            o = off + t::nbytes(self.embd_row);
+            off
+        } else {
+            usize::MAX
+        };
         // keep buf alive for the graph
         std::mem::forget(buf);
 
@@ -2443,7 +2531,7 @@ impl Runner {
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         if caching {
             // keep ctx + cgraph + sched split + instantiated CUDA graph alive
-            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o });
+            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o, embd_off });
         } else {
             // release the cached split plan so the next step's graph gets re-allocated
             unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
@@ -2616,6 +2704,7 @@ impl Runner {
                 emb_pin: inkwell_cuda::host_alloc_mapped(2304 * 4 + 256),
                 ev: inkwell_cuda::event_new(),
                 marshaled: i64::MIN,
+                queued: i64::MIN,
             });
         }
         self.sid.as_mut().expect("sid")
@@ -2641,6 +2730,14 @@ impl Runner {
     /// Record the pos the `in_pin` mirror now holds (or `i64::MIN`).
     fn set_marshaled(&mut self, v: i64) {
         if let Some(s) = self.sid.as_mut() { s.marshaled = v; }
+    }
+
+    fn queued(&mut self) -> i64 {
+        self.sid.as_mut().map_or(i64::MIN, |s| s.queued)
+    }
+
+    fn set_queued(&mut self, v: i64) {
+        if let Some(s) = self.sid.as_mut() { s.queued = v; }
     }
 
     /// Marshal the pos-dependent inputs into the pinned `in_buf` mirror.
@@ -2718,8 +2815,8 @@ impl Runner {
         static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none()) {
             if let Some(gc) = self.step_gcache.take() {
-                let n_kv_full = ((pos + 1 + 63) & !63).min(self.max_ctx);
-                let n_kv_swa = (((pos + 1).min(self.swa) + 63) & !63).min(self.swa);
+                let n_kv_full = kv_bucket(pos + 1, self.max_ctx);
+                let n_kv_swa = kv_bucket((pos + 1).min(self.swa), self.swa);
                 if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
                     let r = self.step_id_cached(id, pos, &gc);
                     self.step_gcache = Some(gc);
@@ -2728,6 +2825,7 @@ impl Runner {
                 self.step_gcache = Some(gc);
             }
         }
+        self.set_queued(i64::MIN);
         host_argmax(&self.step_impl(id, pos, true))
     }
 
@@ -2750,50 +2848,70 @@ impl Runner {
             return token;
         }
         let tb0 = std::time::Instant::now();
+        let detailed = stepprof_enabled();
         let sp = self.sid_parts();
-        let cur_pin = sp.inp[(pos & 1) as usize];
-        if self.marshaled() != pos {
-            self.marshal_inputs(&gc.step, &gc.in_offs, pos, cur_pin);
-        }
-        unsafe { (cur_pin.add(gc.in_offs[0]) as *mut i32).write(id as i32) };
-        // embd row dequant into pinned staging, then one async copy
-        let (src, ty, stride) = self.embd_src;
-        let row = sp.emb as *mut f32;
-        if ty == -2 {
-            let s = unsafe { src.add(id as usize * stride) } as *const u16;
-            for i in 0..2304 {
-                unsafe { *row.add(i) = f32::from_bits(u32::from(*s.add(i)) << 16) };
+        let already = self.queued() == pos;
+        let mut tp1 = tb0;
+        let mut tp2 = tb0;
+        let mut tp3 = tb0;
+        let mut tp4 = tb0;
+        if !already {
+            let cur_pin = sp.inp[(pos & 1) as usize];
+            if self.marshaled() != pos {
+                self.marshal_inputs(&gc.step, &gc.in_offs, pos, cur_pin);
             }
-        } else {
-            let rc = unsafe {
-                inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row, 2304)
+            unsafe { (cur_pin.add(gc.in_offs[0]) as *mut i32).write(id as i32) };
+            tp1 = std::time::Instant::now();
+            // embd row dequant into the pinned input mirror (or its separate staging
+            // buffer under INKWELL_NO_ONEH2D), then async copy.
+            let (src, ty, stride) = self.embd_src;
+            let row = if gc.embd_off == usize::MAX {
+                sp.emb as *mut f32
+            } else {
+                unsafe { cur_pin.add(gc.embd_off) as *mut f32 }
             };
-            assert_eq!(rc, 0, "dequant embd row");
+            if ty == -2 {
+                let s = unsafe { src.add(id as usize * stride) } as *const u16;
+                for i in 0..2304 {
+                    unsafe { *row.add(i) = f32::from_bits(u32::from(*s.add(i)) << 16) };
+                }
+            } else {
+                let rc = unsafe {
+                    inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row, 2304)
+                };
+                assert_eq!(rc, 0, "dequant embd row");
+            }
+            tp2 = std::time::Instant::now();
+            unsafe {
+                inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+                let base = inkwell_ggml::ink_buf_base(self.in_buf.as_ref().expect("in_buf").0 .0);
+                inkwell_cuda::memcpy_h2d_async(base, cur_pin.cast_const().cast(), gc.in_span);
+                if gc.embd_off == usize::MAX {
+                    inkwell_cuda::memcpy_h2d_async(
+                        inkwell_ggml::tensor_data(self.embd_row.0),
+                        sp.emb.cast_const().cast(), 2304 * 4);
+                }
+            }
+            tp3 = std::time::Instant::now();
+            if prof { eprintln!("PROF build={:.1}ms", tb0.elapsed().as_secs_f64() * 1e3); }
+            let t0 = std::time::Instant::now();
+            self.issue_moe_prefetch(pos);
+            tp4 = std::time::Instant::now();
+            unsafe {
+                assert_eq!(
+                    inkwell_ggml::ink_sched_compute_async(self.sched.0, gc.graph.0), 0,
+                    "sched compute async");
+                self.dump_all();
+            }
+            if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
         }
-        unsafe {
-            inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
-            let base = inkwell_ggml::ink_buf_base(self.in_buf.as_ref().expect("in_buf").0 .0);
-            inkwell_cuda::memcpy_h2d_async(base, cur_pin.cast_const().cast(), gc.in_span);
-            inkwell_cuda::memcpy_h2d_async(
-                inkwell_ggml::tensor_data(self.embd_row.0),
-                sp.emb.cast_const().cast(), 2304 * 4);
-        }
-        if prof { eprintln!("PROF build={:.1}ms", tb0.elapsed().as_secs_f64() * 1e3); }
-        let t0 = std::time::Instant::now();
-        self.issue_moe_prefetch(pos);
-        unsafe {
-            assert_eq!(
-                inkwell_ggml::ink_sched_compute_async(self.sched.0, gc.graph.0), 0,
-                "sched compute async");
-            self.dump_all();
-        }
-        if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        let tp5 = std::time::Instant::now();
         // queue argmax + 4B readback after the replay, then marshal the next
         // step's pos-dep inputs while the GPU is still busy (single pinned
         // buf: this step's copy already ran before the graph).
         let next = pos + 1;
-        let n_kv_full = ((next + 1 + 63) & !63).min(self.max_ctx);
-        let n_kv_swa = (((next + 1).min(self.swa) + 63) & !63).min(self.swa);
+        let n_kv_full = kv_bucket(next + 1, self.max_ctx);
+        let n_kv_swa = kv_bucket((next + 1).min(self.swa), self.swa);
         let premarshal = n_kv_full == gc.step.n_kv_full_pad && n_kv_swa == gc.step.n_kv_swa_pad;
         unsafe {
             inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
@@ -2804,12 +2922,42 @@ impl Runner {
                 inkwell_cuda::event_record(sp.ev, inkwell_ggml::cuda_stream());
             }
         }
-        if premarshal {
-            self.marshal_inputs(&gc.step, &gc.in_offs, next, sp.inp[(next & 1) as usize]);
+        let tp6 = std::time::Instant::now();
+        static NO_PIPE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_pipe = *NO_PIPE.get_or_init(|| std::env::var_os("INKWELL_NO_PIPESTEP").is_some());
+        let prefetch_active = self.moe_args_exl3.iter().any(|a|
+            a.cache.as_ref().map_or(false, |c| c.prefetch.is_some()));
+        let (_, ty, stride) = self.embd_src;
+        let dev_resolve = ty == -2 && !self.embd_dev.is_null();
+        let pipeline = premarshal && !no_pipe && gc.embd_off != usize::MAX
+            && self.out_head.is_none() && !prefetch_active && dev_resolve;
+        if pipeline {
+            let next_pin = sp.inp[(next & 1) as usize];
+            self.marshal_inputs(&gc.step, &gc.in_offs, next, next_pin);
+            unsafe {
+                inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+                let base = inkwell_ggml::ink_buf_base(self.in_buf.as_ref().expect("in_buf").0 .0);
+                inkwell_cuda::memcpy_h2d_async(base, next_pin.cast_const().cast(), gc.embd_off);
+                let b = base as *mut u8;
+                inkwell_cuda::pipe_resolve_async(
+                    sp.am.cast(), self.embd_dev.cast_const(), stride,
+                    b.add(gc.in_offs[0]).cast(), b.add(gc.embd_off).cast(), 1);
+                assert_eq!(
+                    inkwell_ggml::ink_sched_compute_async(self.sched.0, gc.graph.0), 0,
+                    "pipelined sched compute async");
+            }
+            self.set_queued(next);
             self.set_marshaled(next);
         } else {
-            self.set_marshaled(i64::MIN);
+            self.set_queued(i64::MIN);
+            if premarshal {
+                self.marshal_inputs(&gc.step, &gc.in_offs, next, sp.inp[(next & 1) as usize]);
+                self.set_marshaled(next);
+            } else {
+                self.set_marshaled(i64::MIN);
+            }
         }
+        let tp7 = std::time::Instant::now();
         if self.out_head.is_some() {
             // own-head needs host launches: sync then take the slow read path
             unsafe { inkwell_cuda::DevBuf::sync() };
@@ -2818,6 +2966,20 @@ impl Runner {
             return token;
         }
         unsafe { inkwell_cuda::event_sync(sp.ev) };
+        let tp8 = std::time::Instant::now();
+        if detailed {
+            stepprof_push(StepProfRow {
+                marshal: stepprof_dur(tb0, tp1),
+                embd: stepprof_dur(tp1, tp2),
+                h2d: stepprof_dur(tp2, tp3),
+                prefetch: stepprof_dur(tp3, tp4),
+                sched: stepprof_dur(tp4, tp5),
+                tailq: stepprof_dur(tp5, tp6),
+                premarshal: stepprof_dur(tp6, tp7),
+                wait: stepprof_dur(tp7, tp8),
+                total: stepprof_dur(tb0, tp8),
+            });
+        }
         let token = unsafe { *(sp.out as *const u32) };
         self.dump_head_record(pos, token, gc.head_in, gc.out, None);
         token
@@ -2857,6 +3019,8 @@ struct SidBufs {
     ev: *mut std::ffi::c_void,
     /// pos whose pos-dep inputs are already marshaled in `in_pin`
     marshaled: i64,
+    /// pos whose graph is already enqueued by the decode pipeline
+    queued: i64,
 }
 
 /// Host-side greedy argmax (the pre-`step_id` selection rule).
@@ -3206,8 +3370,8 @@ impl Runner {
 
         let n_kv_full_raw = pos + NT as i64;
         let n_kv_swa_raw = n_kv_full_raw.min(self.swa);
-        let n_kv_full = ((n_kv_full_raw + 63) & !63).min(self.max_ctx);
-        let n_kv_swa = ((n_kv_swa_raw + 63) & !63).min(self.swa);
+        let n_kv_full = kv_bucket(n_kv_full_raw, self.max_ctx);
+        let n_kv_swa = kv_bucket(n_kv_swa_raw, self.swa);
 
         // per-token input tensors
         let mk_i32 = |v: &[i32]| -> Ptr {

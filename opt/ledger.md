@@ -1838,3 +1838,26 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 - Retry of b28547b (earlier 11/16 on noisy host). A/B 16 pairs vs master 4e7e6d5: CTL 30.851 vs CAND 30.316 ms/tok median (−0.534), 15/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB.
 - Killswitch: INKWELL_NO_RESOLVE_WARP=1.
 - Post-merge master dd6232a, 3 runs: 30.126 / 30.393 / 29.981 ms/tok, md5 5cbe8e06 x3, peak 5,034 MiB.
+
+## 2026-11-25 — Decode host-latency pipeline: ACCEPTED (16/16, -0.714 ms median)
+
+Branch `t3/host-latency`, based on master `79cd1e1` (same code as ledger-only `438eb48`). The acceptance control was a frozen binary built from `79cd1e1`; this matters because the shared master checkout advanced during the run. Decode ms/token is `decode 8 tok in Xs` multiplied by `1000/64` (64 tokens are generated despite the label).
+
+**Measurement.** The fresh profile study found three host-side boundary costs: `embed.weight` mmap cold faults at 0.955 ms/tok uninstrumented (6 x 9.2-13.4 ms stalls in one 64-token run; 15 faults and 1.544 ms/tok under nsys), the pos=64 KV-bucket graph rebuild at 40.7 ms host + 12.4 ms GPU once, and an HtoD-to-first-kernel gap that is mostly nsys overhead (about 50-70 us exposed uninstrumented, not the 1.247 ms/tok node-traced value). Earlier token-boundary profiling showed a median gap of about 0.873 ms from the 4-byte readback end to the first kernel of the next token, inflated by nsys.
+
+**Accepted fix.** The safetensors BF16 embedding table is copied once at load into pinned mapped host memory. In the normal cached decode path, after token N's argmax and 4-byte readback are queued, the host marshals token N+1 into the opposite parity pinned input buffer and queues token N+1 before synchronizing token N. A tiny stream-ordered device kernel reads the winning id from the argmax buffer, writes it into the next graph input, and converts that BF16 embedding row directly into the device input buffer. The small inputs and embedding row share one packed input HtoD span; when the device resolver is active the copy is truncated before the embedding row because the kernel writes that row on device. Killswitches: `INKWELL_NO_PIPESTEP` disables the pinned table/pipeline, `INKWELL_NO_ONEH2D` disables input packing, and `INKWELL_NO_EMBED_WARM` disables the unpinned fallback rewarm. `INKWELL_STEPPROF` reports host-phase timings.
+
+**Acceptance.** Interleaved `ctl,cand,cand,ctl` x 8 against frozen `79cd1e1`, paired positionally as (1,2) and (4,3) in each group. Every run generated md5 `5cbe8e06`; peak process VRAM was 5034 MiB on every run (limit 5080). Build warnings were 62 (limit 64).
+
+| metric | ctl `79cd1e1` | cand |
+|---|---:|---:|
+| median ms/token | 32.278 | **31.564** |
+| mean ms/token | 32.5733 | **31.5961** |
+| positional pair wins | — | **16/16** |
+| peak MiB | 5034 | 5034 |
+
+**Host-memory cost.** The full BF16 table copy is 883.4 MiB of pinned host memory. Process RSS does not account for it like ordinary anonymous memory: per-run peak RssAnon medians were 549,732 KiB candidate vs 544,676 KiB control (about +5 MiB), with RssFile unchanged. Median minimum `MemAvailable` while processes were alive was 5,524,946 KiB candidate vs 6,466,928 KiB control, about 918 MiB lower, consistent with the pinned table. This is a real host-memory tradeoff even though `/proc/pid/status` mostly hides it.
+
+**Negative results.** An earlier packed-upload + `cudaLaunchHostFunc` host-callback pipeline on master `887150b` was correct but not accepted: median 33.608 ctl vs 33.5525 cand, only 8/16 positional pair wins. The callback enqueue cost roughly hundreds of microseconds and was removed; the final design uses the device resolver instead. Increasing KV buckets from 64 to 128 to avoid the pos=64 rebuild was also rejected: in a repeated probe pin+pipeline averaged about 31.552 ms/tok with 64 padding vs 31.999 with 128 padding because the extra padded attention work cost more than the amortized rebuild. The unpinned mmap rewarm path was correct and reduced cold-fault exposure, but was not better than the final pinned/device-resolver design.
+
+**Residual.** The pos=64 KV-bucket graph rebuild is still present. Simply padding to 128 is worse, and the ggml CUDA graph key currently hashes the op sequence rather than shapes, so a one-shot shape-128 prewarm is overwritten by subsequent shape-64 use. Fixing this likely needs shape-aware graph keys or a deliberate multi-shape graph cache, not just host scheduling.

@@ -409,6 +409,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         .unwrap_or_else(|_| "<decode error>".into());
     eprintln!("generated text: {text:?}");
     eprintln!("decode 8 tok in {:?}", dec_t);
+    inkwell_run::runner::stepprof_dump();
 
     if std::env::var_os("INKWELL_VTEST").is_some() {
         // verify path sanity: block of 8×(last id) at `pos` — row 0 logits must
