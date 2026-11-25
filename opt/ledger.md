@@ -1797,3 +1797,10 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 
 - Merged `t3/ch2-nopless-integrate` (40de564, 3c02652, c829bf8). Child A/B: 16 pairs, CTL median 38.658 vs CAND 37.063 ms/tok, 15/16 wins, md5 5cbe8e06 on every run, peak 5,034 MiB, busy host.
 - Master check after merge: ctx512 md5 5cbe8e06 in 2 runs. Decode 2.161 s and 2.167 s for 64 tokens (the log line says "8 tok", but `INKWELL_GENS` defaults to 64) = **33.8 ms/tok**. Log: `ch2nopless: enabled cubin=1320720 bytes`, self-test 4.8–8.4 ms. Build: 62 warnings.
+
+## 2026-11-25 — TOP32 K1.5/K2 stream (branch t3/ch2-top32-integrate, 84def41): NOT accepted, 11/16
+
+- Source: the round-1 hill-climb (069a05c + c2a8df8, cherry-picked onto 887150b) plus a build-step fix. The fix labels loops by their SHF immediate set (ptxas lays them out in a different order from the source), passes the detected loop ranges to the NOP remover, and sets the expected shape to 233/32w for K1.5/K2 and 248/249 for K2.5–K4, with patch fingerprint (463, 465, 1646, 470). The generated target-kernel SASS is identical to the GPU-gated cubin.
+- Isolated GPU gate (orchestrator, `reasm_drv_perk`, ref = 45855f8a): bitwise exact for all six K values, gate/up and down. Against the current NOP-less kernel: K1.5 +6.7–6.9%, K2 +6.0–6.2%, K2.5/K3 +0.6–1.3%, K3.5 −0.3–0.5%, K4 −0.7–1.8%.
+- End-to-end A/B (16 pairs, ctl,cand,cand,ctl, one flock): CTL median 33.795 vs CAND 33.453 ms/tok (−0.34), **11/16 wins**, md5 5cbe8e06 on every run, peak 5,034 MiB. Below the ≥12/16 gate, so not merged.
+- Kept on its branch to be stacked with the round-2 hill-climb result and A/B'd again as a new candidate.
