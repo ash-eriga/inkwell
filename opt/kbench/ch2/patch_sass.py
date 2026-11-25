@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 NOP_WORD = 0x50B0000000070F00
-KERNEL = "gemv_moe_s"
+KERNELS = ("gemv_moe_s", "gemv_sf_ch2")
 FAKE_RE = re.compile(r"XMAD\s+R\d+,\s+(R\d+)(?:\.reuse)?,\s+0x83dc,\s+(R\d+)\s*;.*?/\* (0x[0-9a-f]+) \*/")
 LP_RE = re.compile(r"XMAD\s+(R\d+),\s+(R\d+)\.H1(?:\.reuse)?,\s+0xd12d,\s+RZ\s*;.*?/\* (0x[0-9a-f]+) \*/")
 
@@ -31,10 +31,15 @@ def sass_text(cuobjdump: str, obj: Path) -> str:
 
 def target_chunk(text: str) -> str:
     chunks = re.split(r"\n\s*Function : ", text)[1:]
-    target = [c for c in chunks if KERNEL in c.split("\n", 1)[0]]
-    if len(target) != 1:
-        raise SystemExit(f"expected one {KERNEL} function, found {len(target)}")
-    return target[0]
+    out = []
+    for kernel in KERNELS:
+        target = [c for c in chunks if kernel in c.split("\n", 1)[0]]
+        if len(target) > 1:
+            raise SystemExit(f"expected at most one {kernel} function, found {len(target)}")
+        out.extend(target)
+    if not out:
+        raise SystemExit("no CH2 target functions found")
+    return "\n".join(out)
 
 
 def collect(text: str):
