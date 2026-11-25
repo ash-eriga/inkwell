@@ -4124,6 +4124,21 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
     for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) t0[i] = s0[i];
 }
 
+// Bulk ccopy (side stream) grid parts per (slot, proj). The copy is PCIe-bound;
+// a wide grid occupies every SM and delays the hit GEMV running beside it.
+// Default 2 (scan of 1/2/4/8/16 on master 438eb48: 2 best, ~0.66 ms/tok under 16).
+// INKWELL_CCOPY_PARTS overrides (1..64); 16 restores the old grid.
+static int ink_ccopy_parts() {
+    static int p = -1;
+    if (p < 0) {
+        const char* e = getenv("INKWELL_CCOPY_PARTS");
+        p = e ? atoi(e) : 2;
+        if (p < 1) p = 1;
+        if (p > 64) p = 64;
+    }
+    return p;
+}
+
 __global__ void inkwell_exl3_copy8(const int* __restrict__ src, int* __restrict__ dst) {
     if (threadIdx.x < 8) dst[threadIdx.x] = src[threadIdx.x];
 }
@@ -4389,7 +4404,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
             (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, nullptr, soff);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
-        inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 16), 128, 0, ss>>>(
+        inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, ink_ccopy_parts()), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
             (uint8_t*)bank, slot_proj,
@@ -4877,7 +4892,7 @@ extern "C" void ink_launch_exl3_moe_ntok(
             (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, unexp, soff);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
-        inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, 16), 128, 0, ss>>>(
+        inkwell_exl3_moe_ccopy<<<dim3(nexp * 3, ink_ccopy_parts()), 128, 0, ss>>>(
             (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
             uids, (uint8_t*)cache, map, miss,
             nullptr, slot_proj,
