@@ -32,7 +32,26 @@ fn main() {
         total / 1_048_576
     );
 
-    if let Some("--run") = args.next().as_deref() {
+    let mode = args.next();
+    if mode.as_deref() == Some("--encode-file") {
+        let input = args.next().expect("--encode-file <text> <ids>");
+        let output = args.next().expect("--encode-file <text> <ids>");
+        let text = std::fs::read_to_string(input).expect("read prompt text");
+        let ids = Tokenizer::from_gguf(&g).expect("tokenizer").encode(&text);
+        let mut bytes = Vec::with_capacity(ids.len() * 4);
+        for id in ids { bytes.extend_from_slice(&id.to_le_bytes()); }
+        std::fs::write(output, bytes).expect("write prompt ids");
+        return;
+    }
+    if mode.as_deref() == Some("--decode-file") {
+        let input = args.next().expect("--decode-file <ids> <text>");
+        let output = args.next().expect("--decode-file <ids> <text>");
+        let ids = read_ids_file(std::ffi::OsStr::new(&input));
+        let text = Tokenizer::from_gguf(&g).expect("tokenizer").decode(&ids).expect("decode ids");
+        std::fs::write(output, text).expect("write prompt text");
+        return;
+    }
+    if mode.as_deref() == Some("--run") {
         // deep ggml graphs (48 visits) overflow the default 8MB stack in
         // ggml_build_forward_expand's recursive DFS — run on a big-stack thread
         let cfg2 = cfg.clone();
@@ -45,7 +64,7 @@ fn main() {
             .expect("run_e2e panicked");
         return;
     }
-    if let Some("--types") = args.next().as_deref() {
+    if mode.as_deref() == Some("--types") {
         let mut census = std::collections::BTreeMap::new();
         for (name, t) in &g.tensors {
             let e = census.entry(t.ggml_type).or_insert((0usize, 0u64));
@@ -58,36 +77,36 @@ fn main() {
         }
         return;
     }
-    if let Some("--spec") = args.next().as_deref() {
+    if mode.as_deref() == Some("--spec") {
         bench_spec();
         return;
     }
-    if let Some("--graph") = args.next().as_deref() {
+    if mode.as_deref() == Some("--graph") {
         dump_graph(&cfg);
         return;
     }
-    if let Some("--samplebench") = args.next().as_deref() {
+    if mode.as_deref() == Some("--samplebench") {
         sample_bench(&cfg);
         return;
     }
-    if let Some("--pager") = args.next().as_deref() {
+    if mode.as_deref() == Some("--pager") {
         bench_pager(&g, &cfg);
         return;
     }
-    if let Some("--kv") = args.next().as_deref() {
+    if mode.as_deref() == Some("--kv") {
         dump_kv(&cfg);
         return;
     }
-    if let Some("--model") = args.next().as_deref() {
+    if mode.as_deref() == Some("--model") {
         let g: &'static inkwell_gguf::GgufFile = Box::leak(Box::new(g));
         dump_model(g);
         return;
     }
-    if let Some("--tokbench") = args.next().as_deref() {
+    if mode.as_deref() == Some("--tokbench") {
         bench_tok(&g, 1000);
         return;
     }
-    if let Some("--tok") = args.next().as_deref() {
+    if mode.as_deref() == Some("--tok") {
         let text = args.next().expect("--tok <text>");
         let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
         let ids = tok.encode(&text);
@@ -282,6 +301,11 @@ fn bench_spec() {
 }
 
 /// End-to-end decode: encode prompt tokens one at a time, then generate.
+fn read_ids_file(path: &std::ffi::OsStr) -> Vec<u32> {
+    std::fs::read(path).expect("read token id file")
+        .chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().expect("u32"))).collect()
+}
+
 fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path: &str) {
     use inkwell_run::runner::Runner;
     use std::time::Instant;
@@ -295,9 +319,13 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     };
     eprintln!("runner loaded");
     // real prompt via our tokenizer (bit-identical to llama.cpp)
-    let mut ids = inkwell_tokenizer::Tokenizer::from_gguf(gg)
-        .expect("tokenizer")
-        .encode(&std::env::var("INKWELL_PROMPT").unwrap_or_else(|_| "The capital of France is".into()));
+    let ids = if let Ok(path) = std::env::var("INKWELL_PROMPT_IDS") {
+        read_ids_file(std::ffi::OsStr::new(&path))
+    } else {
+        inkwell_tokenizer::Tokenizer::from_gguf(gg)
+            .expect("tokenizer")
+            .encode(&std::env::var("INKWELL_PROMPT").unwrap_or_else(|_| "The capital of France is".into()))
+    };
     // upstream adds no BOS for this model (add_bos=false)
     let t0 = Instant::now();
     let mut pos = 0i64;
@@ -323,6 +351,12 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let mut id = ids[ids.len() - 1];
     let mut gen_ids = Vec::new();
     let n_gen: usize = std::env::var("INKWELL_GENS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    // INKWELL_FORCE_IDS=<u32le file>: teacher-force this generated-token sequence.
+    // Row 0 is produced from the final prompt token; force[0] is then fed at row 1.
+    let force_ids = std::env::var_os("INKWELL_FORCE_IDS").map(|p| read_ids_file(&p));
+    if let Some(f) = &force_ids {
+        assert!(f.len() >= n_gen, "INKWELL_FORCE_IDS has {} tokens, need {n_gen}", f.len());
+    }
     // INKWELL_VTEST8: after every serial step, replay the 8 tokens just
     // processed as one step_block (conv state snapshotted 8 steps back) and
     // compare all 8 rows against the serial logits — covers deep rows, which
@@ -338,6 +372,26 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let mut logit_dump = std::env::var_os("INKWELL_LOGIT_DUMP")
         .map(|path| std::fs::File::create(path).expect("logit dump file"));
     let dump_logits = logit_dump.is_some();
+    // INKWELL_BTEST8: run one 8-token block at the current position and dump
+    // its rows. Inputs are the final prompt token followed by force[0..7].
+    if std::env::var_os("INKWELL_BTEST8").is_some() {
+        let f = force_ids.as_ref().expect("INKWELL_BTEST8 needs INKWELL_FORCE_IDS");
+        assert!(f.len() >= 7, "INKWELL_BTEST8 needs at least 7 forced ids");
+        let mut blk = [0u32; 8];
+        blk[0] = id;
+        blk[1..].copy_from_slice(&f[..7]);
+        let vl = r.step_block(&blk, pos);
+        let nv = vl.len() / 8;
+        if let Some(f) = &mut logit_dump {
+            use std::io::Write as _;
+            for j in 0..8 {
+                f.write_all(&(nv as u32).to_le_bytes()).expect("logit dump write");
+                for x in &vl[j * nv..(j + 1) * nv] { f.write_all(&x.to_le_bytes()).expect("logit dump write"); }
+            }
+        }
+        eprintln!("BTEST8 base={pos} rows=8");
+        return;
+    }
     for g in 0..n_gen {
         if vtest8 { hist_snaps.push_back(r.snapshot_conv()); }
         let ts = Instant::now();
@@ -363,7 +417,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
             fed_id = id;
         }
         pos += 1;
-        id = best as u32;
+        id = if let Some(f) = &force_ids { f[g] } else { best as u32 };
         gen_ids.push(id);
         if vtest8 {
             fed.push(fed_id);
@@ -403,6 +457,11 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     }
     if vtest8 { eprintln!("VTEST8 total: rows={vt8_rows} mismatches={vt8_bad}"); }
     let dec_t = t1.elapsed();
+    if let Some(path) = std::env::var_os("INKWELL_GEN_IDS_DUMP") {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(path).expect("create generated ids dump");
+        for id in &gen_ids { f.write_all(&id.to_le_bytes()).expect("write generated id"); }
+    }
     let text = inkwell_tokenizer::Tokenizer::from_gguf(gg)
         .expect("tokenizer")
         .decode(&gen_ids)
