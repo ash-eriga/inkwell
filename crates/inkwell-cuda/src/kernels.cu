@@ -7305,6 +7305,115 @@ extern "C" void ink_launch_relbias_gather_dynpos(const float* mm, const float* s
         mm, sinks, d_pos, d_nkv, y, y_stride, nh, ext, mode, swa, rel_extent);
 }
 
+__device__ __forceinline__ float ink_bf16_lo(uint32_t u) {
+    return __uint_as_float(u << 16);
+}
+__device__ __forceinline__ float ink_bf16_hi(uint32_t u) {
+    return __uint_as_float(u & 0xffff0000u);
+}
+
+// Fused attn_sink_proj mmvf + per-row rel-bias dot + gather - sink.
+// mode < 0 reads rel_pos[j]; modes 0/1/2 compute positions as dynpos.
+__global__ void inkwell_sink_relbias_fused(
+        const __nv_bfloat16* __restrict__ w_sink,
+        const float* __restrict__ inp0,
+        const __nv_bfloat16* __restrict__ rel_bias,
+        const float* __restrict__ r,
+        const int* __restrict__ pos_data,
+        const int* __restrict__ d_nkv,
+        float* __restrict__ kq_b,
+        int y_stride, int nkv_static, int ncols2,
+        int mode, int swa, int rel_extent) {
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float buf_iw[32];
+    __shared__ float s_sink;
+    __shared__ float sr[16];
+    if (tid < 32) buf_iw[tid] = 0.0f;
+    if (tid < 16) sr[tid] = r[h * 16 + tid];
+    __syncthreads();
+
+    const __nv_bfloat162* x2 = (const __nv_bfloat162*)(w_sink + (size_t)h * (ncols2 * 2));
+    const float2* y2 = (const float2*)inp0;
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += 256) {
+        const __nv_bfloat162 tmpx = x2[col2];
+        const float2 tmpy = __ldg(&y2[col2]);
+        sumf += __bfloat162float(tmpx.x) * tmpy.x;
+        sumf += __bfloat162float(tmpx.y) * tmpy.y;
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) sumf += __shfl_xor_sync(0xffffffffu, sumf, m);
+    buf_iw[tid >> 5] = sumf;
+    __syncthreads();
+    if (tid < 32) {
+        sumf = buf_iw[tid];
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) sumf += __shfl_xor_sync(0xffffffffu, sumf, m);
+        if (tid == 0) s_sink = sumf;
+    }
+    __syncthreads();
+
+    const float sk = s_sink;
+    const float4 r0 = ((const float4*)sr)[0];
+    const float4 r1 = ((const float4*)sr)[1];
+    const float4 r2 = ((const float4*)sr)[2];
+    const float4 r3 = ((const float4*)sr)[3];
+    const int nkv = d_nkv ? *d_nkv : nkv_static;
+    const int pos = (mode >= 0) ? *pos_data : 0;
+    for (int j = tid; j < nkv; j += 256) {
+        int rp;
+        if (mode < 0) {
+            rp = __ldg(&pos_data[j]);
+        } else if (mode == 1) {
+            const int dpos = pos - j;
+            if (pos < swa) {
+                rp = dpos;
+            } else if ((swa & (swa - 1)) == 0) {
+                rp = dpos & (swa - 1);
+            } else {
+                rp = dpos % swa;
+                if (rp < 0) rp += swa;
+            }
+        } else if (mode == 2) {
+            rp = nkv - 1 - j;
+        } else {
+            rp = pos - j;
+        }
+        if (mode >= 0) rp = min(rp, rel_extent);
+        const uint4* rb = (const uint4*)(rel_bias + (size_t)rp * 16);
+        const uint4 q0 = __ldg(&rb[0]);
+        const uint4 q1 = __ldg(&rb[1]);
+        float acc = 0.0f;
+        acc = fmaf(ink_bf16_lo(q0.x), r0.x, acc);
+        acc = fmaf(ink_bf16_hi(q0.x), r0.y, acc);
+        acc = fmaf(ink_bf16_lo(q0.y), r0.z, acc);
+        acc = fmaf(ink_bf16_hi(q0.y), r0.w, acc);
+        acc = fmaf(ink_bf16_lo(q0.z), r1.x, acc);
+        acc = fmaf(ink_bf16_hi(q0.z), r1.y, acc);
+        acc = fmaf(ink_bf16_lo(q0.w), r1.z, acc);
+        acc = fmaf(ink_bf16_hi(q0.w), r1.w, acc);
+        acc = fmaf(ink_bf16_lo(q1.x), r2.x, acc);
+        acc = fmaf(ink_bf16_hi(q1.x), r2.y, acc);
+        acc = fmaf(ink_bf16_lo(q1.y), r2.z, acc);
+        acc = fmaf(ink_bf16_hi(q1.y), r2.w, acc);
+        acc = fmaf(ink_bf16_lo(q1.z), r3.x, acc);
+        acc = fmaf(ink_bf16_hi(q1.z), r3.y, acc);
+        acc = fmaf(ink_bf16_lo(q1.w), r3.z, acc);
+        acc = fmaf(ink_bf16_hi(q1.w), r3.w, acc);
+        kq_b[(size_t)h * y_stride + j] = __fsub_rn(acc, sk);
+    }
+}
+
+extern "C" void ink_launch_sink_relbias_fused(const void* w_sink, const float* inp0,
+        const void* rel_bias, const float* r, const void* pos_data, const int* d_nkv,
+        float* y, int y_stride, int nh, int nkv_static, int ncols2,
+        int mode, int swa, int rel_extent, void* stream) {
+    inkwell_sink_relbias_fused<<<dim3((unsigned)nh), 256, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)w_sink, inp0, (const __nv_bfloat16*)rel_bias, r,
+        (const int*)pos_data, d_nkv, y, y_stride, nkv_static, ncols2, mode, swa, rel_extent);
+}
+
 // ---- ctrl gf_cat GEMV + ctrl_apply fusion (INKWELL_NO_GFAPPLY=1 disables) ----
 // One warp per output element i: gain = dot(row i, gate), forget =
 // dot(row fo+i, gate), then the ctrl_apply tail. Replicates mmvf's
