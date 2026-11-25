@@ -2247,3 +2247,32 @@ Base `fb9180a`; branch `t3/prefill-chunked-encode-phase0-1`. Implements the seri
 - 3-run canonical validation: md5 5cbe8e06 ×3; decode 28.280 / 27.986 / 28.009 ms/tok; peak **5,060 MiB** (dyn-nkv master 5,032). Warnings 59.
 - Decode path unchanged; encode −10% (512: 32.40 → 29.25 ms/tok; 2048: 36.03 → 32.07).
 - Open risk: +28 MiB post-cache peak from the headless prompt graph, and one agent-side `cudaGraphInstantiate` abort. The 20 MiB margin to 5,080 is thin. The phase-2 arena must reclaim this.
+## t3/prefill-batched-kernel-speedup — batched prefill tile rewrite
+
+Base `f3422c4`; branch `t3/prefill-batched-kernel-speedup`. Design notes: `opt/PREFILL_BATCHED_TILE_DESIGN.md`.
+
+**Implemented.** EXL3 prefill GEMM tiles are derived from the sm_61 shared-memory roofline. Dense M>32 uses a BM=64/BN=64, 128-thread, 4x8 register tile with strided conflict-free scalar shared loads; narrow-N dense shapes use BM=32/BN=64 4x4 tiles to recover output parallelism; ka=3 halfk dense wo keeps the higher-occupancy legacy tile because it measured faster there. The grouped MoE kernel keeps its public launch contract but maps even column CTAs over 128 columns and processes unpadded 32-row pieces, eliminating the half-tile padding at the realistic mean of 32 rows/expert. The reduction order for every output remains k-tile then r ascending; all final numbers below are bit-identical to the scalar references.
+
+**Rejected experiments.** Vectorized float4 weight loads were slower than conflict-free scalar strided loads (grouped 1.54 vs 1.69 TFLOP/s in the comparison run). Narrow-everything dense tiling was much worse (wq 1.04 vs 1.50). Flash head-split CTAs were neutral (0.89 vs 0.92), shared-FP32 K/V conversion was worse (0.63), BQ16 high-occupancy tiling was correct but slower (0.73), key-parallel QK ownership was correct but slower (0.79), and probability-vector/transposed-PV variants were incorrect or no faster, so flash remains the Phase-1 schedule.
+
+**Final harness run** (`/tmp/prefill-final.log`, one run; shared GPU, expect several percent noise): OVERALL PASS, conv 0 bit diffs, MoE grouped/pipeline 0 bit diffs, flash max abs 1.583e-8/2.282e-8 SWA and 1.770e-8 full.
+
+| kernel, realistic M=64/C=512 shape | before TFLOP/s | after TFLOP/s |
+|---|---:|---:|
+| EXL3 MoE gu 2304x1152 | 0.74 | 0.97 |
+| EXL3 MoE dn 1152x2304 | 1.05 | 1.05 |
+| dense wq 2304x3072 | 0.89 | 1.37 |
+| dense wo 3072x2304 | 1.17 | 1.32 |
+| grouped MoE 512x8, ~32 rows/expert | 0.68 | 1.60 |
+| flash_prefill_gqa3 | 0.91 | 0.85 in the final noisy sample; kernel unchanged |
+
+Earlier same-binary comparison measurements before final dispatch were grouped 1.69, gu 1.07, wq 1.50, dn 1.14, so the final row should be read as a conservative noisy sample rather than a regression in those paths. No FP32 reordering was accepted; no error-versus-FP64 relaxation is needed.
+
+**Decode validation and build.** Final default release build rc0, 57 warning lines (limit 64). Canonical ctx512 validation of `target/release/inkwell`: generated-text md5 `5cbe8e06` on 3/3 runs; decode 28.202 / 28.188 / 28.253 ms/tok; peak 5,060 MiB each; `ch2nopless: enabled` on all three runs. An earlier normal-ptxas build also passed md5 3/3 but at 33.5–34.8 ms/tok; the final numbers above are the default CuAssembler-enabled binary.
+
+**Interpretation.** Grouped MoE is no longer padding-bound and reaches the intended range. Dense narrow-N shapes are limited by the parallelism/arithmetic-intensity tradeoff: a 4x8 tile gives too few threads at N=1152, while 4x4 restores threads but lowers the shared-memory roof. Flash is now the limiting kernel. Its roofline is not DRAM (~98 FLOP/B); it is Pascal issue/occupancy: 168 registers, ~32 KiB smem, 3 CTAs/SM, redundant half-to-float conversions, and serialization around small K tiles. Tested occupancy/conversion trades either lowered occupancy or added enough register pressure to lose more than they saved.
+
+## t3/prefill-batched-kernel-speedup (e7f0219) — merged (kernels only, not on the decode path)
+- Bit-exact retiling: grouped MoE 0.68 → 1.60–1.69 TFLOP/s; dense wq 0.89 → 1.37–1.50; MoE gu 0.74 → 0.97–1.07. Flash is unchanged at ~0.9.
+- Agent validation: md5 5cbe8e06 ×3, decode 28.19–28.25 ms/tok, peak 5,060, warnings 57.
+- Orchestrator estimate: at ≤8K, flash is ~0.6–0.65 GFLOP/tok (~0.7 ms at 0.9 TFLOP/s). MoE is 6.1 GFLOP/tok (~3.8 ms at 1.6). Flash is not the 140 tok/s limiter below ~16K.
