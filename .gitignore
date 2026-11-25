@@ -12,3 +12,4 @@ opt/splitk-gate/artifacts/
 opt/splitk-gate/bin/
 __pycache__/
 *.pyc
+opt/hostlat/
