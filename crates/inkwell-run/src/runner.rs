@@ -4257,6 +4257,26 @@ impl Runner {
         let (n, h) = (2304usize, c * 2304);
         let (x0, x1, cat, gate, gain) =
             (a.ptr("cn"), a.ptr("cm"), a.ptr("cat"), a.ptr("cg"), a.ptr("ctrlg"));
+        let dn = l.ctrl_down[ctrl].expect("ctrl_down");
+        if let Some(gfcat) = l.ctrl_gf_cat[ctrl] {
+            let [go, fo] = l.ctrl_gf_off[ctrl];
+            let exact = unsafe {
+                inkwell_ggml::ink_tensor_type(dn.0) == BF16
+                    && inkwell_ggml::ink_tensor_type(gfcat.0) == BF16
+                    && inkwell_ggml::ink_tensor_ne(dn.0, 0) == 2 * n as i64
+                    && inkwell_ggml::ink_tensor_ne(dn.0, 1) == 64
+                    && inkwell_ggml::ink_tensor_ne(gfcat.0, 0) == 64
+                    && go == 0 && fo == n as i64
+                    && inkwell_ggml::ink_tensor_ne(gfcat.0, 1) - fo == n as i64
+            };
+            if exact {
+                unsafe {
+                    inkwell_cuda::pf_ctrl_exact_async(cur.cast_const(), msg, tdata(dn).cast(),
+                        tdata(gfcat).cast(), gate, cur, c as i32, n as i32, 64, 1e-6, fo as i32);
+                }
+                return;
+            }
+        }
         pf_copy(x0, cur, h * 4);
         pf_copy(x1, msg, h * 4);
         unsafe {
@@ -4267,7 +4287,7 @@ impl Runner {
                 inkwell_cuda::memcpy_d2d_async(cat.add(j * 2 * n + n).cast(), x1.add(j * n).cast_const().cast(), n * 4);
             }
         }
-        self.pf_dense(cat.cast_const(), l.ctrl_down[ctrl].expect("ctrl_down"), gate, c, 64, 2 * n);
+        self.pf_dense(cat.cast_const(), dn, gate, c, 64, 2 * n);
         if let Some(gfcat) = l.ctrl_gf_cat[ctrl] {
             self.pf_dense(gate.cast_const(), gfcat, gain, c, 2 * n, 64);
             unsafe { inkwell_cuda::pf_ctrl_apply_cat_async(gain.cast_const(), cur, msg, c as i32, n as i32) };
