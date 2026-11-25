@@ -2225,3 +2225,25 @@ Weighted static count: **6.744156 instr/w**, versus part-1 **6.774625** and targ
 - Scratch merge 6aca5eb (one ledger-only conflict). Build warnings 59.
 - A/B 16 interleaved pairs, ctl = master 17c3b3c build, cand = merge build: ctl median 28.399, cand 28.072 ms/tok, **−0.327 ms/tok, 14/16 wins**, md5 5cbe8e06 on all 32 runs, peak 5,032 MiB both arms.
 - Killswitch `INKWELL_NO_DYN_NKV=1`. Raw: ~/.cache/inkwell-ab/dynnkv3.out.
+## t3/prefill-chunked-encode-phase0-1 — Phase 0 headless encode + Phase 1 prefill kernels
+
+Base `fb9180a`; branch `t3/prefill-chunked-encode-phase0-1`. Implements the serial-encode lm_head skip and the standalone Phase 1 kernels in `crates/inkwell-cuda/src/prefill.cu`; no prefill driver is wired into decode.
+
+**Phase 0.** The remaining step_block hit/miss ordering bug is fixed in `ink_launch_exl3_moe_ntok` (hit expert GEMV now precedes the miss GEMV on the joined stream). Non-final teacher-forced encode rows use `step_prompt_state`: the cached graph ends at the normed hidden state, so lm_head, argmax, and logit readback are omitted while state-update nodes stay unchanged; `clear_step_cache` drops that headless cache before headed generation. Controlled same-session encode A/B, `/tmp/inkwell-phase0-before` vs `/tmp/inkwell-phase0-headless-final`: ctx512 16.554603 s/511 = 32.396 ms/tok before vs 14.947819 s/511 = 29.252 ms/tok after (−3.144 ms/tok, −9.71%), generated text `";"` md5-line hash 21b63086 both; ctx2048 73.761369 s/2047 = 36.034 ms/tok before vs 65.639186 s/2047 = 32.066 ms/tok after (−3.968 ms/tok, −11.01%), generated text `"h"` md5-line hash 55522e02 both. The gain is below the study's ~15% prediction.
+
+**Validation.** Exact final binary canonical ctx512: md5 `5cbe8e06` on 3/3 runs, decode 28.839 / 29.643 / 29.240 ms/tok, peak 5,060 MiB each run (cap 5,080), `ch2nopless: enabled`. Release warning lines 59 (limit 64). INKWELL_VTEST8 runs without the master controller-shape crash but remains numerically non-exact (8 rows, 6 mismatches), consistent with the pre-existing batch FP-order mismatch documented under `t3/swa-ring-fix`. Memory caveat: one earlier exact-final validation attempt aborted in `cudaGraphInstantiate` after a 1,200 MiB cache-table allocation; the quiet-queue rerun passed 3/3 at 5,060 MiB. This margin is thin and Phase 2 should reserve/arena graph memory deliberately.
+
+**Kernel harness.** Re-runnable harness: `cd opt/kbench/prefill && make test` (uses `gpu-run`; binary ignored). Final `prefill_tests all`: OVERALL PASS.
+
+- EXL3 GEMM: 0 bit diffs vs the single-token order for M=1/16/64. M=64 TFLOP/s: MoE gu 0.74, MoE dn 1.05, dense wq 0.89, dense wo 1.17.
+- conv_prefill: PASS, 0 bit diffs vs C sequential conv steps.
+- flash_prefill_gqa3: PASS, max_abs 1.583e-8/2.282e-8 at pos1100/1500 SWA with ring wrap and 1.770e-8 at pos700 full attention (tolerance 5e-5); 0.91 TFLOP/s. This misses the ≥1.0 target. Best variant was branchless relative-bias; vectorized float K/V lost more occupancy than it saved in conversions, and shared rel_w caching was slower.
+- MoE group/sort/grouped GEMM: PASS, 0 bit diffs, 0.68 TFLOP/s on the realistic grouped shape; deterministic fused SiLU/weighted scatter pipeline PASS, 0 bit diffs.
+
+**Phase 2 requirements.** The kernels take caller-owned scratch and already valid device descriptors. The MoE H2D ring contract is documented at the end of `prefill.cu`: a 32 MiB device ring in two 16 MiB buffers, tile t+1 copied on the side stream, buffer reuse only after tile t−2 compute, descriptor rewriting to ring addresses, and events ordered before grouped GEMM. The driver must also preserve prompt-state ordering, use headed logits only for the final prompt row, handle ring wrap/SWA masks exactly, and solve CUDA-graph/activation memory headroom instead of relying on the current marginal 5,060 MiB peak.
+
+## t3/prefill-chunked-encode-phase0-1 (faf17b3) — brain validation — ACCEPTED, merged
+- Merged on top of dyn-nkv (scratch f3422c4). Conflicts resolved in runner.rs: the headless prompt-state path now uses dyn-nkv's `step_shape_match`, and `StepCache` carries both `input_copy_len` and `has_head`.
+- 3-run canonical validation: md5 5cbe8e06 ×3; decode 28.280 / 27.986 / 28.009 ms/tok; peak **5,060 MiB** (dyn-nkv master 5,032). Warnings 59.
+- Decode path unchanged; encode −10% (512: 32.40 → 29.25 ms/tok; 2048: 36.03 → 32.07).
+- Open risk: +28 MiB post-cache peak from the headless prompt graph, and one agent-side `cudaGraphInstantiate` abort. The 20 MiB margin to 5,080 is thin. The phase-2 arena must reclaim this.

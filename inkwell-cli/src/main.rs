@@ -336,11 +336,14 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         eprintln!("state loaded; skipped encode of {} tok", ids.len() - 1);
     } else {
         for &id in &ids[..ids.len() - 1] {
-            logits = r.step(id, pos);
+            // Prompt rows before the final row never need logits, so run only
+            // the state-update graph and omit lm_head/logits entirely.
+            r.step_prompt_state(id, pos);
             pos += 1;
         }
         eprintln!("encode {} tok in {:?}", ids.len() - 1, t0.elapsed());
-        eprintln!("prompt-logits sum={:.5} first3={:?}", logits.iter().sum::<f32>(), &logits[..3]);
+        eprintln!("prompt lm_head/logits skipped for non-final encode rows");
+        r.clear_step_cache();
     }
     if let Some(state) = std::env::var_os("INKWELL_STATE_SAVE") {
         r.save_state(&state.to_string_lossy());
