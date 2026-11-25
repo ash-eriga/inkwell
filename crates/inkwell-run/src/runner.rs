@@ -187,6 +187,8 @@ struct StepCache {
     embd_off: usize,
     /// packed input bytes needed by the pipelined device-resolver path
     input_copy_len: usize,
+    /// whether the cached graph output includes the lm_head logits
+    has_head: bool,
 }
 
 /// One cached-step host timing row, microseconds.
@@ -2525,6 +2527,11 @@ impl Runner {
     }
 
     fn step_impl(&mut self, id: u32, pos: i64, dump_selection: bool) -> Vec<f32> {
+        self.step_impl_mode(id, pos, dump_selection, false, true)
+    }
+
+    fn step_impl_mode(&mut self, id: u32, pos: i64, dump_selection: bool,
+        skip_head: bool, need_logits: bool) -> Vec<f32> {
         let tb0 = std::time::Instant::now();
         // per-visit max n_kv this step, padded to a bucket multiple so tensor
         // shapes stay constant across steps (CUDA-graph replayable). The
@@ -2542,7 +2549,8 @@ impl Runner {
             && ((pos + 1) & pos) == 0 && (1024..=32768).contains(&(pos + 1));
         if caching && !dump_pow2 {
             if let Some(gc) = self.step_gcache.take() {
-                if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity()) {
+                if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity())
+                    && gc.has_head == !skip_head {
                     let logits = self.step_cached(id, pos, &gc);
                     self.step_gcache = Some(gc);
                     if dump_selection && crate::head_dump::enabled() {
@@ -2700,7 +2708,7 @@ impl Runner {
         self.dump("result_norm", cur);
         let head_in = cur;
         let own_head = self.out_head.is_some();
-        if !own_head {
+        if !skip_head && !own_head {
             cur = if let Some(oi) = self.output_exl3 {
                 let e = &*self.exl3_w[oi];
                 let mut args = [cur.0];
@@ -2743,7 +2751,7 @@ impl Runner {
             self.dump_all();
         }
         if prof { eprintln!("PROF compute={:.1}ms", t0.elapsed().as_secs_f64() * 1e3); }
-        let logits = self.read_logits(cur, prof);
+        let logits = if need_logits { self.read_logits(cur, prof) } else { Vec::new() };
         if dump_selection && crate::head_dump::enabled() {
             let token = host_argmax(&logits);
             self.dump_head_record(pos, token, head_in, cur, Some(&logits));
@@ -2751,7 +2759,7 @@ impl Runner {
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         if caching {
             // keep ctx + cgraph + sched split + instantiated CUDA graph alive
-            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o, embd_off, input_copy_len });
+            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o, embd_off, input_copy_len, has_head: !skip_head });
         } else {
             // release the cached split plan so the next step's graph gets re-allocated
             unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
@@ -3091,7 +3099,7 @@ impl Runner {
         static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none()) {
             if let Some(gc) = self.step_gcache.take() {
-                if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity()) {
+                if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity()) && gc.has_head {
                     let r = self.step_id_cached(id, pos, &gc);
                     self.step_gcache = Some(gc);
                     return r;
@@ -3102,6 +3110,80 @@ impl Runner {
         self.set_queued(i64::MIN);
         host_argmax(&self.step_impl(id, pos, true))
     }
+
+    /// Cached prompt-state step. The graph ends at the normed hidden state, so
+    /// neither the lm_head nor any logit readback runs. The blocking compute is
+    /// deliberate: it makes reuse of the pinned input mirror safe without the
+    /// speculative generation pipeline.
+    fn step_prompt_cached(&mut self, id: u32, pos: i64, gc: &StepCache) {
+        let sp = self.sid_parts();
+        let cur_pin = sp.inp[(pos & 1) as usize];
+        if self.marshaled() != pos {
+            self.marshal_inputs(&gc.step, &gc.in_offs, pos, cur_pin);
+        }
+        unsafe { (cur_pin.add(gc.in_offs[0]) as *mut i32).write(id as i32) };
+        let (src, ty, stride) = self.embd_src;
+        let row = if gc.embd_off == usize::MAX {
+            sp.emb as *mut f32
+        } else {
+            unsafe { cur_pin.add(gc.embd_off) as *mut f32 }
+        };
+        if ty == -2 {
+            let src = unsafe { src.add(id as usize * stride) } as *const u16;
+            for i in 0..2304 {
+                unsafe { *row.add(i) = f32::from_bits(u32::from(*src.add(i)) << 16) };
+            }
+        } else {
+            let rc = unsafe {
+                inkwell_ggml::ink_dequant(ty, src.add(id as usize * stride).cast(), row, 2304)
+            };
+            assert_eq!(rc, 0, "dequant embd row");
+        }
+        unsafe {
+            inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+            let base = inkwell_ggml::ink_buf_base(self.in_buf.as_ref().expect("in_buf").0 .0);
+            inkwell_cuda::memcpy_h2d_async(base, cur_pin.cast_const().cast(), gc.in_span);
+            if gc.embd_off == usize::MAX {
+                inkwell_cuda::memcpy_h2d_async(
+                    inkwell_ggml::tensor_data(self.embd_row.0),
+                    sp.emb.cast_const().cast(), 2304 * 4);
+            }
+        }
+        self.issue_moe_prefetch(pos);
+        unsafe {
+            assert_eq!(inkwell_ggml::ink_sched_compute(self.sched.0, gc.graph.0), 0,
+                "prompt sched compute");
+            self.dump_all();
+        }
+        self.set_marshaled(pos);
+        self.set_queued(i64::MIN);
+    }
+
+    /// Teacher-forced prompt/state step with the lm_head omitted. This is used
+    /// only for rows whose logits are never consumed; state updates are the
+    /// same graph nodes in the same order.
+    pub fn step_prompt_state(&mut self, id: u32, pos: i64) {
+        let caching = std::env::var_os("INKWELL_NO_GCACHE").is_none();
+        if caching {
+            if let Some(gc) = self.step_gcache.take() {
+                if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity()) && !gc.has_head {
+                    self.step_prompt_cached(id, pos, &gc);
+                    self.step_gcache = Some(gc);
+                    return;
+                }
+                self.step_gcache = Some(gc);
+            }
+        }
+        self.set_queued(i64::MIN);
+        let _ = self.step_impl_mode(id, pos, false, true, false);
+    }
+
+    /// Drop the prompt-shaped cache before generation builds/uses the headed graph.
+    pub fn clear_step_cache(&mut self) {
+        self.step_gcache = None;
+        self.set_queued(i64::MIN);
+    }
+
 
     /// Gcache-hit step returning the greedy id (see [`Self::step_id`]).
     fn step_id_cached(&mut self, id: u32, pos: i64, gc: &StepCache) -> u32 {

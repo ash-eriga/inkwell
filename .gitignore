@@ -24,3 +24,4 @@ opt/zc_bench
 opt/kbench/gemv_v2_bench
 opt/kbench/gemv_v2_dbg
 opt/kbench/v2_isolate
+opt/kbench/prefill/prefill_tests

@@ -28,9 +28,11 @@ fn main() {
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let outdir = Path::new(&out);
     let src = Path::new("src/kernels.cu");
+    let prefill_src = Path::new("src/prefill.cu");
     let ch2dir = Path::new("../../opt/kbench/ch2");
 
     println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", prefill_src.display());
     println!("cargo:rerun-if-changed={}", ch2dir.join("build_nopless.py").display());
     println!("cargo:rerun-if-changed={}", ch2dir.join("patch_sass.py").display());
     println!("cargo:rerun-if-changed={}", ch2dir.join("reasm_remove_loop_nops.py").display());
@@ -53,6 +55,18 @@ fn main() {
         .status()
         .expect("nvcc");
     assert!(status.success(), "nvcc failed");
+
+    let prefill_obj = format!("{out}/prefill.o");
+    let status = Command::new(&nvcc)
+        .args([
+            "-O3", "-std=c++17", "--use_fast_math",
+            "-ccbin", gxx.to_str().expect("gxx path"),
+            "-gencode", "arch=compute_61,code=sm_61",
+            "-c", &prefill_src.to_string_lossy(), "-o", &prefill_obj,
+        ])
+        .status()
+        .expect("nvcc prefill");
+    assert!(status.success(), "nvcc prefill failed");
 
     // Optional fail-closed CH2 artifact: transform a copy of the cubin embedded
     // in this exact object, never the runtime-linked object itself.  Any missing
@@ -112,7 +126,7 @@ fn main() {
 
     let lib = format!("{out}/libinkwell_kernels.a");
     let status = Command::new("ar")
-        .args(["rcs", &lib, &obj, &embed_obj])
+        .args(["rcs", &lib, &obj, &prefill_obj, &embed_obj])
         .status()
         .expect("ar");
     assert!(status.success(), "ar failed");
