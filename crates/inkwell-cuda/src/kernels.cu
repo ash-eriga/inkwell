@@ -7220,6 +7220,8 @@ __global__ void inkwell_relbias_gather_dynpos(const float* __restrict__ mm,
             const int dpos = pos - j;
             if (pos < swa) {
                 rp = dpos;
+            } else if ((swa & (swa - 1)) == 0) {
+                rp = dpos & (swa - 1);
             } else {
                 rp = dpos % swa;
                 if (rp < 0) rp += swa;
