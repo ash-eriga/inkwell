@@ -2276,3 +2276,11 @@ Earlier same-binary comparison measurements before final dispatch were grouped 1
 - Bit-exact retiling: grouped MoE 0.68 → 1.60–1.69 TFLOP/s; dense wq 0.89 → 1.37–1.50; MoE gu 0.74 → 0.97–1.07. Flash is unchanged at ~0.9.
 - Agent validation: md5 5cbe8e06 ×3, decode 28.19–28.25 ms/tok, peak 5,060, warnings 57.
 - Orchestrator estimate: at ≤8K, flash is ~0.6–0.65 GFLOP/tok (~0.7 ms at 0.9 TFLOP/s). MoE is 6.1 GFLOP/tok (~3.8 ms at 1.6). Flash is not the 140 tok/s limiter below ~16K.
+
+## Challenge 4 (integer Tier-Q numerics, noise-floor gate) — SWE-2.1 max on Devbox — DONE, nothing to adopt
+- Q-A = ε 3e-5 (gate A); Q-B = ε 1e-4. Synthetic rows only (no real activation pack on the Devbox). Candidates: cand_qa_resid16 PASS Q-A (Q1 2.01e-5); cand_qa_splitcorr PASS Q-A (2.26e-5); cand_qb_split8 PASS Q-B (4.82e-5).
+- m=1 decode: Q-A integer ≈24–26 MAC/SM-cycle vs shipped FP32 25.8, i.e. ≈1.0×. **Integer numerics do not speed up decode.**
+- Ragged m=1–4 verify: B=4 costs 2.78× B=1 (Q-A) / 2.71× (Q-B); the distinct-expert floor is 2.495×.
+- Prefill m≥32: Q-A is capped by the same 128 MAC/SM-cycle roof as FP32 (112.8 at m=32, 123.8 at m=128). Q-B reaches 143.4 / 162.9 (roof 170.7). Ceiling: Q-A ~434–443 tok/s, Q-B ~535; 64K ~191 / ~209.
+- Byte-code bound: the best possible deterministic 1-byte weight code has RMSE 0.56% rms(z), above the ~0.5% the Q-A residual needs. Q-B cannot be repaired into Q-A by a better code.
+- Consequence: prefill stays FP32. The 140 tok/s target is ~3× below the FP32 roof, so kernel efficiency is what matters. Solution files stay on the Devbox (work/challenge4/solution/, SOLUTION.md sha256 85fe486f…a825).
