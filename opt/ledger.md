@@ -2138,3 +2138,74 @@ Workload-share aggregate of those isolated timings: gu **+3.61%**, dn **+2.64%**
 - The child's power-law ε values (5.5e-4 at 512, 7.5e-5 at 4K for KLD 1e-3) fit a curve that is flat at 4K. Do not use them as budgets.
 - Dumps: /tmp/actq-xh/ (15 files; sha256 in the study).
 - Next steps: owner decides the gate definition (absolute vs relative to the FP-noise floor); then a larger-sample eval (≥2K scored tokens × several prompts) of the floor (ε 1e-7/1e-6), g128_8 and row12.
+
+## t3/challenge3b-decode-schedule-part2 — direct-window feasibility audit — NEGATIVE / UNRESOLVED, no kernel change
+
+**Scope.** Second implementation attempt starting from `t3/challenge3b-whole-loop-port` (`93f69cc`). This entry records negative evidence gathered before changing the production kernel. The branch intentionally keeps the part-1 bit-exact kernel unless a later commit adds a validated SASS transform.
+
+**Experimental dead ends reproduced locally.**
+- A compile-time induction-ring-pointer (`qind`) probe stayed `REG:40 STACK:0 LOCAL:0`, but expert patched-loop counts improved only by 0–2 instructions/32w: K1.5/K2 247->246, K2.5/K3 251->250, K3.5 255->254, K4 243->241/243 depending on copy. It also changed the fail-closed patch fingerprint from `(fake=1078 lp=1088 words=4388 hi_d12d=1086)` to `(1078,1080,6094,1094)`, so it was not a safe drop-in and was reverted.
+- A CUDA-level K4 low-half probe (`mul.wide.u16 lo`) reproduced the parallel-attempt failure exactly: ptxas common-subexpression-fused the high and low fake products. K4 loops collapsed to malformed forms with only 16 `XMAD.PSL` sites and 64 total XMADs rather than the patcher's 32/96 structure. Thus the low-half rewrite must be done after ptxas, not by another plain CUDA formulation.
+
+**Structural evidence against the published static target as a literal sm_61 warp schedule.**
+1. **Cyclic ring boundary.** With the present zero-bloat linear ring layout, lane `w0` values cover every ring-word index for K1.5/K2 (and nearly all indices for the other Ks). Therefore every cyclic successor edge `(w,w+1 mod NW)` is needed by some lane. If two direct loads use one per-lane base and uniform immediates, their signed offsets must be identical for every lane. A non-wrapping lane requires spacing `+1` word; the wrapping lane requires spacing `-(NW-1)` words. No lane-dependent base register can change that difference. Reordering rows or pipelining across rows changes the constant but leaves the same two different differences. This is the concrete memory-layout hole in L4' as implemented on linear memory; candidate_3b.c models `ring[(w0+n)%nw]` mathematically but does not provide a zero-cost physical realization.
+2. **Lane-local free windows are not warp-uniform.** sm_61 XMAD `.H0/.H1` selectors and SHF operations are warp-uniform instructions. For K1.5 the 16 free lane-windows are split 8 lanes at j=2 and 8 different lanes at j=7; K2.5 similarly splits j=4/j=7, K3 splits j=7 by parity, and K3.5 splits j=6/j=7. K2 j=7 is high-half free on even lanes and low-half free on odd lanes. These cannot all be free in one warp-uniform operand selector without a lane/window remapping that candidate_3b does not construct. The often-quoted 30-SHF extraction count is therefore not directly attainable as a warp-level static schedule merely by patching selectors.
+3. **K4 low-half register lifetimes are the real blocker.** A conservative cuasm audit of the part-1 K4 loops found 14 movable low-half `PRMT` sites per expert loop, but only 3 per loop are trivially safe. In the other sites the extracted source register is overwritten before the low-half PSL (often by the paired high-half PSL) or the first-product temporary is still live. A complete rewrite requires local SASS register reallocation and downstream use renaming, not just deleting each `PRMT`. This is consistent with the parallel attempt's note that plain H0 forms do not survive ptxas.
+
+**Consequence.** The requested 6.442125 instr/w target should not be treated as established attainable for the production warp-uniform sm_61 kernel without an additional construction that explicitly solves (a) cyclic physical memory adjacency, (b) warp-uniform lane/window selector alignment, and (c) ≤40-register dataflow. The part-1 hybrid remains the best validated implementation at 6.774625 instr/w. Acceptance measurements on this branch are measurements of that unchanged part-1 artifact plus this audit, not of a new direct-window schedule.
+
+
+## t3/challenge3b-decode-schedule-part2 — qind control reduction — BIT-EXACT, PARTIAL; A/B gate missed
+
+**Implemented.** The fixed-width expert CH2 paths other than K4 now use a compile-time induction ring pointer (`qind`) instead of recomputing `p + a*stride` in every tile. K4 was deliberately left in its part-1 source form because its qind register allocation diverged between the tn=72 and tn=144 copies without a uniform win. Dense runtime-width CH2 source and all extraction/data-layout arithmetic are unchanged. No donor `SHFL` was removed and no direct cyclic `LDG` schedule was added. `INKWELL_NO_CH3B=1` remains the killswitch.
+
+**Rejected experiments.**
+- A conservative post-ptxas K4 low-half operand rewrite statically removed 3 `PRMT`s per expert loop, but the final nopless cubin was not bit-exact: K4 gu **`badbits=4560/9216`** and dn **`badbits=8336/18432`**. The patched-with-NOPs variant remained exact, isolating the failure to the operand/lifetime rewrite. It was removed.
+- An aggressive post-SASS qind induction-MOV rotation caused an illegal memory access. The entry copy is part of pointer register-pair packing/initialization, and the base register can be reused after the closing induction update; eliminating it requires loop-carried register reallocation rather than local deletion. It was also removed.
+- The earlier negative audit remains binding for the rest of the requested schedule: cyclic ring adjacency, lane-dependent free-half selectors, and ≤40-register lifetimes are unresolved.
+
+**Static counts.** Per 32 weights after NOP deletion; both expert copies have the same count.
+
+| K | part 1 | this branch | target |
+|---|---:|---:|---:|
+| K1.5 | 215 | **214** | 207 |
+| K2 | 215 | **214** | 205 |
+| K2.5 | 219 | **218** | 207 |
+| K3 | 219 | **218** | 207 |
+| K3.5 | 223 | **222** | 211 |
+| K4 | 211 | **211** | 189 |
+
+Weighted static count: **6.744156 instr/w**, versus part-1 **6.774625** and target **6.442125**. Extraction remains part-1-shaped: SHF+PRMT `32+0` K1.5, `24+8` K2, `36+0` K2.5/K3/K3.5, `8+20` K4; LDG 4/32w and donor SHFLs remain.
+
+**Build/pipeline.** Patch fingerprint `fake=1078 lp=1084 words=5382 hi_d12d=1090`. A function-by-function SASS diff audit showed replacements only in `gemv_moe_s` and `gemv_sf_ch2`; all other kernels were unchanged. Generated cubin sha256 **`8768643f01d8bc58387177c6404c7df2af9aa8949982944b08e6c557800ec282`**, **1,476,816 bytes**. Release binary sha256 **`5ba838158bcd8c6d7ffd6013ff57442d25167cb54d0b1bb1eb4e7a051f1f5dce`**, release rc **0**, warnings **62/64**, expert `REG:40 STACK:0 LOCAL:0`.
+
+**Per-K GPU gate.** `reasm_drv_perk`: every K1.5–K4 row, gu and dn, nops and nopless, had **`badbits=0`**. Min-of-31 timings (`unpatched` is the harness pre-patch compiler baseline; `part1` is the prior nopless artifact):
+
+| K | shape | unpatched ms | part1 ms | qind ms |
+|---|---|---:|---:|---:|
+| K1.5 | gu | 0.0798 | 0.0676 | **0.0666** |
+| K1.5 | dn | 0.0826 | 0.0702 | **0.0686** |
+| K2 | gu | 0.0799 | 0.0666 | **0.0666** |
+| K2 | dn | 0.0816 | 0.0696 | **0.0696** |
+| K2.5 | gu | 0.0891 | 0.0694 | **0.0696** |
+| K2.5 | dn | 0.0922 | 0.0717 | **0.0734** |
+| K3 | gu | 0.0911 | 0.0696 | **0.0707** |
+| K3 | dn | 0.0932 | 0.0736 | **0.0737** |
+| K3.5 | gu | 0.0922 | 0.0734 | **0.0727** |
+| K3.5 | dn | 0.0948 | 0.0765 | **0.0763** |
+| K4 | gu | 0.0887 | 0.0745 | **0.0754** |
+| K4 | dn | 0.0908 | 0.0776 | **0.0778** |
+
+**End-to-end validation.** ctx512: md5 **`5cbe8e06` on all 3 runs**, decode **30.090 / 28.758 / 30.614 ms/tok**, peak **5,032 MiB** each, `ch2nopless: enabled`; validate rc **0**.
+
+**16-pair A/B.** `runs ctl=16 cand=16 ctl_med=28.553 cand_med=28.396 delta=-0.157 wins=6/16 md5=['5cbe8e06'] peak=5032`. The median is 0.157 ms/tok faster, but the win count is only **6/16**, so the requested **wins ≥12/16** gate is not met. Exactness and memory gates pass.
+
+**Interpretation.** This is a small validated control reduction over part 1, not the requested decode schedule. The large remaining gap is unchanged: no direct ring `LDG`, no donor elimination, no warp-uniform free-half extraction construction, and no valid K4 low-half PRMT removal. The branch is useful as bit-exact evidence and as a small static-count improvement, but it is not an accepted Challenge 3b implementation under the stated gates.
+
+## t3/challenge3b-decode-schedule-part2 (37d454f) — orchestrator verdict — NOT MERGED
+- Rejected: 6/16 wins vs CTL, far from 12/16, and the static gain is only 6.775 → 6.744 instr/w. Part 1 (13/16, −0.267) on master stays the best validated version.
+- Keep the audit. It shows candidate_3b.c is not SIMT-faithful.
+  - The ring wrap breaks the "uniform immediate offsets" assumption.
+  - Free half-word windows are lane-dependent, while XMAD .H0/.H1 selectors are warp-uniform.
+  - K4 low-half reuse needs register reallocation.
+- So the 6.442 instr/w target is unproven for a real warp. Any follow-up needs a SIMT-faithful re-statement of Challenge 3b, with warp-uniform instruction streams, per-lane data only in registers, and physical ring adjacency.
