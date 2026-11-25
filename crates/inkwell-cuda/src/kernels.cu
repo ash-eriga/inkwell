@@ -1576,6 +1576,210 @@ __global__ void inkwell_attn_decode(const void* __restrict__ K, const void* __re
         out[h * hd + d] = o * inv;
     }
 }
+
+#define INKWELL_ATTN_GQA3_VTILE 128
+
+__global__ void inkwell_attn_decode_gqa3_exact(const void* __restrict__ K, const void* __restrict__ V,
+                                               const float* __restrict__ Q, const float* __restrict__ bias,
+                                               const float* __restrict__ mask, float* __restrict__ out,
+                                               int n_kv, int k_s1, int k_s2, int v_s1, int v_s2,
+                                               int q_s2, int b_s2, float scale) {
+    extern __shared__ float smg[];
+    float* scores = smg;
+    float* qs = smg + 3 * n_kv;
+    __shared__ float red[3][32];
+    __shared__ uint2 kvbuf[INKWELL_ATTN_GQA3_VTILE][32];
+    const int hk = blockIdx.x;
+    const int h0 = hk * 3;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int w = tid >> 5;
+
+    if ((((uintptr_t)Q) & 15) == 0 && (q_s2 & 3) == 0) {
+        for (int i = tid; i < 96; i += 256) {
+            const int g = i >> 5;
+            const int f = (i & 31) * 4;
+            const float4 qv = __ldg((const float4*)(Q + (size_t)(h0 + g) * q_s2 + f));
+            qs[g * 128 + f] = qv.x;
+            qs[g * 128 + f + 1] = qv.y;
+            qs[g * 128 + f + 2] = qv.z;
+            qs[g * 128 + f + 3] = qv.w;
+        }
+    } else {
+        for (int i = tid; i < 384; i += 256) {
+            const int g = i >> 7;
+            const int d = i & 127;
+            qs[i] = Q[(size_t)(h0 + g) * q_s2 + d];
+        }
+    }
+    __syncthreads();
+
+    const char* Kh = (const char*)K + (size_t)hk * k_s2;
+    const size_t kstep = (size_t)8 * k_s1;
+    for (int base = 0; base < n_kv; base += INKWELL_ATTN_GQA3_VTILE) {
+        const int cnt = min(INKWELL_ATTN_GQA3_VTILE, n_kv - base);
+        const char* kj = Kh + (size_t)(base + w) * k_s1;
+        for (int r = w; r < cnt; r += 8, kj += kstep) {
+            kvbuf[r][lane] = __ldcs((const uint2*)(kj + lane * 8));
+        }
+        __syncthreads();
+        for (int r = w; r < cnt; r += 8) {
+            const int j = base + r;
+            const __half* kh = (const __half*)kvbuf[r];
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int d = lane + 32 * t;
+                const float kv = __half2float(kh[d]);
+                a0 += qs[d] * kv;
+                a1 += qs[128 + d] * kv;
+                a2 += qs[256 + d] * kv;
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                a0 += __shfl_down_sync(0xffffffffu, a0, o);
+                a1 += __shfl_down_sync(0xffffffffu, a1, o);
+                a2 += __shfl_down_sync(0xffffffffu, a2, o);
+            }
+            if (lane == 0) {
+                scores[j] = a0;
+                scores[n_kv + j] = a1;
+                scores[2 * n_kv + j] = a2;
+            }
+        }
+        __syncthreads();
+    }
+
+    float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f;
+    for (int j = tid; j < n_kv; j += 256) {
+        const float mk = mask[j];
+        const float s0 = scores[j] * scale + bias[j + h0 * b_s2] + mk;
+        const float s1 = scores[n_kv + j] * scale + bias[j + (h0 + 1) * b_s2] + mk;
+        const float s2 = scores[2 * n_kv + j] * scale + bias[j + (h0 + 2) * b_s2] + mk;
+        scores[j] = s0;
+        scores[n_kv + j] = s1;
+        scores[2 * n_kv + j] = s2;
+        m0 = fmaxf(m0, s0);
+        m1 = fmaxf(m1, s1);
+        m2 = fmaxf(m2, s2);
+    }
+    const float msink = mask[n_kv];
+    m0 = fmaxf(m0, msink);
+    m1 = fmaxf(m1, msink);
+    m2 = fmaxf(m2, msink);
+    for (int o = 16; o > 0; o >>= 1) {
+        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, o));
+        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, o));
+        m2 = fmaxf(m2, __shfl_xor_sync(0xffffffffu, m2, o));
+    }
+    if (lane == 0) {
+        red[0][w] = m0;
+        red[1][w] = m1;
+        red[2][w] = m2;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float mm0 = -1e30f, mm1 = -1e30f, mm2 = -1e30f;
+        for (int i = lane; i < 8; i += 32) {
+            mm0 = fmaxf(mm0, red[0][i]);
+            mm1 = fmaxf(mm1, red[1][i]);
+            mm2 = fmaxf(mm2, red[2][i]);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            mm0 = fmaxf(mm0, __shfl_xor_sync(0xffffffffu, mm0, o));
+            mm1 = fmaxf(mm1, __shfl_xor_sync(0xffffffffu, mm1, o));
+            mm2 = fmaxf(mm2, __shfl_xor_sync(0xffffffffu, mm2, o));
+        }
+        if (lane == 0) {
+            red[0][0] = mm0;
+            red[1][0] = mm1;
+            red[2][0] = mm2;
+        }
+    }
+    __syncthreads();
+    const float mx0 = red[0][0], mx1 = red[1][0], mx2 = red[2][0];
+
+    float den0 = 0.f, den1 = 0.f, den2 = 0.f;
+    for (int j = tid; j < n_kv; j += 256) {
+        const float e0 = __expf(scores[j] - mx0);
+        const float e1 = __expf(scores[n_kv + j] - mx1);
+        const float e2 = __expf(scores[2 * n_kv + j] - mx2);
+        scores[j] = e0;
+        scores[n_kv + j] = e1;
+        scores[2 * n_kv + j] = e2;
+        den0 += e0;
+        den1 += e1;
+        den2 += e2;
+    }
+    if (tid == 0) {
+        den0 += __expf(msink - mx0);
+        den1 += __expf(msink - mx1);
+        den2 += __expf(msink - mx2);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        den0 += __shfl_xor_sync(0xffffffffu, den0, o);
+        den1 += __shfl_xor_sync(0xffffffffu, den1, o);
+        den2 += __shfl_xor_sync(0xffffffffu, den2, o);
+    }
+    if (lane == 0) {
+        red[0][w] = den0;
+        red[1][w] = den1;
+        red[2][w] = den2;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float dd0 = 0.f, dd1 = 0.f, dd2 = 0.f;
+        for (int i = lane; i < 8; i += 32) {
+            dd0 += red[0][i];
+            dd1 += red[1][i];
+            dd2 += red[2][i];
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            dd0 += __shfl_xor_sync(0xffffffffu, dd0, o);
+            dd1 += __shfl_xor_sync(0xffffffffu, dd1, o);
+            dd2 += __shfl_xor_sync(0xffffffffu, dd2, o);
+        }
+        if (lane == 0) {
+            red[0][0] = dd0;
+            red[1][0] = dd1;
+            red[2][0] = dd2;
+        }
+    }
+    __syncthreads();
+    const float inv0 = 1.f / red[0][0];
+    const float inv1 = 1.f / red[1][0];
+    const float inv2 = 1.f / red[2][0];
+
+    const int d = tid;
+    const float* score0 = scores;
+    const float* score1 = scores + n_kv;
+    const float* score2 = scores + 2 * n_kv;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    const char* Vh = (const char*)V + (size_t)hk * v_s2;
+    const size_t vstep = (size_t)8 * v_s1;
+    for (int base = 0; base < n_kv; base += INKWELL_ATTN_GQA3_VTILE) {
+        const int cnt = min(INKWELL_ATTN_GQA3_VTILE, n_kv - base);
+        const char* vj = Vh + (size_t)(base + w) * v_s1;
+        for (int r = w; r < cnt; r += 8, vj += vstep) {
+            kvbuf[r][lane] = __ldcs((const uint2*)(vj + lane * 8));
+        }
+        __syncthreads();
+        if (tid < 128) {
+            for (int r = 0; r < cnt; ++r) {
+                const int j = base + r;
+                const float vv = __half2float(((const __half*)kvbuf[r])[d]);
+                acc0 += score0[j] * vv;
+                acc1 += score1[j] * vv;
+                acc2 += score2[j] * vv;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 128) {
+        out[h0 * 128 + d] = acc0 * inv0;
+        out[(h0 + 1) * 128 + d] = acc1 * inv1;
+        out[(h0 + 2) * 128 + d] = acc2 * inv2;
+    }
+}
 // Split-K decode attention. Each block owns one KV chunk and up to three query
 // heads sharing one KV head. Partials are [m, l, acc(hd)] per (chunk, q head);
 // the reduce kernel adds the same zero-logit sink as the single-block kernel.
@@ -1810,6 +2014,17 @@ extern "C" void ink_launch_attn_decode_old(const void* K, const void* V, const v
     }
 }
 
+extern "C" void ink_launch_attn_decode_gqa3_exact(const void* K, const void* V, const void* Q,
+                                                  const void* bias, const void* mask, void* out,
+                                                  long long hkv, long long n_kv,
+                                                  long long k_s1, long long k_s2, long long v_s1, long long v_s2,
+                                                  long long q_s2, long long b_s2, float scale, void* stream) {
+    const size_t sm = (size_t)(3 * n_kv + 384) * 4;
+    inkwell_attn_decode_gqa3_exact<<<dim3((unsigned)hkv), 256, sm, (cudaStream_t)stream>>>(
+        K, V, (const float*)Q, (const float*)bias, (const float*)mask, (float*)out,
+        (int)n_kv, (int)k_s1, (int)k_s2, (int)v_s1, (int)v_s2, (int)q_s2, (int)b_s2, scale);
+}
+
 static float* inkwell_attn_partbuf(size_t floats) {
     static float* p = nullptr;
     static size_t cap = 0;
@@ -1864,6 +2079,7 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
     static int no_split = -1;
     static int split_min = -1;
     static int chunk_len = -1;
+    static int no_gqa_exact = -1;
     if (no_split < 0) {
         no_split = getenv("INKWELL_NO_ATTNSPLIT") ? 1 : 0;
         const char* e = getenv("INKWELL_ATTNSPLIT_MIN");
@@ -1871,6 +2087,7 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
         e = getenv("INKWELL_ATTNSPLIT_CHUNK");
         chunk_len = e ? atoi(e) : 0;
         if (e && chunk_len < 32) chunk_len = 32;
+        no_gqa_exact = getenv("INKWELL_NO_ATTN_GQA_EXACT") ? 1 : 0;
     }
 
     int use_chunk = chunk_len;
@@ -1882,6 +2099,16 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
     if (!no_split && shape_ok && n_kv >= split_min && nchunks <= INKWELL_ATTN_MAX_SPLIT &&
         ink_launch_attn_decode_split(K, V, Q, bias, mask, out, nh, hkv, n_kv, hd,
             k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, kv16, use_chunk, stream)) {
+        return;
+    }
+    const size_t gqa_sm = (size_t)(3 * n_kv + 384) * 4;
+    const bool gqa3_shape = kv16 && hkv > 0 && nh == 3 * hkv && hd == 128 &&
+        k_s1 % 8 == 0 && k_s2 % 8 == 0 && v_s1 % 8 == 0 && v_s2 % 8 == 0 &&
+        (((uintptr_t)K) & 7) == 0 && (((uintptr_t)V) & 7) == 0 &&
+        gqa_sm + 33152 <= 48 * 1024;
+    if (!no_gqa_exact && gqa3_shape && n_kv < split_min) {
+        ink_launch_attn_decode_gqa3_exact(K, V, Q, bias, mask, out, hkv, n_kv,
+            k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, stream);
         return;
     }
     ink_launch_attn_decode_old(K, V, Q, bias, mask, out, nh, hkv, n_kv, hd,
