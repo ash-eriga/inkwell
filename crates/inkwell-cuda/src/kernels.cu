@@ -1841,19 +1841,14 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
     if (no_split < 0) {
         no_split = getenv("INKWELL_NO_ATTNSPLIT") ? 1 : 0;
         const char* e = getenv("INKWELL_ATTNSPLIT_MIN");
-        // Default: split only where the old one-block kernel cannot run (it fails at
-        // n_kv >= 12160; 12096 is the last length validated). Below that the output
-        // stays bit-identical to the old kernel until split-K passes the noise gate.
-        split_min = e ? atoi(e) : 12097;
+        split_min = e ? atoi(e) : 320;
         e = getenv("INKWELL_ATTNSPLIT_CHUNK");
         chunk_len = e ? atoi(e) : 0;
-        if (chunk_len < 32) chunk_len = 32;
+        if (e && chunk_len < 32) chunk_len = 32;
     }
 
     int use_chunk = chunk_len;
-    if (use_chunk == 0) {
-        use_chunk = n_kv <= 1024 ? 64 : (n_kv <= 2048 ? 128 : 256);
-    }
+    if (use_chunk == 0) use_chunk = n_kv <= 16384 ? 32 : 256;
     const int ratio = hkv > 0 ? (int)(nh / hkv) : 0;
     const bool shape_ok = hkv > 0 && nh % hkv == 0 && ratio > 0 && hd == 128 &&
         (kv16 ? (k_s1 % 8 == 0 && v_s1 % 16 == 0) : (k_s1 % 16 == 0 && v_s1 % 16 == 0));
