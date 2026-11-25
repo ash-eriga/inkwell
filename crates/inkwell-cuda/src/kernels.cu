@@ -3221,6 +3221,26 @@ __device__ __forceinline__ float ch2_bs_f32(uint32_t p) {
 #endif
 }
 template <int KA, int H>
+__device__ __forceinline__ int ch2_generic_donor(int t, int step) {
+    int d;
+    if constexpr (KA == 2 && H == 1) {
+        const int r = t & 7;
+        d = (step == 1) ? 1 + ((r == 1) | (r == 4) | (r == 6))
+                        : 3 - ((r == 2) | (r == 7)) + (r == 4);
+    } else if constexpr (KA == 3 && H == 0) {
+        const int r = t & 3;
+        d = (step == 1) ? 1 + (r == 2)
+                        : 2 + ((r == 1) | (r == 2));
+    } else if constexpr (KA == 3 && H == 1) {
+        const int r = t & 7;
+        d = (step == 1) ? 1 + (r == 4)
+                        : 2 + ((r == 3) | (r == 4));
+    } else {
+        d = step;
+    }
+    return (t + d) & 31;
+}
+template <int KA, int H>
 __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn, int tn_i,
                                         int tk_lo, int tk_hi, const float* __restrict__ xs,
                                         float& a0, float& a1) {
@@ -3230,8 +3250,6 @@ __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn,
     int B = (H ? (8 * t + 1) * KA + ((8 * t + 1) >> 1) : (8 * t + 1) * KA) - 16;
     if (B < 0) B += R;
     const int w0 = B >> 5, o = B & 31;
-    const int w1 = (w0 + 1 == NW) ? 0 : w0 + 1;
-    const int w2 = (w1 + 1 == NW) ? 0 : w1 + 1;
     const int r0 = 2 * (t & 3);
     const size_t stride = (size_t)tn * NW;
     const uint32_t* p = tb + (size_t)tn_i * NW;
@@ -3262,11 +3280,15 @@ __device__ __forceinline__ void ch2_run(const uint32_t* __restrict__ tb, int tn,
             CH2_ACCUM8();
         }
     } else {
+        const int shfl_w1 = ch2_generic_donor<KA, H>(t, 1);
+        const int shfl_w2 = ch2_generic_donor<KA, H>(t, 2);
 #pragma unroll 4
         for (int a = tk_lo; a < tk_hi; ++a) {
             const uint32_t* q = p + (size_t)a * stride;
             const int kb = a * 16 + r0;
-            const uint32_t W0 = __ldg(q + w0), W1 = __ldg(q + w1), W2 = __ldg(q + w2);
+            const uint32_t W0 = __ldg(q + w0);
+            const uint32_t W1 = __shfl_sync(0xffffffffu, W0, shfl_w1);
+            const uint32_t W2 = __shfl_sync(0xffffffffu, W0, shfl_w2);
             const uint32_t hi = __funnelshift_l(W1, W0, o), lo = __funnelshift_l(W2, W1, o);
             uint32_t pp[8];
             pp[0] = ch2_mul16_hi(ch2_view<SG_D(0)>(hi, lo)); pp[1] = ch2_mul16_hi(ch2_view<SG_D(1)>(hi, lo));

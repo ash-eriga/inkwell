@@ -64,7 +64,7 @@ for lo, hi, name, body in out:
     core = cls["product"] + cls["bytesum"] + cls["convert"] + cls["accumulate"]
     total = len(body)
     print(f"{name:5} {total:5d} {core:4d} {cls['extract']:4d} {cls['load-global']:3d} {cls['load-shared']:3d} "
-          f"{cls['address/loop']:4d} {cls['control']:3d} {cls['other'] + cls['nop']:3d} {total/32:6.3f}")
+          f"{cls['shuffle']:4d} {cls['address/loop']:4d} {cls['control']:3d} {cls['other'] + cls['nop']:3d} {total/32:6.3f}")
     if "--verbose" in sys.argv:
         ops = Counter(o for _, o, _ in body)
         print("  " + " ".join(f"{k}:{v}" for k, v in sorted(ops.items())))

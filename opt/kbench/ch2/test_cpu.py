@@ -116,27 +116,90 @@ def test_random_tiles():
     print(f"ch2 cpu tile GEMV exactness: cases={cases} PASS")
 
 
+def lane_start(ka, h, lane):
+    rbits = 32 * (8 * ka + 4 * h)
+    base = (8 * lane + 1) * ka + ((8 * lane + 1) >> 1 if h else 0) - 16
+    return base % rbits
+
+
+def generic_donor(ka, h, lane, step):
+    if (ka, h) == (2, 1):
+        r = lane & 7
+        d = 1 + ((r == 1) | (r == 4) | (r == 6)) if step == 1 else 3 - ((r == 2) | (r == 7)) + (r == 4)
+    elif (ka, h) == (3, 0):
+        r = lane & 3
+        d = 1 + (r == 2) if step == 1 else 2 + ((r == 1) | (r == 2))
+    elif (ka, h) == (3, 1):
+        r = lane & 7
+        d = 1 + (r == 4) if step == 1 else 2 + ((r == 3) | (r == 4))
+    else:
+        d = step
+    return (lane + d) & 31
+
+
 def test_top32_shuffle_donors():
     cases = 0
     for ka, h in ((1, 1), (2, 0)):
         nw = 8 * ka + 4 * h
-        rbits = 32 * nw
         for lane in range(32):
-            base = (8 * lane + 1) * ka + ((8 * lane + 1) >> 1 if h else 0) - 16
-            if base < 0:
-                base += rbits
+            base = lane_start(ka, h, lane)
             w0 = base >> 5
             if ka == 2:
                 donor = (lane + 2) & 31
             else:
                 donor = ((lane + 1) if (lane & 7) == 1 else (lane + 3)) & 31
-            dbase = (8 * donor + 1) * ka + ((8 * donor + 1) >> 1 if h else 0) - 16
-            if dbase < 0:
-                dbase += rbits
+            dbase = lane_start(ka, h, donor)
             if (dbase >> 5) != (w0 + 1) % nw:
                 raise SystemExit(f"shuffle donor mismatch ka={ka} h={h} lane={lane}")
             cases += 1
     print(f"ch2 top32 shuffle donors: cases={cases} PASS")
+
+
+def test_generic_shuffle_donors():
+    rng = random.Random(771177)
+    donor_cases = stream_cases = 0
+    for ka, h in ((2, 1), (3, 0), (3, 1), (4, 0)):
+        nw = 8 * ka + 4 * h
+        base_phases = set()
+        stream_phases = set()
+        for lane in range(32):
+            base = lane_start(ka, h, lane)
+            base_phases.add(base & 31)
+            w0 = base >> 5
+            for step in (1, 2):
+                donor = generic_donor(ka, h, lane, step)
+                dbase = lane_start(ka, h, donor)
+                if (dbase >> 5) != (w0 + step) % nw:
+                    raise SystemExit(f"generic donor mismatch K={ka+h/2} lane={lane} step={step}")
+                dist = (donor - lane) & 31
+                for earlier in range(1, dist):
+                    ebase = lane_start(ka, h, (lane + earlier) & 31)
+                    if (ebase >> 5) == (w0 + step) % nw:
+                        raise SystemExit(f"generic donor not minimal K={ka+h/2} lane={lane} step={step}")
+                donor_cases += 1
+        for trial in range(24):
+            words = [rng.getrandbits(32) for _ in range(nw)]
+            own = []
+            for lane in range(32):
+                own.append(words[lane_start(ka, h, lane) >> 5])
+            for lane in range(32):
+                base = lane_start(ka, h, lane)
+                off = base & 31
+                w0 = own[lane]
+                w1 = own[generic_donor(ka, h, lane, 1)]
+                w2 = own[generic_donor(ka, h, lane, 2)]
+                hi = fsl(w1, w0, off)
+                lo = fsl(w2, w1, off)
+                for j in range(8):
+                    D = j * ka + h * ((j + 1) >> 1)
+                    stream_phases.add((base + D) & 31)
+                    want = ring_window(words, base + D)
+                    got = (ch2_view(D, hi, lo) >> 16) & 0xFFFF
+                    if got != want:
+                        raise SystemExit(f"generic stream mismatch K={ka+h/2} lane={lane} j={j}")
+                    stream_cases += 1
+        print(f"ch2 generic shuffle donors K={ka+h/2}: lanes=32 base_phases={len(base_phases)} stream_phases={len(stream_phases)} PASS")
+    print(f"ch2 generic shuffle donors: donor_cases={donor_cases} stream_cases={stream_cases} PASS")
 
 
 def main():
@@ -167,6 +230,7 @@ def main():
     test_top32_rotate_views()
     test_random_tiles()
     test_top32_shuffle_donors()
+    test_generic_shuffle_donors()
 
 
 if __name__ == "__main__":
