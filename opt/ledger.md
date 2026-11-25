@@ -1550,3 +1550,9 @@ End-to-end exactness gate **failed**. Under the same bounded expert-cache config
 Standard post-rebase benchmark (ctx512, default split inactive): md5 **5cbe8e06**, decode line **2.581207358 s / 8 tokens = 40.331 ms/token**. Build after rebase: rc0, **62 warnings** (limit 64).
 
 Verdict: **do not enable as a production exactness-preserving path yet**. It is a useful correctness-capability/performance prototype, but the owner's end-to-end exactness gate and the bandwidth target both remain unmet.
+
+## 2026-11-24 — split-K merged with default threshold at the old kernel's limit
+
+- Orchestrator change on top of the child's work: `INKWELL_ATTNSPLIT_MIN` now defaults to **12097** (was 320). The old one-block kernel fails at n_kv ≥ 12,160 (shared memory); 12,096 is the last validated length. Below the threshold the output is bit-identical to master; above it the old kernel could not run at all.
+- Reason: the end-to-end exactness gate at 8K failed (max_abs 2.337 on logits, top-1 16/16), so split-K is not yet shown to be numeric noise where the old kernel works. Lowering the default needs that demonstration.
+- Check on master 9a70b74 + this branch: ctx512 md5 5cbe8e06 (2 runs; decode 2.653 s and 2.227 s for 8 tokens). Build: 62 warnings.
