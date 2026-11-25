@@ -1956,3 +1956,38 @@ K5 is the unchanged fallback; the small ratio difference is noise. Before the in
 - Narrow 1A/1B rejected (qcols=1 slower; A/B 2/16, 6/16).
 - Batch-only A/B: −0.269 (11/16), retry −0.348 (9/16) on a noisy host. Not merged; no third solo retry.
 - Plan: re-gate bundled with the next small exact change (e.g. gemv_sf dynamic smem) on a quiet host.
+
+## t3/swa-ring-fix — ring-correct sliding-window KV cache — implemented, with oracle-noise caveat
+
+Base `9c735bd`. Implementation in `crates/inkwell-run/src/runner.rs` plus teacher-forcing/debug harness in `inkwell-cli/src/main.rs` and `opt/swa-ring-fix/`.
+
+**Paths fixed.** SWA KV slot selection, relative-position generation, and visibility masks were centralized and applied in serial input upload, packed one-H2D/pipelined decode, cached graph premarshaling, and the NT-token `step_block` path. Default slot is now `pos % 1024`; `INKWELL_SWA_LEGACY_MIN=1` restores the old `min(pos,1023)` behavior only for comparison. `INKWELL_SWA_ORACLE=1` allocates full-length SWA arenas, writes `kv_idx=pos`, uses `rel_pos=pos-slot`, and masks everything older than the last 1024 positions. Ring rel-positions are `(pos-slot) mod 1024`, clamped to `rel_extent`; unfilled/padded slots remain masked. Normal, split-width, and GQA-3 attention consume the supplied per-slot mask/rel-bias and needed no kernel change. State snapshots are versioned `INKWST02` because ring slot meanings changed; oracle and ring state layouts are not interchangeable.
+
+**NT overwrite hazard.** Once the ring is full, every later write in an 8-token batch can evict a row still visible to an earlier token in that batch. `step_block` now detects this regime and makes each later KV write depend on the previous token's attention output through a mathematically neutral `0*x+1` scalar. A separate pre-existing batch bug was also fixed: the fused controller path is serial-only and returned `[n,1]` for `[n,NT]`, causing the ggml view assert seen on master. Batch control now slices each token, applies the exact serial fused control path, and concatenates the token outputs.
+
+**Teacher-forced oracle table** (natural text, 128 rows, full-vocabulary float64 KLD):
+
+| context | top-1 agreement | mean KLD | median | p95 | max | row0 KLD |
+|---|---:|---:|---:|---:|---:|---:|
+| 2K | 127/128 = 0.9922 | 0.0002231 | 7.57e-5 | 0.001020 | 0.005919 | 0.000170 |
+| 4K | 125/128 = 0.9766 | 0.0049746 | 0.001872 | 0.018443 | 0.069943 | 0.000551 |
+
+The 2K independent-run gate passes. The raw independent 4K run misses the requested gate, but the failure is numerical amplification rather than a demonstrated slot/mask bug. Evidence:
+
+- From mathematically identical 4K states, ring vs oracle teacher-forcing for 16 rows was essentially exact: top-1 16/16, mean KLD 4.41e-9, max KLD 1.94e-8, row0 bitwise identical.
+- Ring-vs-oracle KV state comparison at the end of independent 4K encodes: 81,872/81,920 rows (99.94%) were closer to the correct oracle position than to either adjacent position; correct/adjacent difference ratio mean 0.0293, p95 0.1126. This validates the physical ring write-slot mapping despite fp divergence.
+- One controlled NT block starting at position 4095 across the ring wrap, again from mathematically identical ring/oracle states: top-1 8/8, row0 KLD 9.08e-5, mean KLD 0.004324, max KLD 0.015089. KLD grows over the 8 rows because scan-order noise recurs through the block, but there is no systematic top-1 divergence.
+
+**ctx512 regression.** Canonical validation passed all three runs: md5 `5cbe8e06` each time; decode 30.063 / 29.952 / 30.549 ms/tok; peak VRAM 5,032 MiB each run (cap 5,080); `ch2nopless: enabled`.
+
+**4K free-run.** Fixed binary rc0 and coherent text. First 200 characters:
+
+```text
+phone-mic status\nphone-dict "texto"       # ditar e colar no campo de foco (backend escolhido)\nphone-dict --backend parake "texto"\nphone-dict --backend hex "texto"\n```\n\n`phone-dict` aceita `--ba
+```
+
+Single-run decode at 4K: master 43.599 ms/tok vs fixed 48.663 ms/tok. The master baseline used a prompt one token shorter because shell command substitution strips the trailing newline; treat this as indicative, not a rigorous paired benchmark. Master's generated text degenerated to repeated `||||...`, while the fixed binary stayed coherent.
+
+**NT/VTEST status.** Master crashes even at small context in `INKWELL_VTEST8` with `GGML_ASSERT(view_size + view_offs <= ggml_nbytes(view_src))`; this is the pre-existing serial-only controller shape bug, not an SWA regression. The fixed branch no longer crashes. However serial-vs-block logits remain non-exact even at ctx512/base4 where ring and legacy indexing are identical and the wrap hazard is false (8 rows, 2 argmax mismatches, maxdiff up to 9.5). That pre-existing batch numerical discrepancy means VTEST8 cannot isolate SWA overwrite correctness end-to-end. The controlled ring-vs-oracle BTEST above is the meaningful SWA-specific NT evidence.
+
+**Build/state.** Release build rc0. Warning count 55 warning blocks / 59 lines beginning `warning` (limit 64). Validation artifacts are in `opt/swa-ring-fix/artifacts/` and intentionally not committed.

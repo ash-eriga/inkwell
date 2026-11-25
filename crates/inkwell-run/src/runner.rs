@@ -120,6 +120,8 @@ pub struct Runner {
     feat_ops: std::cell::RefCell<Vec<Ptr>>,
     max_ctx: i64,
     swa: i64,
+    swa_oracle: bool,
+    swa_legacy_min: bool,
     visits: Vec<(usize /*layer*/, usize /*slot*/)>,
     n_full: usize,
     /// built step graph kept alive across tokens while padded n_kv shapes are
@@ -879,6 +881,9 @@ impl Runner {
 
         // KV arenas + conv states per slot
         let (hd, hkv, swa) = (128i64, 8i64, 1024i64);
+        let swa_oracle = std::env::var_os("INKWELL_SWA_ORACLE").is_some();
+        let swa_legacy_min = std::env::var_os("INKWELL_SWA_LEGACY_MIN").is_some();
+        let swa_cap = if swa_oracle { max_ctx } else { swa };
         let n_slots = nphys + (np - 1) * (end - start);
         let mut k_arena = Vec::new();
         let mut v_arena = Vec::new();
@@ -890,7 +895,7 @@ impl Runner {
         for slot in 0..n_slots {
             let il_phys = if slot < nphys { slot } else { start + (slot - nphys) % (end - start) };
             let full = il_phys % 6 == 5;
-            let cap = if full { max_ctx } else { swa };
+            let cap = if full { max_ctx } else { swa_cap };
             k_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
             v_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
             conv_state.push(t::new(rt.ctx(), F32, &[3, n_sconv as i64]));
@@ -919,7 +924,7 @@ impl Runner {
             exl3_w: Vec::new(), exl3_blk: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
-            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits,
+            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits,
             n_full, step_gcache: None, sid: None,
         }
     }
@@ -1403,6 +1408,9 @@ impl Runner {
         let n_full = visits.iter().filter(|(il, _)| il % 6 == 5).count();
 
         let (hd, hkv, swa) = (128i64, 8i64, 1024i64);
+        let swa_oracle = std::env::var_os("INKWELL_SWA_ORACLE").is_some();
+        let swa_legacy_min = std::env::var_os("INKWELL_SWA_LEGACY_MIN").is_some();
+        let swa_cap = if swa_oracle { max_ctx } else { swa };
         let n_slots = nphys + (np - 1) * (end - start);
         let mut k_arena = Vec::new();
         let mut v_arena = Vec::new();
@@ -1411,7 +1419,7 @@ impl Runner {
         for slot in 0..n_slots {
             let il_phys = if slot < nphys { slot } else { start + (slot - nphys) % (end - start) };
             let full = il_phys % 6 == 5;
-            let cap = if full { max_ctx } else { swa };
+            let cap = if full { max_ctx } else { swa_cap };
             k_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
             v_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
             conv_state.push(t::new(rt.ctx(), F32, &[3, n_sconv as i64]));
@@ -1629,7 +1637,7 @@ impl Runner {
             moe_args: Vec::new(), exl3_w, exl3_blk, moe_args_exl3, output_exl3,
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
-            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, visits, n_full,
+            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits, n_full,
             step_gcache: None, sid: None,
         }
     }
@@ -1640,6 +1648,41 @@ impl Runner {
 impl Runner {
     /// layer helpers
     fn is_swa_layer(&self, il: usize) -> bool { il % 6 != 5 }
+
+    fn swa_capacity(&self) -> i64 { if self.swa_oracle { self.max_ctx } else { self.swa } }
+
+    fn swa_positions(&self, n: i64) -> i64 { if self.swa_oracle { n } else { n.min(self.swa) } }
+
+    fn swa_kv_idx(&self, pos: i64) -> i64 {
+        if self.swa_oracle { pos }
+        else if self.swa_legacy_min { pos.min(self.swa - 1) }
+        else { pos.rem_euclid(self.swa) }
+    }
+
+    fn swa_filled_count(&self, pos: i64) -> i64 { self.swa_positions(pos + 1) }
+
+    fn swa_filled(&self, pos: i64, slot: i64) -> bool {
+        if self.swa_oracle { 0 <= slot && slot <= pos }
+        else { 0 <= slot && slot < self.swa_filled_count(pos) }
+    }
+
+    fn swa_visible(&self, pos: i64, slot: i64) -> bool {
+        if self.swa_oracle { self.swa_filled(pos, slot) && slot + self.swa - 1 >= pos }
+        else { self.swa_filled(pos, slot) }
+    }
+
+    fn swa_rel_pos(&self, pos: i64, slot: i64) -> i32 {
+        let d = if self.swa_oracle { pos - slot }
+        else if self.swa_legacy_min { self.swa_filled_count(pos) - 1 - slot }
+        else { (pos - slot).rem_euclid(self.swa) };
+        d.min(self.cfg.rel_extent as i64) as i32
+    }
+
+    fn swa_wrap_hazard(&self, pos: i64, n: i64) -> bool {
+        // Once the ring is full, every later write evicts a row near the edge of
+        // every earlier token's window in the same batch.
+        !self.swa_oracle && !self.swa_legacy_min && n > 1 && pos + n - 1 >= self.swa
+    }
 
     /// GEMV dispatch: EXL3 descriptor or ggml mmq.
     fn proj(&self, c: Ptr, l: &L, key: &'static str, w: Option<Ptr>, x: Ptr) -> Ptr {
@@ -1950,6 +1993,22 @@ impl Runner {
         // ctrl_apply does tanh x2 + the (1-forget)*cur + gain*msg tail.
         let fuse = std::env::var_os("INKWELL_NO_CTRLFUSE").is_none();
         let n = t::ne(cur, 0);
+        let ntok = t::ne(cur, 1);
+        if ntok > 1 {
+            // The fused control kernels are single-token. Preserve their exact
+            // serial numerics in NT batches by applying them per token.
+            let mut xs = Vec::with_capacity(ntok as usize);
+            for j in 0..ntok {
+                let cj = t::cont(c, self.tokslice(c, cur, n, j));
+                let mj = t::cont(c, self.tokslice(c, msg, n, j));
+                xs.push(self.control(cj, mj, l, ctrl));
+            }
+            let mut acc = t::reshape3(c, xs[0], n, 1, 1);
+            for x in &xs[1..] {
+                acc = t::concat(c, acc, t::reshape3(c, *x, n, 1, 1), 1);
+            }
+            return t::reshape2(c, acc, n, ntok);
+        }
         let dn = l.ctrl_down[ctrl].expect("ctrl_down");
         // rms2down fuses rms2cat + the down GEMV (INKWELL_NO_RMSDOWN=1
         // restores the pair). Bit-identical to it.
@@ -2142,7 +2201,6 @@ impl Runner {
 
         // KV write via set_rows: in-place write into arena + dep edge so the
         // attention reads below see this token's k/v (upstream pattern).
-        let pos_k = step_pos_key(step, is_swa, self.swa);
         // n_kv padded to a multiple of 64: constant shapes across steps keep
         // the CUDA graph reusable (recapture only on 64-token boundaries).
         let n_kv = if is_swa { step.n_kv_swa_pad } else { step.n_kv_full_pad };
@@ -2297,10 +2355,6 @@ impl Runner {
     }
 }
 
-/// absolute key position for this step's KV write
-fn step_pos_key(s: &Step, is_swa: bool, swa: i64) -> i64 {
-    if is_swa { s.pos_val % swa } else { s.pos_val }
-}
 /// tau scale tensor (built per step in `step()`)
 fn step_tau(s: &Step) -> Ptr { s.tau }
 
@@ -2336,9 +2390,9 @@ impl Runner {
         // shapes stay constant across steps (CUDA-graph replayable). The
         // -inf softmax masks cover the padding columns.
         let n_kv_full_raw = pos + 1;
-        let n_kv_swa_raw = (pos + 1).min(self.swa);
+        let n_kv_swa_raw = self.swa_positions(pos + 1);
         let n_kv_full = kv_bucket(n_kv_full_raw, self.max_ctx);
-        let n_kv_swa = kv_bucket(n_kv_swa_raw, self.swa);
+        let n_kv_swa = kv_bucket(n_kv_swa_raw, self.swa_capacity());
 
         // Reuse the built ggml graph + sched splits + instantiated CUDA graph
         // while the shape signature is unchanged: only input data varies.
@@ -2564,17 +2618,16 @@ impl Runner {
             t::set(s.ids, [id as i32].as_ptr().cast(), 0, 4);
             t::set(s.pos, [pos as i32].as_ptr().cast(), 0, 4);
             t::set(s.kv_idx_full, [pos as i32].as_ptr().cast(), 0, 4);
-            t::set(s.kv_idx_swa, [(pos.min(self.swa - 1)) as i32].as_ptr().cast(), 0, 4);
-            // rel_pos[j] = distance (pos - key_pos) clamped to extent; slot j of
-            // the SWA window holds position pos-(n_kv-1-j). Padded slots get a
-            // harmless index — their logits are masked to -inf before softmax.
+            t::set(s.kv_idx_swa, [self.swa_kv_idx(pos) as i32].as_ptr().cast(), 0, 4);
+            // rel_pos[j] = distance (pos - key_pos) clamped to extent. Ring mode
+            // recovers the key position modulo swa; padded slots get a harmless
+            // index because their logits are masked to -inf before softmax.
             let n_kv_full_raw = pos + 1;
-            let n_kv_swa_raw = (pos + 1).min(self.swa);
             let rp = |nk: i64, raw: i64| -> Vec<i32> {
                 (0..nk).map(|j| if j < raw { (raw - 1 - j).min(self.cfg.rel_extent as i64) as i32 } else { 0 }).collect()
             };
             let rp_f = rp(s.n_kv_full_pad, n_kv_full_raw);
-            let rp_s = rp(s.n_kv_swa_pad, n_kv_swa_raw);
+            let rp_s: Vec<i32> = (0..s.n_kv_swa_pad).map(|j| if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 }).collect();
             t::set(s.rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
             t::set(s.rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
             // -inf on padded columns (plus a 0 for the appended sink column)
@@ -2582,7 +2635,7 @@ impl Runner {
                 (0..=nk).map(|j| if j < raw || j == nk { 0.0 } else { f32::NEG_INFINITY }).collect()
             };
             let mk_f = mk(s.n_kv_full_pad, n_kv_full_raw);
-            let mk_s = mk(s.n_kv_swa_pad, n_kv_swa_raw);
+            let mk_s: Vec<f32> = (0..=s.n_kv_swa_pad).map(|j| if j == s.n_kv_swa_pad || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY }).collect();
             t::set(s.mask_full, mk_f.as_ptr().cast(), 0, mk_f.len() * 4);
             t::set(s.mask_swa, mk_s.as_ptr().cast(), 0, mk_s.len() * 4);
             let z = vec![0f32; (t::ne(s.sink_zero, 2) * t::ne(s.sink_zero, 3)) as usize];
@@ -2747,9 +2800,8 @@ impl Runner {
         unsafe {
             (dst.add(offs[1]) as *mut i32).write(pos as i32);
             (dst.add(offs[2]) as *mut i32).write(pos as i32);
-            (dst.add(offs[3]) as *mut i32).write(pos.min(self.swa - 1) as i32);
+            (dst.add(offs[3]) as *mut i32).write(self.swa_kv_idx(pos) as i32);
             let nfr = pos + 1;
-            let nsr = (pos + 1).min(self.swa);
             let ext = self.cfg.rel_extent as i64;
             let rf = dst.add(offs[4]) as *mut i32;
             for j in 0..s.n_kv_full_pad {
@@ -2757,7 +2809,7 @@ impl Runner {
             }
             let rs = dst.add(offs[5]) as *mut i32;
             for j in 0..s.n_kv_swa_pad {
-                rs.add(j as usize).write(if j < nsr { (nsr - 1 - j).min(ext) as i32 } else { 0 });
+                rs.add(j as usize).write(if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 });
             }
             let mf = dst.add(offs[6]) as *mut f32;
             for j in 0..=s.n_kv_full_pad {
@@ -2765,7 +2817,7 @@ impl Runner {
             }
             let ms = dst.add(offs[7]) as *mut f32;
             for j in 0..=s.n_kv_swa_pad {
-                ms.add(j as usize).write(if j < nsr || j == s.n_kv_swa_pad { 0.0 } else { f32::NEG_INFINITY });
+                ms.add(j as usize).write(if j == s.n_kv_swa_pad || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY });
             }
         }
     }
@@ -2816,7 +2868,7 @@ impl Runner {
         if *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none()) {
             if let Some(gc) = self.step_gcache.take() {
                 let n_kv_full = kv_bucket(pos + 1, self.max_ctx);
-                let n_kv_swa = kv_bucket((pos + 1).min(self.swa), self.swa);
+                let n_kv_swa = kv_bucket(self.swa_positions(pos + 1), self.swa_capacity());
                 if gc.step.n_kv_full_pad == n_kv_full && gc.step.n_kv_swa_pad == n_kv_swa {
                     let r = self.step_id_cached(id, pos, &gc);
                     self.step_gcache = Some(gc);
@@ -2911,7 +2963,7 @@ impl Runner {
         // buf: this step's copy already ran before the graph).
         let next = pos + 1;
         let n_kv_full = kv_bucket(next + 1, self.max_ctx);
-        let n_kv_swa = kv_bucket((next + 1).min(self.swa), self.swa);
+        let n_kv_swa = kv_bucket(self.swa_positions(next + 1), self.swa_capacity());
         let premarshal = n_kv_full == gc.step.n_kv_full_pad && n_kv_swa == gc.step.n_kv_swa_pad;
         unsafe {
             inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
@@ -3043,6 +3095,7 @@ struct StepBlk {
     tau8: Ptr, // [8] f32
     n_kv_full_pad: i64,
     n_kv_swa_pad: i64,
+    swa_wrap_hazard: bool,
 }
 
 impl Runner {
@@ -3194,8 +3247,14 @@ impl Runner {
         for j in 0..NT {
             let k_j = t::reshape3(c, self.tokslice(c, k8, hd * hkv, j as i64), hd, hkv, 1);
             let v_j = t::reshape3(c, self.tokslice(c, v8, hd * hkv, j as i64), hd, hkv, 1);
-            let k_rows = t::permute(c, k_j, 0, 2, 1, 3);
-            let v_rows = t::permute(c, v_j, 0, 2, 1, 3);
+            let mut k_rows = t::permute(c, k_j, 0, 2, 1, 3);
+            let mut v_rows = t::permute(c, v_j, 0, 2, 1, 3);
+            if is_swa && step.swa_wrap_hazard && j > 0 {
+                // A wrap overwrite must not pass the attention that still reads the old row.
+                let one = t::scale_bias(c, t::view1(c, outs[j - 1], 1, 0), 0.0, 1.0);
+                k_rows = t::mul(c, k_rows, one);
+                v_rows = t::mul(c, v_rows, one);
+            }
             let kv_idx = if is_swa { step.kv_idx_swa[j] } else { step.kv_idx_full[j] };
             k_cur = t::set_rows(c, k_cur, k_rows, kv_idx);
             v_cur = t::set_rows(c, v_cur, v_rows, kv_idx);
@@ -3304,7 +3363,7 @@ impl Runner {
         let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter()).copied().collect();
         let mut f = std::fs::File::create(path).expect("create state snapshot");
         use std::io::Write as _;
-        f.write_all(b"INKWST01").expect("write state magic");
+        f.write_all(b"INKWST02").expect("write state magic");
         f.write_all(&(tensors.len() as u64).to_le_bytes()).expect("write state count");
         for x in tensors {
             let n = t::nbytes(x);
@@ -3322,7 +3381,7 @@ impl Runner {
         use std::io::Read as _;
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic).expect("read state magic");
-        assert_eq!(&magic, b"INKWST01", "state snapshot magic");
+        assert_eq!(&magic, b"INKWST02", "state snapshot magic");
         let mut u64b = [0u8; 8];
         f.read_exact(&mut u64b).expect("read state count");
         assert_eq!(u64::from_le_bytes(u64b) as usize, tensors.len(), "state tensor count");
@@ -3369,9 +3428,9 @@ impl Runner {
         let n_embd = self.cfg.n_embd as i64;
 
         let n_kv_full_raw = pos + NT as i64;
-        let n_kv_swa_raw = n_kv_full_raw.min(self.swa);
+        let n_kv_swa_raw = self.swa_positions(n_kv_full_raw);
         let n_kv_full = kv_bucket(n_kv_full_raw, self.max_ctx);
-        let n_kv_swa = kv_bucket(n_kv_swa_raw, self.swa);
+        let n_kv_swa = kv_bucket(n_kv_swa_raw, self.swa_capacity());
 
         // per-token input tensors
         let mk_i32 = |v: &[i32]| -> Ptr {
@@ -3390,6 +3449,7 @@ impl Runner {
             tau8: t::new(c, F32, &[NT as i64]),
             n_kv_full_pad: n_kv_full,
             n_kv_swa_pad: n_kv_swa,
+            swa_wrap_hazard: self.swa_wrap_hazard(pos, NT as i64),
         };
         let embd8 = t::new(c, F32, &[n_embd, NT as i64]);
         unsafe { inkwell_ggml::ink_set_input(embd8.0) };
@@ -3399,7 +3459,7 @@ impl Runner {
         let mut setf: Vec<(Ptr, Vec<f32>)> = Vec::new();
         for j in 0..NT {
             for (arr, v) in [(&mut step.kv_idx_full, (pos + j as i64) as i32),
-                             (&mut step.kv_idx_swa, ((pos + j as i64).min(self.swa - 1)) as i32)] {
+                             (&mut step.kv_idx_swa, self.swa_kv_idx(pos + j as i64) as i32)] {
                 let t0 = t::new(c, I32, &[1]);
                 unsafe { inkwell_ggml::ink_set_input(t0.0) };
                 sets.push((t0, vec![v]));
@@ -3407,12 +3467,20 @@ impl Runner {
                 small.push(t0);
             }
             for is_swa in [true, false] {
-                let (nk, raw) = if is_swa { (n_kv_swa, n_kv_swa_raw.min(pos + j as i64 + 1)) }
-                                else { (n_kv_full, pos + j as i64 + 1) };
-                // rel_pos[j] = distance to key at slot j (0..raw-1), clamp extent
-                let rp: Vec<i32> = (0..nk).map(|i| if i < raw { (raw - 1 - i).min(self.cfg.rel_extent as i64) as i32 } else { 0 }).collect();
+                let ppos = pos + j as i64;
+                let (nk, raw) = if is_swa { (n_kv_swa, self.swa_positions(ppos + 1)) }
+                                else { (n_kv_full, ppos + 1) };
+                // rel_pos[i] = distance to the key in slot i, clamped to extent
+                let rp: Vec<i32> = (0..nk).map(|i| {
+                    if i >= raw { 0 }
+                    else if is_swa { self.swa_rel_pos(ppos, i) }
+                    else { (raw - 1 - i).min(self.cfg.rel_extent as i64) as i32 }
+                }).collect();
                 let t_rp = t::new(c, I32, &[nk, 1]);
-                let mk: Vec<f32> = (0..=nk).map(|i| if i < raw || i == nk { 0.0 } else { f32::NEG_INFINITY }).collect();
+                let mk: Vec<f32> = (0..=nk).map(|i| {
+                    let visible = if is_swa { self.swa_visible(ppos, i) } else { i < raw };
+                    if i == nk || visible { 0.0 } else { f32::NEG_INFINITY }
+                }).collect();
                 let t_mk = t::new(c, F32, &[nk + 1, 1, 1, 1]);
                 unsafe {
                     inkwell_ggml::ink_set_input(t_rp.0);
