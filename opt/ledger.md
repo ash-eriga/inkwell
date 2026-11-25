@@ -1956,3 +1956,20 @@ K5 is the unchanged fallback; the small ratio difference is noise. Before the in
 - Narrow 1A/1B rejected (qcols=1 slower; A/B 2/16, 6/16).
 - Batch-only A/B: −0.269 (11/16), retry −0.348 (9/16) on a noisy host. Not merged; no third solo retry.
 - Plan: re-gate bundled with the next small exact change (e.g. gemv_sf dynamic smem) on a quiet host.
+
+## Neon study: path to 20 ms (spec decode / batched verify) — partial, child crashed (provider error); data recovered by orchestrator
+Worktree t3/spec-decode-feasibility-study (uncommitted diagnostic hooks `INKWELL_LOOP_NP`, `INKWELL_SKIP_EPI`, `INKWELL_SELFSPEC_EVAL`). Raw: /tmp/spec_study_results.txt, /tmp/spec_study_part2.txt.
+- Batched EXL3 GEMV kbench, B tokens sharing the same weights, 0 bit diffs B=1..8. B4/B1 time: MoE GU K2 1.37×, K3 1.20×, MoE DN 1.35×, dense wq 0.97×, wo 0.95×, unembed 1.45×. Caveat: real MoE verify routes different experts per token, so the expert union grows. This bench is a lower bound for MoE cost.
+- nsys baseline 9c735bd: ccopy 31.3% of GPU time (72 inst, 449 µs avg), gemv_sf_ch2 25.1%, gemv_moe_s 24.1%, mix 2.3%, attn 1.5%.
+- Reduced-pass self-draft, measured decode with graphs, 32 tok: np3 30.06, np2 21.87, np1 16.16, np0 9.19 ms/tok. Skipping the epilogue: np2 18.60, np1 13.09.
+- Self-spec acceptance, 5 prompts × 16 samples, greedy, draft = fewer loop passes:
+
+| draft | p1 range | emit@k=4 range |
+|---|---|---|
+| np2+epi (36 visits) | 0.81–1.00 | 3.44–4.88 |
+| np1+epi (24 visits) | 0.75–1.00 | 3.13–4.88 |
+| np0+epi (12 visits) | 0.44–0.69 | 1.88–2.88 |
+| no-epilogue variants | ≤0.25 | ≤1.25 (useless) |
+
+- Existing paths are BROKEN on master: `INKWELL_VTEST8`, `INKWELL_SPEC=7` (n-gram) and `INKWELL_SPEC=mtp` all abort with `GGML_ASSERT(view_size + view_offs <= ggml_nbytes(view_src))` (ggml.c:1868). Probably a regression from the kslot/arena or NT-batch views.
+- Orchestrator estimate: np1 draft at 16.2 ms/tok is too expensive for a naive scheme. Drafting k=3 costs 48 ms and a full 4-token verify ≥40 ms, which is about 27–31 ms/tok and no gain. A viable path must reuse the draft's prelude + pass-1 work in the verify (LayerSkip-style shared prefix: only passes 2–3 + epilogue run batched). It must also amortise ccopy/expert streaming across the verified tokens.
