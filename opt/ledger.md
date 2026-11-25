@@ -2003,3 +2003,13 @@ Raw: /tmp/prefill-study/results/{kbench,default_ctx512,vtest8_ctx512}.log. Only 
 - Supersedes the partial entry above. An oracle drafter (0 ms) still has a floor of 20.13 ms/tok at B=2. Real routing grows distinct experts 8.00→12.89/16.59/19.96 (B=2/3/4), so the ragged MoE verify costs 1.67/2.19/2.68×.
 - Best training-free drafter: int4-requantised mtp.safetensors (~120 MiB, 1.45 ms) + ragged B=2 verify, modelled at 25.48 ms/tok. Self-spec np1 costs 29.98 ms/tok (no gain).
 - ≤20 ms requires a trained ~30 MiB EAGLE-style drafter plus a bit-exact ragged B=2..4 verify (modelled 19.5–22 ms/tok). It also requires fixing the Runner::control() GGML_ASSERT regression.
+
+## Prefill study — final (d2bc6bc, opt/studies/prefill-2026-11-25.md)
+- Supersedes the partial prefill entry above.
+- Serial step() encode: 32.8–40.8 ms/tok (512–8K).
+- Existing step_block (NT=8, after 3 bugfixes left unstaged on t3/prefill-chunked-study) is 1.6–1.9× slower, 52.6–78.1 ms/tok, and peaks at 5,406 MiB (over the cap). Cause: MOE_NKY=2 forces gemv_moe_ntok (40.8–49.9 ms/tok vs 12.4–13.5 for ch2nopless).
+- step_block is not exact: atomicAdd nky=2, mix8, control, clip and router all change FP order. At 512 tok the first-gen KLD is 3.53e-5, but rare MoE top-8 flips give K_max_abs 10.83, and greedy text diverges at gen 56/64.
+- Architecture: loop state is per-token; sconv is a parallel FIR; only attention is cross-token. PCIe streaming of the 14 host-pinned MoE layers (3.4–4.9 GiB/chunk) needs C=256–512 with double buffering.
+- FP32 tiled prefill at C=512 with GQA-3 flash attention is predicted at 81.9 tok/s (2K), 80.2 (8K), 75.2 (32K) and 69.6 (64K; needs K4V2). It borrows 108.8 MiB from the expert cache.
+- Plan: FP-order prefill gated by teacher-forced KLD (<1e-3 first token, <5e-4 64-tok mean), killswitch INKWELL_NO_PREFILL. Phases: 0 = step_block fixes + step_id encode; 1 = prefill.cu kernels; 2 = PrefillArena + Runner::prefill.
+- Orchestrator note: ~80 tok/s is the FP32 path. Challenge 4 (integer Tier Q numerics) targets ≥150 MAC/SM-cycle for the 500 tok/s goal.
