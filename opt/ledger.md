@@ -2055,3 +2055,10 @@ Single-run decode at 4K: master 43.599 ms/tok vs fixed 48.663 ms/tok. The master
 - Verdict: MERGED as a correctness fix. Short context costs nothing; without the fix, output past 1K is garbage ("||||" at 4K). Killswitch `INKWELL_SWA_LEGACY_MIN=1`.
 - Open: 4K speed (48.66 vs 43.60 ms/tok single run) is not comparable, because master's 4K output is garbage. It needs a proper 4K A/B against a correct baseline.
 - Post-merge check on master ed6f659 (release build, 59 warnings), ctx512: md5 5cbe8e06 ×3; 28.97 / 28.40 / 29.86 ms/tok.
+
+## t3/sf-dynsmem (07208de) — msg batching alone (`INKWELL_NO_SF_DYNSMEM=1`), orchestrator A/B
+- Bundle (dynsmem + msg batching), child A/B: +0.083 ms/tok, 7/16 wins. REJECTED. Isolated, dynamic smem is 0.76–0.96× of static. Occupancy is 6 CTAs/SM before and after (register-capped), so the premise did not hold.
+- Msg batching only, 16 pairs vs frozen CTL e03df94: ctl_med 28.455, cand_med 28.564 (+0.109). Wins 11/16. md5 5cbe8e06 on all runs. Peak 5,032 MiB.
+- Per-pair deltas (cand − ctl, mean of the two runs in each ctl,cand,cand,ctl block, 8 blocks): −0.06, −2.63, +1.85, −1.36, −0.01, +0.28, −0.41, −0.39. Median ≈ −0.2.
+- The host was loaded (4 agents, with 30–31 ms outliers on both arms).
+- Verdict: near-miss, not merged. Queued for an improvement plus re-A/B when a code slot frees.
