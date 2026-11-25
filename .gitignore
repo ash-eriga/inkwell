@@ -17,3 +17,10 @@ opt/kbench/kslot_gold
 opt/kbench/kslot_replay
 
 opt/hostlat/
+
+# built bench binaries (untracked for GitHub)
+opt/bench_d2d
+opt/zc_bench
+opt/kbench/gemv_v2_bench
+opt/kbench/gemv_v2_dbg
+opt/kbench/v2_isolate
