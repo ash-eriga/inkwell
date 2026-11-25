@@ -1535,3 +1535,18 @@ IADD3 and LOP32I ran alone: IADD3 at 1.94 per cycle (half rate), LOP32I at full 
 - Interleaved A/B, 16 pairs, same env as the resolve-warp check. Median ctl 34.550 ms, cand 35.219 ms (+0.67 ms); candidate wins 6/16. md5 5cbe8e06 in all 32 runs; peak 5,034 MiB both.
 - Per-pair Δ (cand − ctl, ms): 0.36 2.46 0.02 0.07 1.11 −0.09 0.05 −0.19 0.67 0.73 −1.90 −0.35 −1.62 0.15 −3.87 1.01.
 - Reading: no clear regression (6/16 is a coin flip), but no clean pass either. Not merged; re-run on a quiet host together with resolve-warp.
+## 2026-11-24 — split-K decode attention for long context: correctness gate failed
+
+Branch `t3/attn-splitk-flash-decode`, rebased on master `32a522a`. Pieces: `c56a355` warp-split decode-attention kernel and host dispatch, `912e609` attention/logit dump hooks, `1215027` attention-context probe. `INKWELL_NO_ATTNSPLIT=1` restores the old kernel; default dispatch keeps the old kernel below n_kv 320 and uses chunks 64/128/256 above that.
+
+Synthetic probe (FP16 K/V, FP64 CPU reference): old/new max abs about **1-2e-8**, normalized rel **4e-7..3.2e-6**; split vs FP64 max abs about **1-3e-9**, rel **1.4e-7..3.9e-7**. The old kernel still reports `invalid argument` at n_kv >= 16384; split runs through 131072.
+
+Indicative per-visit times (dynamic chunks, one global visit): 320 **0.040 ms**, 512 **0.053**, 1K **0.065**, 2K **0.121**, 4K **0.222-0.231**, 8K **0.427-0.454**, 16K **0.85**, 32K **1.70**, 64K **3.2-3.35**, 128K **6.29-6.37 ms**. That is only **80-85 GB/s** at long context, so the 1.5x KV-floor target (~120 GB/s) was **missed**, although it is about **6x** faster than the old kernel at 8K and removes the >12K launch failure.
+
+End-to-end exactness gate **failed**. Under the same bounded expert-cache configuration (cacheK8 with 24 MiB per-layer arenas), forcing split at all lengths on an exactly 8000-token prompt completed in 419.116 s encode and 4.475680874 s for the decode line; the old kernel control completed in 486.033 s and 4.751162691 s. Logits over 16 generated rows differed by **max_abs 2.33707** with top-1 agreement **16/16**. The old-kernel ck20 vs ck24 control was bit-identical (`max_abs=0`), so the difference is not an expert-cache artefact. A scalar-strided/bit-compatible dot-order experiment (`bitdot2`) did not improve synthetic old/new error and reduced bandwidth (32K about 1.96 ms vs 1.70 ms committed), so it was discarded.
+
+32K end-to-end did **not** reach prefill in the cache24 configuration. KV allocation was 1187 MiB; after bounded cache arenas only 44 MiB remained free after moe21, and the run failed before prefill in a ggml `cudaMalloc` of 16 MiB (`out of memory`). This is a memory-capacity failure, not a split-kernel launch failure. Real-tensor FP64 validation was attempted but the first diagnostic used an exactly 4096-token prompt, so the first decode position was 4097 and no power-of-two dump fired; a corrected 4095-token run was queued but not completed before foreign GPU benchmarking took the lock.
+
+Standard post-rebase benchmark (ctx512, default split inactive): md5 **5cbe8e06**, decode line **2.581207358 s / 8 tokens = 40.331 ms/token**. Build after rebase: rc0, **62 warnings** (limit 64).
+
+Verdict: **do not enable as a production exactness-preserving path yet**. It is a useful correctness-capability/performance prototype, but the owner's end-to-end exactness gate and the bandwidth target both remain unmet.

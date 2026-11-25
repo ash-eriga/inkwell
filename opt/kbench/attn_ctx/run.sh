@@ -1,6 +1,7 @@
 #!/bin/sh
 # Build and run the decode-attention context probe on the GTX 1060.
-# Usage: opt/kbench/attn_ctx/run.sh   (GPU part runs under the shared lock)
+# ATTN_PROBE_MAX, ATTN_PROBE_REF, ATTN_PROBE_REPS and INKWELL_ATTNSPLIT_CHUNK
+# select the probe sweep. The GPU part runs under the shared lock.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 src=$here/../../../crates/inkwell-cuda/src
