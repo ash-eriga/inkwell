@@ -546,6 +546,13 @@ struct RelbiasDynPosArgs {
     rel_extent: i32,
 }
 
+struct SinkRelbiasArgs {
+    mode: i32,
+    swa: i32,
+    rel_extent: i32,
+    dynamic: i32,
+}
+
 /// `ggml_custom_op_t`: fixed-capacity rel-bias gather whose integer relative
 /// positions are computed on device. srcs = [table, sinks, pos, n_kv].
 unsafe extern "C" fn relbias_dynpos_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
@@ -562,6 +569,25 @@ unsafe extern "C" fn relbias_dynpos_cb(dst: *mut std::ffi::c_void, _ith: i32, _n
         inkwell_cuda::relbias_gather_dynpos_async(inkwell_ggml::ink_tensor_data(mm).cast(),
             s(1).cast(), s(2).cast(), s(3).cast(), inkwell_ggml::ink_tensor_data(dst).cast(),
             cap, nh, ext, a.mode, a.swa, a.rel_extent)
+    };
+}
+
+/// `ggml_custom_op_t`: fused BF16 sink projection + rel-bias dot/gather.
+/// srcs = [sink weight, input, BF16 padded rel-bias, r, pos/rel_pos, optional n_kv].
+unsafe extern "C" fn sink_relbias_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<SinkRelbiasArgs>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let t = |i: i32| unsafe { inkwell_ggml::ink_tensor_src(dst, i) };
+    let d = |i: i32| unsafe { inkwell_ggml::ink_tensor_data(t(i)) };
+    let ws = unsafe { t(0) };
+    let nh = unsafe { inkwell_ggml::ink_tensor_ne(ws, 1) } as i32;
+    let ncols2 = (unsafe { inkwell_ggml::ink_tensor_ne(ws, 0) } / 2) as i32;
+    let y_stride = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let d_nkv = if a.dynamic != 0 { d(5).cast() } else { std::ptr::null() };
+    unsafe {
+        inkwell_cuda::sink_relbias_fused_async(d(0), d(1).cast(), d(2), d(3).cast(),
+            d(4), d_nkv, inkwell_ggml::ink_tensor_data(dst).cast(), y_stride, nh,
+            y_stride, ncols2, a.mode, a.swa, a.rel_extent)
     };
 }
 
@@ -647,6 +673,20 @@ fn bf16_to_f32_t(d: &[u8], shape: &[u64]) -> Vec<u8> {
         }
     }
     unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), r * c * 4) }.to_vec()
+}
+
+/// BF16 bytes transposed as raw 2-byte elements, same layout as `bf16_to_f32_t`.
+fn bf16_t(d: &[u8], shape: &[u64]) -> Vec<u8> {
+    let (r, c) = (shape[0] as usize, shape[1] as usize);
+    let mut out = vec![0u8; d.len()];
+    for a in 0..r {
+        for b in 0..c {
+            let src = (a * c + b) * 2;
+            let dst = (b * r + a) * 2;
+            out[dst..dst + 2].copy_from_slice(&d[src..src + 2]);
+        }
+    }
+    out
 }
 
 /// bf16 bytes -> f32 bytes.
@@ -1054,13 +1094,15 @@ impl Runner {
         let count_dup_gfcat = devbuf_trim
             && std::env::var_os("INKWELL_NO_GFCAT_TRIM").is_some()
             && std::env::var_os("INKWELL_NOCTRLCAT").is_none();
+        let relbias_bf16 = bf16w && std::env::var_os("INKWELL_NO_SINKRELBIAS").is_none();
         let mut dev_bytes = dev_headroom;
         for (n, t) in &repo.tensors {
             let (name, ti) = (n.as_str(), &t.1);
             if name.contains(".experts.") || name.contains(".trellis") || name.contains(".suh")
                 || name.contains(".svh") || name.contains(".mul1") || name == "model.llm.embed.weight"
                 || name.contains("visual") { continue; }
-            let w = if bf16_ok(name) && ti.dtype == "BF16" { 2 } else { 4 };
+            let rb2 = relbias_bf16 && name.ends_with("attn.rel_logits_proj.proj");
+            let w = if (bf16_ok(name) || rb2) && ti.dtype == "BF16" { 2 } else { 4 };
             let bytes = (ti.elems() * w) as usize;
             dev_bytes += bytes + 256;
             if count_dup_gfcat && name.contains(".controllers.")
@@ -1253,12 +1295,18 @@ impl Runner {
                 }),
                 attn_rel_bias_pad: Some({
                     let n0 = 16usize; let n1 = 1024usize;
-                    let np = t::new(rt.ctx(), F32, &[n0 as i64, n1 as i64 + 1, 1, 1]);
+                    let raw = dtp(&lp(il, "attn.rel_logits_proj.proj"));
+                    let fused = bf16w && std::env::var_os("INKWELL_NO_SINKRELBIAS").is_none();
+                    let (ty, esz, bytes) = if fused {
+                        (BF16, 2usize, bf16_t(raw, &[16, 1024]))
+                    } else {
+                        (F32, 4usize, bf16_to_f32_t(raw, &[16, 1024]))
+                    };
+                    let np = t::new(rt.ctx(), ty, &[n0 as i64, n1 as i64 + 1, 1, 1]);
                     let o = (off_dev + 127) & !127;
                     dev_buf.assign(np, o);
-                    let bytes = bf16_to_f32_t(dtp(&lp(il, "attn.rel_logits_proj.proj")), &[16, 1024]);
-                    let mut dst = vec![0u8; n0 * (n1 + 1) * 4];
-                    dst[..n0 * n1 * 4].copy_from_slice(&bytes);
+                    let mut dst = vec![0u8; n0 * (n1 + 1) * esz];
+                    dst[..n0 * n1 * esz].copy_from_slice(&bytes);
                     unsafe { t::set(np, dst.as_ptr(), 0, dst.len()) };
                     off_dev = o + t::nbytes(np);
                     np
@@ -1791,6 +1839,15 @@ impl Runner {
         t::output(t0); // keep alive: gallocr won't reuse output memory
         unsafe { (*self.dump_list.get()).push((name.to_string(), t0)); }
     }
+
+    fn sr_dump(&self, il: usize, pass: usize, pos: i64, name: &str, t0: Ptr) {
+        if std::env::var_os("INKWELL_SR_DUMP_DIR").is_none() { return; }
+        let want_l = std::env::var("INKWELL_SR_DUMP_LAYER").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(5);
+        let want_pos = std::env::var("INKWELL_SR_DUMP_POS").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(64);
+        if il != want_l || pass != 0 || pos + 1 != want_pos { return; }
+        t::output(t0);
+        unsafe { (*self.dump_list.get()).push((format!("sr_pos{}_l{il}p{pass}_{name}", pos + 1), t0)); }
+    }
     fn dump_list_get(&self) -> &Vec<(String, Ptr)> { unsafe { &*self.dump_list.get() } }
     fn attn_dump_enabled(il: usize, pass: usize, nkv: i64) -> bool {
         static FILTER: std::sync::OnceLock<Vec<(Option<usize>, Option<usize>, Option<i64>)>> = std::sync::OnceLock::new();
@@ -1819,6 +1876,19 @@ impl Runner {
     }
     fn dump_all(&self) {
         for (name, t0) in unsafe { &*self.dump_list.get() } {
+            if name.starts_with("sr_") {
+                let Some(dir) = std::env::var_os("INKWELL_SR_DUMP_DIR") else { continue };
+                let n = t::ne(*t0,0)*t::ne(*t0,1)*t::ne(*t0,2)*t::ne(*t0,3);
+                let mut v = vec![0f32; n as usize];
+                unsafe { t::get(*t0, v.as_mut_ptr().cast(), 0, (n*4) as usize) };
+                let _ = std::fs::create_dir_all(&dir);
+                if let Ok(mut f) = std::fs::File::create(std::path::Path::new(&dir).join(format!("{name}.f32"))) {
+                    use std::io::Write as _;
+                    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 4) };
+                    let _ = f.write_all(bytes);
+                }
+                continue;
+            }
             if name.starts_with("attn_pos") {
                 let Some(dir) = std::env::var_os("INKWELL_ATTN_DUMP_DIR") else { continue };
                 let nbytes = t::nbytes(*t0);
@@ -2309,37 +2379,77 @@ impl Runner {
         }
 
         // rel bias (upstream): table = mm(pad(rel_bias), r) - sinks; gather by distance
-        let sinks = t::mmq(c, l.attn_sink_proj.expect("sink"), inputs[0]); // [nh, 1]
-        let table = t::mmq(c, l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias"), r); // [ext+1, nh, 1]
+        let sink_w = l.attn_sink_proj.expect("sink");
+        let rel_w = l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias");
         let rel_pos = if is_swa { step.rel_pos_swa } else { step.rel_pos_full };
-        // fused gather+sub (INKWELL_NO_RELGATHER=1 restores the chain):
-        // kq_b[j,0,h] = table[rel_pos[j], h] - sinks[h] in one kernel.
-        let kq_b = if step.dyn_nkv {
-            let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
-            if step.direct_relbias {
-                let mode = if !is_swa { 0 } else if self.swa_legacy_min { 2 } else { 1 };
-                let ud = Box::leak(Box::new(RelbiasDynPosArgs {
-                    mode, swa: self.swa as i32, rel_extent: self.cfg.rel_extent as i32 }));
-                let mut args = [table.0, sinks.0, step.pos.0, nkv_dev.0];
-                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
-                    relbias_dynpos_cb as *const () as usize, (ud as *mut RelbiasDynPosArgs).cast()) })
-            } else {
-                let mut args = [table.0, sinks.0, rel_pos.0, nkv_dev.0];
-                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
-                    relbias_dyn_cb as *const () as usize, std::ptr::null_mut()) })
-            }
-        } else if std::env::var_os("INKWELL_NO_RELGATHER").is_none() {
-            let mut args = [table.0, sinks.0, rel_pos.0];
-            Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
-                relbias_cb as *const () as usize, std::ptr::null_mut()) })
-        } else {
-            let table = t::sub(c, table, t::reshape3(c, sinks, 1, nh, 1));
-            let table = t::cont(c, t::permute(c, table, 1, 0, 2, 3)); // [nh, ext+1, 1]
-            let kq_b = t::get_rows(c, table, rel_pos); // [nh, n_kv, 1]
-            // permute(2,0,1,3): src dim i goes to dst dim arg_i -> [n_kv, 1, nh, 1]
-            t::cont(c, t::permute(c, t::reshape4(c, kq_b, nh, n_kv, 1, 1), 2, 0, 1, 3))
+        let fuse_sink_relbias = std::env::var_os("INKWELL_NO_SINKRELBIAS").is_none() && unsafe {
+            inkwell_ggml::ink_tensor_type(sink_w.0) == BF16
+                && inkwell_ggml::ink_tensor_type(rel_w.0) == BF16
+                && inkwell_ggml::ink_tensor_ne(rel_w.0, 0) == n_rel
         };
-        if il == 0 { self.dump("table-0", table); self.dump("kqb-0", kq_b); }
+        let (kq_b, table_dbg) = if fuse_sink_relbias {
+            let (mode, pos_src, nkv_src, dynamic) = if step.dyn_nkv {
+                let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
+                if step.direct_relbias {
+                    let mode = if !is_swa { 0 } else if self.swa_legacy_min { 2 } else { 1 };
+                    (mode, step.pos, nkv_dev, 1)
+                } else {
+                    (-1, rel_pos, nkv_dev, 1)
+                }
+            } else {
+                (-1, rel_pos, rel_pos, 0)
+            };
+            let ud = Box::leak(Box::new(SinkRelbiasArgs {
+                mode, swa: self.swa as i32, rel_extent: self.cfg.rel_extent as i32, dynamic }));
+            let out = if dynamic != 0 {
+                let mut args = [sink_w.0, inputs[0].0, rel_w.0, r.0, pos_src.0, nkv_src.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                    sink_relbias_cb as *const () as usize, (ud as *mut SinkRelbiasArgs).cast()) })
+            } else {
+                let mut args = [sink_w.0, inputs[0].0, rel_w.0, r.0, pos_src.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                    sink_relbias_cb as *const () as usize, (ud as *mut SinkRelbiasArgs).cast()) })
+            };
+            (out, None)
+        } else {
+            let sinks = t::mmq(c, sink_w, inputs[0]); // [nh, 1]
+            let table = t::mmq(c, rel_w, r); // [ext+1, nh, 1]
+            // fused gather+sub (INKWELL_NO_RELGATHER=1 restores the chain):
+            // kq_b[j,0,h] = table[rel_pos[j], h] - sinks[h] in one kernel.
+            let kq_b = if step.dyn_nkv {
+                let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
+                if step.direct_relbias {
+                    let mode = if !is_swa { 0 } else if self.swa_legacy_min { 2 } else { 1 };
+                    let ud = Box::leak(Box::new(RelbiasDynPosArgs {
+                        mode, swa: self.swa as i32, rel_extent: self.cfg.rel_extent as i32 }));
+                    let mut args = [table.0, sinks.0, step.pos.0, nkv_dev.0];
+                    Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                        relbias_dynpos_cb as *const () as usize, (ud as *mut RelbiasDynPosArgs).cast()) })
+                } else {
+                    let mut args = [table.0, sinks.0, rel_pos.0, nkv_dev.0];
+                    Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                        relbias_dyn_cb as *const () as usize, std::ptr::null_mut()) })
+                }
+            } else if std::env::var_os("INKWELL_NO_RELGATHER").is_none() {
+                let mut args = [table.0, sinks.0, rel_pos.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                    relbias_cb as *const () as usize, std::ptr::null_mut()) })
+            } else {
+                let table = t::sub(c, table, t::reshape3(c, sinks, 1, nh, 1));
+                let table = t::cont(c, t::permute(c, table, 1, 0, 2, 3)); // [nh, ext+1, 1]
+                let kq_b = t::get_rows(c, table, rel_pos); // [nh, n_kv, 1]
+                // permute(2,0,1,3): src dim i goes to dst dim arg_i -> [n_kv, 1, nh, 1]
+                t::cont(c, t::permute(c, t::reshape4(c, kq_b, nh, n_kv, 1, 1), 2, 0, 1, 3))
+            };
+            (kq_b, Some(table))
+        };
+        if il == 0 {
+            if let Some(table) = table_dbg { self.dump("table-0", table); }
+            self.dump("kqb-0", kq_b);
+        }
+        self.sr_dump(il, pass, step.pos_val, "inp0", inputs[0]);
+        self.sr_dump(il, pass, step.pos_val, "r", r);
+        self.sr_dump(il, pass, step.pos_val, "kqb", kq_b);
 
         // Fused decode attention (replaces kq GEMV + softmax + V GEMV chain)
         let k_view = t::view3(c, k_upd, hd, n_kv, hkv, t::nb(k_upd, 1), t::nb(k_upd, 2), 0);
