@@ -3441,7 +3441,7 @@ static Ch2NpState g_ch2np;
 static int ch2np_requested() {
     if (getenv("INKWELL_NO_CH2NOPLESS")) return 0;
     const char* e = getenv("INKWELL_CH2NOPLESS");
-    return e && atoi(e) != 0;   // default OFF until the end-to-end A/B passes
+    return e ? atoi(e) != 0 : 1;   // accepted; INKWELL_NO_CH2NOPLESS remains the killswitch
 }
 
 static CUresult ch2np_driver_launch(CUfunction f, dim3 grid,
