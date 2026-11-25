@@ -1811,3 +1811,9 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 - K1.5/K2 loop: 247 → 225 instr per 32 weights (7.719 → 7.031/w). K2.5–K4: 248/249 (+1 vs before).
 - A/B (16 pairs, ctl,cand,cand,ctl, one flock; CTL = master 60f1cfe): CTL median 32.368 vs CAND **31.890 ms/tok** (−0.478), **15/16 wins**, md5 5cbe8e06 on every run, peak 5,034 MiB. Accepted.
 - Master check after merge: ctx512 md5 5cbe8e06 in 2 runs; generated cubin 270a4be4 (1,319,312 bytes); build 62 warnings.
+
+## 2026-11-25 — donor-lane K2.5–K4 expert loops merged (round-3 hill-climb)
+
+- Candidate: branch `t3/ch2-donor-integrate` (376e449) = 6de5276 + 9919252 + 21f8374 from `t3/sass-hillclimb-3` (donor-only, MOV removal off), plus the build-step shape (233/32w, SHF 36, LDG 4 for K2.5–K4) and fingerprint (463, 467, 1710, 468). The target-kernel SASS is identical to the GPU-gated cubin f77d3133, which is bitwise exact for all six K values, gate/up and down.
+- Loops (instr per 32 weights): K1.5/K2 225, K2.5–K4 233 (was 248/249).
+- A/B (16 pairs, one flock; CTL = master 438eb48): CTL median 32.133 vs CAND **31.782 ms/tok** (−0.350), **13/16 wins**, md5 5cbe8e06 on every run, peak 5,034 MiB. Accepted.
