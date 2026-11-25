@@ -2047,3 +2047,10 @@ Single-run decode at 4K: master 43.599 ms/tok vs fixed 48.663 ms/tok. The master
 **NT/VTEST status.** Master crashes even at small context in `INKWELL_VTEST8` with `GGML_ASSERT(view_size + view_offs <= ggml_nbytes(view_src))`; this is the pre-existing serial-only controller shape bug, not an SWA regression. The fixed branch no longer crashes. However serial-vs-block logits remain non-exact even at ctx512/base4 where ring and legacy indexing are identical and the wrap hazard is false (8 rows, 2 argmax mismatches, maxdiff up to 9.5). That pre-existing batch numerical discrepancy means VTEST8 cannot isolate SWA overwrite correctness end-to-end. The controlled ring-vs-oracle BTEST above is the meaningful SWA-specific NT evidence.
 
 **Build/state.** Release build rc0. Warning count 55 warning blocks / 59 lines beginning `warning` (limit 64). Validation artifacts are in `opt/swa-ring-fix/artifacts/` and intentionally not committed.
+
+## t3/swa-ring-fix — A/B and merge (master ed6f659)
+
+- 16-pair A/B: CTL frozen e03df94 vs CAND master bcb7f52 + ring fix (scratch merge 05a343e), ctx512, interleaved ctl,cand,cand,ctl.
+- Result: ctl_med 29.009, cand_med 29.044 ms/tok (delta +0.035, within noise). Wins 9/16. md5 5cbe8e06 on all 32 runs. Peak 5,032 MiB.
+- Verdict: MERGED as a correctness fix. Short context costs nothing; without the fix, output past 1K is garbage ("||||" at 4K). Killswitch `INKWELL_SWA_LEGACY_MIN=1`.
+- Open: 4K speed (48.66 vs 43.60 ms/tok single run) is not comparable, because master's 4K output is garbage. It needs a proper 4K A/B against a correct baseline.
