@@ -1,0 +1,12 @@
+--- a/CuAsm/CuAsmParser.py
++++ b/CuAsm/CuAsmParser.py
+@@ -1455,8 +1455,7 @@
+             smversion = flags & 0xff
+             self.m_Arch = CuSMVersion(smversion)
+ 
+-            if (not hasattr(self, '__mCuInsAsmRepos') 
+-                or self.__mCuInsAsmRepos is None 
++            if (self.__mCuInsAsmRepos is None
+                 or (self.__mCuInsAsmRepos.getSMVersion() != self.m_Arch) ):
+ 
+                 CuAsmLogger.logSubroutine('Setting CuInsAsmRepos to default dict...')
