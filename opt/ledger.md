@@ -1817,3 +1817,7 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 - Candidate: branch `t3/ch2-donor-integrate` (376e449) = 6de5276 + 9919252 + 21f8374 from `t3/sass-hillclimb-3` (donor-only, MOV removal off), plus the build-step shape (233/32w, SHF 36, LDG 4 for K2.5–K4) and fingerprint (463, 467, 1710, 468). The target-kernel SASS is identical to the GPU-gated cubin f77d3133, which is bitwise exact for all six K values, gate/up and down.
 - Loops (instr per 32 weights): K1.5/K2 225, K2.5–K4 233 (was 248/249).
 - A/B (16 pairs, one flock; CTL = master 438eb48): CTL median 32.133 vs CAND **31.782 ms/tok** (−0.350), **13/16 wins**, md5 5cbe8e06 on every run, peak 5,034 MiB. Accepted.
+
+## 7afd673 — ccopy bulk grid 2 parts per (slot, proj) — ACCEPTED, merged (32dd91d)
+- A/B 16 pairs vs pre-ccopy master: CTL 32.311 vs CAND 31.696 ms/tok median (−0.615), 15/16 wins, md5 5cbe8e06 all runs.
+- Post-merge master (donor + ccopy) 3 runs: 32.139 / 31.662 / 31.502 ms/tok, md5 5cbe8e06 ×3. Killswitch-equivalent: INKWELL_CCOPY_PARTS=1.
