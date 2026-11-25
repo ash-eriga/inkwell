@@ -113,7 +113,7 @@ struct Staging {
 static STAGING: OnceLock<Staging> = OnceLock::new();
 
 /// Eagerly allocate staging buffers (must run before CUDA-graph capture).
-pub fn warm_staging() { staging(); }
+pub fn warm_staging() { staging(); cu::ch2nopless_startup(); }
 
 fn staging() -> &'static Staging {
     STAGING.get_or_init(|| Staging {
