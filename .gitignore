@@ -15,3 +15,5 @@ __pycache__/
 
 opt/kbench/kslot_gold
 opt/kbench/kslot_replay
+
+opt/hostlat/
