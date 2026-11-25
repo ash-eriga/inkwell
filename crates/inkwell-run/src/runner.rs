@@ -1470,6 +1470,7 @@ impl Runner {
                 let dev_margin: usize = std::env::var("INKWELL_DEV_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
                 let on_dev = place_plan.as_ref().map_or(true, |p| p[il])
                     && (f_free as usize) > total + (dev_margin << 20);
+                let mut host_base = 0usize;
                 let base = if on_dev {
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
                     blob.write_bytes(&host);
@@ -1481,6 +1482,7 @@ impl Runner {
                     let pb = inkwell_cuda::host_alloc_mapped(total);
                     unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), pb.host, total) };
                     pinned_bytes += total;
+                    host_base = pb.host as usize;
                     let b = pb.dev as u64;
                     pinned.push(pb);
                     b
@@ -1499,6 +1501,8 @@ impl Runner {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
                     v2_descs_ok, on_dev, cache: None, max_slot,
                     layer: moe_args_exl3.len() as i32,
+                    descs_host: descs.clone(), expert_host_base: host_base,
+                    expert_dev_base: base as usize,
                 }));
             }
             l.proj0_off = [-1; 3];
@@ -4221,6 +4225,13 @@ fn pf_exl3(e: &Exl3W, x: *const f32, y: *mut f32, c: usize, scratch: *mut f32) {
     }
 }
 
+fn pf_dbg(name: &str, x: *const f32, n: usize) {
+    if std::env::var_os("INKWELL_PFDBG").is_none() { return; }
+    let mut v = vec![0f32; n];
+    unsafe { inkwell_cuda::memcpy_d2h_sync(v.as_mut_ptr().cast(), x.cast(), n * 4) };
+    eprintln!("PFDBG {name} sum={:.6} first8={:?}", v.iter().sum::<f32>(), &v[..8.min(n)]);
+}
+
 impl Runner {
     fn pf_norm(&self, x: *mut f32, w: Ptr, rows: usize, n: usize) {
         unsafe { inkwell_cuda::pf_rmsnorm_async(x, tdata(w).cast_const(), rows as i32, n as i32, 1e-6) };
@@ -4295,6 +4306,7 @@ impl Runner {
                 inputs[j] = dst;
             }
         }
+        if il == 0 { pf_dbg("inputs0", inputs[0], 8.min(c*n).max(8)); }
         let (x0,x1,x2) = (a.ptr("x0"),a.ptr("x1"),a.ptr("x2"));
         if is_swa && messages {
             for (z,x) in [x0,x1,x2].into_iter().enumerate() { let _=z; self.pf_norm(x, l.attn_norm.expect("attn_norm"), c, n); inputs = match z {0=>[x,x1,x2],1=>[x0,x,x2],_=>[x0,x1,x]}; }
@@ -4320,7 +4332,7 @@ impl Runner {
             self.pf_dense(inputs[2].cast_const(), l.attn_v_conv_proj.expect("vcp"), a.ptr("vdyn"), c, 32, n);
         }
         let scale_static = 1.0 / 5f32.sqrt();
-        let scale_dyn = 1.0 / 3f32.sqrt();
+        let scale_dyn = 1.0 / 3.0f32;
         let conv_state = unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0).cast::<f32>() };
         unsafe {
             inkwell_cuda::conv_prefill_async(kbuf.cast_const(), conv_state, 0, tdata(l.attn_k_conv.expect("kconv")).cast_const(),
@@ -4332,6 +4344,7 @@ impl Runner {
             inkwell_cuda::pf_rmsnorm_async(a.ptr("vout"), std::ptr::null(), c as i32 * 8, 128, 1e-6);
             inkwell_cuda::pf_clip_async(r, tdata(l.attn_rel_clip.expect("rclip")).cast_const(), c as i32, 24, 16, self.cfg.rel_clip);
         }
+        if il == 0 { pf_dbg("Qcur-0", q, 8); pf_dbg("Kcur-0", a.ptr("kout"), 8); pf_dbg("Vcur-0", a.ptr("vout"), 8); pf_dbg("Rcur-0", r, 8); }
         if !is_swa {
             unsafe { inkwell_cuda::pf_tau_qr_async(q, r, c as i32, self.cfg.log_scale_alpha, self.cfg.log_scale_floor as f32, pos0 as i32) };
         }
@@ -4355,6 +4368,7 @@ impl Runner {
             inkwell_cuda::flash_prefill_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
                 a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), c as i32, pos0 as i32,
                 cap as i32, swa, 1.0 / (128f32).sqrt(), a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            if il == 0 { pf_dbg("kqv_out-0", a.ptr("attn"), 8); }
             inkwell_cuda::pf_mul_sigmoid_async(a.ptr("attn"), gate.cast_const(), (c * 3072) as i64);
         }
         let ewo = &*self.exl3_w[l.exl3["wo"]];
@@ -4382,6 +4396,7 @@ impl Runner {
             self.pf_control(a, fcur, unsafe{a.ptr("msgbuf").add(3*c*n)}.cast_const(), l, 3);
         }
         self.pf_norm(fcur, l.ffn_norm.expect("ffn_norm"), c, n);
+        if il == 0 { pf_dbg("moe_in-0", fcur, 8); }
         self.pf_dense(fcur.cast_const(), l.ffn_gate_inp.expect("gate"), a.ptr("router"), c, 128, n);
         unsafe {
             inkwell_cuda::pf_router8_async(a.ptr("router").cast_const(), tdata(l.ffn_exp_probs_b.expect("pb")).cast_const(), c as i32,
@@ -4396,6 +4411,7 @@ impl Runner {
         let mi = l.moe_exl3.expect("moe exl3");
         let m = &self.moe_args_exl3[mi];
         unsafe {
+            if il == 0 { pf_dbg("router-0", a.ptr("router"), 8); }
             inkwell_cuda::exl3_moe_group_sort_async(a.ptr("ids").cast(), a.ptr("wts").cast(), c as i32,
                 eo, stok, sslot, sw.cast(), inv, te, ts, tc, tn);
             inkwell_cuda::exl3_moe_grouped_gemm_async(m.descs_g.dev(), m.descs_u.dev(), m.descs_d.dev(),
@@ -4406,6 +4422,7 @@ impl Runner {
             inkwell_cuda::pf_add_async(a.ptr("ffnout"), cur, (c*n) as i64);
         }
         pf_copy(cur, a.ptr("ffnout"), hbytes);
+        if il == 0 { pf_dbg("l_out-0", cur, 8); }
     }
 
     /// Encode token ids in chunks through the batched prefill path. Returns the

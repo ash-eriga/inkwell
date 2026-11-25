@@ -351,6 +351,11 @@ pub struct MoeArgsExl3 {
     pub max_slot: usize,
     /// ordinal of this MoE layer (for INKWELL_MOE_IDLOG histograms)
     pub layer: i32,
+    /// host-side copy of all three patched descriptor tables ([proj][expert][4])
+    pub descs_host: Vec<u64>,
+    /// host and device base addresses of the packed expert blob
+    pub expert_host_base: usize,
+    pub expert_dev_base: usize,
 }
 
 /// Expert-usage histograms: HIST[layer][expert] counts, only when

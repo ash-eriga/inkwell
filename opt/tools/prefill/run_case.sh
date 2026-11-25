@@ -18,5 +18,5 @@ set -e
 kill $sp 2>/dev/null || true
 peak=$(grep -v '^$' "$OUT/mem" 2>/dev/null | awk -F', ' '{v=$2; sub(/ MiB/,"",v); v+=0; if(v>m)m=v} END{print m+0}')
 echo "$rc" >"$OUT/rc"; echo "$peak" >"$OUT/peak_mib"
-echo "mode=$MODE ctx=$CTX rc=$rc peak=$peak $(grep -m1 'encode .* tok in' "$OUT" || true)"
+echo "mode=$MODE ctx=$CTX rc=$rc peak=$peak $(grep -m1 'encode .* tok in' "$OUT/log" || true)"
 exit "$rc"
