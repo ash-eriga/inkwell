@@ -19,6 +19,8 @@
 #define OP_FFMA   asm volatile("fma.rn.f32 %0, %0, %1, %2;" : "+f"(fv[u]) : "f"(fy), "f"(fz));
 #define OP_FADD   asm volatile("add.f32 %0, %0, %1;" : "+f"(fv[u]) : "f"(fy));
 #define OP_SHFL   asm volatile("shfl.sync.idx.b32 %0, %0, %1, 0x1f, 0xffffffff;" : "+r"(v[u]) : "r"(src));
+#define OP_I2FW   asm volatile("{.reg .f32 t; cvt.rn.f32.s32 t, %0; mov.b32 %0, t;}" : "+r"(w[u]));
+#define OP_SHFLW  asm volatile("shfl.sync.idx.b32 %0, %0, %1, 0x1f, 0xffffffff;" : "+r"(w[u]) : "r"(src));
 #define OP_LDS    asm volatile("ld.shared.u32 %0, [%0];" : "+r"(v[u]));
 
 __shared__ uint32_t tab[64 * 32];
@@ -48,8 +50,8 @@ __global__ void __launch_bounds__(1024) k_##NAME(uint32_t* out, long long* cyc, 
     const uint32_t y = seed ^ (threadIdx.x * 0x9e3779b9u), z = (seed * 3u + threadIdx.x) & 15u;    \
     const uint32_t src = (lane + 1) & 31;                                                          \
     const float fy = 1.0f + 1e-7f * (seed & 7), fz = 1e-30f;                                       \
-    uint32_t v[U]; float fv[U];                                                                    \
-    for (int u = 0; u < U; ++u) { v[u] = y + u; fv[u] = (float)u; }                                \
+    uint32_t v[U], w[U]; float fv[U];                                                              \
+    for (int u = 0; u < U; ++u) { v[u] = y + u; w[u] = z + u; fv[u] = (float)u; }                  \
     if (MODE != NOLDS) init_tab<U, MODE>(v, lane);                                                 \
     (void)src; (void)z; (void)fy; (void)fz;                                                        \
     __syncthreads();                                                                               \
@@ -62,7 +64,7 @@ __global__ void __launch_bounds__(1024) k_##NAME(uint32_t* out, long long* cyc, 
     __syncthreads();                                                                               \
     const long long t1 = clock64();                                                                \
     uint32_t acc = 0;                                                                              \
-    for (int u = 0; u < U; ++u) acc ^= v[u] ^ __float_as_uint(fv[u]);                             \
+    for (int u = 0; u < U; ++u) acc ^= v[u] ^ w[u] ^ __float_as_uint(fv[u]);                             \
     out[blockIdx.x * blockDim.x + threadIdx.x] = acc;                                              \
     if (threadIdx.x == 0) cyc[blockIdx.x] = t1 - t0;                                               \
 }
@@ -76,8 +78,8 @@ KERNEL(ffma_3shf, OP_FFMA OP_SHF OP_SHF OP_SHF) KERNEL(xmad_shf, OP_XMAD OP_SHF)
 KERNEL(shf_bfe, OP_SHF OP_BFE) KERNEL(shf_prmt, OP_SHF OP_PRMT) KERNEL(shf_iscadd, OP_SHF OP_ISCADD)
 KERNEL(ffma_i2f, OP_FFMA OP_I2F) KERNEL(ffma3_i2f, OP_FFMA OP_FFMA OP_FFMA OP_I2F)
 KERNEL(ffma_lds, OP_FFMA OP_LDS) KERNEL(ffma3_lds, OP_FFMA OP_FFMA OP_FFMA OP_LDS) KERNEL(ffma_shfl, OP_FFMA OP_SHFL)
-KERNEL(shf_i2f, OP_SHF OP_I2F) KERNEL(i2f_popc, OP_I2F OP_POPC) KERNEL(i2f_shfl, OP_I2F OP_SHFL)
-KERNEL(i2f_lds, OP_I2F OP_LDS) KERNEL(shfl_lds, OP_SHFL OP_LDS)
+KERNEL(shf_i2f, OP_SHF OP_I2FW) KERNEL(i2f_popc, OP_I2FW OP_POPC) KERNEL(i2f_shfl, OP_I2FW OP_SHFL)
+KERNEL(i2f_lds, OP_I2FW OP_LDS) KERNEL(shfl_lds, OP_SHFLW OP_LDS)
 
 typedef void (*kfn)(uint32_t*, long long*, int, uint32_t);
 struct Bench { const char* name; kfn thr; kfn lat; };

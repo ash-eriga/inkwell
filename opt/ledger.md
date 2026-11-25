@@ -1494,3 +1494,27 @@ Implementation commits: `e3934a2` lazy `Exl3Blk` scratch, `fdec037` direct contr
 | 8 | 38.79 | 35.92 | 36.05 | 39.13 |
 
   ctl median **37.77** ms/tok; cand median **35.90** ms/tok; candidate **−1.87 ms/tok (−4.9%)**. Pair wins **16/16** (bar ≥12/16). Verdict: **ACCEPTED**.
+
+### Brain re-validation on master (54909d9 + rebase, 2026-11-24): VRAM cap + trims + budgeted caches — ACCEPTED
+
+- ctl = master `54909d9`; cand = branch rebased onto it (`da6cfaf`). BEST env, 8 × (ctl,cand,cand,ctl), one flock.
+- ctl median **37.62**, cand **35.55** ms/tok → **−2.07 ms/tok**, **15/16** pairs. md5 `5cbe8e06` on all 32 runs.
+- Process VRAM peak (nvidia-smi, 200 ms): ctl 5,052 MiB, cand **5,034 MiB**. Both are under the 5,120 cap; cand also meets the ≤5,080 target.
+- Killswitches: INKWELL_NO_LAZY_BLKSCRATCH, INKWELL_NO_GFCAT_TRIM, INKWELL_NO_DEVBUF_TRIM, INKWELL_NO_VRAMCAP, INKWELL_NO_CACHE_BUDGET.
+
+### sm_61 slow-pipe sharing (2026-11-24) — MEASUREMENT
+
+Measured with `opt/kbench/isa_rates`. Results are pairs per cycle per SM for 1:1 mixes.
+
+| Mix | Pairs/cycle | Reading |
+|---|---|---|
+| SHF + BFE | 0.98 | shared half-rate pipe |
+| SHF + ISCADD | 0.98 | shared half-rate pipe |
+| SHF + PRMT | 1.84 | PRMT is separate |
+| SHF + I2F | 1.00 | separate (I2F binds) |
+| I2F + POPC | 0.50 | shared quarter-rate pipe |
+| SHFL + LDS | 0.50 | shared quarter-rate pipe |
+| I2F + LDS | 0.99 | separate |
+| I2F + SHFL | 0.67 | partial contention |
+
+IADD3 and LOP32I ran alone: IADD3 at 1.94 per cycle (half rate), LOP32I at full rate.
