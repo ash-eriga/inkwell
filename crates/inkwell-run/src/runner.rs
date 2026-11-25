@@ -185,6 +185,8 @@ struct StepCache {
     in_span: usize,
     /// embedding row offset inside the packed input span (`usize::MAX` when unpacked)
     embd_off: usize,
+    /// packed input bytes needed by the pipelined device-resolver path
+    input_copy_len: usize,
 }
 
 /// One cached-step host timing row, microseconds.
@@ -533,6 +535,31 @@ unsafe extern "C" fn relbias_dyn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth:
         inkwell_cuda::relbias_gather_dyn_async(inkwell_ggml::ink_tensor_data(mm).cast(),
             s(1).cast(), s(2).cast(), s(3).cast(), inkwell_ggml::ink_tensor_data(dst).cast(),
             cap, nh, ext)
+    };
+}
+
+struct RelbiasDynPosArgs {
+    mode: i32,
+    swa: i32,
+    rel_extent: i32,
+}
+
+/// `ggml_custom_op_t`: fixed-capacity rel-bias gather whose integer relative
+/// positions are computed on device. srcs = [table, sinks, pos, n_kv].
+unsafe extern "C" fn relbias_dynpos_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<RelbiasDynPosArgs>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let mm = unsafe { inkwell_ggml::ink_tensor_src(dst, 0) };
+    let s = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i))
+    };
+    let cap = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
+    let nh = unsafe { inkwell_ggml::ink_tensor_ne(mm, 1) } as i32;
+    let ext = unsafe { inkwell_ggml::ink_tensor_ne(mm, 0) } as i32;
+    unsafe {
+        inkwell_cuda::relbias_gather_dynpos_async(inkwell_ggml::ink_tensor_data(mm).cast(),
+            s(1).cast(), s(2).cast(), s(3).cast(), inkwell_ggml::ink_tensor_data(dst).cast(),
+            cap, nh, ext, a.mode, a.swa, a.rel_extent)
     };
 }
 
@@ -2287,9 +2314,18 @@ impl Runner {
         // kq_b[j,0,h] = table[rel_pos[j], h] - sinks[h] in one kernel.
         let kq_b = if step.dyn_nkv {
             let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
-            let mut args = [table.0, sinks.0, rel_pos.0, nkv_dev.0];
-            Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
-                relbias_dyn_cb as *const () as usize, std::ptr::null_mut()) })
+            if step.direct_relbias {
+                let mode = if !is_swa { 0 } else if self.swa_legacy_min { 2 } else { 1 };
+                let ud = Box::leak(Box::new(RelbiasDynPosArgs {
+                    mode, swa: self.swa as i32, rel_extent: self.cfg.rel_extent as i32 }));
+                let mut args = [table.0, sinks.0, step.pos.0, nkv_dev.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                    relbias_dynpos_cb as *const () as usize, (ud as *mut RelbiasDynPosArgs).cast()) })
+            } else {
+                let mut args = [table.0, sinks.0, rel_pos.0, nkv_dev.0];
+                Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
+                    relbias_dyn_cb as *const () as usize, std::ptr::null_mut()) })
+            }
         } else if std::env::var_os("INKWELL_NO_RELGATHER").is_none() {
             let mut args = [table.0, sinks.0, rel_pos.0];
             Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_kv, 1, nh, 1], &mut args,
@@ -2462,6 +2498,7 @@ struct Step {
     attn_allow_gqa_full: bool,
     attn_allow_gqa_swa: bool,
     dyn_nkv: bool,
+    direct_relbias: bool,
 }
 
 fn step_shape_match(step: &Step, pos: i64, max_ctx: i64, swa: i64) -> bool {
@@ -2561,18 +2598,25 @@ impl Runner {
         let buf = self.in_buf.as_ref().unwrap().clone();
         let mut o = 0usize;
         let mut in_offs = [usize::MAX; 11];
-        let mut inputs = vec![ids, pos_t, kv_idx_full, kv_idx_swa, rel_pos_full, rel_pos_swa, mask_full, mask_swa, sink_zero];
+        let mut inputs: Vec<(usize, Ptr)> = vec![
+            (0, ids), (1, pos_t), (2, kv_idx_full), (3, kv_idx_swa)];
         if let (Some(nf), Some(ns)) = (n_kv_full_dev, n_kv_swa_dev) {
-            inputs.push(nf);
-            inputs.push(ns);
+            inputs.push((9, nf));
+            inputs.push((10, ns));
         }
-        for (i, x) in inputs.iter().enumerate() {
+        let n_small_inputs = inputs.len();
+        inputs.extend([
+            (4, rel_pos_full), (5, rel_pos_swa), (6, mask_full), (7, mask_swa), (8, sink_zero)]);
+        let mut small_end = 0usize;
+        for (ord, (i, x)) in inputs.iter().enumerate() {
             unsafe { inkwell_ggml::ink_set_input(x.0) };
             let off = (o + 255) & !255;
             buf.assign(*x, off);
-            in_offs[i] = off;
+            in_offs[*i] = off;
             o = off + t::nbytes(*x);
+            if ord + 1 == n_small_inputs { small_end = o; }
         }
+        let direct_relbias = dyn_nkv && !self.swa_oracle;
         // Pack the embedding row after the small inputs so the cached fast path
         // needs one HtoD copy per token. INKWELL_NO_ONEH2D keeps the old copy pair.
         let embd_off = if std::env::var_os("INKWELL_NO_ONEH2D").is_none() {
@@ -2583,6 +2627,7 @@ impl Runner {
         } else {
             usize::MAX
         };
+        let input_copy_len = if direct_relbias { small_end } else { embd_off };
         // keep buf alive for the graph
         std::mem::forget(buf);
 
@@ -2598,7 +2643,7 @@ impl Runner {
                           attn_regime_full: attn_regime_for_pad(n_kv_full),
                           attn_regime_swa: attn_regime_for_pad(n_kv_swa),
                           attn_allow_gqa_full: n_kv_full < attn_split_cfg().1,
-                          attn_allow_gqa_swa: n_kv_swa < attn_split_cfg().1, dyn_nkv };
+                          attn_allow_gqa_swa: n_kv_swa < attn_split_cfg().1, dyn_nkv, direct_relbias };
         self.upload_step_inputs(&step, id, pos);
 
         // embed: dequantize the row host-side (embd stays quantized, ~230 MiB not 1.85 GiB)
@@ -2706,7 +2751,7 @@ impl Runner {
         // (unpadded vocab is a contiguous prefix slice of the padded logits)
         if caching {
             // keep ctx + cgraph + sched split + instantiated CUDA graph alive
-            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o, embd_off });
+            self.step_gcache = Some(StepCache { step, graph: g, out: cur, head_in, in_offs, in_span: o, embd_off, input_copy_len });
         } else {
             // release the cached split plan so the next step's graph gets re-allocated
             unsafe { inkwell_ggml::ink_sched_reset(self.sched.0) };
@@ -2754,29 +2799,35 @@ impl Runner {
             if let Some(ns) = s.n_kv_swa_dev {
                 t::set(ns, [n_kv_swa_raw as i32].as_ptr().cast(), 0, 4);
             }
-            let rp_f: Vec<i32> = if s.dyn_nkv {
-                (0..n_kv_full_raw).map(|j| (n_kv_full_raw - 1 - j).min(self.cfg.rel_extent as i64) as i32).collect()
-            } else {
-                rp(s.n_kv_full_pad, n_kv_full_raw)
-            };
-            let rp_s: Vec<i32> = if s.dyn_nkv {
-                (0..n_kv_swa_raw).map(|j| self.swa_rel_pos(pos, j)).collect()
-            } else {
-                (0..s.n_kv_swa_pad).map(|j| if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 }).collect()
-            };
-            t::set(s.rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
-            t::set(s.rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
+            if !s.direct_relbias {
+                let rp_f: Vec<i32> = if s.dyn_nkv {
+                    (0..n_kv_full_raw).map(|j| (n_kv_full_raw - 1 - j).min(self.cfg.rel_extent as i64) as i32).collect()
+                } else {
+                    rp(s.n_kv_full_pad, n_kv_full_raw)
+                };
+                let rp_s: Vec<i32> = if s.dyn_nkv {
+                    (0..n_kv_swa_raw).map(|j| self.swa_rel_pos(pos, j)).collect()
+                } else {
+                    (0..s.n_kv_swa_pad).map(|j| if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 }).collect()
+                };
+                t::set(s.rel_pos_full, rp_f.as_ptr().cast(), 0, rp_f.len() * 4);
+                t::set(s.rel_pos_swa, rp_s.as_ptr().cast(), 0, rp_s.len() * 4);
+            }
             // Dynamic mode never reads padding, so its mask is all zero.  The
             // fallback preserves master's -inf padded columns (plus the sink 0).
             let mk = |nk: i64, raw: i64| -> Vec<f32> {
                 (0..=nk).map(|j| if s.dyn_nkv || j < raw || j == nk { 0.0 } else { f32::NEG_INFINITY }).collect()
             };
-            let mk_f: Vec<f32> = if s.dyn_nkv {
+            let mk_f: Vec<f32> = if s.direct_relbias {
+                vec![0.0; (s.cap_full + 1) as usize]
+            } else if s.dyn_nkv {
                 vec![0.0; (n_kv_full_raw + 1) as usize]
             } else {
                 mk(s.n_kv_full_pad, n_kv_full_raw)
             };
-            let mk_s: Vec<f32> = if s.dyn_nkv {
+            let mk_s: Vec<f32> = if s.direct_relbias {
+                vec![0.0; (s.cap_swa + 1) as usize]
+            } else if s.dyn_nkv {
                 (0..=n_kv_swa_raw).map(|j| if j == n_kv_swa_raw || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY }).collect()
             } else {
                 (0..=s.n_kv_swa_pad).map(|j| if j == s.n_kv_swa_pad || self.swa_visible(pos, j) { 0.0 } else { f32::NEG_INFINITY }).collect()
@@ -2952,14 +3003,28 @@ impl Runner {
                 (dst.add(offs[9]) as *mut i32).write(nfr as i32);
                 (dst.add(offs[10]) as *mut i32).write(nsr as i32);
             }
-            let ext = self.cfg.rel_extent as i64;
-            let rf = dst.add(offs[4]) as *mut i32;
-            for j in 0..s.cap_full {
-                rf.add(j as usize).write(if j < nfr { (nfr - 1 - j).min(ext) as i32 } else { 0 });
-            }
-            let rs = dst.add(offs[5]) as *mut i32;
-            for j in 0..s.cap_swa {
-                rs.add(j as usize).write(if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 });
+            if !s.direct_relbias {
+                let ext = self.cfg.rel_extent as i64;
+                let rf = dst.add(offs[4]) as *mut i32;
+                if s.dyn_nkv {
+                    for j in 0..nfr {
+                        rf.add(j as usize).write((nfr - 1 - j).min(ext) as i32);
+                    }
+                } else {
+                    for j in 0..s.cap_full {
+                        rf.add(j as usize).write(if j < nfr { (nfr - 1 - j).min(ext) as i32 } else { 0 });
+                    }
+                }
+                let rs = dst.add(offs[5]) as *mut i32;
+                if s.dyn_nkv {
+                    for j in 0..nsr {
+                        rs.add(j as usize).write(self.swa_rel_pos(pos, j));
+                    }
+                } else {
+                    for j in 0..s.cap_swa {
+                        rs.add(j as usize).write(if self.swa_filled(pos, j) { self.swa_rel_pos(pos, j) } else { 0 });
+                    }
+                }
             }
             if s.dyn_nkv {
                 if self.swa_oracle {
@@ -3144,7 +3209,7 @@ impl Runner {
             unsafe {
                 inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
                 let base = inkwell_ggml::ink_buf_base(self.in_buf.as_ref().expect("in_buf").0 .0);
-                inkwell_cuda::memcpy_h2d_async(base, next_pin.cast_const().cast(), gc.embd_off);
+                inkwell_cuda::memcpy_h2d_async(base, next_pin.cast_const().cast(), gc.input_copy_len);
                 let b = base as *mut u8;
                 inkwell_cuda::pipe_resolve_async(
                     sp.am.cast(), self.embd_dev.cast_const(), stride,

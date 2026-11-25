@@ -7201,6 +7201,45 @@ extern "C" void ink_launch_relbias_gather_dyn(const float* mm, const float* sink
         mm, sinks, (const int*)rel_pos, d_nkv, y, y_stride, nh, ext);
 }
 
+// Device-computed relative positions for the normal full/ring/legacy paths.
+// mode 0: full contiguous pos-j; mode 1: SWA ring modulo; mode 2: legacy clamp.
+__global__ void inkwell_relbias_gather_dynpos(const float* __restrict__ mm,
+        const float* __restrict__ sinks, const int* __restrict__ d_pos,
+        const int* __restrict__ d_nkv, float* __restrict__ y, int y_stride,
+        int nh, int ext, int mode, int swa, int rel_extent) {
+    const int h = blockIdx.x;
+    if (h >= nh) return;
+    const int nkv = *d_nkv;
+    const int pos = *d_pos;
+    const float sh = sinks[h];
+    const float* mmh = mm + (size_t)h * ext;
+    float* yh = y + (size_t)h * y_stride;
+    for (int j = threadIdx.x; j < nkv; j += blockDim.x) {
+        int rp;
+        if (mode == 1) {
+            const int dpos = pos - j;
+            if (pos < swa) {
+                rp = dpos;
+            } else {
+                rp = dpos % swa;
+                if (rp < 0) rp += swa;
+            }
+        } else if (mode == 2) {
+            rp = nkv - 1 - j;
+        } else {
+            rp = pos - j;
+        }
+        rp = min(rp, rel_extent);
+        yh[j] = __fsub_rn(mmh[rp], sh);
+    }
+}
+extern "C" void ink_launch_relbias_gather_dynpos(const float* mm, const float* sinks,
+        const int* d_pos, const int* d_nkv, float* y, int y_stride,
+        int nh, int ext, int mode, int swa, int rel_extent, void* stream) {
+    inkwell_relbias_gather_dynpos<<<dim3((unsigned)nh), 256, 0, (cudaStream_t)stream>>>(
+        mm, sinks, d_pos, d_nkv, y, y_stride, nh, ext, mode, swa, rel_extent);
+}
+
 // ---- ctrl gf_cat GEMV + ctrl_apply fusion (INKWELL_NO_GFAPPLY=1 disables) ----
 // One warp per output element i: gain = dot(row i, gate), forget =
 // dot(row fo+i, gate), then the ctrl_apply tail. Replicates mmvf's

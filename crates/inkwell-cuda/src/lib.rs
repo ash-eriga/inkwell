@@ -105,6 +105,7 @@ extern "C" {
         dk: *mut f32, dv: *mut f32, nrows: i32, ncols2: i32, stream: *mut c_void);
     fn ink_launch_relbias_gather(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, y: *mut f32, nkv: i32, nh: i32, ext: i32, stream: *mut c_void);
     fn ink_launch_relbias_gather_dyn(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32, stream: *mut c_void);
+    fn ink_launch_relbias_gather_dynpos(mm: *const f32, sinks: *const f32, d_pos: *const i32, d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32, mode: i32, swa: i32, rel_extent: i32, stream: *mut c_void);
     fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_exl3_gemv_mz(trel: *const *const c_void, suh: *const *const c_void, svh: *const *const c_void, x: *const *const f32, y: *mut f32, ystride: i64, scr: *const *mut f32, k: *const i64, n: *const i64, ka: *const i64, halfk: *const i64, nz: i32, stream: *mut c_void);
     fn ink_launch_expert_wsum(dn: *const f32, w: *const f32, sd: *const f32, out: *mut f32, ncols: i64, nslots: i64, stream: *mut c_void);
@@ -954,6 +955,16 @@ pub unsafe fn relbias_gather_async(mm: *const f32, sinks: *const f32, rel_pos: *
 pub unsafe fn relbias_gather_dyn_async(mm: *const f32, sinks: *const f32, rel_pos: *const c_void,
     d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32) {
     unsafe { ink_launch_relbias_gather_dyn(mm, sinks, rel_pos, d_nkv, y, y_stride, nh, ext, stream()) };
+}
+
+/// Dynamic rel-bias gather with integer positions computed on device.
+///
+/// # Safety
+/// Raw device pointers; launched on the ggml cuda stream.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn relbias_gather_dynpos_async(mm: *const f32, sinks: *const f32, d_pos: *const i32,
+    d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32, mode: i32, swa: i32, rel_extent: i32) {
+    unsafe { ink_launch_relbias_gather_dynpos(mm, sinks, d_pos, d_nkv, y, y_stride, nh, ext, mode, swa, rel_extent, stream()) };
 }
 /// Multi-projection EXL3 gemv: `nz` independent projections on parallel side streams.
 ///
