@@ -2121,3 +2121,20 @@ Workload-share aggregate of those isolated timings: gu **+3.61%**, dn **+2.64%**
 - Part 2 (direct LDG, per-window SHF, K4 PRMT 20→4, free half operands; target 6.442 instr/w) is in progress on a child branch of 93f69cc.
 - Post-merge check on master e7ac0fb (59 warnings), ctx512: md5 5cbe8e06 ×3; 28.08 / 29.17 / 30.34 ms/tok; ch2nopless enabled.
   - Runs 2–3 went through `gpu-run -p high` after the plain-flock attempt starved for more than 1 h.
+
+## ACTQ study — int8 activation KLD calibration (9f4b5fd on t3/actq-kld-epsilon-study-3; doc copied to opt/studies/actq-kld-2026-11-25.md; hooks not merged)
+- Teacher-forced, 256 scored rows, one prompt. Sim applied to every EXL3 input, unembed included.
+
+| mode | KLD 512 | KLD 4K | top-1 (512 / 4K) | PPL Δ (512 / 4K) |
+|---|---:|---:|---:|---:|
+| row8 | 3.1e-3 | 6.6e-3 | 96.5% / 91.8% | +0.66% / +1.48% |
+| g128_8 | 2.3e-3 | 4.2e-3 | 96.9% / 94.5% | +0.26% / +0.66% |
+| row12 | 1.4e-3 | 3.1e-3 | 96.9% / 96.1% | −0.08% / +0.74% |
+
+- **Noise floor is the key finding.** At 4K, output noise with ε = 1e-6 … 1e-4 all give mean KLD 1.3e-3 … 3.4e-3 and top-1 ~97–98%. Baseline-vs-baseline is exactly 0.
+- Cause: chaotic amplification through the 3-pass loop and discrete top-8 routing flips.
+- Consequence: an absolute gate of KLD ≤ 1e-3 at 4K cannot be met by any non-bit-exact change, FP32 reorders included (that covers the planned FP-order prefill).
+- 256 rows resolve PPL only to about ±0.5%: noise 3e-6 gives +0.46%, noise 1e-5 gives −0.09%.
+- The child's power-law ε values (5.5e-4 at 512, 7.5e-5 at 4K for KLD 1e-3) fit a curve that is flat at 4K. Do not use them as budgets.
+- Dumps: /tmp/actq-xh/ (15 files; sha256 in the study).
+- Next steps: owner decides the gate definition (absolute vs relative to the FP-noise floor); then a larger-sample eval (≥2K scored tokens × several prompts) of the floor (ε 1e-7/1e-6), g128_8 and row12.
