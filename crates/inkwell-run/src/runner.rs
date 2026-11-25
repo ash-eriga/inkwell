@@ -4156,9 +4156,11 @@ impl PfArena {
         for name in ["cur","x0","x1","x2","cat","ctrlg","ctrlf","fcur","moe_out","tmp0","tmp1","tmp2","head","prelude","bankout","cn","cm","cg"] {
             put(name, h, &mut off, &mut o);
         }
-        for name in ["blk0","blk1","blk2","blk3","bank","mixbuf","msgbuf"] {
-            put(name, h * 4, &mut off, &mut o);
+        for name in ["blk0","blk1","blk2","blk3","bank"] {
+            put(name, h, &mut off, &mut o);
         }
+        put("mixbuf", h * 3, &mut off, &mut o);
+        put("msgbuf", h * 4, &mut off, &mut o);
         put("q", c * 3072 * 4, &mut off, &mut o);
         put("gate", c * 3072 * 4, &mut off, &mut o);
         put("attn", c * 3072 * 4, &mut off, &mut o);
@@ -4182,7 +4184,7 @@ impl PfArena {
         put("rel", 24 * 1025 * 16 * 4, &mut off, &mut o);
         put("sort", c * 8 * 8 * 4 + 8192, &mut off, &mut o);
         let p = c * 8;
-        put("moews", p * 14976 * 4 + p * 4 + 256, &mut off, &mut o);
+        put("moews", p * 6912 * 4 + p * 4 + 256, &mut off, &mut o);
         put("scratch", c * (3072 + 3072) * 4, &mut off, &mut o);
         put("logits", 201024 * 4 + 256, &mut off, &mut o);
         let bytes = o;
@@ -4406,7 +4408,8 @@ impl Runner {
             let host_ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
             unsafe {
                 inkwell_cuda::memcpy_h2d_async(a.ptr("tokids").cast(), host_ids.as_ptr().cast(), c*4);
-                inkwell_cuda::pf_embed_async(self.embd_src.0.cast(), a.ptr("tokids").cast(), a.ptr("cur"), c as i32, 2304, self.embd_src.2 as i64);
+                let embd_dev: *const u8 = if self.embd_dev.is_null() { self.embd_src.0 } else { self.embd_dev.cast() };
+                inkwell_cuda::pf_embed_async(embd_dev.cast(), a.ptr("tokids").cast(), a.ptr("cur"), c as i32, 2304, self.embd_src.2 as i64);
                 inkwell_cuda::pf_rmsnorm_async(a.ptr("cur"), tdata(self.tok_norm).cast_const(), c as i32, 2304, 1e-6);
             }
             let mut blocks: Vec<usize> = Vec::new();
@@ -4436,8 +4439,10 @@ impl Runner {
                 self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos);
                 vi += 1;
             }
-            // final mix + norm; compute lm_head only for the last row.
+            // final mix + norm; compute lm_head only for the last row of the final chunk.
+            let is_last_chunk = pos + c as i64 == ids.len() as i64;
             let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([a.ptr("cur").cast_const()]).collect();
+            if is_last_chunk {
             self.pf_mix_run(&states, self.output_res_query, a.ptr("head"), c, 1);
             self.pf_norm(a.ptr("head"), self.output_norm, c, 2304);
             let last = unsafe { a.ptr("head").add((c-1)*2304) };
@@ -4450,6 +4455,7 @@ impl Runner {
                     for x in &mut logits { *x = (*x / self.cfg.softcap).tanh() * self.cfg.softcap; }
                 }
                 out_logits = logits;
+            }
             }
             pos += c as i64;
         }

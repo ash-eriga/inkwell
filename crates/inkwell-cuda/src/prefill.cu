@@ -734,10 +734,11 @@ __global__ void inkwell_moe_fill_row_expert(const int*, const int*, const int*, 
 __global__ void inkwell_moe_had_out_pair_rows(const uint64_t*, const uint64_t*, const int*, const float*, const float*, float*, int, int);
 
 // Full grouped MoE pipeline over rows already sorted by inkwell_exl3_moe_group_sort.
-// Workspace layout (floats unless noted): xhg[P*2304], xhu[P*2304],
-// tg[P*1152], tu[P*1152], gu[P*2304], xhd[P*1152], td[P*2304], dn[P*2304],
-// then row_expert[P] as int.  This Phase-1 layout is deliberately simple;
-// Phase 2 must stream it in four 32-expert tiles and reuse the arena.
+// Workspace layout (floats unless noted): A[P*2304], B[P*2304], T[P*2304],
+// then row_expert[P] as int.  Stream ordering lets the short-lived arrays
+// share those three regions: xhg=A, xhu=B, tg/tu=T, gu=A, xhd=B, td=A,
+// dn=T.  Peak MoE scratch is therefore 3*P*2304 floats rather than the
+// naive Phase-1 layout; Phase 2 still owns the arena and expert streaming.
 extern "C" void ink_launch_exl3_moe_grouped_gemm(
         const void* descs_g, const void* descs_u, const void* descs_d,
         const float* x, int C,
@@ -752,11 +753,11 @@ extern "C" void ink_launch_exl3_moe_grouped_gemm(
     float* xhu = xhg + (size_t)P * KG;
     float* tg = xhu + (size_t)P * KG;
     float* tu = tg + (size_t)P * NG;
-    float* gu = tu + (size_t)P * NG;
-    float* xhd = gu + (size_t)P * (2 * NG);
-    float* td = xhd + (size_t)P * NG;
-    float* dn = td + (size_t)P * ND;
-    int* row_expert = (int*)(dn + (size_t)P * ND);
+    float* gu = xhg;
+    float* xhd = xhu;
+    float* td = xhg;
+    float* dn = tg;
+    int* row_expert = (int*)(tg + (size_t)P * (2 * NG));
     // row_expert is derived on-device: one row per expanded selection.
     // tile_start/count are inclusive contiguous ranges; expand them with a tiny kernel below.
     inkwell_moe_fill_row_expert<<<1, 128, 0, st>>>(tile_expert, tile_start, tile_count, tile_n, row_expert);
