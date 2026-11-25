@@ -2062,3 +2062,9 @@ Single-run decode at 4K: master 43.599 ms/tok vs fixed 48.663 ms/tok. The master
 - Per-pair deltas (cand − ctl, mean of the two runs in each ctl,cand,cand,ctl block, 8 blocks): −0.06, −2.63, +1.85, −1.36, −0.01, +0.28, −0.41, −0.39. Median ≈ −0.2.
 - The host was loaded (4 agents, with 30–31 ms outliers on both arms).
 - Verdict: near-miss, not merged. Queued for an improvement plus re-A/B when a code slot frees.
+
+## t3/moe-phase1 (a967ddb) — expert GEMV phase-1 exact transforms (T2 + simple T3): superseded by the Challenge 3b port
+- 7.141 → 6.843 instr/w. Bit-exact on all K and both shapes. Kernel geomean 1.040×, normalized. md5 5cbe8e06 ×3, peak 5,032 MiB, 62 warnings.
+- A/B vs frozen CTL e03df94: −0.104 ms (9/16), then −0.117 ms (11/16). Median faster both times, pair gate missed.
+- Rejected inside the branch: T7 (bit-exact, slower on dn); T6 (+0.57 ms with T7, 3/16; 8/16 without); post-SASS MOV removal (illegal address); K4 paired extraction (ptxas reassociated the XMADs).
+- Verdict: not merged on its own. It edits the same loop as t3/challenge3b-whole-loop-port, which gets lower (6.775 instr/w in part 1; target 6.442). Its techniques were handed to the 3b part-2 agent, and the near-miss retry is folded into that A/B.
