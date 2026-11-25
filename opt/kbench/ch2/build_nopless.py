@@ -94,7 +94,7 @@ LOOP_SHAPE = {
 # The dense fused epilogue/prologue changes the surrounding register schedule;
 # its donor-lane CH2 loops are one instruction shorter than the expert loops.
 DENSE_LOOP_SHAPE = {
-    'K3.5': (232, 36, 4), 'K4': (232, 36, 4),
+    'K3': (232, 36, 4), 'K3.5': (232, 36, 4), 'K4': (232, 36, 4),
 }
 
 def require_loop_shape(rows, nops, shape=LOOP_SHAPE, label='CH2'):
@@ -188,6 +188,100 @@ def patch_and_verify_nvinfo(cubin, sass, kernels):
         if ex != exits or co != shfls:
             raise Ch2Fail(f'{kernel}: EXIT/COOP metadata verification failed after rewrite')
 
+
+def brx_count(sass, kernel):
+    chunk = target_chunk(sass, kernel)
+    n = 0
+    for _a, o in re.findall(r"/\*([0-9a-f]{4,})\*/\s+(.*?);", chunk):
+        op = re.sub(r"^@!?P\d\s+", "", o.strip()).split()[0]
+        n += op == 'BRX'
+    return n
+
+def indirect_target_records(blob):
+    vals = [v for k, v, _p, _s in nvinfo_attrs(blob) if k == 0x3404]
+    if len(vals) != 1:
+        raise Ch2Fail(f'expected one indirect-branch nv.info attribute, found {len(vals)}')
+    vals = vals[0]
+    records = []
+    for i in range(len(vals) - 4):
+        n = vals[i + 2]
+        if vals[i + 1] == 0 and 1 < n <= 16 and i + 3 + n <= len(vals):
+            records.append((vals[i], vals[i + 3:i + 3 + n]))
+    return records
+
+def kernel_section(cubin, kernel, prefix):
+    from elftools.elf.elffile import ELFFile
+    with cubin.open('rb') as f:
+        elf = ELFFile(f)
+        hits = [sec for sec in elf.iter_sections() if sec.name.startswith(prefix) and kernel in sec.name]
+        if len(hits) != 1:
+            raise Ch2Fail(f'{kernel}: expected one {prefix} section, found {len(hits)}')
+        sec = hits[0]
+        return sec['sh_offset'], sec['sh_size'], sec.data()
+
+def repair_indirect_branch_tables(patched_cubin, patched_sass, nopless_cubin, nopless_sass, kernels):
+    """Copy CuAssembler's corrected indirect targets into raw constant-bank jump tables.
+
+    cuasm represents .nv.constant2 as opaque bytes.  NOP deletion shifts case
+    labels but cannot rewrite those bytes.  Its nv.info indirect-target list is
+    label-based and is correct after reassembly, so use the input/output target
+    lists as the authoritative old->new mapping.  Any mismatch is fail-closed.
+    """
+    data = bytearray(nopless_cubin.read_bytes())
+    for kernel in kernels:
+        want_brx = brx_count(patched_sass, kernel)
+        if brx_count(nopless_sass, kernel) != want_brx:
+            raise Ch2Fail(f'{kernel}: BRX count changed during reassembly')
+        _ioff, _isz, iblob = kernel_section(patched_cubin, kernel, '.nv.info.')
+        _ooff, _osz, oblob0 = kernel_section(nopless_cubin, kernel, '.nv.info.')
+        rin = indirect_target_records(iblob)
+        rout = indirect_target_records(oblob0)
+        if len(rin) != want_brx or len(rout) != want_brx:
+            raise Ch2Fail(f'{kernel}: indirect metadata records {len(rin)}/{len(rout)} != BRX {want_brx}')
+        mapping = {}
+        for (bi, ti), (bo, to) in zip(rin, rout):
+            if len(ti) != len(to):
+                raise Ch2Fail(f'{kernel}: indirect target count mismatch at BRX {bi:x}/{bo:x}')
+            for old, new in zip(ti, to):
+                if old in mapping and mapping[old] != new:
+                    raise Ch2Fail(f'{kernel}: inconsistent indirect target mapping for {old:x}')
+                mapping[old] = new
+        ioff, isz, iconst = kernel_section(patched_cubin, kernel, '.nv.constant2.')
+        ooff, osz, oconst = kernel_section(nopless_cubin, kernel, '.nv.constant2.')
+        if isz != osz or isz % 4:
+            raise Ch2Fail(f'{kernel}: constant2 size mismatch/alignment {isz}/{osz}')
+        expected = bytearray(iconst)
+        changed = 0
+        for pos in range(0, isz, 4):
+            old = int.from_bytes(iconst[pos:pos + 4], 'little')
+            if old in mapping:
+                expected[pos:pos + 4] = mapping[old].to_bytes(4, 'little')
+                changed += mapping[old] != old
+        current = bytes(data[ooff:ooff + osz])
+        if current == bytes(expected):
+            continue
+        if current != bytes(iconst):
+            raise Ch2Fail(f'{kernel}: reassembled constant2 was neither input nor repaired target table')
+        data[ooff:ooff + osz] = expected
+    nopless_cubin.write_bytes(data)
+    for kernel in kernels:
+        _ioff, isz, iconst = kernel_section(patched_cubin, kernel, '.nv.constant2.')
+        ooff, osz, oconst = kernel_section(nopless_cubin, kernel, '.nv.constant2.')
+        expected = bytearray(iconst)
+        # Recompute the same map for verification.  It is deliberately exact:
+        # every constant-bank byte must either be unchanged or the nv.info target.
+        _x, _y, iblob = kernel_section(patched_cubin, kernel, '.nv.info.')
+        _x, _y, oblob0 = kernel_section(nopless_cubin, kernel, '.nv.info.')
+        rin, rout = indirect_target_records(iblob), indirect_target_records(oblob0)
+        mapping = {old: new for (_bi, ti), (_bo, to) in zip(rin, rout) for old, new in zip(ti, to)}
+        for pos in range(0, isz, 4):
+            old = int.from_bytes(iconst[pos:pos + 4], 'little')
+            if old in mapping:
+                expected[pos:pos + 4] = mapping[old].to_bytes(4, 'little')
+        if bytes(data[ooff:ooff + osz]) != bytes(expected):
+            raise Ch2Fail(f'{kernel}: indirect constant2 verification failed after rewrite')
+
+
 def res_usage_ok(cuobj, cubin, kernel, want_reg, want_shared):
     txt = subprocess.check_output([str(cuobj), '-res-usage', str(cubin)], text=True)
     blocks = re.split(r'(?m)^\s*Function\s+', txt)
@@ -253,7 +347,7 @@ def generate(obj, outcubin, workdir, cuda_home):
     shutil.copyfile(unpatched, patched)
     pout = run([str(venvpy), str(ch2 / 'patch_sass.py'), str(patched), str(cuobj)], workdir, workdir / 'patch.log', env, capture=True)
     pm = re.search(r'fake=(\d+) lp=(\d+) words=(\d+) hi_d12d=(\d+)', pout)
-    if not pm or tuple(map(int, pm.groups())) != (543, 547, 1968, 548):
+    if not pm or tuple(map(int, pm.groups())) != (583, 587, 2198, 588):
         raise Ch2Fail('patched-with-NOPs baseline pattern mismatch: ' + (pout.strip() or 'no patch output'))
     sassp = run([str(cuobj), '-sass', str(patched)], workdir, workdir / 'patched.sass.stdout', env, capture=True)
     (workdir / 'kernels_patched_nops.sass').write_text(sassp)
@@ -264,7 +358,7 @@ def generate(obj, outcubin, workdir, cuda_home):
         workdir, workdir / 'cuasm_disassemble.log', env)
     run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges.json', 'gemv_moe_s', '6'],
         workdir, workdir / 'loop_ranges.log', env)
-    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges_dense.json', 'gemv_sf_ch2', '2'],
+    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges_dense.json', 'gemv_sf_ch2', '3'],
         workdir, workdir / 'loop_ranges_dense.log', env)
     run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_patched_nops.cuasm', 'kernels_moe_nopless.cuasm', 'loop_ranges.json'],
         workdir, workdir / 'remove_nops.log', env)
@@ -279,6 +373,7 @@ def generate(obj, outcubin, workdir, cuda_home):
     require_loop_shape(rows_n, nops=False)
     require_loop_shape(loop_rows(sassn, 'gemv_sf_ch2'), nops=False, shape=DENSE_LOOP_SHAPE, label='dense CH2')
     patch_and_verify_nvinfo(nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2'])
+    repair_indirect_branch_tables(patched, sassp, nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2'])
     res_usage_ok(cuobj, nopless, 'gemv_moe_s', 40, 9248)
     res_usage_ok(cuobj, nopless, 'gemv_sf_ch2', 40, 12848)
 
