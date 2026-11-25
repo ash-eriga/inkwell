@@ -1837,3 +1837,4 @@ Branch `t3/ch2-nopless-integrate`, based on master `8d3e840`, integrated the val
 ## t3/kslot-warp-retry — warp-parallel kslot resolve — ACCEPTED, merged
 - Retry of b28547b (earlier 11/16 on noisy host). A/B 16 pairs vs master 4e7e6d5: CTL 30.851 vs CAND 30.316 ms/tok median (−0.534), 15/16 wins, md5 5cbe8e06 all runs, peak 5,034 MiB.
 - Killswitch: INKWELL_NO_RESOLVE_WARP=1.
+- Post-merge master dd6232a, 3 runs: 30.126 / 30.393 / 29.981 ms/tok, md5 5cbe8e06 x3, peak 5,034 MiB.
