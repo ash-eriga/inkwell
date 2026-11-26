@@ -386,7 +386,10 @@ impl Engine {
                             .iter()
                             .find(|s| !s.is_empty() && content_tail.ends_with(s.as_str()))
                         {
-                            let keep = text.len().saturating_sub(stop_s.len());
+                            let mut keep = text.len().saturating_sub(stop_s.len());
+                            while keep > 0 && !text.is_char_boundary(keep) {
+                                keep -= 1;
+                            }
                             if keep > 0 && !on_chunk(GenChunk::Content(text[..keep].to_owned())) {
                                 finish_reason = "stop";
                                 break;

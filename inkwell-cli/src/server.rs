@@ -183,11 +183,15 @@ struct HttpRequest {
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut req_line = String::new();
     let n = reader.read_line(&mut req_line).map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("empty request".to_owned());
+    }
+    if n > 8192 {
+        return Err("request line too long".to_owned());
     }
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_owned();
@@ -195,11 +199,16 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let path = raw_path.split('?').next().unwrap_or("/").to_owned();
 
     let mut content_len = 0usize;
-    loop {
+    let mut header_bytes = 0usize;
+    for _ in 0..128 {
         let mut hline = String::new();
         let hn = reader.read_line(&mut hline).map_err(|e| e.to_string())?;
         if hn == 0 || hline == "\r\n" || hline == "\n" {
             break;
+        }
+        header_bytes += hn;
+        if header_bytes > 64 * 1024 {
+            return Err("headers exceed 64 KiB".to_owned());
         }
         if let Some((k, v)) = hline.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {

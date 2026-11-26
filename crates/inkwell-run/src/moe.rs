@@ -497,7 +497,10 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
     let x_dev = src(0) as *const f32;
     let ids_dev = src(1) as *const i32;
     let w_dev = src(2) as *const f32;
-    if std::env::var("INKWELL_MOE_SKIP").is_ok() {
+    static MOE_SKIP: OnceLock<bool> = OnceLock::new();
+    static MOE_IDSEQ: OnceLock<bool> = OnceLock::new();
+    static MOE_IDLOG: OnceLock<bool> = OnceLock::new();
+    if *MOE_SKIP.get_or_init(|| std::env::var_os("INKWELL_MOE_SKIP").is_some()) {
         unsafe { cu::memset_dev_async(inkwell_ggml::ink_tensor_data(dst), 0, N_EMBD * 4) };
         return;
     }
@@ -505,10 +508,11 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
     let mut hid = st.hid.lock().expect("hid");
     let mut dn = st.dn.lock().expect("dn");
     let mut xh = st.xh.lock().expect("xh");
-    if std::env::var_os("INKWELL_IDSEQ").is_some() { moe_idseq(ids_dev, a.layer); }
+    if *MOE_IDSEQ.get_or_init(|| std::env::var_os("INKWELL_IDSEQ").is_some()) { moe_idseq(ids_dev, a.layer); }
+    let idlog = *MOE_IDLOG.get_or_init(|| std::env::var_os("INKWELL_MOE_IDLOG").is_some());
     unsafe {
         if let Some(c) = &a.cache {
-            if std::env::var_os("INKWELL_MOE_IDLOG").is_some() { moe_idlog(ids_dev, a.layer); }
+            if idlog { moe_idlog(ids_dev, a.layer); }
             if let Some(pf) = &c.prefetch {
                 cu::memcpy_ids8_async(pf.hist.dev_ptr(), ids_dev.cast());
             }
@@ -533,7 +537,7 @@ unsafe extern "C" fn moe_cb_exl3(dst: *mut c_void, _ith: i32, _nth: i32, ud: *mu
                 c.soff.as_ref().map_or(std::ptr::null_mut(), |b| b.dev_ptr().cast()),
                 c.fl.as_ref().map_or(std::ptr::null_mut(), |b| b.dev_ptr().cast()));
         } else {
-            if std::env::var_os("INKWELL_MOE_IDLOG").is_some() { moe_idlog(ids_dev, a.layer); }
+            if idlog { moe_idlog(ids_dev, a.layer); }
             cu::exl3_moe_async(a.descs_g.dev(), a.descs_u.dev(), a.descs_d.dev(), ids_dev,
                 x_dev, xh.dev_ptr().cast(), gu.dev_ptr().cast(), hid.dev_ptr().cast(),
                 dn.dev_ptr().cast(), w_dev, inkwell_ggml::ink_tensor_data(dst).cast(),

@@ -2844,8 +2844,10 @@ impl Runner {
         // Reuse the built ggml graph + sched splits + instantiated CUDA graph
         // while the shape signature is unchanged: only input data varies.
         // Killswitch: INKWELL_NO_GCACHE=1 forces the per-step rebuild.
-        let caching = std::env::var_os("INKWELL_NO_GCACHE").is_none();
-        let dump_pow2 = std::env::var_os("INKWELL_ATTN_DUMP_DIR").is_some()
+        static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ATTN_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let caching = *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none());
+        let dump_pow2 = *ATTN_DUMP.get_or_init(|| std::env::var_os("INKWELL_ATTN_DUMP_DIR").is_some())
             && ((pos + 1) & pos) == 0 && (1024..=32768).contains(&(pos + 1));
         if caching && !dump_pow2 {
             if let Some(gc) = self.step_gcache.take() {
@@ -2937,7 +2939,7 @@ impl Runner {
         };
         let input_copy_len = if direct_relbias { small_end } else { embd_off };
         // keep buf alive for the graph
-        std::mem::forget(buf);
+        let _ = buf;
 
         // tau: log-scaled position (full layers)
         let posf = t::cast(c, pos_t, F32);
@@ -3463,7 +3465,8 @@ impl Runner {
     /// only for rows whose logits are never consumed; state updates are the
     /// same graph nodes in the same order.
     pub fn step_prompt_state(&mut self, id: u32, pos: i64) {
-        let caching = std::env::var_os("INKWELL_NO_GCACHE").is_none();
+        static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let caching = *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none());
         if caching {
             if let Some(gc) = self.step_gcache.take() {
                 if step_shape_match(&gc.step, pos, self.max_ctx, self.swa_capacity()) && !gc.has_head {
@@ -4128,7 +4131,7 @@ impl Runner {
             buf.assign(*x, off);
             o = off + t::nbytes(*x);
         }
-        std::mem::forget(buf);
+        let _ = buf;
         // now that every input is buffer-assigned, upload values
         for (t0, v) in &sets {
             unsafe { t::set(*t0, v.as_ptr().cast(), 0, v.len() * 4) };
@@ -4566,7 +4569,8 @@ fn pf_exact_attn_enabled() -> bool {
 }
 
 fn pf_dbg(name: &str, x: *const f32, n: usize) {
-    if std::env::var_os("INKWELL_PFDBG").is_none() { return; }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("INKWELL_PFDBG").is_some()) { return; }
     let mut v = vec![0f32; n];
     unsafe {
         inkwell_cuda::memcpy_d2h_async(v.as_mut_ptr().cast(), x.cast(), n * 4);
@@ -4660,13 +4664,20 @@ impl Runner {
         // Residual-stack attention queries (q/k/v input selectors).
         let mut inputs = [cur, cur, cur];
         if let Some(rq) = l.attn_res_query {
-            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([cur.cast_const()]).collect();
-            self.pf_mix_run(&states, rq, a.ptr("mixbuf"), c, if is_swa {1} else {3});
+            let mut states = [std::ptr::null::<f32>(); 8];
+            let mut ns = 0usize;
+            for &b in blocks.iter().rev() {
+                states[ns] = a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const();
+                ns += 1;
+            }
+            states[ns] = cur.cast_const();
+            ns += 1;
+            self.pf_mix_run(&states[..ns], rq, a.ptr("mixbuf"), c, if is_swa {1} else {3});
             inputs = if is_swa { [a.ptr("mixbuf"), a.ptr("mixbuf"), a.ptr("mixbuf")] } else { [a.ptr("mixbuf"), unsafe{a.ptr("mixbuf").add(c*n)}, unsafe{a.ptr("mixbuf").add(2*c*n)}] };
         }
         // Loop-pass controller messages. The message tensor rows are materialized by mixbuf.
         if messages {
-            let states: Vec<*const f32> = [a.ptr("bank").cast_const(), a.ptr("bankout").cast_const()].into_iter().collect();
+            let states = [a.ptr("bank").cast_const(), a.ptr("bankout").cast_const()];
             self.pf_mix_run(&states, l.msg_query.expect("msg_query"), a.ptr("msgbuf"), c, 4);
             for j in 0..3 {
                 let dst = a.ptr(match j {0=>"x0",1=>"x1",_=>"x2"});
@@ -4775,8 +4786,15 @@ impl Runner {
         // FFN input mix/control/norm.
         let fcur = a.ptr("fcur");
         if let Some(fq) = l.ffn_res_query {
-            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([cur.cast_const()]).collect();
-            self.pf_mix_run(&states, fq, fcur, c, 1);
+            let mut states = [std::ptr::null::<f32>(); 8];
+            let mut ns = 0usize;
+            for &b in blocks.iter().rev() {
+                states[ns] = a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const();
+                ns += 1;
+            }
+            states[ns] = cur.cast_const();
+            ns += 1;
+            self.pf_mix_run(&states[..ns], fq, fcur, c, 1);
         } else { pf_copy(fcur, cur, hbytes); }
         if messages {
             self.pf_control(a, fcur, unsafe{a.ptr("msgbuf").add(3*c*n)}.cast_const(), l, 3);
@@ -4979,9 +4997,16 @@ impl Runner {
             }
             // final mix + norm; compute lm_head only for the last row of the final chunk.
             let is_last_chunk = pos + c as i64 == pos0 + ids.len() as i64;
-            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([a.ptr("cur").cast_const()]).collect();
             if is_last_chunk {
-            self.pf_mix_run(&states, self.output_res_query, a.ptr("head"), c, 1);
+            let mut states = [std::ptr::null::<f32>(); 8];
+            let mut ns = 0usize;
+            for &b in blocks.iter().rev() {
+                states[ns] = a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const();
+                ns += 1;
+            }
+            states[ns] = a.ptr("cur").cast_const();
+            ns += 1;
+            self.pf_mix_run(&states[..ns], self.output_res_query, a.ptr("head"), c, 1);
             self.pf_norm(a.ptr("head"), self.output_norm, c, 2304);
             let last = unsafe { a.ptr("head").add((c-1)*2304) };
             if let Some(oi) = self.output_exl3 {
