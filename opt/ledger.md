@@ -2376,3 +2376,44 @@ The cached-MoE bulk miss copy was split into per-projection side-stream launches
 
 Changed the four CH2 expert loops from `#pragma unroll 4` to `#pragma unroll 8` and updated the fail-closed SASS pipeline for 64-weight loop bodies. The generator succeeded structurally: expert loops were reduced from 215/219/223/211 to 423/431/439/415 instructions per 64 weights (a 3.5-instruction saving per 32 weights), with dense CH2 shapes 444/452/427 per 64. However the patched cubin grew from 1,596,304 to 1,670,416 bytes and the whole-model validation was already slower: candidate 27.740 ms/tok vs control 27.210 ms/tok. The interleaved A/B was stopped early after a consistent large regression; complete rows were control 26.980/27.036/27.096 ms/tok vs candidate 27.544/27.613/27.387 ms/tok, all md5 `5cbe8e06`, peak 5,048 MiB. Likely causes are I-cache/branch/scheduling cost from the doubled body and imperfect NOP-control transfer, outweighing the small loop-count saving. Not committed; experiment tree and binary remain under `/home/ash/.cache/inkwell-dec25/t7tree` and `/home/ash/.cache/inkwell-dec25/target-t7u8`.
 - Brain validation (gpu-run -p high), 3 runs of the same binary (sha 1f268f07): 27.525 / 27.125 / 27.116 ms/tok, md5 5cbe8e06 in all 3 runs, peak 5,048 MiB, ch2nopless enabled. Merged into master. The new decode control is this binary.
+
+## t3/chunked-prefill-driver — BF16 rel-bias fix — prefill KLD restored (78de50c, bc12834)
+
+**Verdict.** The mean KLD of 1.06–2.81 that was read as a refutation of phase 2 was not the lb4prod experiment: clean `4bd1329` reproduces it byte for byte. It was a tensor-dtype break introduced by the rebase onto the m3a sink-relbias merge, and it is fixed. Chunked prefill is back at the pre-rebase level (mean KLD 3.7e-4 at 512, 4.2e-4 at 4K, top-1 1.0) with decode still md5 `5cbe8e06`.
+
+**Root cause.** m3a (`c4092a8`, merged as `1441a23`) keeps `attn_rel_bias_pad` in BF16 on the device for the fused decode sink/relbias kernel (`relbias_bf16` + `bf16_t`; 4 B -> 2 B per element). The prefill driver still handed that tensor to the F32-only `inkwell_pf_expand_rel`, which reads `src[i]` as `float`. Every prefill layer therefore ran with a garbage 16x1025 rel-position bias, so the encoded state was wrong while decode stayed untouched — which is why md5 and the decode A/B stayed green. `prefill.cu` is byte-identical between the pre-rebase tip `e024bb6` and `4bd1329`; no kernel changed.
+
+**Evidence.** Clean `4bd1329` (foreign brain bench, `bench_encode.sh`, chunk 128, no dirty files) and the lb4prod candidate (chunk 512) agree exactly:
+
+| probe | 127 | 512 | 2K | 4K | 8K |
+|---|---:|---:|---:|---:|---:|
+| clean 4bd1329 mean KLD | 1.0617 | 1.5758 | 1.5095 | 2.1626 | 2.8149 |
+| lb4prod candidate mean KLD | 1.0617 | 1.5758 | 1.5095 | 2.1626 | — |
+| pre-rebase e024bb6 mean KLD | 3.7e-6 | 4.4e-4 | 2.8e-4 | 4.0e-4* | 4.9e-4 |
+| pre-rebase top-1 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 |
+
+Recomputed today from the e024bb6 dumps (`out/pffull-cache/encode/<len>`): 127 3.703e-6, 512 4.414e-4, 2K 2.759e-4, 8K 4.888e-4, top-1 1.0, and chunk 128 and chunk 512 dumps are bit-identical. There is no e024bb6 dump for 4K, so the starred cell is the figure the pre-rebase bench printed, not a recomputation.
+
+Dump-level cross-check (CPU, no GPU): old-vs-new *serial* dumps differ by 1.70e-4 / 3.44e-4 / 1.22e-3 mean KLD at 512 / 2K / 8K — the accepted decode drift from HADVEC + sink relbias. Old-vs-new *prefill* dumps differ by 1.5–1.6. After the fix the old-vs-new prefill drift is 2.1e-9 / 8.0e-5 / 4.0e-10, i.e. the prefill path is bit-identical with the pre-rebase kernel again at 512 and 8K.
+
+Row alignment was ruled out directly rather than assumed. On the 512 pair, the max-abs matrix of clean-4bd1329 prefill rows vs serial rows is lowest on the diagonal (18.2–24.4 for rows 0–3) and reaches 33.9 off it, and top-8 token overlap is 1–3/8 on the diagonal against 0–1/8 one row off; a row shift would invert both. The decisive form: the same compare tooling reports 3.7e-4 on the fixed binary, and a row offset in the dump/compare path would not vanish when the kernel dtype is fixed. `greedy32_exact` could not have shown any of this: it compares the fed id stream (see the gate-flaw paragraph).
+
+**Fix.** `inkwell_pf_expand_rel_bf16` + `pf_expand_rel_bf16_async` + a dtype dispatch in `pf_layer` on `ink_tensor_type`. bf16->f32 is exact, so both table dtypes must produce the same expanded table. Harness `prefill_tests rel`: f32 bitdiff 0, bf16 bitdiff 0, `REL PASS`, `OVERALL PASS`.
+
+**Gate on the fixed binary** (chunk 512, 32 teacher-forced rows, raw output `/home/ash/.cache/inkwell-prefill/out/relfix*`):
+
+| prompt | serial tok/s | chunked tok/s | speedup | peak MiB | mean KLD | max KLD | top-1 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 127 | 31.0 | 47.8 | 1.54x | 5,014 | 7.9e-5 | 9.4e-4 | 0.969 |
+| 512 | 30.5 | 95.5 | 3.14x | 5,034 | 3.7e-4 | 3.3e-3 | 1.000 |
+| 2K | 28.6 | 84.1 | 2.94x | 4,854 | 3.7e-4 | 3.7e-3 | 0.969 |
+| 4K | 25.8 | 88.8 | 3.45x | 4,918 | 4.2e-4 | 3.3e-3 | 1.000 |
+| 8K | 25.1 | 77.6 | 3.09x | 5,046 | 1.4e-3 | 3.2e-2 | 1.000 |
+
+The 8K residual is decode drift, not prefill: the serial dumps alone differ by 1.22e-3 there, and the fixed prefill dump matches the pre-rebase prefill dump to 4.0e-10. Decode md5 on the fixed binary: `5cbe8e06` x3, 27.9 / 33.3 / 33.5 ms/tok, peak 5,048 MiB.
+
+**Bench-gate flaw (bc12834).** `greedy32_exact` compared the fed id stream, and both arms are teacher-forced from the same `INKWELL_FORCE_IDS`, so it printed `exact` while `top1_agree` was 0.50. It now comes from the logits argmax; fed-id equality is reported as `forced32_*`.
+
+**lb4prod experiment** (pitch8 + `__launch_bounds__(256,4)`, stash `stash@{0}`, files in `~/.cache/inkwell-prefill/exp-lb4prod/`): harness bit-exact (group32/64/adaptive bitdiff 0 twice), but encode 127 1.936 vs 2.223 s (+14.8%), 512 4.950 vs 4.834 (-2.4%), 2K 21.572 vs 20.978 (-2.8%), 4K 47.130 vs 44.359 (-6.2%). Rejected, not committed.
+
+**Session drift / cost.** Absolute tok/s here run 4–14% below the 08:40 baseline while decode-only runs of the two binaries in the same session scatter -2.6% to +8.6% in both directions, so cross-session speeds are not comparable; use the serial/prefill ratios. No matched cost A/B was completed: the interleaved clean-vs-fix job failed in its own harness (`local tag=$1 od=$OUT/$tag` expands before `tag` is bound) while the GPU was busy with foreign high-priority work, and it was not re-run. The change is inert on the decode path and adds one host-side `ink_tensor_type` call plus a 32 KiB (was 64 KiB) table read per layer visit.
