@@ -340,26 +340,45 @@ pub fn download_preset(preset: &HfPreset) -> Result<PathBuf, String> {
     }
 }
 
+/// Selection returned by the interactive model picker.
+#[derive(Debug, Clone)]
+pub struct ModelChoice {
+    /// Local path to the selected (or freshly downloaded) EXL3 model directory.
+    pub path: String,
+    /// Soft vision-tower toggle state (`false` by default in v0.1).
+    pub vision_enabled: bool,
+}
+
 /// Interactive selector used when `inkwell serve` or `inkwell chat` is invoked without `<model>`.
-pub fn select_or_download_model() -> Result<String, String> {
+pub fn select_or_download_model() -> Result<ModelChoice, String> {
     let tty = io::stdout().is_terminal();
     let local = discover_local_exl3();
     let available = missing_presets(&local);
+    let mut vision_enabled = std::env::var("INKWELL_VISION").as_deref() == Ok("1");
 
     render_catalog(&local, &available);
 
     let total = local.len() + available.len();
     if !io::stdin().is_terminal() {
         if let Some(first) = local.first() {
-            return Ok(first.path.to_string_lossy().into_owned());
+            return Ok(ModelChoice {
+                path: first.path.to_string_lossy().into_owned(),
+                vision_enabled,
+            });
         }
         return Err("no local EXL3 models found and stdin is not interactive; pass <model> or run in a terminal".to_owned());
     }
 
     let default_idx = 1usize;
     loop {
+        let v_badge = if vision_enabled {
+            format!("{}ON{} {}(soft · preview){}", color(tty, GREEN), color(tty, RESET), color(tty, DIM), color(tty, RESET))
+        } else {
+            format!("{}OFF{} {}(text-only, saves VRAM){}", color(tty, DIM), color(tty, RESET), color(tty, DIM), color(tty, RESET))
+        };
+        println!("  {}Vision tower:{} {v_badge}  {}[press 'v' to toggle]{}", color(tty, BOLD), color(tty, RESET), color(tty, DIM), color(tty, RESET));
         print!(
-            "{}Select model [1-{total}] (default {default_idx}, q to quit):{} ",
+            "{}Select model [1-{total}] (default {default_idx}, v=vision, q=quit):{} ",
             color(tty, BOLD),
             color(tty, RESET)
         );
@@ -375,6 +394,23 @@ pub fn select_or_download_model() -> Result<String, String> {
         if s.eq_ignore_ascii_case("q") || s.eq_ignore_ascii_case("quit") {
             return Err("cancelled".to_owned());
         }
+        if s.eq_ignore_ascii_case("v") || s.eq_ignore_ascii_case("vision") {
+            vision_enabled = !vision_enabled;
+            if vision_enabled {
+                println!(
+                    "{}Vision tower marked ON (soft flag INKWELL_VISION=1 — image encoding arrives in v0.1.5+; text runs normally).{}\n",
+                    color(tty, YELLOW),
+                    color(tty, RESET)
+                );
+            } else {
+                println!(
+                    "{}Vision tower OFF (text-only mode).{}\n",
+                    color(tty, DIM),
+                    color(tty, RESET)
+                );
+            }
+            continue;
+        }
         let choice: usize = if s.is_empty() {
             default_idx
         } else {
@@ -382,7 +418,7 @@ pub fn select_or_download_model() -> Result<String, String> {
                 Ok(v) if (1..=total).contains(&v) => v,
                 _ => {
                     println!(
-                        "{}Please enter a number between 1 and {total} (or q).{}",
+                        "{}Please enter 1-{total}, 'v' to toggle vision tower, or 'q' to quit.{}",
                         color(tty, YELLOW),
                         color(tty, RESET)
                     );
@@ -391,13 +427,16 @@ pub fn select_or_download_model() -> Result<String, String> {
             }
         };
 
-        if choice <= local.len() {
-            let chosen = &local[choice - 1];
-            return Ok(chosen.path.to_string_lossy().into_owned());
-        }
+        let path = if choice <= local.len() {
+            local[choice - 1].path.to_string_lossy().into_owned()
+        } else {
+            let preset = available[choice - local.len() - 1];
+            download_preset(preset)?.to_string_lossy().into_owned()
+        };
 
-        let preset = available[choice - local.len() - 1];
-        let downloaded = download_preset(preset)?;
-        return Ok(downloaded.to_string_lossy().into_owned());
+        return Ok(ModelChoice {
+            path,
+            vision_enabled,
+        });
     }
 }

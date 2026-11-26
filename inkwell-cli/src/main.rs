@@ -93,7 +93,13 @@ fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), 
     inkwell_run::runner::set_verbose(verbose);
     opts.model = match model {
         Some(m) => m,
-        None => models::select_or_download_model()?,
+        None => {
+            let chosen = models::select_or_download_model()?;
+            if chosen.vision_enabled {
+                eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
+            }
+            chosen.path
+        }
     };
     run_on_big_stack(move || server::run_server(&opts))
 }
@@ -145,15 +151,92 @@ fn parse_cli_opts(
     inkwell_run::runner::set_verbose(verbose);
     opts.model = match model {
         Some(m) => m,
-        None => models::select_or_download_model()?,
+        None => {
+            let chosen = models::select_or_download_model()?;
+            if chosen.vision_enabled {
+                eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
+            }
+            chosen.path
+        }
     };
     Ok(opts)
+}
+
+fn interactive_launcher() -> Result<(), String> {
+    use std::io::{self, IsTerminal, Write};
+    if !io::stdin().is_terminal() {
+        print!("{HELP_TEXT}");
+        return Ok(());
+    }
+    let tty = io::stdout().is_terminal();
+    let (b, c, d, r) = if tty {
+        ("\x1b[1m", "\x1b[36m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+    println!("\n{b}{c}inkwell {}{r}  {d}EXL3 inference engine{r}\n", env!("CARGO_PKG_VERSION"));
+    println!("  {c}[1]{r} {b}serve{r}    {d}OpenAI-compatible HTTP/SSE server (http://127.0.0.1:8080/v1){r}");
+    println!("  {c}[2]{r} {b}chat{r}     {d}Interactive multi-turn terminal chat{r}");
+    println!("  {c}[3]{r} {b}models{r}   {d}List local EXL3 models & Hugging Face presets{r}");
+    println!("  {d}[q] quit{r}\n");
+
+    loop {
+        print!("{b}Choose an action [1-3] (default 1, q=quit):{r} ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        let n = io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("failed to read input: {e}"))?;
+        if n == 0 {
+            return Ok(());
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "1" | "serve" => {
+                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
+                let chosen = models::select_or_download_model()?;
+                if chosen.vision_enabled {
+                    eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
+                }
+                let opts = server::ServeOpts {
+                    model: chosen.path,
+                    host: "127.0.0.1".to_owned(),
+                    port: 8080,
+                    ctx: 4096,
+                    default_effort: "none".to_owned(),
+                };
+                return run_on_big_stack(move || server::run_server(&opts));
+            }
+            "2" | "chat" => {
+                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
+                let chosen = models::select_or_download_model()?;
+                if chosen.vision_enabled {
+                    eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
+                }
+                let opts = cli_ui::CliRunOpts {
+                    model: chosen.path,
+                    ..cli_ui::CliRunOpts::default()
+                };
+                return run_on_big_stack(move || cli_ui::run_chat(&opts));
+            }
+            "3" | "models" => {
+                models::print_model_catalog();
+                return Ok(());
+            }
+            "q" | "quit" | "exit" => return Ok(()),
+            _ => println!("Enter 1 (serve), 2 (chat), 3 (models), or q."),
+        }
+    }
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(first) = args.next() else {
-        print!("{HELP_TEXT}");
+        if let Err(e) = interactive_launcher() {
+            if e != "cancelled" {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     };
     match first.as_str() {
