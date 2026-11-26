@@ -25,7 +25,6 @@ SERVE OPTIONS:
   --port <port>           Bind port (default: 8080)
   --ctx <tokens>          Max context length (default: 4096)
   --effort <level>        Default reasoning effort: none|minimal|low|medium|high|max (default: none)
-  -v, --verbose           Show internal VRAM/cache/prefill diagnostics
 
 CHAT / RUN OPTIONS:
   -p, --prompt <text>     Prompt text (required for `run`)
@@ -37,7 +36,6 @@ CHAT / RUN OPTIONS:
   --top-k <n>             Top-k sampling cap (default: 40)
   --effort <level>        Reasoning effort: none|minimal|low|medium|high|max (default: none)
   --raw                   Skip chat template (`run` only)
-  -v, --verbose           Show internal VRAM/cache/prefill diagnostics
 ";
 
 fn run_on_big_stack<F>(f: F) -> Result<(), String>
@@ -52,21 +50,52 @@ where
         .map_err(|_| "worker thread panicked".to_owned())?
 }
 
-fn next_val(args: &mut std::iter::Skip<std::env::Args>, flag: &str) -> Result<String, String> {
+fn next_val(args: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
     args.next()
         .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+/// Profile-level developer diagnostics setting: reads `dev = true` from
+/// `$XDG_CONFIG_HOME/inkwell/config.toml` (or `~/.config/inkwell/config.toml`),
+/// with `INKWELL_DEV=1` / `INKWELL_VERBOSE=1` as env overrides.
+fn env_dev_enabled() -> bool {
+    if std::env::var_os("INKWELL_DEV").is_some() || std::env::var_os("INKWELL_VERBOSE").is_some() {
+        return true;
+    }
+    let cfg_path = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|d| std::path::PathBuf::from(d).join("inkwell/config.toml"))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".config/inkwell/config.toml"))
+        });
+    let Some(path) = cfg_path else { return false };
+    let Ok(contents) = std::fs::read_to_string(path) else { return false };
+    for raw in contents.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            let val = v.trim();
+            if (key == "dev" || key == "verbose") && val.eq_ignore_ascii_case("true") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Run the interactive `inkwell` menu on the large-stack worker thread so a loaded
 /// `Engine` can stay resident across `chat <-> serve` switches and quietly unload
 /// after 4 seconds of idle time at the menu.
-fn interactive_launcher() -> Result<(), String> {
+fn interactive_launcher(dev_mode: bool) -> Result<(), String> {
     use std::io::{self, IsTerminal};
     if !io::stdin().is_terminal() {
         print!("{HELP_TEXT}");
         return Ok(());
     }
-    run_on_big_stack(interactive_launcher_inner)
+    run_on_big_stack(move || interactive_launcher_inner(dev_mode))
 }
 
 fn read_menu_line_with_idle_unload(
@@ -125,7 +154,7 @@ fn read_menu_line_with_idle_unload(
     }
 }
 
-fn interactive_launcher_inner() -> Result<(), String> {
+fn interactive_launcher_inner(dev_mode: bool) -> Result<(), String> {
     use std::io::{self, IsTerminal, Write};
     use std::time::Duration;
 
@@ -154,7 +183,7 @@ fn interactive_launcher_inner() -> Result<(), String> {
 
         match line.trim().to_ascii_lowercase().as_str() {
             "" | "1" | "serve" => {
-                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
+                inkwell_run::runner::set_verbose(dev_mode || env_dev_enabled());
                 let (model_path, mut eng) = if let Some((path, eng)) = warm.take() {
                     (path, eng)
                 } else {
@@ -177,7 +206,7 @@ fn interactive_launcher_inner() -> Result<(), String> {
                 warm = Some((model_path, eng));
             }
             "2" | "chat" => {
-                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
+                inkwell_run::runner::set_verbose(dev_mode || env_dev_enabled());
                 let (model_path, mut eng) = if let Some((path, eng)) = warm.take() {
                     (path, eng)
                 } else {
@@ -205,9 +234,12 @@ fn interactive_launcher_inner() -> Result<(), String> {
     }
 }
 
-fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), String> {
+fn parse_serve_and_run(
+    mut args: std::vec::IntoIter<String>,
+    dev_flag: bool,
+) -> Result<(), String> {
     let mut model: Option<String> = None;
-    let mut verbose = std::env::var_os("INKWELL_VERBOSE").is_some();
+    let mut verbose = dev_flag || env_dev_enabled();
     let mut opts = server::ServeOpts {
         model: String::new(),
         host: "127.0.0.1".to_owned(),
@@ -227,7 +259,7 @@ fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), 
                 opts.ctx = v.parse().map_err(|_| format!("invalid ctx: {v}"))?;
             }
             "--effort" => opts.default_effort = next_val(&mut args, "--effort")?,
-            "-v" | "--verbose" => verbose = true,
+            "--dev" | "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => {
                 print!("{HELP_TEXT}");
                 return Ok(());
@@ -253,11 +285,12 @@ fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), 
 }
 
 fn parse_cli_opts(
-    mut args: std::iter::Skip<std::env::Args>,
+    mut args: std::vec::IntoIter<String>,
     cmd: &str,
+    dev_flag: bool,
 ) -> Result<cli_ui::CliRunOpts, String> {
     let mut model: Option<String> = None;
-    let mut verbose = std::env::var_os("INKWELL_VERBOSE").is_some();
+    let mut verbose = dev_flag || env_dev_enabled();
     let mut opts = cli_ui::CliRunOpts::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -285,7 +318,7 @@ fn parse_cli_opts(
             }
             "--effort" => opts.effort = next_val(&mut args, "--effort")?,
             "--raw" => opts.raw = true,
-            "-v" | "--verbose" => verbose = true,
+            "--dev" | "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => {
                 print!("{HELP_TEXT}");
                 std::process::exit(0);
@@ -311,9 +344,19 @@ fn parse_cli_opts(
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let mut dev_flag = false;
+    raw_args.retain(|a| {
+        if a == "--dev" {
+            dev_flag = true;
+            false
+        } else {
+            true
+        }
+    });
+    let mut args = raw_args.into_iter();
     let Some(first) = args.next() else {
-        if let Err(e) = interactive_launcher() {
+        if let Err(e) = interactive_launcher(dev_flag) {
             if e != "cancelled" {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -335,14 +378,16 @@ fn main() {
             return;
         }
         "serve" => {
-            if let Err(e) = parse_serve_and_run(args) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+            if let Err(e) = parse_serve_and_run(args, dev_flag) {
+                if e != "cancelled" {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
             return;
         }
         "chat" => {
-            let res = parse_cli_opts(args, "chat")
+            let res = parse_cli_opts(args, "chat", dev_flag)
                 .and_then(|chat_opts| run_on_big_stack(move || cli_ui::run_chat(&chat_opts).map(|_| ())));
             if let Err(e) = res {
                 if e != "cancelled" {
@@ -353,7 +398,7 @@ fn main() {
             return;
         }
         "run" => {
-            let res = parse_cli_opts(args, "run")
+            let res = parse_cli_opts(args, "run", dev_flag)
                 .and_then(|opts| run_on_big_stack(move || cli_ui::run_oneshot(&opts)));
             if let Err(e) = res {
                 eprintln!("error: {e}");
