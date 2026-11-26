@@ -20,7 +20,7 @@
 | 4,096 tok | **104.9 tok/s** (39.0 s) | **25.8 tok/s** (38.7 ms/tok) | 5,194 MiB |
 | 16,384 tok | **84.8 tok/s** (193.3 s) | **19.6 tok/s** (50.9 ms/tok) | 5,298 MiB |
 
-*(Validated up to 16k on 6 GB VRAM in v0.1; 32k/64k compressed KV cache is slated for v0.1.5.)*
+*(Validated up to 16k on 6 GB VRAM in v0.1.)*
 
 ## Build
 
@@ -51,11 +51,6 @@ inkwell serve ~/models/inkling --host 127.0.0.1 --port 8080 --ctx 4096
 ```
 
 Pass `--verbose` (or `INKWELL_VERBOSE=1`) to display internal VRAM, cache, and prefill diagnostics.
-
-## Roadmap
-
-- **v0.1.5**: Compressed KV cache (32k / 64k context on 6 GB VRAM), further kernel refinement toward sub-25 ms/tok short-context decode.
-- **v0.2**: Self-contained **8 MB** runtime target (drop the external 129 MB `libggml-cuda.so` dependency), built-in Vercel `fx` integration for an embedded interactive chat experience alongside the local model, plus standalone EXL3 Pascal kernels on the Hugging Face Kernel Hub.
 
 Test with `curl`:
 

@@ -151,6 +151,8 @@ pub struct Engine {
     tokenizer: Tokenizer,
     model_id: String,
     max_ctx: usize,
+    /// Exact sequence of token ids currently committed in the runner's KV cache + conv state.
+    cached_ids: Vec<u32>,
 }
 
 impl Engine {
@@ -208,6 +210,7 @@ impl Engine {
             tokenizer,
             model_id,
             max_ctx,
+            cached_ids: Vec::new(),
         })
     }
 
@@ -251,27 +254,41 @@ impl Engine {
             ));
         }
 
-        self.runner.reset();
+        let prompt_len = prompt_ids.len();
+        // Reuse existing KV + conv state when the new prompt strictly extends the
+        // exact token sequence already committed on the GPU (multi-turn chat / serve).
+        let can_reuse = !self.cached_ids.is_empty()
+            && self.cached_ids.len() < prompt_len
+            && prompt_ids.starts_with(&self.cached_ids);
+
+        let start_pos = if can_reuse {
+            self.cached_ids.len()
+        } else {
+            self.runner.reset();
+            self.cached_ids.clear();
+            0
+        };
 
         let t_prefill = Instant::now();
-        let prompt_len = prompt_ids.len();
-        let mut pos: i64 = 0;
-        if prompt_len > 1 {
-            let prefix = &prompt_ids[..prompt_len - 1];
+        let mut pos: i64 = start_pos as i64;
+        if start_pos < prompt_len - 1 {
+            let delta = &prompt_ids[start_pos..prompt_len - 1];
             let use_chunked =
-                std::env::var_os("INKWELL_NO_PREFILL").is_none() && prefix.len() >= 16;
+                std::env::var_os("INKWELL_NO_PREFILL").is_none() && delta.len() >= 64;
             if use_chunked {
-                let _ = self.runner.prefill_chunked(prefix, 0);
-                pos = prefix.len() as i64;
+                let _ = self.runner.prefill_chunked(delta, pos);
+                pos += delta.len() as i64;
             } else {
-                for &tid in prefix {
+                for &tid in delta {
                     self.runner.step_prompt_state(tid, pos);
                     pos += 1;
                 }
             }
+            self.cached_ids.extend_from_slice(delta);
             self.runner.clear_step_cache();
         }
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
+        let prefilled_tokens = (prompt_len - 1).saturating_sub(start_pos) + 1;
 
         let t_decode = Instant::now();
         let max_gen = params
@@ -318,6 +335,7 @@ impl Engine {
                 apply_penalties(&mut logits, &recent, &penalties);
                 sampler.sample(&logits, &mut rng)
             };
+            self.cached_ids.push(cur_id);
             pos += 1;
             cur_id = next_id;
             completion_tokens += 1;
@@ -396,7 +414,7 @@ impl Engine {
 
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
         Ok(GenStats {
-            prompt_tokens: prompt_len,
+            prompt_tokens: prefilled_tokens,
             completion_tokens,
             prefill_ms,
             decode_ms,
