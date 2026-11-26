@@ -5,5 +5,6 @@
 pub mod head_dump;
 pub mod moe;
 pub mod ops;
+pub mod prof;
 pub mod draft;
 pub mod runner;

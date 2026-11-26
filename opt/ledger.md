@@ -2464,3 +2464,15 @@ The 8K residual is decode drift, not prefill: the serial dumps alone differ by 1
 **Residual tradeoff.** Streaming buys 2.0 s of encode and costs 10.8 ms/tok of decode over 8 tokens; with streaming off the handoff is free (39.1 vs 38.4). The stage is one layer's whole expert blob (~360 MiB) and the VRAM slack is ~254 MiB, so some caches must be released. Shrinking the stage is the lever that would make the handoff free while keeping streaming's encode win; the 64-token check (is the residual a one-time gather or per-token) is queued, not answered.
 
 **Tooling note.** `main.rs` prints `decode 8 tok in …` with the count hardcoded; the real count is `INKWELL_GENS`, so scripts must divide by that, not by 8.
+
+## 2026-11-26 — startup/model-loading overlap (t3/optimize-model-startup-time) — GPU GATE BLOCKED
+
+Implemented a warm-cache startup loader restructuring plus instrumentation:
+
+- `INKWELL_LOADPROF=1` phase timers/marks for GGUF/tokenizer, safetensors repo open, CUDA/ggml init, dense/EXL3 uploads, device-expert gather/H2D, pinned-expert spawn/wait, KV arena, warm staging, cache setup, and first decode step.
+- Default expert loading now copies pinned layers directly mmap→pinned in per-layer background threads. `cudaHostAlloc` also runs in those threads; the loader receives the mapped addresses through a channel and continues dense setup plus device-resident expert H2D uploads. Copies are joined only after cache setup, before any decode can zero-copy them.
+- Device-resident expert layers still use the same contiguous bytes and synchronous H2D upload, but their temporary host gather is parallelized.
+- Killswitches: `INKWELL_NO_PINBG=1` (synchronous direct pinned copies), `INKWELL_NO_PINDIR=1` (old double-copy gather path), `INKWELL_NO_PARCOPY=1` (serial segment copies); `INKWELL_LOAD_THREADS` and `INKWELL_PIN_COPY_THREADS` tune worker counts.
+- `opt/tools/startup_ab.py` is an interleaved warm startup A/B harness measuring external launch→first `stepwall`, md5, decode ms/tok, and peak VRAM.
+
+Verification status: `cargo check --release -p inkwell-cli` and `cargo build --release` pass. No GPU verification has been run in this session because a foreign interactive process `/home/ash/inkwell/target/release/inkwell` (pid 1585228, parent interactive bash 1544767) is holding ~4.9 GiB VRAM on the GTX 1060. Per the shared-GPU rule it was not killed. Baseline/optimized startup, md5/VRAM/decode gates, and CLI smoke remain unmeasured; do not merge until the GPU is free and `opt/tools/gpu-run -p normal python3 opt/tools/startup_ab.py <outdir>` plus the legacy gate complete.

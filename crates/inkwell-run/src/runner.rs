@@ -677,6 +677,76 @@ unsafe extern "C" fn conv_step_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i
     }
 }
 
+/// One memcpy segment: src/dst as usize so copy plans are `Send`.
+#[derive(Debug)]
+struct CopySeg {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+/// Copy disjoint segments with `nth` workers and drop source PTEs as in the
+/// original loader. `INKWELL_NO_PARCOPY=1` forces serial copying.
+fn par_memcpy_abs(segs: &[CopySeg], nth: usize) {
+    let one = |seg: &CopySeg| {
+        unsafe {
+            std::ptr::copy_nonoverlapping(seg.src as *const u8, seg.dst as *mut u8, seg.len);
+            madv::dontneed(seg.src as *const u8, seg.len);
+        }
+    };
+    if std::env::var_os("INKWELL_NO_PARCOPY").is_some() || nth < 2 || segs.len() < 8 {
+        for seg in segs { one(seg); }
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..nth {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= segs.len() { break; }
+                one(&segs[i]);
+            });
+        }
+    });
+}
+
+struct PinJob {
+    rx: std::sync::mpsc::Receiver<(usize, usize)>,
+    handle: std::thread::JoinHandle<inkwell_cuda::PinnedBuf>,
+}
+
+struct ExpertLoad {
+    il: usize,
+    descs: Vec<u64>,
+    on_dev: bool,
+    max_slot: usize,
+    total: usize,
+    host_base: usize,
+    dev_base: usize,
+    pin: Option<PinJob>,
+}
+
+/// Allocate a pinned expert layer and copy it in the background. Allocation
+/// coordinates are sent back as soon as `cudaHostAlloc` returns; the copy keeps
+/// overlapping subsequent device-resident expert uploads and CUDA setup.
+fn spawn_pin_job(mut segs: Vec<CopySeg>, total: usize) -> PinJob {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name(format!("inkwell-pinload-{total}"))
+        .spawn(move || {
+            let pb = inkwell_cuda::host_alloc_mapped(total);
+            tx.send((pb.host as usize, pb.dev as usize)).expect("pinload channel");
+            let base = pb.host as usize;
+            for seg in &mut segs { seg.dst += base; }
+            let nth = std::env::var("INKWELL_PIN_COPY_THREADS").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+            par_memcpy_abs(&segs, nth);
+            pb
+        })
+        .expect("spawn pinned expert loader");
+    PinJob { rx, handle }
+}
+
 /// bf16 bytes -> f32 bytes; `T`: transpose first (HF `[in,out]` -> ggml `[in,out]` col-major).
 fn bf16_to_f32_t(d: &[u8], shape: &[u64]) -> Vec<u8> {
     let (r, c) = (shape[0] as usize, shape[1] as usize);
@@ -1080,6 +1150,8 @@ impl Runner {
     #[must_use]
     #[expect(clippy::too_many_lines)]
     pub fn load_st(repo: &inkwell_st::StRepo, cfg: &InklingConfig, max_ctx: i64) -> Self {
+        crate::prof::init();
+        let _g_rt = crate::prof::guard("rt_cuda_init");
         let rt = Rt::cuda();
         let (vram_baseline_free, _) = inkwell_cuda::mem_info();
         let cpu = Ptr(unsafe { inkwell_ggml::ink_backend_cpu(4) });
@@ -1092,6 +1164,7 @@ impl Runner {
             inkwell_ggml::ink_sched_new(bs.as_mut_ptr(), bufts.as_mut_ptr(), 2, 32768)
         });
 
+        drop(_g_rt);
         let lp = |il: usize, name: &str| format!("model.llm.layers.{il}.{name}");
         let tp = |name: &str| repo.tensor(name).unwrap_or_else(|| panic!("missing {name}"));
         let dtp = |name: &str| repo.data(name).unwrap_or_else(|| panic!("missing data {name}"));
@@ -1140,6 +1213,7 @@ impl Runner {
         /// upload a dense tensor as F32 ggml tensor, dims = reversed HF shape (drop ==1 middles)
         macro_rules! dense {
             ($name:expr) => {{
+                let _pg = crate::prof::guard("dense_upload");
                 let ti = tp($name);
                 let mut dims: Vec<i64> = ti.shape.iter().rev().map(|&d| d as i64).collect();
                 dims.retain(|&d| d != 1);
@@ -1159,6 +1233,7 @@ impl Runner {
         /// order on sm_61); widen to F32 otherwise.
         macro_rules! densew {
             ($name:expr) => {{
+                let _pg = crate::prof::guard("densew_upload");
                 let ti = tp($name);
                 let mut dims: Vec<i64> = ti.shape.iter().rev().map(|&d| d as i64).collect();
                 dims.retain(|&d| d != 1);
@@ -1178,6 +1253,7 @@ impl Runner {
 
         /// build an Exl3W from `<base>.{trellis,suh,svh}` on device
         fn exl3_of(repo: &inkwell_st::StRepo, base: &str) -> Box<Exl3W> {
+            let _pg = crate::prof::guard("exl3proj_upload");
             let tr = repo.tensor(&format!("{base}.trellis")).unwrap_or_else(|| panic!("{base}.trellis"));
             let (k, n) = ((tr.shape[0] * 16) as usize, (tr.shape[1] * 16) as usize);
             let k16 = tr.shape[2] as usize;
@@ -1295,6 +1371,7 @@ impl Runner {
         let mut expert_dev: Vec<inkwell_cuda::DevBuf> = Vec::new();
         let mut moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>> = Vec::new();
         let mut moe_gw: Vec<[u32; 384]> = Vec::new();
+        let mut expert_loads: Vec<ExpertLoad> = Vec::with_capacity(24);
         let conv = |il: usize| il % 6 == 5;
         for il in 0..24usize {
             let mut l = L {
@@ -1461,18 +1538,17 @@ impl Runner {
                     }
                 }
                 if il == 6 { let (f0, _) = inkwell_cuda::mem_info(); vlog!("MEM before experts: {f0}"); }
-                let mut host = vec![0u8; total];
                 let mut descs: Vec<u64> = vec![0; 3 * 128 * 4];
                 let mut off = 0usize;
                 let mut max_slot = 0usize;
                 let mut gxp = [0u32; 384];
+                let mut segs: Vec<CopySeg> = Vec::with_capacity(3 * 128 * 3);
                 for e in 0..128usize {
                     for (pi, proj) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
                         let base = format!("{pre}.{e}.{proj}");
                         for (ai, part) in ["trellis", "suh", "svh"].iter().enumerate() {
                             let b = dtp(&format!("{base}.{part}"));
-                            host[off..off + b.len()].copy_from_slice(b);
-                            unsafe { madv::dontneed(b.as_ptr(), b.len()) };
+                            segs.push(CopySeg { src: b.as_ptr() as usize, dst: off, len: b.len() });
                             descs[pi * 512 + e * 4 + ai] = off as u64; // patched after upload
                             off += b.len();
                         }
@@ -1492,42 +1568,114 @@ impl Runner {
                 let on_dev = place_plan.as_ref().map_or(true, |p| p[il])
                     && (f_free as usize) > total + (dev_margin << 20);
                 let mut host_base = 0usize;
-                let base = if on_dev {
+                let mut dev_base = 0usize;
+                let mut pin = None;
+                if std::env::var_os("INKWELL_NO_PINDIR").is_some() {
+                    // Compatibility path: gather into pageable memory first, then
+                    // copy once more into the final pinned/device destination.
+                    let mut host = vec![0u8; total];
+                    let mut off2 = 0usize;
+                    for e in 0..128usize {
+                        for proj in ["gate_proj", "up_proj", "down_proj"] {
+                            let base = format!("{pre}.{e}.{proj}");
+                            for part in ["trellis", "suh", "svh"] {
+                                let b = dtp(&format!("{base}.{part}"));
+                                host[off2..off2 + b.len()].copy_from_slice(b);
+                                unsafe { madv::dontneed(b.as_ptr(), b.len()) };
+                                off2 += b.len();
+                            }
+                        }
+                    }
+                    if on_dev {
+                        let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
+                        blob.write_bytes(&host);
+                        dev_base = blob.dev_ptr() as usize;
+                        expert_dev.push(blob);
+                    } else {
+                        let pb = inkwell_cuda::host_alloc_mapped(total);
+                        unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), pb.host, total) };
+                        pinned_bytes += total;
+                        host_base = pb.host as usize;
+                        dev_base = pb.dev as usize;
+                        pinned.push(pb);
+                    }
+                } else if on_dev {
+                    // Parallel-gather the layer once, then keep the existing
+                    // synchronous contiguous H2D upload. Pinned layers copy in
+                    // background threads underneath these device uploads.
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
-                    blob.write_bytes(&host);
-                    drop(host);
-                    let b = blob.dev_ptr() as u64;
+                    let mut host = vec![0u8; total];
+                    let base_addr = host.as_mut_ptr() as usize;
+                    for seg in &mut segs { seg.dst += base_addr; }
+                    let nth = std::env::var("INKWELL_LOAD_THREADS").ok()
+                        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+                    {
+                        let _pg = crate::prof::guard("expdev_gather");
+                        par_memcpy_abs(&segs, nth);
+                    }
+                    {
+                        let _pg = crate::prof::guard("expdev_h2d");
+                        blob.write_bytes(&host);
+                    }
+                    dev_base = blob.dev_ptr() as usize;
                     expert_dev.push(blob);
-                    b
-                } else {
+                } else if std::env::var_os("INKWELL_NO_PINBG").is_some() {
+                    // Direct mmap -> pinned copy, but synchronous on the loader
+                    // thread (killswitch for the default overlapped loader).
                     let pb = inkwell_cuda::host_alloc_mapped(total);
-                    unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), pb.host, total) };
+                    let base_addr = pb.host as usize;
+                    for seg in &mut segs { seg.dst += base_addr; }
+                    let nth = std::env::var("INKWELL_LOAD_THREADS").ok()
+                        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+                    par_memcpy_abs(&segs, nth);
                     pinned_bytes += total;
                     host_base = pb.host as usize;
-                    let b = pb.dev as u64;
+                    dev_base = pb.dev as usize;
                     pinned.push(pb);
-                    b
-                };
-                for d in descs.chunks_exact_mut(4) {
-                    d[0] += base; d[1] += base; d[2] += base;
+                } else {
+                    {
+                        let _pg = crate::prof::guard("exppin_spawn");
+                        pin = Some(spawn_pin_job(segs, total));
+                    }
                 }
-                let v2_descs_ok = crate::moe::exl3_descs_v2_ok(&descs);
-                let mk = |pi: usize| {
-                    crate::moe::DescTable::from_bytes(unsafe {
-                        std::slice::from_raw_parts(descs[pi * 512..].as_ptr().cast::<u8>(), 128 * 32)
-                    })
-                };
-                l.moe_exl3 = Some(moe_args_exl3.len());
-                moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
-                    descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
-                    v2_descs_ok, on_dev, cache: None, max_slot,
-                    layer: moe_args_exl3.len() as i32,
-                    descs_host: descs.clone(), expert_host_base: host_base,
-                    expert_dev_base: base as usize, expert_total: total,
-                }));
+                expert_loads.push(ExpertLoad {
+                    il, descs, on_dev, max_slot, total, host_base, dev_base, pin,
+                });
             }
             l.proj0_off = [-1; 3];
             layers.push(l);
+        }
+        // Materialize expert descriptors after the layer loop. Background
+        // pinned jobs report their cudaHostAlloc coordinates as soon as the
+        // allocation exists; their byte copies keep running while dense setup,
+        // device-resident expert uploads, KV allocation, and cache setup proceed.
+        let mut pin_handles = Vec::new();
+        for mut x in expert_loads {
+            if let Some(job) = x.pin {
+                let (h, d) = job.rx.recv().expect("pinned expert allocation channel");
+                x.host_base = h;
+                x.dev_base = d;
+                pinned_bytes += x.total;
+                pin_handles.push(job.handle);
+            }
+            let base = x.dev_base as u64;
+            for d in x.descs.chunks_exact_mut(4) {
+                d[0] += base; d[1] += base; d[2] += base;
+            }
+            let v2_descs_ok = crate::moe::exl3_descs_v2_ok(&x.descs);
+            let mk = |pi: usize| {
+                crate::moe::DescTable::from_bytes(unsafe {
+                    std::slice::from_raw_parts(x.descs[pi * 512..].as_ptr().cast::<u8>(), 128 * 32)
+                })
+            };
+            layers[x.il].moe_exl3 = Some(moe_args_exl3.len());
+            moe_args_exl3.push(Box::new(crate::moe::MoeArgsExl3 {
+                descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
+                v2_descs_ok, on_dev: x.on_dev, cache: None, max_slot: x.max_slot,
+                layer: x.il as i32,
+                descs_host: x.descs.clone(), expert_host_base: x.host_base,
+                expert_dev_base: x.dev_base, expert_total: x.total,
+            }));
         }
         assert!(off_dev <= dev_bytes, "dev_buf overflow: use={off_dev} alloc={dev_bytes}");
         vlog!("dev_buf: use={:.1}MiB alloc={:.1}MiB slack={:.1}MiB",
@@ -1579,6 +1727,7 @@ impl Runner {
             v_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
             conv_state.push(t::new(rt.ctx(), F32, &[3, n_sconv as i64]));
         }
+        let _g_kv = crate::prof::guard("kv_arena");
         let kv_bytes: usize = k_arena.iter().chain(v_arena.iter()).map(|x| t::nbytes(*x) + 256).sum::<usize>()
             + conv_state.iter().map(|x| t::nbytes(*x) + 256).sum::<usize>();
         let kv_buf = rt.buf(buft_dev, kv_bytes);
@@ -1591,8 +1740,12 @@ impl Runner {
         vlog!("bufs: dev={}MiB kv={}MiB hd={hd} hkv={hkv} swa={swa} n_slots={n_slots}",
             dev_bytes >> 20, kv_bytes >> 20);
         std::mem::forget(kv_buf);
+        drop(_g_kv);
 
-        crate::moe::warm_staging(); // staging buffers must exist before CUDA-graph capture
+        {
+            let _g = crate::prof::guard("warm_staging");
+            crate::moe::warm_staging(); // staging buffers must exist before CUDA-graph capture
+        }
         // Pinned layers stage expert blobs over PCIe every visit (~25-40 ms/tok
         // total). Cache k experts/layer in VRAM; k must be ≥ N_SLOTS(8) so a
         // single visit never evicts its own slots. Runs post-load so f_free is
@@ -1601,6 +1754,7 @@ impl Runner {
         let ck: usize = std::env::var("INKWELL_EXL3_CACHE_K")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         let kslot = std::env::var_os("INKWELL_NO_KSLOT").is_none();
+        let _g_cache = crate::prof::guard("cache_setup");
         if ck >= 8 {
             // Per-layer arena MiB, measured by replaying the real routing
             // trace through the kslot policy (opt/ledger.md). Loop layers
@@ -1776,6 +1930,18 @@ impl Runner {
                     cache_allocated >> 20, post_cache_used >> 20);
             }
         }
+        // Pinned expert bytes must be complete before the first decode can
+        // zero-copy them. Joining here keeps the copies overlapped with all of
+        // the device upload/cache setup above rather than serializing per layer.
+        if !pin_handles.is_empty() {
+            let _g = crate::prof::guard("pinbg_wait");
+            for h in pin_handles {
+                pinned.push(h.join().expect("pinned expert loader panicked"));
+            }
+        }
+        drop(_g_cache);
+        crate::prof::mark("load_st_done");
+        crate::prof::dump();
         if embd_dev.is_null() && std::env::var_os("INKWELL_NO_EMBED_WARM").is_none() {
             warm_file_pages(embd_src.0, embd_bytes.len());
         }
