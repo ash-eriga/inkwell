@@ -2307,3 +2307,7 @@ Base `e5dea6c`; branch `t3/m3a-sink-relbias-port`. Ports the M3a `sink_relbias_f
 **Validation.** Release build rc0; 64 warning diagnostics (limit 64). Canonical validation of the exact candidate binary: md5 `5cbe8e06` on 3/3 runs, decode 27.411 / 27.342 / 27.469 ms/tok, peak 5,048 MiB each, `ch2nopless: enabled`; no cudaGraphInstantiate OOM.
 
 **A/B.** 16 interleaved pairs vs `ctl-master-f46f37f-inkwell`: `runs ctl=16 cand=16 ctl_med=28.079 cand_med=27.445 delta=-0.634 wins=16/16 md5=['5cbe8e06'] peak=5060`. Candidate arm peaked at 5,048 MiB vs control 5,060 MiB. Median is 0.634 ms/tok faster, above the 0.29–0.55 ms/tok prediction; all runs retained the canonical md5.
+
+## t3/m3a-sink-relbias-port (1441a23) — brain validation — ACCEPTED, merged (fast-forward)
+- Agent A/B vs ctl-master-f46f37f: 28.079 → 27.445 ms/tok (−0.634), 16/16, md5 5cbe8e06 all runs, peak 5,048 MiB (−12 MiB vs master). Gate A: KLD 8.0e-4 vs noise-floor 1.06e-3, top-1 disagreement 1.12% vs 0.73%, PPL Δ +0.045%; all 95% CIs overlap over 2,048 teacher-forced tokens.
+- Brain validate on the same binary (gpu-run -p high), 3 runs: 27.475 / 27.267 / 27.404 ms/tok, md5 5cbe8e06 ×3, peak 5,048 MiB. Killswitch INKWELL_NO_SINKRELBIAS=1. Build warnings 64 (at limit).
