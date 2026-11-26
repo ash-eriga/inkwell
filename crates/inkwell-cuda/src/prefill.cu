@@ -1316,6 +1316,15 @@ extern "C" void ink_launch_pf_mul_sigmoid(float* x, const float* gate, long long
     inkwell_pf_mul_sigmoid<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, gate, n);
 }
 
+extern "C" __global__ void inkwell_pf_softcap(float* __restrict__ x, int n, float cap) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = cap * tanhf(x[i] / cap);
+}
+
+extern "C" void ink_launch_pf_softcap(float* x, int n, float cap, void* stream) {
+    inkwell_pf_softcap<<<(unsigned)((n + 255) / 256), 256, 0, (cudaStream_t)stream>>>(x, n, cap);
+}
+
 extern "C" __global__ void inkwell_pf_tau_qr(float* __restrict__ q, float* __restrict__ r,
         int C, float log_alpha, float log_floor, int pos0) {
     const int t = blockIdx.y;
@@ -1333,7 +1342,7 @@ extern "C" void ink_launch_pf_tau_qr(float* q, float* r, int C, float log_alpha,
 
 // Small/medium row-major GEMM for dense BF16 control, router, sink, and conv-projection weights.
 // x [M,K] f32, w [N,K] bf16 or f32 row-major, y [M,N] f32.
-extern "C" __global__ void inkwell_pf_dense_gemm(const float* __restrict__ x,
+extern "C" __global__ void inkwell_pf_dense_gemm_tiled(const float* __restrict__ x,
         const void* __restrict__ w, float* __restrict__ y, int M, int N, int K, int w_is_bf16) {
     constexpr int TM = 16, TN = 16, TK = 16;
     __shared__ float xs[TM][TK + 1];
@@ -1363,10 +1372,142 @@ extern "C" __global__ void inkwell_pf_dense_gemm(const float* __restrict__ x,
     if (row < M && col < N) y[(size_t)row * N + col] = acc;
 }
 
-extern "C" void ink_launch_pf_dense_gemm(const float* x, const void* w, float* y,
+extern "C" void ink_launch_pf_dense_gemm_tiled(const float* x, const void* w, float* y,
         int M, int N, int K, int w_is_bf16, void* stream) {
     dim3 g((N + 15) / 16, (M + 15) / 16);
-    inkwell_pf_dense_gemm<<<g, 256, 0, (cudaStream_t)stream>>>(x, w, y, M, N, K, w_is_bf16);
+    inkwell_pf_dense_gemm_tiled<<<g, 256, 0, (cudaStream_t)stream>>>(x, w, y, M, N, K, w_is_bf16);
+}
+
+__device__ __forceinline__ float2 pf_dense_wload2(const float* w, size_t i) {
+    return ((const float2*)w)[i];
+}
+
+__device__ __forceinline__ float2 pf_dense_wload2(const __nv_bfloat16* w, size_t i) {
+    const __nv_bfloat162 v = ((const __nv_bfloat162*)w)[i];
+    return make_float2(__bfloat162float(v.x), __bfloat162float(v.y));
+}
+
+// Batched dense projection in the serial mmvf reduction order. blockIdx.y is
+// the token row, so every token sees the same pair order as a single-token GEMV.
+template <typename T, int R, int BLOCK>
+__global__ void inkwell_pf_dense_mmvf_exact(const float* __restrict__ x,
+        const T* __restrict__ w, float* __restrict__ y, int M, int N, int K) {
+    constexpr int NW = BLOCK / 32;
+    static_assert(R <= NW, "rows use one reduction warp each");
+    __shared__ float buf[R][32];
+    const int tok = blockIdx.y;
+    const int r0 = blockIdx.x * R;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5, lane = tid & 31;
+    const int k2 = K >> 1;
+    if (tid < 32) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) buf[r][tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const float2* x2 = (const float2*)(x + (size_t)tok * K);
+    const T* wr0 = w + (size_t)r0 * K;
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
+
+    for (int col2 = tid; col2 < k2; col2 += BLOCK) {
+        const float2 xv = x2[col2];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r0 + r < N) {
+                const float2 wv = pf_dense_wload2(wr0 + (size_t)r * K, (size_t)col2);
+                sum[r] += wv.x * xv.x;
+                sum[r] += wv.y * xv.y;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], m);
+    }
+
+    if constexpr (BLOCK == 32) {
+        if (tid == 0) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (r0 + r < N) y[(size_t)tok * N + r0 + r] = sum[r];
+            }
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (lane == 0) buf[r][wid] = sum[r];
+        }
+        __syncthreads();
+        if (wid < R) {
+            const int r = wid;
+            float v = buf[r][lane];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0 && r0 + r < N) y[(size_t)tok * N + r0 + r] = v;
+        }
+    }
+    (void)M;
+}
+
+static int pf_mmvf_block_size(int k) {
+    int best = 32;
+    int best_iter = (k + 2 * 32 - 1) / (2 * 32);
+    for (int bs = 64; bs <= 256; bs += 32) {
+        const int niter = (k + 2 * bs - 1) / (2 * bs);
+        if (niter < best_iter) {
+            best_iter = niter;
+            best = bs;
+        }
+    }
+    return best;
+}
+
+template <typename T, int BLOCK>
+static void pf_launch_dense_exact_block(const float* x, const T* w, float* y,
+        int M, int N, int K, cudaStream_t stream) {
+    constexpr int R = BLOCK / 32 < 4 ? BLOCK / 32 : 4;
+    dim3 g((unsigned)((N + R - 1) / R), (unsigned)M);
+    inkwell_pf_dense_mmvf_exact<T, R, BLOCK><<<g, BLOCK, 0, stream>>>(x, w, y, M, N, K);
+}
+
+template <typename T>
+static void pf_launch_dense_exact_type(const float* x, const T* w, float* y,
+        int M, int N, int K, cudaStream_t stream) {
+    switch (pf_mmvf_block_size(K)) {
+        case 32:  pf_launch_dense_exact_block<T, 32>(x, w, y, M, N, K, stream); break;
+        case 64:  pf_launch_dense_exact_block<T, 64>(x, w, y, M, N, K, stream); break;
+        case 96:  pf_launch_dense_exact_block<T, 96>(x, w, y, M, N, K, stream); break;
+        case 128: pf_launch_dense_exact_block<T, 128>(x, w, y, M, N, K, stream); break;
+        case 160: pf_launch_dense_exact_block<T, 160>(x, w, y, M, N, K, stream); break;
+        case 192: pf_launch_dense_exact_block<T, 192>(x, w, y, M, N, K, stream); break;
+        case 224: pf_launch_dense_exact_block<T, 224>(x, w, y, M, N, K, stream); break;
+        default:  pf_launch_dense_exact_block<T, 256>(x, w, y, M, N, K, stream); break;
+    }
+}
+
+// Exact path requires even K and tightly packed row-major BF16/F32 weights.
+extern "C" void ink_launch_pf_dense_gemm_exact(const float* x, const void* w, float* y,
+        int M, int N, int K, int w_is_bf16, void* stream) {
+    if (M <= 0 || N <= 0) return;
+    if (w_is_bf16) {
+        pf_launch_dense_exact_type(x, (const __nv_bfloat16*)w, y, M, N, K, (cudaStream_t)stream);
+    } else {
+        pf_launch_dense_exact_type(x, (const float*)w, y, M, N, K, (cudaStream_t)stream);
+    }
+}
+
+extern "C" void ink_launch_pf_dense_gemm(const float* x, const void* w, float* y,
+        int M, int N, int K, int w_is_bf16, void* stream) {
+    if ((K & 1) == 0) {
+        ink_launch_pf_dense_gemm_exact(x, w, y, M, N, K, w_is_bf16, stream);
+    } else {
+        ink_launch_pf_dense_gemm_tiled(x, w, y, M, N, K, w_is_bf16, stream);
+    }
 }
 
 // Batched loop-controller chain in the reduction order of the serial fused

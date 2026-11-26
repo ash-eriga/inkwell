@@ -1345,8 +1345,13 @@ extern "C" {
     fn ink_launch_pf_clip_heads(x: *mut f32, scale: *const f32, c: i32, heads: i32, d: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_pf_add(x: *mut f32, y: *const f32, n: i64, stream: *mut c_void);
     fn ink_launch_pf_mul_sigmoid(x: *mut f32, gate: *const f32, n: i64, stream: *mut c_void);
+    fn ink_launch_pf_softcap(x: *mut f32, n: i32, cap: f32, stream: *mut c_void);
     fn ink_launch_pf_tau_qr(q: *mut f32, r: *mut f32, c: i32, log_alpha: f32, log_floor: f32, pos0: i32, stream: *mut c_void);
     fn ink_launch_pf_dense_gemm(x: *const f32, w: *const c_void, y: *mut f32,
+        m: i32, n: i32, k: i32, w_is_bf16: i32, stream: *mut c_void);
+    fn ink_launch_pf_dense_gemm_exact(x: *const f32, w: *const c_void, y: *mut f32,
+        m: i32, n: i32, k: i32, w_is_bf16: i32, stream: *mut c_void);
+    fn ink_launch_pf_dense_gemm_tiled(x: *const f32, w: *const c_void, y: *mut f32,
         m: i32, n: i32, k: i32, w_is_bf16: i32, stream: *mut c_void);
     fn ink_launch_pf_ctrl_exact(cur: *const f32, msg: *const f32, down: *const c_void,
         gf: *const c_void, gate: *mut f32, dst: *mut f32, c: i32, n: i32, rows: i32,
@@ -1441,8 +1446,11 @@ pfwrap!(pf_rmsnorm_async, ink_launch_pf_rmsnorm, x: *mut f32, w: *const f32, row
 pfwrap!(pf_clip_async, ink_launch_pf_clip_heads, x: *mut f32, scale: *const f32, c: i32, heads: i32, d: i32, thr: f32);
 pfwrap!(pf_add_async, ink_launch_pf_add, x: *mut f32, y: *const f32, n: i64);
 pfwrap!(pf_mul_sigmoid_async, ink_launch_pf_mul_sigmoid, x: *mut f32, gate: *const f32, n: i64);
+pfwrap!(pf_softcap_async, ink_launch_pf_softcap, x: *mut f32, n: i32, cap: f32);
 pfwrap!(pf_tau_qr_async, ink_launch_pf_tau_qr, q: *mut f32, r: *mut f32, c: i32, log_alpha: f32, log_floor: f32, pos0: i32);
 pfwrap!(pf_dense_gemm_async, ink_launch_pf_dense_gemm, x: *const f32, w: *const c_void, y: *mut f32, m: i32, n: i32, k: i32, w_is_bf16: i32);
+pfwrap!(pf_dense_gemm_exact_async, ink_launch_pf_dense_gemm_exact, x: *const f32, w: *const c_void, y: *mut f32, m: i32, n: i32, k: i32, w_is_bf16: i32);
+pfwrap!(pf_dense_gemm_tiled_async, ink_launch_pf_dense_gemm_tiled, x: *const f32, w: *const c_void, y: *mut f32, m: i32, n: i32, k: i32, w_is_bf16: i32);
 pfwrap!(pf_ctrl_exact_async, ink_launch_pf_ctrl_exact, cur: *const f32, msg: *const f32, down: *const c_void, gf: *const c_void, gate: *mut f32, dst: *mut f32, c: i32, n: i32, rows: i32, eps: f32, fo: i32);
 pfwrap!(pf_ctrl_apply_async, ink_launch_pf_ctrl_apply, gain: *const f32, forget: *const f32, cur: *mut f32, msg: *const f32, n: i64);
 pfwrap!(pf_ctrl_apply_cat_async, ink_launch_pf_ctrl_apply_cat, gf: *const f32, cur: *mut f32, msg: *const f32, c: i32, n: i32);

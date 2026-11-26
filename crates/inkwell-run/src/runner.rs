@@ -4215,6 +4215,26 @@ impl PfArena {
 
 fn tdata(x: Ptr) -> *mut f32 { unsafe { inkwell_ggml::ink_tensor_data(x.0).cast() } }
 fn ttype(x: Ptr) -> i32 { unsafe { inkwell_ggml::ink_tensor_type(x.0) } }
+
+fn pf_dense_exact_layout(w: Ptr, n: usize, k: usize) -> bool {
+    if k & 1 != 0 { return false; }
+    let ts: i64 = match ttype(w) {
+        BF16 => 2,
+        F32 => 4,
+        _ => return false,
+    };
+    let pair = 2 * ts;
+    unsafe {
+        inkwell_ggml::ink_tensor_ne(w.0, 0) == k as i64
+            && inkwell_ggml::ink_tensor_ne(w.0, 1) == n as i64
+            && inkwell_ggml::ink_tensor_nb(w.0, 0) == ts
+            && inkwell_ggml::ink_tensor_nb(w.0, 1) == k as i64 * ts
+            && (inkwell_ggml::ink_tensor_data(w.0) as usize) % (pair as usize) == 0
+            && inkwell_ggml::ink_tensor_nb(w.0, 2) % pair == 0
+            && inkwell_ggml::ink_tensor_nb(w.0, 3) % pair == 0
+    }
+}
+
 fn pf_copy(dst: *mut f32, src: *const f32, bytes: usize) {
     unsafe { inkwell_cuda::memcpy_d2d_async(dst.cast(), src.cast(), bytes) };
 }
@@ -4241,7 +4261,13 @@ impl Runner {
     }
     fn pf_dense(&self, x: *const f32, w: Ptr, y: *mut f32, c: usize, n: usize, k: usize) {
         let bf = i32::from(ttype(w) == BF16);
-        unsafe { inkwell_cuda::pf_dense_gemm_async(x, tdata(w).cast(), y, c as i32, n as i32, k as i32, bf) };
+        unsafe {
+            if pf_dense_exact_layout(w, n, k) && (x as usize) % 8 == 0 {
+                inkwell_cuda::pf_dense_gemm_exact_async(x, tdata(w).cast(), y, c as i32, n as i32, k as i32, bf);
+            } else {
+                inkwell_cuda::pf_dense_gemm_tiled_async(x, tdata(w).cast(), y, c as i32, n as i32, k as i32, bf);
+            }
+        }
     }
     fn pf_mix_run(&self, states: &[*const f32], query: Ptr, out: *mut f32, c: usize, qcols: usize) {
         let mut ps = [std::ptr::null::<std::ffi::c_void>(); 8];
@@ -4524,10 +4550,10 @@ impl Runner {
                 let e = &*self.exl3_w[oi];
                 pf_exl3(e, last.cast_const(), a.ptr("logits"), 1, a.ptr("scratch"));
                 let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
-                unsafe { inkwell_cuda::memcpy_d2h_sync(logits.as_mut_ptr().cast(), a.ptr("logits").cast_const().cast(), logits.len()*4) };
                 if self.cfg.softcap != 0.0 {
-                    for x in &mut logits { *x = (*x / self.cfg.softcap).tanh() * self.cfg.softcap; }
+                    unsafe { inkwell_cuda::pf_softcap_async(a.ptr("logits"), logits.len() as i32, self.cfg.softcap) };
                 }
+                unsafe { inkwell_cuda::memcpy_d2h_sync(logits.as_mut_ptr().cast(), a.ptr("logits").cast_const().cast(), logits.len()*4) };
                 out_logits = logits;
             }
             }
