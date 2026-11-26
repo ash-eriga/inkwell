@@ -6,10 +6,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static STOP_SERVER: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_sigint(_sig: libc::c_int) {
+    STOP_SERVER.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_sigint_handler() -> libc::sighandler_t {
+    STOP_SERVER.store(false, Ordering::SeqCst);
+    unsafe { libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t) }
+}
+
+#[cfg(unix)]
+fn restore_sigint_handler(prev: libc::sighandler_t) {
+    unsafe {
+        let _ = libc::signal(libc::SIGINT, prev);
+    }
+}
 
 /// Server launch configuration.
 #[derive(Debug, Clone)]
@@ -64,18 +84,32 @@ struct ServerInfo {
     jobs: Sender<InferJob>,
 }
 
-/// Start the OpenAI-compatible HTTP server. Runs the CUDA engine on the calling
-/// (large-stack) thread and handles HTTP connections on lightweight worker threads.
-pub fn run_server(opts: &ServeOpts) -> Result<(), String> {
+/// Start the OpenAI-compatible HTTP server, loading the model and returning the
+/// warm [`Engine`] when stopped via Ctrl+C so the caller can switch modes without reloading.
+pub fn run_server(opts: &ServeOpts) -> Result<Engine, String> {
     let _ = parse_effort(Some(&opts.default_effort))?;
     eprintln!("inkwell serve: loading {} (ctx={})...", opts.model, opts.ctx);
     let mut engine = Engine::load(&opts.model, opts.ctx)?;
+    run_server_with_engine(&mut engine, opts)?;
+    Ok(engine)
+}
+
+/// Serve OpenAI-compatible HTTP/SSE requests using an already-loaded [`Engine`].
+/// Stops cleanly on Ctrl+C (`SIGINT`), leaving the engine warm in VRAM.
+pub fn run_server_with_engine(engine: &mut Engine, opts: &ServeOpts) -> Result<(), String> {
+    let _ = parse_effort(Some(&opts.default_effort))?;
     let model_id = engine.model_id().to_owned();
     let max_ctx = engine.max_ctx();
 
     let addr = format!("{}:{}", opts.host, opts.port);
     let listener =
         TcpListener::bind(&addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to configure listener: {e}"))?;
+
+    #[cfg(unix)]
+    let prev_sig = install_sigint_handler();
 
     let (job_tx, job_rx) = mpsc::channel::<InferJob>();
     let info = Arc::new(ServerInfo {
@@ -87,37 +121,58 @@ pub fn run_server(opts: &ServeOpts) -> Result<(), String> {
     });
 
     eprintln!(
-        "\ninkwell server listening on http://{addr}\n  model:     {model_id}\n  max_ctx:   {max_ctx}\n  endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions\n"
+        "\ninkwell server listening on http://{addr}\n  model:     {model_id}\n  max_ctx:   {max_ctx}\n  endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions\n  press Ctrl+C to stop (keeps model warm for 4s)\n"
     );
 
     let accept_info = Arc::clone(&info);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            let st = Arc::clone(&accept_info);
-            std::thread::spawn(move || {
-                let _ = handle_conn(stream, &st);
-            });
+    let accept_handle = std::thread::spawn(move || {
+        while !STOP_SERVER.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let st = Arc::clone(&accept_info);
+                    std::thread::spawn(move || {
+                        let _ = handle_conn(stream, &st);
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                Err(_) => break,
+            }
         }
     });
 
-    for job in job_rx {
-        let ids = match &job.prompt {
-            PromptInput::Chat(s) => engine.tokenizer().encode_with_special(s),
-            PromptInput::Raw(s) => engine.tokenizer().encode(s),
-        };
-        let reply = job.reply;
-        match engine.generate(&ids, &job.params, |chunk| {
-            reply.send(JobEvent::Chunk(chunk)).is_ok()
-        }) {
-            Ok(stats) => {
-                let _ = reply.send(JobEvent::Done(stats));
+    while !STOP_SERVER.load(Ordering::Relaxed) {
+        match job_rx.recv_timeout(Duration::from_millis(60)) {
+            Ok(job) => {
+                let ids = match &job.prompt {
+                    PromptInput::Chat(s) => engine.tokenizer().encode_with_special(s),
+                    PromptInput::Raw(s) => engine.tokenizer().encode(s),
+                };
+                let reply = job.reply;
+                match engine.generate(&ids, &job.params, |chunk| {
+                    !STOP_SERVER.load(Ordering::Relaxed)
+                        && reply.send(JobEvent::Chunk(chunk)).is_ok()
+                }) {
+                    Ok(stats) => {
+                        let _ = reply.send(JobEvent::Done(stats));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(JobEvent::Err(e));
+                    }
+                }
             }
-            Err(e) => {
-                let _ = reply.send(JobEvent::Err(e));
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    drop(info);
+    let _ = accept_handle.join();
+    #[cfg(unix)]
+    restore_sigint_handler(prev_sig);
+    eprintln!("\ninkwell server stopped.");
     Ok(())
 }
 

@@ -373,13 +373,9 @@ pub fn run_oneshot(opts: &CliRunOpts) -> Result<(), String> {
     Ok(())
 }
 
-/// Interactive multi-turn terminal chat REPL.
-pub fn run_chat(opts: &CliRunOpts) -> Result<(), String> {
-    let mut effort = parse_effort(Some(&opts.effort))?;
-    let mut effort_label = opts.effort.clone();
-    let mut temperature = opts.temperature;
+/// Interactive multi-turn terminal chat REPL (loads model, then runs [`run_chat_with_engine`]).
+pub fn run_chat(opts: &CliRunOpts) -> Result<Engine, String> {
     let tty = io::stdout().is_terminal();
-
     eprintln!(
         "{}inkwell{} loading {} (ctx={})...",
         color(tty, BOLD),
@@ -388,6 +384,16 @@ pub fn run_chat(opts: &CliRunOpts) -> Result<(), String> {
         opts.ctx
     );
     let mut engine = Engine::load(&opts.model, opts.ctx)?;
+    run_chat_with_engine(&mut engine, opts)?;
+    Ok(engine)
+}
+
+/// Interactive multi-turn terminal chat REPL using an already-loaded [`Engine`].
+pub fn run_chat_with_engine(engine: &mut Engine, opts: &CliRunOpts) -> Result<(), String> {
+    let mut effort = parse_effort(Some(&opts.effort))?;
+    let mut effort_label = opts.effort.clone();
+    let mut temperature = opts.temperature;
+    let tty = io::stdout().is_terminal();
 
     let mut history: Vec<ChatMessage> = Vec::new();
     if let Some(sys) = &opts.system {
