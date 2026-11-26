@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 inkwell-gguf = { path = "../inkwell-gguf" }
 fancy-regex = "0.14"
+rustc-hash = "2.1"
 thiserror = "2"
 
 [lints]

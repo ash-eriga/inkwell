@@ -782,11 +782,44 @@ fn bf16_t(d: &[u8], shape: &[u64]) -> Vec<u8> {
 /// bf16 bytes -> f32 bytes.
 fn bf16_to_f32(d: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; d.len() * 2];
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { bf16_to_f32_avx2(d, &mut out) };
+        return out;
+    }
+    bf16_to_f32_scalar(d, &mut out);
+    out
+}
+
+fn bf16_to_f32_scalar(d: &[u8], out: &mut [u8]) {
     for (i, ch) in d.chunks_exact(2).enumerate() {
         let bits = u32::from(ch[0]) | (u32::from(ch[1]) << 8);
         out[i * 4..i * 4 + 4].copy_from_slice(&(bits << 16).to_le_bytes());
     }
-    out
+}
+
+/// Widening is an exact bit shift, so SIMD conversion is bit-identical to the
+/// scalar loop while doing eight elements per iteration.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bf16_to_f32_avx2(d: &[u8], out: &mut [u8]) {
+    use core::arch::x86_64::{
+        _mm_loadu_si128, _mm256_cvtepu16_epi32, _mm256_slli_epi32, _mm256_storeu_si256,
+    };
+    let n = d.len() / 2;
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let x = unsafe { _mm_loadu_si128(d.as_ptr().add(i * 2).cast()) };
+        let wide = unsafe { _mm256_cvtepu16_epi32(x) };
+        let shifted = unsafe { _mm256_slli_epi32(wide, 16) };
+        unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(i * 4).cast(), shifted) };
+        i += 8;
+    }
+    while i < n {
+        let bits = u32::from(d[i * 2]) | (u32::from(d[i * 2 + 1]) << 8);
+        out[i * 4..i * 4 + 4].copy_from_slice(&(bits << 16).to_le_bytes());
+        i += 1;
+    }
 }
 
 /// Tensor layout and bytes for a safetensors mul_mat weight, using the same
@@ -1217,12 +1250,19 @@ impl Runner {
                 let ti = tp($name);
                 let mut dims: Vec<i64> = ti.shape.iter().rev().map(|&d| d as i64).collect();
                 dims.retain(|&d| d != 1);
-                let bytes = if ti.dtype == "BF16" { bf16_to_f32(dtp($name)) }
-                    else { assert_eq!(ti.dtype, "F32"); dtp($name).to_vec() };
                 let ten = t::new(rt.ctx(), F32, &dims);
                 let o = (off_dev + 127) & !127;
                 dev_buf.assign(ten, o);
-                unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                let src = dtp($name);
+                if ti.dtype == "BF16" {
+                    let bytes = bf16_to_f32(src);
+                    unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                } else {
+                    assert_eq!(ti.dtype, "F32");
+                    // F32 safetensors already have the exact upload bytes;
+                    // copying them into a temporary Vec first is pure startup cost.
+                    unsafe { t::set(ten, src.as_ptr(), 0, src.len()) };
+                }
                 off_dev = o + t::nbytes(ten);
                 ten
             }};
@@ -1237,15 +1277,21 @@ impl Runner {
                 let ti = tp($name);
                 let mut dims: Vec<i64> = ti.shape.iter().rev().map(|&d| d as i64).collect();
                 dims.retain(|&d| d != 1);
-                let (ty, bytes) = if bf16_ok($name) && ti.dtype == "BF16" {
-                    (BF16, dtp($name).to_vec())
-                } else if ti.dtype == "BF16" {
-                    (F32, bf16_to_f32(dtp($name)))
-                } else { assert_eq!(ti.dtype, "F32"); (F32, dtp($name).to_vec()) };
+                let src = dtp($name);
+                let keep_bf16 = bf16_ok($name) && ti.dtype == "BF16";
+                let ty = if keep_bf16 { BF16 } else { F32 };
                 let ten = t::new(rt.ctx(), ty, &dims);
                 let o = (off_dev + 127) & !127;
                 dev_buf.assign(ten, o);
-                unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                if ti.dtype == "BF16" && !keep_bf16 {
+                    let bytes = bf16_to_f32(src);
+                    unsafe { t::set(ten, bytes.as_ptr(), 0, bytes.len()) };
+                } else {
+                    if !keep_bf16 { assert_eq!(ti.dtype, "F32"); }
+                    // Keep-BF16 and F32 inputs upload straight from the mmap
+                    // without a host-side copy.
+                    unsafe { t::set(ten, src.as_ptr(), 0, src.len()) };
+                }
                 off_dev = o + t::nbytes(ten);
                 ten
             }};

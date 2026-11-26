@@ -151,6 +151,7 @@ name = "inkwell-st"
 version = "0.1.0"
 dependencies = [
  "memmap2",
+ "serde",
  "serde_json",
  "thiserror",
 ]
@@ -161,6 +162,7 @@ version = "0.1.0"
 dependencies = [
  "fancy-regex",
  "inkwell-gguf",
+ "rustc-hash",
  "thiserror",
 ]
 
@@ -225,6 +227,12 @@ name = "regex-syntax"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "serde"

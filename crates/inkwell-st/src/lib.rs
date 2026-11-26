@@ -6,6 +6,8 @@ use std::fs::File;
 use std::path::Path;
 
 use memmap2::Mmap;
+use serde::de::{self, MapAccess, Visitor};
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -54,6 +56,48 @@ impl StTensor {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct HeaderTensor {
+    dtype: String,
+    shape: Vec<u64>,
+    data_offsets: [u64; 2],
+}
+
+#[derive(Debug)]
+struct TensorHeader(Vec<(String, HeaderTensor)>);
+
+impl<'de> Deserialize<'de> for TensorHeader {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HeaderVisitor;
+        impl<'de> Visitor<'de> for HeaderVisitor {
+            type Value = TensorHeader;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a safetensors header object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "__metadata__" {
+                        map.next_value::<de::IgnoredAny>()?;
+                    } else {
+                        entries.push((key, map.next_value::<HeaderTensor>()?));
+                    }
+                }
+                Ok(TensorHeader(entries))
+            }
+        }
+        deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
 /// An opened safetensors file: mmap'd, header parsed, tensor index built.
 #[derive(Debug)]
 pub struct StFile {
@@ -77,48 +121,24 @@ impl StFile {
         }
         let hlen = u64::from_le_bytes(mmap[0..8].try_into().expect("8-byte slice")) as usize;
         let hstart = 8usize;
-        let hend = hstart
-            .checked_add(hlen)
-            .ok_or(StError::Truncated(hstart))?;
+        let hend = hstart.checked_add(hlen).ok_or(StError::Truncated(hstart))?;
         if hend > mmap.len() {
             return Err(StError::Truncated(hend));
         }
-        let hdr: Value = serde_json::from_slice(&mmap[hstart..hend])?;
-        let obj = hdr
-            .as_object()
-            .ok_or_else(|| StError::Malformed("header not an object".into()))?;
-
-        let mut tensors = HashMap::with_capacity(obj.len());
-        for (name, ent) in obj {
-            if name == "__metadata__" {
-                continue;
-            }
-            let dtype = ent
-                .get("dtype")
-                .and_then(Value::as_str)
-                .ok_or_else(|| StError::Malformed(name.clone()))?
-                .to_owned();
-            let shape: Vec<u64> = ent
-                .get("shape")
-                .and_then(Value::as_array)
-                .ok_or_else(|| StError::Malformed(name.clone()))?
-                .iter()
-                .filter_map(Value::as_u64)
-                .collect();
-            let offs = ent
-                .get("data_offsets")
-                .and_then(Value::as_array)
-                .ok_or_else(|| StError::Malformed(name.clone()))?;
-            let begin = offs.first().and_then(Value::as_u64).unwrap_or(0);
-            let end = offs.get(1).and_then(Value::as_u64).unwrap_or(0);
+        // Parse directly into tensor entries rather than a serde_json::Value
+        // DOM. The first shard's 4.5 MB header has ~37k entries; avoiding the
+        // DOM removes millions of temporary allocations at startup.
+        let hdr: TensorHeader = serde_json::from_slice(&mmap[hstart..hend])?;
+        let mut tensors = HashMap::with_capacity(hdr.0.len());
+        for (name, ent) in hdr.0 {
             tensors.insert(
                 name.clone(),
                 StTensor {
-                    name: name.clone(),
-                    dtype,
-                    shape,
-                    begin,
-                    end,
+                    name,
+                    dtype: ent.dtype,
+                    shape: ent.shape,
+                    begin: ent.data_offsets[0],
+                    end: ent.data_offsets[1],
                 },
             );
         }
@@ -158,8 +178,15 @@ impl StRepo {
         let path = path.as_ref();
         if path.is_file() {
             let f = StFile::open(path)?;
-            let tensors = f.tensors.iter().map(|(n, t)| (n.clone(), (0usize, t.clone()))).collect();
-            return Ok(Self { files: vec![f], tensors });
+            let tensors = f
+                .tensors
+                .iter()
+                .map(|(n, t)| (n.clone(), (0usize, t.clone())))
+                .collect();
+            return Ok(Self {
+                files: vec![f],
+                tensors,
+            });
         }
         let idx_p = path.join("model.safetensors.index.json");
         let idx: Value = serde_json::from_slice(&std::fs::read(&idx_p)?)?;
@@ -167,7 +194,11 @@ impl StRepo {
             .get("weight_map")
             .and_then(Value::as_object)
             .ok_or_else(|| StError::Malformed("weight_map".into()))?;
-        let mut shards: Vec<String> = wm.values().filter_map(Value::as_str).map(str::to_owned).collect();
+        let mut shards: Vec<String> = wm
+            .values()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
         shards.sort();
         shards.dedup();
         let mut files = Vec::with_capacity(shards.len());
