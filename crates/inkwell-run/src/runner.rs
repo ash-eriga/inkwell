@@ -4221,6 +4221,7 @@ struct PfExpertStageBuf {
     dd: inkwell_cuda::DevBuf,
     reuse_event: *mut std::ffi::c_void,
     done_event: *mut std::ffi::c_void,
+    layer: i32,
 }
 
 struct PfExpertStage {
@@ -4242,6 +4243,7 @@ impl PfExpertStage {
                 dd: inkwell_cuda::DevBuf::new_bytes(4096),
                 reuse_event: inkwell_cuda::new_event(),
                 done_event: inkwell_cuda::new_event(),
+                layer: -1,
             });
         }
         Some(Self { bufs, next: 0, table_keepalive: Vec::new() })
@@ -4264,6 +4266,12 @@ fn pf_host_experts(r: &Runner, il: usize) -> Option<&crate::moe::MoeArgsExl3> {
 /// cannot overwrite the slot before all previously enqueued consumers retire.
 fn pf_prepare_experts(r: &Runner, stage: &mut PfExpertStage, il: usize) -> Option<usize> {
     let m = pf_host_experts(r, il)?;
+    // Repeated loop layers revisit identical weights with only the other loop
+    // layer interleaved.  If either double-buffer slot already holds this
+    // layer, reuse it instead of streaming hundreds of MiB again.
+    if let Some(hit) = stage.bufs.iter().position(|b| b.layer == il as i32) {
+        return Some(hit);
+    }
     let bi = stage.next;
     stage.next ^= 1;
     let b = &mut stage.bufs[bi];
@@ -4292,6 +4300,7 @@ fn pf_prepare_experts(r: &Runner, stage: &mut PfExpertStage, il: usize) -> Optio
         inkwell_cuda::event_record(b.done_event, inkwell_cuda::side_stream_raw());
     }
     stage.table_keepalive.push(table);
+    b.layer = il as i32;
     Some(bi)
 }
 
