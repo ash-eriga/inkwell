@@ -14,6 +14,7 @@ forces=(/tmp/inkwell-pf-bench/f128.ids "$CORPUS/f513.ids" "$CORPUS/f2049.ids" "$
 
 for i in "${!labels[@]}"; do
   n="${labels[$i]}"
+  mkdir -p "$OUT/$n"
   for mode in serial prefill; do
     od="$OUT/$n/$mode"
     rm -rf "$od"
