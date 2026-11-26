@@ -3,6 +3,7 @@
 mod chat_template;
 mod cli_ui;
 mod engine;
+mod models;
 mod server;
 
 use inkwell_core::InklingConfig;
@@ -13,9 +14,10 @@ const HELP_TEXT: &str = "\
 inkwell 0.1.0 — local EXL3/GGUF inference engine for Inkling-2
 
 USAGE:
-  inkwell serve <model> [OPTIONS]       Start OpenAI-compatible HTTP/SSE server
-  inkwell chat  <model> [OPTIONS]       Interactive multi-turn terminal chat
+  inkwell serve [model] [OPTIONS]       Start OpenAI-compatible HTTP/SSE server (interactive picker if model omitted)
+  inkwell chat  [model] [OPTIONS]       Interactive multi-turn terminal chat (interactive picker if model omitted)
   inkwell run   <model> -p <prompt>     One-shot streaming generation
+  inkwell models                        List local EXL3 models and Hugging Face EXL3 presets
   inkwell <model> --run                 Legacy benchmark harness
 
 SERVE OPTIONS:
@@ -54,18 +56,16 @@ fn next_val(args: &mut std::iter::Skip<std::env::Args>, flag: &str) -> Result<St
 }
 
 fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), String> {
-    let model = args
-        .next()
-        .ok_or_else(|| "usage: inkwell serve <model> [--host 127.0.0.1] [--port 8080] [--ctx 4096]".to_owned())?;
+    let mut model: Option<String> = None;
     let mut opts = server::ServeOpts {
-        model,
+        model: String::new(),
         host: "127.0.0.1".to_owned(),
         port: 8080,
         ctx: 4096,
         default_effort: "none".to_owned(),
     };
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--host" => opts.host = next_val(&mut args, "--host")?,
             "--port" => {
                 let v = next_val(&mut args, "--port")?;
@@ -80,9 +80,16 @@ fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), 
                 print!("{HELP_TEXT}");
                 return Ok(());
             }
+            other if !other.starts_with('-') && model.is_none() => {
+                model = Some(other.to_owned());
+            }
             other => return Err(format!("unknown option for serve: {other}")),
         }
     }
+    opts.model = match model {
+        Some(m) => m,
+        None => models::select_or_download_model()?,
+    };
     run_on_big_stack(move || server::run_server(&opts))
 }
 
@@ -90,16 +97,11 @@ fn parse_cli_opts(
     mut args: std::iter::Skip<std::env::Args>,
     cmd: &str,
 ) -> Result<cli_ui::CliRunOpts, String> {
-    let model = args
-        .next()
-        .ok_or_else(|| format!("usage: inkwell {cmd} <model> [OPTIONS]"))?;
-    let mut opts = cli_ui::CliRunOpts {
-        model,
-        ..cli_ui::CliRunOpts::default()
-    };
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "-p" | "--prompt" => opts.prompt = Some(next_val(&mut args, &flag)?),
+    let mut model: Option<String> = None;
+    let mut opts = cli_ui::CliRunOpts::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-p" | "--prompt" => opts.prompt = Some(next_val(&mut args, &arg)?),
             "--system" => opts.system = Some(next_val(&mut args, "--system")?),
             "--ctx" => {
                 let v = next_val(&mut args, "--ctx")?;
@@ -110,7 +112,7 @@ fn parse_cli_opts(
                 opts.max_tokens = v.parse().map_err(|_| format!("invalid max-tokens: {v}"))?;
             }
             "--temp" | "--temperature" => {
-                let v = next_val(&mut args, &flag)?;
+                let v = next_val(&mut args, &arg)?;
                 opts.temperature = v.parse().map_err(|_| format!("invalid temp: {v}"))?;
             }
             "--top-p" => {
@@ -127,9 +129,16 @@ fn parse_cli_opts(
                 print!("{HELP_TEXT}");
                 std::process::exit(0);
             }
+            other if !other.starts_with('-') && model.is_none() => {
+                model = Some(other.to_owned());
+            }
             other => return Err(format!("unknown option for {cmd}: {other}")),
         }
     }
+    opts.model = match model {
+        Some(m) => m,
+        None => models::select_or_download_model()?,
+    };
     Ok(opts)
 }
 
@@ -146,6 +155,10 @@ fn main() {
         }
         "-V" | "--version" => {
             println!("inkwell {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        "models" => {
+            models::print_model_catalog();
             return;
         }
         "serve" => {

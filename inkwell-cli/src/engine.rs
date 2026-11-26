@@ -159,8 +159,22 @@ impl Engine {
         let p = Path::new(model_path);
         let is_dir = p.is_dir();
         let gguf_path = if is_dir {
-            std::env::var("INKWELL_TOK_GGUF")
-                .unwrap_or_else(|_| format!("{model_path}/Inkling-2-Mini-UD-IQ2_XXS.gguf"))
+            if let Ok(env_gg) = std::env::var("INKWELL_TOK_GGUF") {
+                env_gg
+            } else {
+                let local_gg = format!("{model_path}/Inkling-2-Mini-UD-IQ2_XXS.gguf");
+                if Path::new(&local_gg).is_file() {
+                    local_gg
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+                    let fallback = format!("{home}/models/inkling/Inkling-2-Mini-UD-IQ2_XXS.gguf");
+                    if Path::new(&fallback).is_file() {
+                        fallback
+                    } else {
+                        local_gg
+                    }
+                }
+            }
         } else {
             model_path.to_owned()
         };
