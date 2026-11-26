@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
+#include <cstdlib>
 
 #define PF_INV_SQRT128 0.08838834764831845f
 
@@ -882,6 +883,18 @@ extern "C" void ink_launch_exl3_moe_group_sort(const int* ids, const float* weig
 __global__ void inkwell_moe_fill_row_expert(const int*, const int*, const int*, const int*, int*);
 __global__ void inkwell_moe_had_out_pair_rows(const uint64_t*, const uint64_t*, const int*, const float*, const float*, float*, int, int);
 
+static void pf_launch_grouped_gemm_kernel(bool bm64, dim3 g, const void* descs,
+        const int* tile_expert, const int* tile_start, const int* tile_count, const int* tile_n,
+        const float* xh, float* y, int tk, int tn, cudaStream_t st) {
+    if (bm64) {
+        inkwell_exl3_moe_grouped_gemm64_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+            tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0);
+    } else {
+        inkwell_exl3_moe_grouped_gemm_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+            tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0);
+    }
+}
+
 // Full grouped MoE pipeline over rows already sorted by inkwell_exl3_moe_group_sort.
 // Workspace layout (floats unless noted): A[P*2304], B[P*2304], T[P*2304],
 // then row_expert[P] as int.  Stream ordering lets the short-lived arrays
@@ -915,11 +928,13 @@ extern "C" void ink_launch_exl3_moe_grouped_gemm(
     inkwell_moe_had_in_rows<<<hig, 128, 0, st>>>((const uint64_t*)descs_g, row_expert, sorted_token, x, xhg, P, KG);
     inkwell_moe_had_in_rows<<<hug, 128, 0, st>>>((const uint64_t*)descs_u, row_expert, sorted_token, x, xhu, P, KG);
     const int max_tiles = P / 64 + 128;
+    const char* bm64e = getenv("INKWELL_PF_MOE_BM64");
+    const bool bm64 = bm64e == nullptr || bm64e[0] != '0';
     dim3 gg((NG / 16 + 3) / 4, max_tiles);
-    inkwell_exl3_moe_grouped_gemm_kernel<<<gg, 256, 0, st>>>((const uint64_t*)descs_g,
-        tile_expert, tile_start, tile_count, tile_n, xhg, tg, KG / 16, NG / 16, 0);
-    inkwell_exl3_moe_grouped_gemm_kernel<<<gg, 256, 0, st>>>((const uint64_t*)descs_u,
-        tile_expert, tile_start, tile_count, tile_n, xhu, tu, KG / 16, NG / 16, 0);
+    pf_launch_grouped_gemm_kernel(bm64, gg, descs_g,
+        tile_expert, tile_start, tile_count, tile_n, xhg, tg, KG / 16, NG / 16, st);
+    pf_launch_grouped_gemm_kernel(bm64, gg, descs_u,
+        tile_expert, tile_start, tile_count, tile_n, xhu, tu, KG / 16, NG / 16, st);
     dim3 hog(NG / 128, P, 2);
     // Write gate into gu[:,0,:] and up into gu[:,1,:] using a strided temporary layout.
     // tg/tu are contiguous rows; the epilogue kernels below interleave them into gu halves.
@@ -928,8 +943,8 @@ extern "C" void ink_launch_exl3_moe_grouped_gemm(
     dim3 hd(NG / 128, P);
     inkwell_moe_situ_had_rows<<<hd, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, gu, xhd, 4.f, 25.f, P, NG);
     dim3 gd((ND / 16 + 3) / 4, max_tiles);
-    inkwell_exl3_moe_grouped_gemm_kernel<<<gd, 256, 0, st>>>((const uint64_t*)descs_d,
-        tile_expert, tile_start, tile_count, tile_n, xhd, td, NG / 16, ND / 16, 0);
+    pf_launch_grouped_gemm_kernel(bm64, gd, descs_d,
+        tile_expert, tile_start, tile_count, tile_n, xhd, td, NG / 16, ND / 16, st);
     dim3 hod(ND / 128, P);
     inkwell_moe_had_out_rows<<<hod, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, td, dn, P, ND);
     dim3 gs((ND + 255) / 256, C);
