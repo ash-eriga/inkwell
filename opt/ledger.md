@@ -2311,3 +2311,7 @@ Base `e5dea6c`; branch `t3/m3a-sink-relbias-port`. Ports the M3a `sink_relbias_f
 ## t3/m3a-sink-relbias-port (1441a23) — brain validation — ACCEPTED, merged (fast-forward)
 - Agent A/B vs ctl-master-f46f37f: 28.079 → 27.445 ms/tok (−0.634), 16/16, md5 5cbe8e06 all runs, peak 5,048 MiB (−12 MiB vs master). Gate A: KLD 8.0e-4 vs noise-floor 1.06e-3, top-1 disagreement 1.12% vs 0.73%, PPL Δ +0.045%; all 95% CIs overlap over 2,048 teacher-forced tokens.
 - Brain validate on the same binary (gpu-run -p high), 3 runs: 27.475 / 27.267 / 27.404 ms/tok, md5 5cbe8e06 ×3, peak 5,048 MiB. Killswitch INKWELL_NO_SINKRELBIAS=1. Build warnings 64 (at limit).
+
+## t3/decode-latency-25ms — HADVEC default-on — ACCEPTED
+
+The fused/vectorized MoE Hadamard chain is now default-on; `INKWELL_NO_HADVEC=1` is the killswitch. Clean 16-pair interleaved A/B against the frozen master control `b38f787ebb05dec43c644d13a7a368c000fb5c4cf58071d4f0630bc277fa3fc7`: `runs ctl=16 cand=16 ctl_med=27.435 cand_med=27.224 delta=-0.211 wins=16/16 md5=['5cbe8e06'] peak=5048`. Candidate binary sha256 `1f268f076bfcf4837e6b247037e48dd3d3e478e83a97a75d72b11f79a0c757e2`. Raw output: `/home/ash/.cache/inkwell-dec25/ab-hadvec-clean/out`; summary: `/home/ash/.cache/inkwell-dec25/ab-hadvec-clean/summary.manual`. PW16 remains rejected under the exactness gate in this tree (`md5 7aa1f58b` rather than `5cbe8e06`).
