@@ -3316,6 +3316,7 @@ impl Runner {
     pub fn clear_step_cache(&mut self) {
         self.step_gcache = None;
         self.set_queued(i64::MIN);
+        self.set_marshaled(i64::MIN);
     }
 
 
@@ -3797,6 +3798,7 @@ impl Runner {
     /// Reset per-sequence state (zero conv states and clear cached step graph)
     /// so the runner can serve a fresh prompt from position 0 without reloading weights.
     pub fn reset(&mut self) {
+        inkwell_cuda::DevBuf::sync();
         self.clear_step_cache();
         for s in &self.conv_state {
             unsafe {
