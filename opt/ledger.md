@@ -2289,3 +2289,21 @@ Earlier same-binary comparison measurements before final dispatch were grouped 1
 - Default (cache32 on), 3 runs: md5 5cbe8e06 ×3, 28.46 / 28.69 / 30.50 ms/tok, **peak 5,096 MiB > 5,080 cap**. Master prefill01 is 5,060; cache32 (reserve 96→64 MiB, 1,232 MiB table) plus the +28 MiB headless prompt graph no longer fit.
 - `INKWELL_NO_CACHE32=1`: peak 5,064. A/B 16 pairs vs ctl-master-f46f37f: ctl 28.490 vs cand 28.416 median (−0.075), **8/16**, one cand abort (`cudaGraphInstantiate` out of memory, run 30). The split-D copy + hit pipeline alone carry no measurable win; the −0.328 ms on 17c3b3c came from cache32.
 - Action: retry with cache32 after prefill phase 2 reclaims the headless-graph VRAM (phase-2 contract). The OOM in graph instantiate at 5,064 is a margin warning: whatever lands must keep instantiate headroom, not just steady-state peak.
+
+## t3/m3a-sink-relbias-port — production fused sink projection + rel-bias — ACCEPTED
+
+Base `e5dea6c`; branch `t3/m3a-sink-relbias-port`. Ports the M3a `sink_relbias_fused` kernel into decode. The fused custom op is default-on and replaces the BF16 `attn_sink_proj` mmvf, the `[1025,24,16]` rel-bias SGEMM, and the gather/subtract epilogue. `INKWELL_NO_SINKRELBIAS=1` restores the old chain. The padded rel-bias table is stored transposed as BF16 when fused (about 769 KiB less dense weight storage); dynamic full/SWA-ring/legacy positions are computed with the same mode logic as `relbias_gather_dynpos`, and oracle/static modes read the host rel-pos array.
+
+**Kernel-level gate.** Real layer-5 pass-0 inputs at position 64 were dumped from production (`opt/kbench/sinkrelbias_real/`). Against the shipped-path reference (cuBLAS rel SGEMM + mmvf sink + gather), fused V0 had `bit_diffs=645/1536`, `max_abs=9.54e-7`, `max_rel=1.04e-5` (near-zero denominators inflate max_rel; bench-scale max_abs). The production kernel output was bit-identical to harness V0, as expected. Tested alternate K=16 orders V1–V5 were not bit-exact, so the port remains a small FP32 reorder.
+
+**Whole-model quality gate.** Eight distinct real-text prompts, exact 512-token prefixes, teacher-forced 256 continuations each (2,048 scored tokens per arm). KLD is master || candidate, full softcap-corrected softmax rows. The FP32-noise floor is one deterministic `INKWELL_ACTQ_SIM=noise:1e-6` realization over the same rows; its no-noise binary reproduced the master baseline bit-for-bit on prompt 1. Prompt-cluster bootstrap CIs overlap on all three metrics, so the candidate is statistically indistinguishable from the noise floor.
+
+| metric | candidate | candidate 95% CI | noise floor | noise 95% CI |
+|---|---:|---:|---:|---:|
+| mean KLD | 8.0036e-4 | [5.484e-4, 1.1095e-3] | 1.0631e-3 | [4.944e-4, 1.9385e-3] |
+| top-1 disagreement | 1.1230% | [0.6836%, 1.6602%] | 0.7324% | [0.3418%, 1.2207%] |
+| forced-target PPL delta | +0.0448% | [-0.1083%, +0.2427%] | -0.0093% | [-0.2171%, +0.1777%] |
+
+**Validation.** Release build rc0; 64 warning diagnostics (limit 64). Canonical validation of the exact candidate binary: md5 `5cbe8e06` on 3/3 runs, decode 27.411 / 27.342 / 27.469 ms/tok, peak 5,048 MiB each, `ch2nopless: enabled`; no cudaGraphInstantiate OOM.
+
+**A/B.** 16 interleaved pairs vs `ctl-master-f46f37f-inkwell`: `runs ctl=16 cand=16 ctl_med=28.079 cand_med=27.445 delta=-0.634 wins=16/16 md5=['5cbe8e06'] peak=5060`. Candidate arm peaked at 5,048 MiB vs control 5,060 MiB. Median is 0.634 ms/tok faster, above the 0.29–0.55 ms/tok prediction; all runs retained the canonical md5.
