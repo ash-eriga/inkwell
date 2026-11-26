@@ -2327,3 +2327,22 @@ Base `e5dea6c`; branch `t3/m3a-sink-relbias-port`. Ports the M3a `sink_relbias_f
   - Only Q-B with G64 crosses FP32, at m ≈ 59–66.
   - This withdraws C7's modelled 128.8/135.2 at m=32/128 as an envelope prediction.
 - **Verdict:** nothing to port. Challenge 10 is looking for a way past the floor and will deliver sm_61 micro-benchmarks to test the cost model on the real GPU.
+
+## Challenge 10 — NF10-LX INT8 (G128 strip16, base-254 Karatsuba, bank-private 12-bit digit LUT); sm_61 silicon check
+
+- **Fidelity (CPU, real rows):** PASS. Q1 is 2.83e-5 on moe_gu and 2.71e-5 on moe_dn, both under ε 3e-5.
+- **Model claim:** ≥1.019× vs FP32 at every m (1.033 at m=1, 1.040 at m=8, 1.059 at m=128). The Lean optimality proof holds only within the NF10 class.
+- **GTX 1060 micro-benchmarks** (`gpu-run -p high`; sources and SASS in `~/.cache/c10-mb`):
+
+  | probe | measured | expected | verdict |
+  |---|---|---|---|
+  | core dp4a | 1.953 warp-instr/clk/SM | — | — |
+  | shift SHF | 1.853 warp-instr/clk/SM | — | — |
+  | mixed core+shift | 1.877; mixed/core 0.961 | serialised ≈ 1.0; independent pipes ≥ 1.3 | serialisation confirmed, so the Ch9 floor is real |
+  | PRMT | 1.870; +shift ratio 1.021 | 1.7–2.1 | PASS, PRMT behaves as an independent pipe |
+  | digit LUT, as delivered (`%` index, branchy) | 2.19 lookups/SM-cycle | ≥ 20 (refit below 17) | FAIL |
+  | digit LUT, fair variant (add/select index, branchless 2×LDS + SHF.R.W), 256/512/1024 thr | 6.99 / 7.26 / 7.97 lookups/SM-cycle | ≥ 20 | FAIL |
+  | lut_unpack | 1.28 M cycles per 2000 iterations, no spills | — | toy probe; no per-weight number |
+
+- **Why the LUT misses:** a 12-bit entry that straddles a 32-bit word needs 2 LDS. One warp-wide LDS per clock then caps throughput at 16 lookups/SM-cycle, already below the refit threshold. With the extraction ALU work the measured rate is about 8.
+- **Verdict:** Ch10's speed claim is refuted on silicon. There is nothing to port. INT8 on sm_61 does not beat FP32 at ε 3e-5 with the published constructions. Any next attempt needs a cost model fitted to these measured rates (about 4 warp-instr/clk/SM issue with core and shift serialised; 2 LDS per straddling LUT entry).
