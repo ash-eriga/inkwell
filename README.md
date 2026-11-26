@@ -30,23 +30,32 @@ cargo build --release
 
 ## Quick Start
 
-### Interactive Chat
+### Interactive Chat & Model Picker
 
 ```bash
-inkwell chat /path/to/inkling --ctx 4096 --effort none
+inkwell chat                    # opens EXL3 local + Hugging Face preset picker
+inkwell chat ~/models/inkling --ctx 4096 --effort none
 ```
 
 ### One-Shot Generation
 
 ```bash
-inkwell run /path/to/inkling -p "Explain trellis quantization in 3 bullet points." --max-tokens 256
+inkwell run ~/models/inkling -p "Explain trellis quantization in 3 bullet points." --max-tokens 256
 ```
 
 ### OpenAI-Compatible Server
 
 ```bash
-inkwell serve /path/to/inkling --host 127.0.0.1 --port 8080 --ctx 4096
+inkwell serve                   # opens EXL3 model picker & auto-downloader
+inkwell serve ~/models/inkling --host 127.0.0.1 --port 8080 --ctx 4096
 ```
+
+Pass `--verbose` (or `INKWELL_VERBOSE=1`) to display internal VRAM, cache, and prefill diagnostics.
+
+## Roadmap
+
+- **v0.1.5**: Compressed KV cache (32k / 64k context on 6 GB VRAM), further kernel refinement toward sub-25 ms/tok short-context decode.
+- **v0.2**: Built-in Vercel `fx` integration for an embedded interactive chat experience alongside the local model, plus standalone EXL3 Pascal kernels on the Hugging Face Kernel Hub.
 
 Test with `curl`:
 

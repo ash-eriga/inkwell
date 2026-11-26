@@ -25,6 +25,7 @@ SERVE OPTIONS:
   --port <port>           Bind port (default: 8080)
   --ctx <tokens>          Max context length (default: 4096)
   --effort <level>        Default reasoning effort: none|minimal|low|medium|high|max (default: none)
+  -v, --verbose           Show internal VRAM/cache/prefill diagnostics
 
 CHAT / RUN OPTIONS:
   -p, --prompt <text>     Prompt text (required for `run`)
@@ -36,6 +37,7 @@ CHAT / RUN OPTIONS:
   --top-k <n>             Top-k sampling cap (default: 40)
   --effort <level>        Reasoning effort: none|minimal|low|medium|high|max (default: none)
   --raw                   Skip chat template (`run` only)
+  -v, --verbose           Show internal VRAM/cache/prefill diagnostics
 ";
 
 fn run_on_big_stack<F>(f: F) -> Result<(), String>
@@ -57,6 +59,7 @@ fn next_val(args: &mut std::iter::Skip<std::env::Args>, flag: &str) -> Result<St
 
 fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), String> {
     let mut model: Option<String> = None;
+    let mut verbose = std::env::var_os("INKWELL_VERBOSE").is_some();
     let mut opts = server::ServeOpts {
         model: String::new(),
         host: "127.0.0.1".to_owned(),
@@ -76,6 +79,7 @@ fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), 
                 opts.ctx = v.parse().map_err(|_| format!("invalid ctx: {v}"))?;
             }
             "--effort" => opts.default_effort = next_val(&mut args, "--effort")?,
+            "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => {
                 print!("{HELP_TEXT}");
                 return Ok(());
@@ -86,6 +90,7 @@ fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), 
             other => return Err(format!("unknown option for serve: {other}")),
         }
     }
+    inkwell_run::runner::set_verbose(verbose);
     opts.model = match model {
         Some(m) => m,
         None => models::select_or_download_model()?,
@@ -98,6 +103,7 @@ fn parse_cli_opts(
     cmd: &str,
 ) -> Result<cli_ui::CliRunOpts, String> {
     let mut model: Option<String> = None;
+    let mut verbose = std::env::var_os("INKWELL_VERBOSE").is_some();
     let mut opts = cli_ui::CliRunOpts::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -125,6 +131,7 @@ fn parse_cli_opts(
             }
             "--effort" => opts.effort = next_val(&mut args, "--effort")?,
             "--raw" => opts.raw = true,
+            "-v" | "--verbose" => verbose = true,
             "-h" | "--help" => {
                 print!("{HELP_TEXT}");
                 std::process::exit(0);
@@ -135,6 +142,7 @@ fn parse_cli_opts(
             other => return Err(format!("unknown option for {cmd}: {other}")),
         }
     }
+    inkwell_run::runner::set_verbose(verbose);
     opts.model = match model {
         Some(m) => m,
         None => models::select_or_download_model()?,

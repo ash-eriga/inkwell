@@ -80,8 +80,10 @@ fn safetensors_size(dir: &Path) -> u64 {
     for entry in rd.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
-            if let Ok(meta) = fs::metadata(&p) {
-                total += meta.len();
+            if let Ok(meta) = fs::symlink_metadata(&p) {
+                if !meta.file_type().is_symlink() {
+                    total += meta.len();
+                }
             }
         }
     }

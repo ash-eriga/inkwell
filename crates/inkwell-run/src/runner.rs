@@ -21,6 +21,27 @@ use crate::ops::{t, Buf, Ptr, Rt};
 use inkwell_gguf::GgufFile;
 use inkwell_core::InklingConfig;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+static VERBOSE: AtomicBool = AtomicBool::new(true);
+
+/// Control internal diagnostic logging (`false` for clean interactive/server UX).
+pub fn set_verbose(v: bool) {
+    VERBOSE.store(v, AtomicOrdering::Relaxed);
+}
+
+#[inline]
+fn is_verbose() -> bool {
+    VERBOSE.load(AtomicOrdering::Relaxed)
+}
+
+macro_rules! vlog {
+    ($($arg:tt)*) => {
+        if is_verbose() {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 const F32: i32 = 0;
 const F16: i32 = 1;
@@ -822,7 +843,7 @@ impl Runner {
         }
 
         let (f1,_) = inkwell_cuda::mem_info();
-        eprintln!("MEM after weights: {f1}");
+        vlog!("MEM after weights: {f1}");
         // the dequantized embedding row lives on the device: a CPU tensor here
         // forced a backend split per step, which blocks CUDA-graph capture.
         let embd_row = t::new(rt.ctx(), F32, &[2304, 1, 1, 1]);
@@ -852,7 +873,7 @@ impl Runner {
                     crate::moe::Cache::new(k, ds),
                 )))
             }).unwrap_or_else(|| std::sync::Mutex::new(None));
-            if i == 0 { eprintln!("VRAM cache: vfree={vfree} k={k} experts/layer ({:.1} MiB/layer)", k as f64 * (gs + ds) as f64 / 1e6); }
+            if i == 0 { vlog!("VRAM cache: vfree={vfree} k={k} experts/layer ({:.1} MiB/layer)", k as f64 * (gs + ds) as f64 / 1e6); }
             moe_args.push(Box::new(crate::moe::MoeArgs {
                 gu_w: pinned[gi].dev, gu_stride: gs, gu_type: gu_ti.ggml_type as i32,
                 dn_w: pinned[di].dev, dn_stride: ds, dn_type: dn_ti.ggml_type as i32,
@@ -1263,7 +1284,7 @@ impl Runner {
             }
             let on: Vec<usize> = (0..24).filter(|&i| plan[i]).collect();
             let mib: usize = on.iter().map(|&i| totals[i] >> 20).sum();
-            eprintln!("place: on_dev={on:?} experts={mib}MiB budget={}MiB",
+            vlog!("place: on_dev={on:?} experts={mib}MiB budget={}MiB",
                 budget.map_or("inf".to_string(), |b| (b >> 20).to_string()));
             Some(plan)
         };
@@ -1439,7 +1460,7 @@ impl Runner {
                         }
                     }
                 }
-                if il == 6 { let (f0, _) = inkwell_cuda::mem_info(); eprintln!("MEM before experts: {f0}"); }
+                if il == 6 { let (f0, _) = inkwell_cuda::mem_info(); vlog!("MEM before experts: {f0}"); }
                 let mut host = vec![0u8; total];
                 let mut descs: Vec<u64> = vec![0; 3 * 128 * 4];
                 let mut off = 0usize;
@@ -1466,7 +1487,7 @@ impl Runner {
                 }
                 moe_gw.push(gxp);
                 let (f_free, _) = inkwell_cuda::mem_info();
-                eprintln!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
+                vlog!("experts il={il}: free={}MiB total={}MiB", f_free >> 20, total >> 20);
                 let dev_margin: usize = std::env::var("INKWELL_DEV_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
                 let on_dev = place_plan.as_ref().map_or(true, |p| p[il])
                     && (f_free as usize) > total + (dev_margin << 20);
@@ -1509,10 +1530,10 @@ impl Runner {
             layers.push(l);
         }
         assert!(off_dev <= dev_bytes, "dev_buf overflow: use={off_dev} alloc={dev_bytes}");
-        eprintln!("dev_buf: use={:.1}MiB alloc={:.1}MiB slack={:.1}MiB",
+        vlog!("dev_buf: use={:.1}MiB alloc={:.1}MiB slack={:.1}MiB",
             off_dev as f64 / 1048576.0, dev_bytes as f64 / 1048576.0,
             (dev_bytes - off_dev) as f64 / 1048576.0);
-        eprintln!("load_st: dev={}MiB exl3_w={} pinned={}MiB", dev_bytes >> 20, exl3_w.len(),
+        vlog!("load_st: dev={}MiB exl3_w={} pinned={}MiB", dev_bytes >> 20, exl3_w.len(),
             pinned_bytes >> 20);
         let exl3_blk: Vec<Box<Exl3Blk>> = exl3_w.iter().map(|e| {
             let b = Box::new(Exl3Blk {
@@ -1567,7 +1588,7 @@ impl Runner {
             kv_buf.assign(*x, o);
             o += t::nbytes(*x);
         }
-        eprintln!("bufs: dev={}MiB kv={}MiB hd={hd} hkv={hkv} swa={swa} n_slots={n_slots}",
+        vlog!("bufs: dev={}MiB kv={}MiB hd={hd} hkv={hkv} swa={swa} n_slots={n_slots}",
             dev_bytes >> 20, kv_bytes >> 20);
         std::mem::forget(kv_buf);
 
@@ -1642,7 +1663,7 @@ impl Runner {
             } else {
                 (940, &CACHEL_MB)
             };
-            eprintln!("vramcap: target={target_mib}MiB reserve={reserve_mib}MiB used_pre_cache={}MiB budget={budget_mib}MiB table={table_mib}MiB source={vram_src} enabled={vramcap}",
+            vlog!("vramcap: target={target_mib}MiB reserve={reserve_mib}MiB used_pre_cache={}MiB budget={budget_mib}MiB table={table_mib}MiB source={vram_src} enabled={vramcap}",
                 pre_cache_used >> 20);
             let cachel = std::env::var_os("INKWELL_NO_CACHEL").is_none();
             let over = std::env::var("INKWELL_CACHE_MB_L").unwrap_or_default();
@@ -1666,7 +1687,7 @@ impl Runner {
                 if vramcap {
                     let (used_now, _) = process_vram_bytes(vram_baseline_free);
                     if used_now.saturating_add(cbytes).saturating_add(reserve_bytes) > target_bytes {
-                        eprintln!("vramcap: skip L{} cache={}MiB used={}MiB budget_left={}MiB",
+                        vlog!("vramcap: skip L{} cache={}MiB used={}MiB budget_left={}MiB",
                             a.layer, cbytes >> 20, used_now >> 20,
                             target_bytes.saturating_sub(used_now).saturating_sub(reserve_bytes) >> 20);
                         continue;
@@ -1713,7 +1734,7 @@ impl Runner {
                     gexp = Some(gd);
                     soff = Some(sd);
                     flb = Some(fd);
-                    eprintln!("kslot L{}: arena={} gran kmax={} (cap {}/{}MiB)",
+                    vlog!("kslot L{}: arena={} gran kmax={} (cap {}/{}MiB)",
                         a.layer, arena, kmax,
                         arena * 6912 / 1048576, cbytes / 1048576);
                 }
@@ -1740,18 +1761,18 @@ impl Runner {
                         .map(|&s| format!("{}:{}", s >> 10, esz.iter().filter(|&&e| e == s).count()))
                         .collect();
                     let sum: u64 = esz.iter().map(|&e| u64::from(e)).sum();
-                    eprintln!("KSIZES L{} max={}KiB sum_max={:.1}MiB sum_esz={:.1}MiB k_eff={:.1} [{}]",
+                    vlog!("KSIZES L{} max={}KiB sum_max={:.1}MiB sum_esz={:.1}MiB k_eff={:.1} [{}]",
                         a.layer, a.max_slot >> 10,
                         128.0 * a.max_slot as f64 / 1048576.0, sum as f64 / 1048576.0,
                         ck as f64 * a.max_slot as f64 * 128.0 / sum as f64,
                         dist.join(" "));
                 }
-                eprintln!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED free={}MiB",
+                vlog!("exl3 cache moe={i}: k={ck} slot={}B ({:.0} MiB) CACHED free={}MiB",
                     a.max_slot, cbytes as f64 / 1e6, f >> 20);
             }
             if vramcap {
                 let (post_cache_used, _) = process_vram_bytes(vram_baseline_free);
-                eprintln!("vramcap: cache_allocated={}MiB used_post_cache={}MiB target={target_mib}MiB reserve={reserve_mib}MiB",
+                vlog!("vramcap: cache_allocated={}MiB used_post_cache={}MiB target={target_mib}MiB reserve={reserve_mib}MiB",
                     cache_allocated >> 20, post_cache_used >> 20);
             }
         }
@@ -4685,19 +4706,19 @@ impl Runner {
                         }
                     }
                 }
-                eprintln!("prefill arena: released {} of {} caches, {} MiB (need {} MiB)",
+                vlog!("prefill arena: released {} of {} caches, {} MiB (need {} MiB)",
                     released_caches.len(), n_cand, have >> 20, target >> 20);
             }
             (PfArena::new(cmax), None)
         };
         let mut expert_stage = if stage_max > 0 { PfExpertStage::new(stage_max) } else { None };
         if stage_max > 0 && expert_stage.is_none() {
-            eprintln!("prefill experts: stage allocation {} MiB failed; using direct expert memory", stage_max >> 20);
+            vlog!("prefill experts: stage allocation {} MiB failed; using direct expert memory", stage_max >> 20);
         }
         if pf_exact_attn_enabled() {
             a.exact_attn_ws = Some(inkwell_cuda::DevBuf::new(24 * self.max_ctx as usize));
         }
-        eprintln!("prefill arena: {} MiB chunk={cmax}{}", a.bytes >> 20,
+        vlog!("prefill arena: {} MiB chunk={cmax}{}", a.bytes >> 20,
             borrowed_layer.map_or(String::new(), |l| format!(" borrowed=L{l}")));
         let mut pos = pos0;
         let mut out_logits = Vec::new();
@@ -4826,7 +4847,7 @@ impl Runner {
                     }
                 }
             }
-            eprintln!("prefill arena: invalidated borrowed cache L{layer}");
+            vlog!("prefill arena: invalidated borrowed cache L{layer}");
         }
         if !released_caches.is_empty() {
             drop(a);
@@ -4850,7 +4871,7 @@ impl Runner {
                         }
                     }
                 }
-                eprintln!("prefill arena: restored released cache L{layer}");
+                vlog!("prefill arena: restored released cache L{layer}");
             }
         }
         out_logits
