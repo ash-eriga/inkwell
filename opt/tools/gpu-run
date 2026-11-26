@@ -58,6 +58,6 @@ while :; do
   sleep 1
 done
 
-flock "$LOCK" nice -n 19 "$@"
+flock -o "$LOCK" nice -n 19 "$@"   # -o: children never inherit the lock fd (orphans cannot wedge the queue)
 rc=$?
 exit $rc
