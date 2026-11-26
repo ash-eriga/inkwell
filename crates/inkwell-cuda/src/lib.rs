@@ -1387,6 +1387,7 @@ extern "C" {
     fn ink_launch_pf_write_kv(k: *const f32, v: *const f32, kd: *mut c_void, vd: *mut c_void,
         c: i32, pos0: i32, cap: i32, swa: i32, stream: *mut c_void);
     fn ink_launch_pf_expand_rel(src: *const f32, dst: *mut f32, stream: *mut c_void);
+    fn ink_launch_pf_expand_rel_bf16(src: *const c_void, dst: *mut f32, stream: *mut c_void);
     fn ink_launch_pf_mix(states: *const *const c_void, rows: i32, query: *const f32,
         out: *mut f32, c: i32, n: i32, qcols: i32, scale: f32, eps: f32, stream: *mut c_void);
 }
@@ -1481,6 +1482,7 @@ pfwrap!(pf_ctrl_apply_cat_async, ink_launch_pf_ctrl_apply_cat, gf: *const f32, c
 pfwrap!(pf_router8_async, ink_launch_pf_router8, logits: *const f32, bias: *const f32, c: i32, wscale: f32, wfloor: f32, ids: *mut i32, weights: *mut f32);
 pfwrap!(pf_write_kv_async, ink_launch_pf_write_kv, k: *const f32, v: *const f32, kd: *mut c_void, vd: *mut c_void, c: i32, pos0: i32, cap: i32, swa: i32);
 pfwrap!(pf_expand_rel_async, ink_launch_pf_expand_rel, src: *const f32, dst: *mut f32);
+pfwrap!(pf_expand_rel_bf16_async, ink_launch_pf_expand_rel_bf16, src: *const c_void, dst: *mut f32);
 pfwrap!(pf_mix_async, ink_launch_pf_mix, states: *const *const c_void, rows: i32, query: *const f32, out: *mut f32, c: i32, n: i32, qcols: i32, scale: f32, eps: f32);
 
 extern "C" {

@@ -4504,7 +4504,16 @@ impl Runner {
         }
         self.pf_dense(inputs[0].cast_const(), l.attn_sink_proj.expect("sink"), a.ptr("sink"), c, 24, n);
         unsafe {
-            inkwell_cuda::pf_expand_rel_async(tdata(l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias")).cast_const(), a.ptr("rel"));
+            // `attn_rel_bias_pad` is BF16 while the fused decode sink/relbias
+            // path is active (m3a, default on). Reinterpreting those bytes as
+            // FP32 silently corrupts every prefill attention bias, so dispatch
+            // on the real tensor type.
+            let rb = l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias");
+            if inkwell_ggml::ink_tensor_type(rb.0) == BF16 {
+                inkwell_cuda::pf_expand_rel_bf16_async(tdata(rb).cast(), a.ptr("rel"));
+            } else {
+                inkwell_cuda::pf_expand_rel_async(tdata(rb).cast_const(), a.ptr("rel"));
+            }
             let kd = inkwell_ggml::ink_tensor_data(self.k_arena[slot].0);
             let vd = inkwell_ggml::ink_tensor_data(self.v_arena[slot].0);
             let cap = if is_swa { self.swa_capacity() } else { self.max_ctx };

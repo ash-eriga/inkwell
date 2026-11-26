@@ -2177,6 +2177,22 @@ extern "C" void ink_launch_pf_expand_rel(const float* src, float* dst, void* str
     inkwell_pf_expand_rel<<<(1025 * 16 + 255) / 256, 256, 0, (cudaStream_t)stream>>>(src, dst);
 }
 
+// BF16-table variant.  `attn_rel_bias_pad` stays BF16 on the device for the
+// fused decode sink/relbias kernel, so the prefill driver must convert it
+// instead of reinterpreting those bytes as FP32.
+extern "C" __global__ void inkwell_pf_expand_rel_bf16(const uint16_t* __restrict__ src,
+        float* __restrict__ dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 1025 * 16) return;
+    const float v = __bfloat162float(*(const __nv_bfloat16*)(src + i));
+    for (int h = 0; h < 24; ++h) dst[(size_t)h * 1025 * 16 + i] = v;
+}
+
+extern "C" void ink_launch_pf_expand_rel_bf16(const void* src, float* dst, void* stream) {
+    inkwell_pf_expand_rel_bf16<<<(1025 * 16 + 255) / 256, 256, 0, (cudaStream_t)stream>>>(
+        (const uint16_t*)src, dst);
+}
+
 // Depth-stack mix. states[j] are [C,n]; query rows are qcols contiguous n-vectors.
 // Output layout is [qcol][C][n]. scores are softmax over rows of RMS-normalized states.
 struct PfMixStates { const float* p[8]; };

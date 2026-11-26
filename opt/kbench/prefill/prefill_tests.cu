@@ -259,6 +259,34 @@ static int test_moe_pipeline(){
  return bd!=0;
 }
 
+// Rel-bias table expand, [16][1025] -> [24][16][1025]. The BF16 source is the
+// production dtype (fused decode sink/relbias keeps the table in BF16).
+static int test_rel(){
+ const int N=1025*16;
+ bool pass=true;
+ float *ds=nullptr,*dd=nullptr;uint16_t* dbs=nullptr;
+ CK(cudaMalloc(&ds,N*4));CK(cudaMalloc(&dd,24*(size_t)N*4));CK(cudaMalloc(&dbs,N*2));
+ std::vector<float> h(N);for(auto&x:h)x=frnd();
+ CK(cudaMemcpy(ds,h.data(),N*4,cudaMemcpyHostToDevice));
+ ink_launch_pf_expand_rel(ds,dd,nullptr);CK(cudaDeviceSynchronize());
+ std::vector<float> o(24*(size_t)N);CK(cudaMemcpy(o.data(),dd,o.size()*4,cudaMemcpyDeviceToHost));
+ int bd=0;for(int hh=0;hh<24;hh++)for(int i=0;i<N;i++)bd+=memcmp(&o[(size_t)hh*N+i],&h[i],4)!=0;
+ printf("expand_rel f32 bitdiff=%d\n",bd);pass=pass&&bd==0;
+ // Finite BF16 patterns only (exponent 1..15) so the conversion is exact.
+ std::vector<uint16_t> hb(N);
+ for(int i=0;i<N;i++)hb[i]=(uint16_t)(((rnd()&1)?0x8000:0)|((uint16_t)(1+rnd()%15)<<7)|(rnd()&0x7f));
+ CK(cudaMemcpy(dbs,hb.data(),N*2,cudaMemcpyHostToDevice));
+ ink_launch_pf_expand_rel_bf16(dbs,dd,nullptr);CK(cudaDeviceSynchronize());
+ CK(cudaMemcpy(o.data(),dd,o.size()*4,cudaMemcpyDeviceToHost));
+ bd=0;for(int hh=0;hh<24;hh++)for(int i=0;i<N;i++){
+  uint32_t u=((uint32_t)hb[i])<<16;float e;memcpy(&e,&u,4);
+  bd+=memcmp(&o[(size_t)hh*N+i],&e,4)!=0;}
+ printf("expand_rel bf16 bitdiff=%d\n",bd);pass=pass&&bd==0;
+ printf("REL %s\n",pass?"PASS":"FAIL");
+ cudaFree(ds);cudaFree(dd);cudaFree(dbs);return pass?0:1;
+}
+
 int main(int argc,char**argv){std::string m=argc>1?argv[1]:"all";int rc=0;
  if(m=="gemm"||m=="all")rc|=test_gemm();if(m=="conv"||m=="all")rc|=test_conv();if(m=="flash"||m=="all")rc|=test_flash();if(m=="moe"||m=="all"){rc|=test_moe();rc|=test_moe_pipeline();}
+ if(m=="rel"||m=="all")rc|=test_rel();
  printf("OVERALL %s\n",rc?"FAIL":"PASS");return rc;}
