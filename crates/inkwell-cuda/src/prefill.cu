@@ -261,8 +261,10 @@ __global__ void __launch_bounds__(128) inkwell_exl3_gemm_wide_core(
 
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
         const int tn_i = tn0 + dtile;
-        if (tn_i < tn && du < w) {
-            rings[dtile][du] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + du);
+        if (tn_i < tn) {
+            for (int u = du; u < w; u += 32) {
+                rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
+            }
         }
         for (int idx = tid; idx < 16 * BM; idx += 128) {
             const int mm = idx >> 4;
@@ -368,8 +370,10 @@ __global__ void __launch_bounds__(128) inkwell_exl3_gemm_narrow_core(
 
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
         const int tn_i = tn0 + dtile;
-        if (tn_i < tn && du < w) {
-            rings[dtile][du] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + du);
+        if (tn_i < tn) {
+            for (int u = du; u < w; u += 32) {
+                rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
+            }
         }
         for (int idx = tid; idx < 16 * BM; idx += 128) {
             const int mm = idx >> 4;
@@ -619,8 +623,10 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
         }
         for (int tk_i = 0; tk_i < tk; ++tk_i) {
             const int tn_i = tn0 + dtile;
-            if (tn_i < tn && du < w) {
-                rings[dtile][du] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + du);
+            if (tn_i < tn) {
+                for (int u = du; u < w; u += 32) {
+                    rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
+                }
             }
             for (int idx = tid; idx < 16 * BM; idx += 256) {
                 const int mm = idx >> 4;
