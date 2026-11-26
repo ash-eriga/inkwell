@@ -2395,3 +2395,10 @@ Clean build (sha 3540fe2c), `bench_encode.sh` with chunk 512. Serial is INKWELL_
   - The agent must fix this before merge.
 - **Tooling bug:** bench_encode.sh never creates `$OUT/$n`; fixed in the validation copy only.
 - **Target:** 150 tok/s. The gap is 1.4× at 512 and 1.7× at 8K, and throughput falls with prompt length.
+
+## t3/decode-latency-25ms — MIX2P (two-phase depth-stack mix, opt-in INKWELL_MIX2P=1) — REJECTED
+
+- Brain-run gate and A/B: candidate sha 467b710c against the HADVEC control 1f268f07, via gpu-run -p high. The agent's own A/B had died at its rate-limit stop.
+- Bit-exact: md5 5cbe8e06.
+- A/B: `runs ctl=16 cand=16 ctl_med=28.195 cand_med=28.296 delta=+0.101 wins=7/16 md5=['5cbe8e06'] peak=5048`.
+- Verdict: the 4 KiB score scratch plus the second launch cost more than the redundant row rms/query dots they remove. Stays opt-in; do not flip.
