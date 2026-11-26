@@ -4254,6 +4254,13 @@ fn pf_stream_experts_enabled() -> bool {
     std::env::var("INKWELL_PF_STREAM_EXPERTS").ok().as_deref() != Some("0")
 }
 
+/// Releasing a decode expert cache wipes it, and the experts it held then have
+/// to come back over PCIe during decode. Keep every cache the prefill arena
+/// and expert stage do not need (killswitch: INKWELL_PF_KEEP_CACHE=0).
+fn pf_keep_cache_enabled() -> bool {
+    std::env::var("INKWELL_PF_KEEP_CACHE").ok().as_deref() != Some("0")
+}
+
 fn pf_host_experts(r: &Runner, il: usize) -> Option<&crate::moe::MoeArgsExl3> {
     let mi = r.layers[il].moe_exl3?;
     let m = &r.moe_args_exl3[mi];
@@ -4634,10 +4641,22 @@ impl Runner {
                 .filter_map(|m| m.cache.as_ref().map(|c| (m.layer, c.buf.len * 4)))
                 .collect();
             candidates.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
-            if stage_max > 0 || candidates.iter().map(|&(_, bytes)| bytes).sum::<usize>() >= need {
+            let n_cand = candidates.len();
+            let total: usize = candidates.iter().map(|&(_, bytes)| bytes).sum();
+            if stage_max > 0 || total >= need {
+                // Old behaviour released every cache whenever the expert stage
+                // was in play; that wiped the whole decode cache for a few
+                // hundred MiB. Free only what the arena and stage need.
+                let target = if pf_keep_cache_enabled() {
+                    need.saturating_add(stage_max)
+                } else if stage_max == 0 {
+                    need
+                } else {
+                    usize::MAX
+                };
                 let mut have = 0usize;
                 for (layer, bytes) in candidates {
-                    if stage_max == 0 && have >= need { break; }
+                    if have >= target { break; }
                     if let Some(m) = self.moe_args_exl3.iter_mut().find(|m| m.layer == layer) {
                         if let Some(c) = &mut m.cache {
                             let old = std::mem::replace(&mut c.buf, inkwell_cuda::DevBuf::new_bytes(8));
@@ -4647,6 +4666,8 @@ impl Runner {
                         }
                     }
                 }
+                eprintln!("prefill arena: released {} of {} caches, {} MiB (need {} MiB)",
+                    released_caches.len(), n_cand, have >> 20, target >> 20);
             }
             (PfArena::new(cmax), None)
         };
