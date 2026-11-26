@@ -57,26 +57,77 @@ fn next_val(args: &mut std::iter::Skip<std::env::Args>, flag: &str) -> Result<St
         .ok_or_else(|| format!("missing value for {flag}"))
 }
 
-#[derive(Clone, Copy)]
-enum WarmMode {
-    Serve,
-    Chat,
-}
-
-enum WarmAction {
-    Switch(WarmMode),
-    Exit,
-}
-
-/// Hold the loaded model warm in RAM/VRAM for at least 4 seconds after leaving
-/// `chat` or `serve` so switching modes is instantaneous (zero reload).
-fn warm_handoff_prompt(model_id: &str, last: WarmMode) -> WarmAction {
-    use std::io::{self, IsTerminal, Read, Write};
-    use std::time::{Duration, Instant};
-
+/// Run the interactive `inkwell` menu on the large-stack worker thread so a loaded
+/// `Engine` can stay resident across `chat <-> serve` switches and quietly unload
+/// after 4 seconds of idle time at the menu.
+fn interactive_launcher() -> Result<(), String> {
+    use std::io::{self, IsTerminal};
     if !io::stdin().is_terminal() {
-        return WarmAction::Exit;
+        print!("{HELP_TEXT}");
+        return Ok(());
     }
+    run_on_big_stack(interactive_launcher_inner)
+}
+
+fn read_menu_line_with_idle_unload(
+    warm: &mut Option<(String, engine::Engine)>,
+    idle_limit: std::time::Duration,
+) -> Result<Option<String>, String> {
+    use std::io::{self, BufRead};
+    use std::time::Instant;
+
+    #[cfg(unix)]
+    {
+        let start = Instant::now();
+        loop {
+            if warm.is_some() && start.elapsed() >= idle_limit {
+                *warm = None;
+            }
+            let mut pfd = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = if warm.is_some() { 200 } else { -1 };
+            let ready = unsafe { libc::poll(&mut pfd, 1, timeout) };
+            if ready > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                let mut line = String::new();
+                let n = io::stdin()
+                    .lock()
+                    .read_line(&mut line)
+                    .map_err(|e| format!("failed to read input: {e}"))?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(line));
+            }
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (warm, idle_limit);
+        let mut line = String::new();
+        let n = io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("failed to read input: {e}"))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(line))
+    }
+}
+
+fn interactive_launcher_inner() -> Result<(), String> {
+    use std::io::{self, IsTerminal, Write};
+    use std::time::Duration;
 
     let tty = io::stdout().is_terminal();
     let (b, c, d, r) = if tty {
@@ -84,119 +135,72 @@ fn warm_handoff_prompt(model_id: &str, last: WarmMode) -> WarmAction {
     } else {
         ("", "", "", "")
     };
-    let other_hint = match last {
-        WarmMode::Chat => format!("{c}[s]{r} serve  {c}[c]{r} chat again"),
-        WarmMode::Serve => format!("{c}[c]{r} chat  {c}[s]{r} serve again"),
-    };
 
-    #[cfg(unix)]
-    let orig_termios = {
-        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
-        let ok = unsafe { libc::tcgetattr(0, &mut orig) } == 0;
-        if ok {
-            let mut raw = orig;
-            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
-            raw.c_cc[libc::VMIN] = 0;
-            raw.c_cc[libc::VTIME] = 0;
-            unsafe {
-                let _ = libc::tcflush(0, libc::TCIFLUSH);
-                let _ = libc::tcsetattr(0, libc::TCSANOW, &raw);
-            }
-            Some(orig)
-        } else {
-            None
-        }
-    };
-
-    let deadline = Instant::now() + Duration::from_secs(4);
-    let mut action = WarmAction::Exit;
-    let mut last_sec = u64::MAX;
+    let mut warm: Option<(String, engine::Engine)> = None;
 
     loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let rem_secs = (deadline - now).as_secs() + 1;
-        if rem_secs != last_sec {
-            last_sec = rem_secs;
-            print!(
-                "\r\x1b[2K{b}{model_id}{r} {d}warm in VRAM (unloading in {rem_secs}s):{r} {other_hint}  {d}[q] unload now{r} "
-            );
-            let _ = io::stdout().flush();
-        }
+        println!("\n{b}{c}inkwell {}{r}  {d}EXL3 inference engine{r}\n", env!("CARGO_PKG_VERSION"));
+        println!("  {c}[1]{r} {b}serve{r}    {d}OpenAI-compatible HTTP/SSE server (http://127.0.0.1:8080/v1){r}");
+        println!("  {c}[2]{r} {b}chat{r}     {d}Interactive multi-turn terminal chat{r}");
+        println!("  {c}[3]{r} {b}models{r}   {d}List local EXL3 models & Hugging Face presets{r}");
+        println!("  {d}[q] quit{r}\n");
 
-        #[cfg(unix)]
-        {
-            let mut pfd = libc::pollfd {
-                fd: 0,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut pfd, 1, 100) };
-            if ready > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                let mut byte = [0u8; 1];
-                if io::stdin().read(&mut byte).unwrap_or(0) == 1 {
-                    match byte[0].to_ascii_lowercase() {
-                        b's' | b'1' => {
-                            action = WarmAction::Switch(WarmMode::Serve);
-                            break;
-                        }
-                        b'c' | b'2' => {
-                            action = WarmAction::Switch(WarmMode::Chat);
-                            break;
-                        }
-                        b'q' | 3 | 4 => {
-                            action = WarmAction::Exit;
-                            break;
-                        }
-                        _ => {}
+        print!("{b}Choose an action [1-3] (default 1, q=quit):{r} ");
+        let _ = io::stdout().flush();
+
+        let Some(line) = read_menu_line_with_idle_unload(&mut warm, Duration::from_secs(4))? else {
+            return Ok(());
+        };
+
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "1" | "serve" => {
+                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
+                let (model_path, mut eng) = if let Some((path, eng)) = warm.take() {
+                    (path, eng)
+                } else {
+                    let chosen = models::select_or_download_model()?;
+                    if chosen.vision_enabled {
+                        eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
                     }
-                }
+                    eprintln!("inkwell serve: loading {} (ctx=4096)...", chosen.path);
+                    let eng = engine::Engine::load(&chosen.path, 4096)?;
+                    (chosen.path, eng)
+                };
+                let serve_opts = server::ServeOpts {
+                    model: model_path.clone(),
+                    host: "127.0.0.1".to_owned(),
+                    port: 8080,
+                    ctx: 4096,
+                    default_effort: "none".to_owned(),
+                };
+                server::run_server_with_engine(&mut eng, &serve_opts)?;
+                warm = Some((model_path, eng));
             }
-        }
-        #[cfg(not(unix))]
-        {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    #[cfg(unix)]
-    if let Some(orig) = orig_termios {
-        unsafe {
-            let _ = libc::tcsetattr(0, libc::TCSANOW, &orig);
-        }
-    }
-
-    println!();
-    action
-}
-
-fn run_warm_session(
-    initial: WarmMode,
-    serve_opts: server::ServeOpts,
-    chat_opts: cli_ui::CliRunOpts,
-) -> Result<(), String> {
-    let mut mode = initial;
-    let mut engine = match mode {
-        WarmMode::Serve => server::run_server(&serve_opts)?,
-        WarmMode::Chat => cli_ui::run_chat(&chat_opts)?,
-    };
-
-    loop {
-        match warm_handoff_prompt(engine.model_id(), mode) {
-            WarmAction::Exit => {
-                eprintln!("inkwell: unloading {}...", engine.model_id());
-                drop(engine);
-                return Ok(());
+            "2" | "chat" => {
+                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
+                let (model_path, mut eng) = if let Some((path, eng)) = warm.take() {
+                    (path, eng)
+                } else {
+                    let chosen = models::select_or_download_model()?;
+                    if chosen.vision_enabled {
+                        eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
+                    }
+                    eprintln!("inkwell loading {} (ctx=4096)...", chosen.path);
+                    let eng = engine::Engine::load(&chosen.path, 4096)?;
+                    (chosen.path, eng)
+                };
+                let chat_opts = cli_ui::CliRunOpts {
+                    model: model_path.clone(),
+                    ..cli_ui::CliRunOpts::default()
+                };
+                cli_ui::run_chat_with_engine(&mut eng, &chat_opts)?;
+                warm = Some((model_path, eng));
             }
-            WarmAction::Switch(next) => {
-                mode = next;
-                match mode {
-                    WarmMode::Serve => server::run_server_with_engine(&mut engine, &serve_opts)?,
-                    WarmMode::Chat => cli_ui::run_chat_with_engine(&mut engine, &chat_opts)?,
-                }
+            "3" | "models" => {
+                models::print_model_catalog();
             }
+            "q" | "quit" | "exit" => return Ok(()),
+            _ => println!("Enter 1 (serve), 2 (chat), 3 (models), or q."),
         }
     }
 }
@@ -245,13 +249,7 @@ fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), 
             chosen.path
         }
     };
-    let chat_opts = cli_ui::CliRunOpts {
-        model: opts.model.clone(),
-        ctx: opts.ctx,
-        effort: opts.default_effort.clone(),
-        ..cli_ui::CliRunOpts::default()
-    };
-    run_on_big_stack(move || run_warm_session(WarmMode::Serve, opts, chat_opts))
+    run_on_big_stack(move || server::run_server(&opts).map(|_| ()))
 }
 
 fn parse_cli_opts(
@@ -312,83 +310,6 @@ fn parse_cli_opts(
     Ok(opts)
 }
 
-fn interactive_launcher() -> Result<(), String> {
-    use std::io::{self, IsTerminal, Write};
-    if !io::stdin().is_terminal() {
-        print!("{HELP_TEXT}");
-        return Ok(());
-    }
-    let tty = io::stdout().is_terminal();
-    let (b, c, d, r) = if tty {
-        ("\x1b[1m", "\x1b[36m", "\x1b[2m", "\x1b[0m")
-    } else {
-        ("", "", "", "")
-    };
-    println!("\n{b}{c}inkwell {}{r}  {d}EXL3 inference engine{r}\n", env!("CARGO_PKG_VERSION"));
-    println!("  {c}[1]{r} {b}serve{r}    {d}OpenAI-compatible HTTP/SSE server (http://127.0.0.1:8080/v1){r}");
-    println!("  {c}[2]{r} {b}chat{r}     {d}Interactive multi-turn terminal chat{r}");
-    println!("  {c}[3]{r} {b}models{r}   {d}List local EXL3 models & Hugging Face presets{r}");
-    println!("  {d}[q] quit{r}\n");
-
-    loop {
-        print!("{b}Choose an action [1-3] (default 1, q=quit):{r} ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        let n = io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| format!("failed to read input: {e}"))?;
-        if n == 0 {
-            return Ok(());
-        }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "" | "1" | "serve" => {
-                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
-                let chosen = models::select_or_download_model()?;
-                if chosen.vision_enabled {
-                    eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
-                }
-                let serve_opts = server::ServeOpts {
-                    model: chosen.path.clone(),
-                    host: "127.0.0.1".to_owned(),
-                    port: 8080,
-                    ctx: 4096,
-                    default_effort: "none".to_owned(),
-                };
-                let chat_opts = cli_ui::CliRunOpts {
-                    model: chosen.path,
-                    ..cli_ui::CliRunOpts::default()
-                };
-                return run_on_big_stack(move || run_warm_session(WarmMode::Serve, serve_opts, chat_opts));
-            }
-            "2" | "chat" => {
-                inkwell_run::runner::set_verbose(std::env::var_os("INKWELL_VERBOSE").is_some());
-                let chosen = models::select_or_download_model()?;
-                if chosen.vision_enabled {
-                    eprintln!("inkwell: vision tower = ON (soft flag; text-only inference active in v0.1)");
-                }
-                let serve_opts = server::ServeOpts {
-                    model: chosen.path.clone(),
-                    host: "127.0.0.1".to_owned(),
-                    port: 8080,
-                    ctx: 4096,
-                    default_effort: "none".to_owned(),
-                };
-                let chat_opts = cli_ui::CliRunOpts {
-                    model: chosen.path,
-                    ..cli_ui::CliRunOpts::default()
-                };
-                return run_on_big_stack(move || run_warm_session(WarmMode::Chat, serve_opts, chat_opts));
-            }
-            "3" | "models" => {
-                models::print_model_catalog();
-                return Ok(());
-            }
-            "q" | "quit" | "exit" => return Ok(()),
-            _ => println!("Enter 1 (serve), 2 (chat), 3 (models), or q."),
-        }
-    }
-}
-
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(first) = args.next() else {
@@ -421,16 +342,8 @@ fn main() {
             return;
         }
         "chat" => {
-            let res = parse_cli_opts(args, "chat").and_then(|chat_opts| {
-                let serve_opts = server::ServeOpts {
-                    model: chat_opts.model.clone(),
-                    host: "127.0.0.1".to_owned(),
-                    port: 8080,
-                    ctx: chat_opts.ctx,
-                    default_effort: chat_opts.effort.clone(),
-                };
-                run_on_big_stack(move || run_warm_session(WarmMode::Chat, serve_opts, chat_opts))
-            });
+            let res = parse_cli_opts(args, "chat")
+                .and_then(|chat_opts| run_on_big_stack(move || cli_ui::run_chat(&chat_opts).map(|_| ())));
             if let Err(e) = res {
                 if e != "cancelled" {
                     eprintln!("error: {e}");

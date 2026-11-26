@@ -121,7 +121,7 @@ pub fn run_server_with_engine(engine: &mut Engine, opts: &ServeOpts) -> Result<(
     });
 
     eprintln!(
-        "\ninkwell server listening on http://{addr}\n  model:     {model_id}\n  max_ctx:   {max_ctx}\n  endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions\n  press Ctrl+C to stop (keeps model warm for 4s)\n"
+        "\ninkwell server listening on http://{addr}\n  model:     {model_id}\n  max_ctx:   {max_ctx}\n  endpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions\n"
     );
 
     let accept_info = Arc::clone(&info);
