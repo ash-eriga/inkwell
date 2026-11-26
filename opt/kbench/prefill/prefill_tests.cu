@@ -162,17 +162,48 @@ static int test_moe(){
  std::vector<uint64_t> hd(128*4);for(int e=0;e<128;e++){hd[4*e]=(uint64_t)(uintptr_t)dw;hd[4*e+3]=ka|(hk<<8);}CK(cudaMalloc(&dd,hd.size()*8));CK(cudaMemcpy(dd,hd.data(),hd.size()*8,cudaMemcpyHostToDevice));
  std::vector<float> hx(P*K);for(auto&x:hx)x=frnd();CK(cudaMalloc(&dx,hx.size()*4));CK(cudaMemcpy(dx,hx.data(),hx.size()*4,cudaMemcpyHostToDevice));
  CK(cudaMalloc(&dy,(size_t)P*N*4));CK(cudaMalloc(&dr,(size_t)P*N*4));CK(cudaMalloc(&dte,4096));CK(cudaMalloc(&dts,4096));CK(cudaMalloc(&dtc,4096));CK(cudaMalloc(&dtn,4));CK(cudaMalloc(&drex,P*4));
- // Balanced routed rows: 32 rows for each of the 128 experts, one full
- // grouped tile per expert. This is the meaningful large-C throughput case.
+ // Mixed routed rows: alternating 24/32+8-sized expert tiles exercise both
+ // the 32-row kernel and the 64-row weight-reuse kernel at realistic partial
+ // tile sizes while keeping the same total expanded row count.
  std::vector<int> ht(128),hs(128),hc(128),hn{128},rex(P);
- for(int e=0;e<128;e++){ht[e]=e;hs[e]=e*32;hc[e]=32;for(int i=0;i<32;i++)rex[e*32+i]=e;}
+ int pos=0;
+ for(int e=0;e<128;e++){
+  ht[e]=e;hs[e]=pos;hc[e]=(e&1)?40:24;
+  for(int i=0;i<hc[e];i++)rex[pos+i]=e;
+  pos+=hc[e];
+ }
+ if(pos!=P){printf("bad mixed row count %d\n",pos);return 1;}
  CK(cudaMemcpy(dte,ht.data(),ht.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dts,hs.data(),hs.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dtc,hc.data(),hc.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dtn,hn.data(),4,cudaMemcpyHostToDevice));CK(cudaMemcpy(drex,rex.data(),P*4,cudaMemcpyHostToDevice));
- dim3 g((N/16+3)/4,P/64+128);inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0);
  ref_group_gemm<<<dim3(tn,P),16>>>(dd,drex,dx,dr,P,tk,tn);CK(cudaDeviceSynchronize());
- std::vector<float>a(P*N),b(P*N);CK(cudaMemcpy(a.data(),dy,a.size()*4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(b.data(),dr,b.size()*4,cudaMemcpyDeviceToHost));
- int bd=0;float ma=0;for(size_t i=0;i<a.size();i++){bd+=memcmp(&a[i],&b[i],4)!=0;ma=fmaxf(ma,fabsf(a[i]-b[i]));}
- double ms=timeit([&]{inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0);});
- double tf=2.0*P*K*N/(ms*1e9);printf("moe grouped bitdiff=%d max=%.2e TF=%.2f\nMOE %s\n",bd,ma,tf,bd?"FAIL":"PASS");return bd!=0;
+ std::vector<float>a(P*N),b(P*N);CK(cudaMemcpy(b.data(),dr,b.size()*4,cudaMemcpyDeviceToHost));
+ dim3 g((N/16+3)/4,P/64+128);
+ bool pass=true;
+ auto check=[&](const char*name,int kind,int mode32,int mode64){
+  CK(cudaMemset(dy,0,(size_t)P*N*4));
+  if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+  else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+  else {
+   inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+   inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+  }
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemcpy(a.data(),dy,a.size()*4,cudaMemcpyDeviceToHost));
+  int bd=0;float ma=0;for(size_t i=0;i<a.size();i++){bd+=memcmp(&a[i],&b[i],4)!=0;ma=fmaxf(ma,fabsf(a[i]-b[i]));}
+  double ms=timeit([&]{
+   if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+   else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+   else {
+    inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+    inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+   }
+  });
+  double tf=2.0*P*K*N/(ms*1e9);printf("moe %-8s bitdiff=%d max=%.2e TF=%.2f\n",name,bd,ma,tf);
+  pass=pass&&bd==0;
+ };
+ check("group32",0,0,0);
+ check("group64",1,0,0); // mode zero makes the BM64 core process every tile here.
+ check("adaptive",2,1,2);
+ printf("MOE %s\n",pass?"PASS":"FAIL");return pass?0:1;
 }
 
 // Full grouped-MoE pipeline oracle: identical epilogues, but scalar row GEMVs.
