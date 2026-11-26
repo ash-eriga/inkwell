@@ -410,7 +410,9 @@ fn main() {
     }
 
     let path = first;
+    inkwell_run::prof::init();
     let st_dir = std::path::Path::new(&path).is_dir();
+    let _g_gguf = inkwell_run::prof::guard("gguf_open");
     let g = if st_dir {
         // tokenizer still lives in the GGUF sidecar
         let gg = std::env::var("INKWELL_TOK_GGUF")
@@ -419,6 +421,8 @@ fn main() {
     } else {
         GgufFile::open(&path).expect("open gguf")
     };
+    drop(_g_gguf);
+    inkwell_run::prof::mark("gguf_done");
     let cfg = if st_dir { InklingConfig::rexl3() } else { InklingConfig::from_gguf(&g) };
     println!("{cfg:?}");
     println!("visits/token: {}", cfg.n_visits());
@@ -709,11 +713,16 @@ fn read_ids_file(path: &std::ffi::OsStr) -> Vec<u32> {
 
 fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path: &str) {
     use inkwell_run::runner::Runner;
+    inkwell_run::prof::init();
     use std::time::Instant;
     let max_ctx: i64 = std::env::var("INKWELL_MAX_CTX")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     let mut r = if std::path::Path::new(path).is_dir() {
-        let repo = Box::leak(Box::new(inkwell_st::StRepo::open(std::path::Path::new(path)).expect("st repo")));
+        let repo = {
+            let _g = inkwell_run::prof::guard("strepo_open");
+            Box::leak(Box::new(inkwell_st::StRepo::open(std::path::Path::new(path)).expect("st repo")))
+        };
+        inkwell_run::prof::mark("strepo_done");
         Runner::load_st(repo, cfg, max_ctx)
     } else {
         Runner::load(gg, cfg, max_ctx)
@@ -723,9 +732,12 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let ids = if let Ok(path) = std::env::var("INKWELL_PROMPT_IDS") {
         read_ids_file(std::ffi::OsStr::new(&path))
     } else {
-        inkwell_tokenizer::Tokenizer::from_gguf(gg)
-            .expect("tokenizer")
-            .encode(&std::env::var("INKWELL_PROMPT").unwrap_or_else(|_| "The capital of France is".into()))
+        {
+            let _g = inkwell_run::prof::guard("tokenizer");
+            inkwell_tokenizer::Tokenizer::from_gguf(gg)
+                .expect("tokenizer")
+                .encode(&std::env::var("INKWELL_PROMPT").unwrap_or_else(|_| "The capital of France is".into()))
+        }
     };
     // upstream adds no BOS for this model (add_bos=false)
     let t0 = Instant::now();
@@ -828,6 +840,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
             fed_id = id;
         }
         pos += 1;
+        if g == 0 { inkwell_run::prof::mark("gen0_step_done"); }
         id = if let Some(f) = &force_ids { f[g] } else { best as u32 };
         gen_ids.push(id);
         if vtest8 {

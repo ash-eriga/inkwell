@@ -158,6 +158,7 @@ pub struct Engine {
 impl Engine {
     /// Load a model directory (EXL3 safetensors + GGUF tokenizer sidecar) or standalone `.gguf`.
     pub fn load(model_path: &str, max_ctx: usize) -> Result<Self, String> {
+        inkwell_run::prof::init();
         let p = Path::new(model_path);
         let is_dir = p.is_dir();
         let gguf_path = if is_dir {
@@ -180,10 +181,16 @@ impl Engine {
         } else {
             model_path.to_owned()
         };
-        let gg = GgufFile::open(&gguf_path)
-            .map_err(|e| format!("failed to open GGUF {gguf_path}: {e}"))?;
-        let tokenizer =
-            Tokenizer::from_gguf(&gg).map_err(|e| format!("failed to load tokenizer: {e}"))?;
+        let gg = {
+            let _g = inkwell_run::prof::guard("gguf_open");
+            GgufFile::open(&gguf_path)
+                .map_err(|e| format!("failed to open GGUF {gguf_path}: {e}"))?
+        };
+        let tokenizer = {
+            let _g = inkwell_run::prof::guard("tokenizer");
+            Tokenizer::from_gguf(&gg).map_err(|e| format!("failed to load tokenizer: {e}"))?
+        };
+        inkwell_run::prof::mark("tokenizer_done");
         let cfg = if is_dir {
             InklingConfig::rexl3()
         } else {
@@ -198,13 +205,18 @@ impl Engine {
 
         let max_ctx_i64 = i64::try_from(max_ctx).map_err(|_| "max_ctx overflow".to_owned())?;
         let runner = if is_dir {
-            let repo = inkwell_st::StRepo::open(model_path)
-                .map_err(|e| format!("failed to open safetensors repo {model_path}: {e}"))?;
+            let repo = {
+                let _g = inkwell_run::prof::guard("strepo_open");
+                inkwell_st::StRepo::open(model_path)
+                    .map_err(|e| format!("failed to open safetensors repo {model_path}: {e}"))?
+            };
+            inkwell_run::prof::mark("strepo_done");
             Runner::load_st(&repo, &cfg, max_ctx_i64)
         } else {
             Runner::load(&gg, &cfg, max_ctx_i64)
         };
 
+        inkwell_run::prof::mark("engine_ready");
         Ok(Self {
             runner,
             tokenizer,
