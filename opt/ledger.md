@@ -2315,3 +2315,11 @@ Base `e5dea6c`; branch `t3/m3a-sink-relbias-port`. Ports the M3a `sink_relbias_f
 ## t3/decode-latency-25ms — HADVEC default-on — ACCEPTED
 
 The fused/vectorized MoE Hadamard chain is now default-on; `INKWELL_NO_HADVEC=1` is the killswitch. Clean 16-pair interleaved A/B against the frozen master control `b38f787ebb05dec43c644d13a7a368c000fb5c4cf58071d4f0630bc277fa3fc7`: `runs ctl=16 cand=16 ctl_med=27.435 cand_med=27.224 delta=-0.211 wins=16/16 md5=['5cbe8e06'] peak=5048`. Candidate binary sha256 `1f268f076bfcf4837e6b247037e48dd3d3e478e83a97a75d72b11f79a0c757e2`. Raw output: `/home/ash/.cache/inkwell-dec25/ab-hadvec-clean/out`; summary: `/home/ash/.cache/inkwell-dec25/ab-hadvec-clean/summary.manual`. PW16 remains rejected under the exactness gate in this tree (`md5 7aa1f58b` rather than `5cbe8e06`).
+
+## t3/decode-latency-25ms — scans and rejected/abandoned directions
+
+- **Dense split-target scan:** frozen control at `INKWELL_SGEMV_DENSE_TGT=16/24/32/48/64` measured 28.184/27.717/27.274/27.895/27.631 ms/tok. Existing default 32 is already best; no change.
+- **PW16:** control-binary env scan produced wrong generated-text md5 `7aa1f58b` rather than `5cbe8e06` for both PW16 and HADVEC+PW16. Rejected on exactness before A/B.
+- **Dense CH2 dynamic shared memory:** implemented and built, but abandoned before A/B after the occupancy premise was disproved. Master nsys reports `gemv_sf_ch2` REG40/static shared 12,848 B/`sharedMemoryExecuted=78,336`, consistent with six resident CTAs/SM; registers already cap occupancy at six CTAs/SM (`40*256*6=61,440` of 65,536 registers), so reducing shared memory cannot raise the kernel above six CTAs/SM. The built dyn candidate also added 1–2 address instructions to dense loops. No performance result; not committed.
+- **Cache-table marginal expansion:** offline exact kslot replay on the 68-token routing trace showed current T1200 miss traffic 34.75 MiB/tok and 17.26 misses/tok. Adding 8 MiB to the best single layer saves only about 0.30–0.34 MiB/tok (and +4 MiB much less), likely below 0.1 ms/tok. Rejected as too small for the VRAM-margin risk.
+- **Replacement-policy scan:** same offline replay: global LFU 34.75 MiB/tok; aged LFU 50.05; LRU 40.12; FIFO 51.88; cost-aware 35.32; cost-sqrt 35.27; random 54.26. Existing global LFU is best of these simple policies; no change.
