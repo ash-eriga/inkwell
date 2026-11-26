@@ -55,7 +55,7 @@ Pass `--verbose` (or `INKWELL_VERBOSE=1`) to display internal VRAM, cache, and p
 ## Roadmap
 
 - **v0.1.5**: Compressed KV cache (32k / 64k context on 6 GB VRAM), further kernel refinement toward sub-25 ms/tok short-context decode.
-- **v0.2**: Built-in Vercel `fx` integration for an embedded interactive chat experience alongside the local model, plus standalone EXL3 Pascal kernels on the Hugging Face Kernel Hub.
+- **v0.2**: Self-contained **8 MB** runtime target (drop the external 129 MB `libggml-cuda.so` dependency), built-in Vercel `fx` integration for an embedded interactive chat experience alongside the local model, plus standalone EXL3 Pascal kernels on the Hugging Face Kernel Hub.
 
 Test with `curl`:
 
