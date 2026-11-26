@@ -219,9 +219,14 @@ fn color(tty: bool, code: &'static str) -> &'static str {
     if tty { code } else { "" }
 }
 
-fn render_catalog(local: &[LocalModel], available: &[&HfPreset]) {
+fn render_catalog(local: &[LocalModel], available: &[&HfPreset], vision_enabled: bool) {
     let tty = io::stdout().is_terminal();
     let root = models_dir();
+    let v_tag = if vision_enabled {
+        format!("{}vision: ON{}", color(tty, GREEN), color(tty, DIM))
+    } else {
+        "vision: OFF".to_owned()
+    };
 
     println!(
         "\n{}{}inkwell models{}  {}({}){}",
@@ -247,7 +252,7 @@ fn render_catalog(local: &[LocalModel], available: &[&HfPreset]) {
                 .matched_preset
                 .map_or("EXL3", |p| p.detail.split(" · ").next().unwrap_or("EXL3"));
             println!(
-                "  {}[{}]{} {:<30} {}{} · {} · {}{}",
+                "  {}[{}]{} {:<30} {}{} · {} · {v_tag} · {}{}",
                 color(tty, GREEN),
                 i + 1,
                 color(tty, RESET),
@@ -262,10 +267,14 @@ fn render_catalog(local: &[LocalModel], available: &[&HfPreset]) {
     }
 
     if !available.is_empty() {
-        println!("\n{}Available to download (Hugging Face · EXL3):{}", color(tty, BOLD), color(tty, RESET));
+        println!(
+            "\n{}Available to download (Hugging Face · EXL3):{}",
+            color(tty, BOLD),
+            color(tty, RESET)
+        );
         for (j, p) in available.iter().enumerate() {
             println!(
-                "  {}[{}]{} {:<44} {}{} · {}{}",
+                "  {}[{}]{} {:<44} {}{} · {v_tag} · {}{}",
                 color(tty, CYAN),
                 local.len() + j + 1,
                 color(tty, RESET),
@@ -284,7 +293,8 @@ fn render_catalog(local: &[LocalModel], available: &[&HfPreset]) {
 pub fn print_model_catalog() {
     let local = discover_local_exl3();
     let available = missing_presets(&local);
-    render_catalog(&local, &available);
+    let vision_enabled = std::env::var("INKWELL_VISION").as_deref() == Ok("1");
+    render_catalog(&local, &available, vision_enabled);
 }
 
 /// Download a curated Hugging Face EXL3 preset into `~/models/<slug>`.
@@ -356,10 +366,9 @@ pub fn select_or_download_model() -> Result<ModelChoice, String> {
     let available = missing_presets(&local);
     let mut vision_enabled = std::env::var("INKWELL_VISION").as_deref() == Ok("1");
 
-    render_catalog(&local, &available);
-
     let total = local.len() + available.len();
     if !io::stdin().is_terminal() {
+        render_catalog(&local, &available, vision_enabled);
         if let Some(first) = local.first() {
             return Ok(ModelChoice {
                 path: first.path.to_string_lossy().into_owned(),
@@ -371,14 +380,9 @@ pub fn select_or_download_model() -> Result<ModelChoice, String> {
 
     let default_idx = 1usize;
     loop {
-        let v_badge = if vision_enabled {
-            format!("{}ON{} {}(soft · preview){}", color(tty, GREEN), color(tty, RESET), color(tty, DIM), color(tty, RESET))
-        } else {
-            format!("{}OFF{} {}(text-only, saves VRAM){}", color(tty, DIM), color(tty, RESET), color(tty, DIM), color(tty, RESET))
-        };
-        println!("  {}Vision tower:{} {v_badge}  {}[press 'v' to toggle]{}", color(tty, BOLD), color(tty, RESET), color(tty, DIM), color(tty, RESET));
+        render_catalog(&local, &available, vision_enabled);
         print!(
-            "{}Select model [1-{total}] (default {default_idx}, v=vision, q=quit):{} ",
+            "{}Select model [1-{total}] (default {default_idx}, v=toggle vision, q=quit):{} ",
             color(tty, BOLD),
             color(tty, RESET)
         );
@@ -396,19 +400,6 @@ pub fn select_or_download_model() -> Result<ModelChoice, String> {
         }
         if s.eq_ignore_ascii_case("v") || s.eq_ignore_ascii_case("vision") {
             vision_enabled = !vision_enabled;
-            if vision_enabled {
-                println!(
-                    "{}Vision tower marked ON (soft flag INKWELL_VISION=1 — image encoding arrives in v0.1.5+; text runs normally).{}\n",
-                    color(tty, YELLOW),
-                    color(tty, RESET)
-                );
-            } else {
-                println!(
-                    "{}Vision tower OFF (text-only mode).{}\n",
-                    color(tty, DIM),
-                    color(tty, RESET)
-                );
-            }
             continue;
         }
         let choice: usize = if s.is_empty() {
