@@ -2346,3 +2346,12 @@ Base `e5dea6c`; branch `t3/m3a-sink-relbias-port`. Ports the M3a `sink_relbias_f
 
 - **Why the LUT misses:** a 12-bit entry that straddles a 32-bit word needs 2 LDS. One warp-wide LDS per clock then caps throughput at 16 lookups/SM-cycle, already below the refit threshold. With the extraction ALU work the measured rate is about 8.
 - **Verdict:** Ch10's speed claim is refuted on silicon. There is nothing to port. INT8 on sm_61 does not beat FP32 at ε 3e-5 with the published constructions. Any next attempt needs a cost model fitted to these measured rates (about 4 warp-instr/clk/SM issue with core and shift serialised; 2 LDS per straddling LUT entry).
+
+## DFlash2 port study: do not port (branch commit d160004, not merged)
+
+- **Setup:** CPU acceptance on the EXL3 target. Non-degenerate corpus, teacher-forced, acceptance measured against the target's own greedy output.
+- **Correctness:** feature extraction and the EXL3 unembed are bit-exact against the GPU binary (96/96 argmax).
+- **Acceptance:** DFlash2 2.01 vs DSpark 1.86 tokens/block (+8%). It saturates by k=2–3: emit_by_k = 1.59, 1.83, 1.93, 1.97, 1.99, 2.00, 2.01.
+- **Cost model:** best DFlash2 config is 30.1 ms/tok (0.91× vs 27.4) against DSpark pruned/int4 at 27.3 ms/tok. With the production/teacher-forced correction of 0.93 the ordering holds (DFlash2 ≈ 28.0). DFlash2 streams ~2× the bytes per round (196 vs 120 MiB) and doubles expert-cache displacement.
+- **Verdict:** the 8-token block drafter does not pay on a memory-bound GTX 1060. Any remaining spec-decode leverage is in the verify / expert-union streaming path. Spec decode itself stays cancelled under the release focus.
+- **Report:** opt/dflash2/REPORT.md on that branch.
