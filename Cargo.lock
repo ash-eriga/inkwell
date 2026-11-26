@@ -58,6 +58,7 @@ dependencies = [
  "inkwell-spec",
  "inkwell-st",
  "inkwell-tokenizer",
+ "libc",
  "serde",
  "serde_json",
 ]
