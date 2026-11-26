@@ -29,10 +29,10 @@ __global__ void ref_exl3_m1(const uint32_t* trel,const float* x,float* y,int M,i
 }
 
 static int test_gemm(){
- struct S{const char*name;int K,N,ka,hk;} ss[]={{"MoE_gu",2304,1152,2,1},{"MoE_dn",1152,2304,2,1},{"Dense_wq",2304,3072,3,0},{"Dense_wo",3072,2304,3,1}};
+ struct S{const char*name;int K,N,ka,hk;} ss[]={{"MoE_gu",2304,1152,2,1},{"MoE_dn",1152,2304,2,1},{"Dense_wq",2304,3072,3,0},{"Dense_wo",3072,2304,3,1},{"Dense_rel",2304,384,5,0}};
  bool pass=true; printf("gemm_smem\n");
  for(auto sh:ss){
-  int tk=sh.K/16,tn=sh.N/16,maxM=64;size_t nw=(size_t)tk*tn*((sh.hk ? 256*sh.ka+128 : 256*sh.ka)/32);
+  int tk=sh.K/16,tn=sh.N/16,maxM=128;size_t nw=(size_t)tk*tn*((sh.hk ? 256*sh.ka+128 : 256*sh.ka)/32);
   std::vector<uint32_t> ht(nw);for(auto&x:ht)x=rnd();
   std::vector<float> hx(maxM*sh.K),hsu(sh.K),hsv(sh.N);for(auto&x:hx)x=frnd();
   std::vector<uint16_t> hu(sh.K),hv(sh.N);for(auto&x:hu)x=(uint16_t)(0x3800+(rnd()&0x3ff));for(auto&x:hv)x=(uint16_t)(0x3800+(rnd()&0x3ff));
@@ -40,7 +40,7 @@ static int test_gemm(){
   CK(cudaMalloc(&dx,hx.size()*4));CK(cudaMalloc(&dy,(size_t)maxM*sh.N*4));CK(cudaMalloc(&dr,(size_t)maxM*sh.N*4));CK(cudaMalloc(&ds,(size_t)maxM*(sh.K+sh.N)*4));
   CK(cudaMemcpy(dw,ht.data(),nw*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dx,hx.data(),hx.size()*4,cudaMemcpyHostToDevice));
   CK(cudaMemcpy(du,hu.data(),sh.K*2,cudaMemcpyHostToDevice));CK(cudaMemcpy(dv,hv.data(),sh.N*2,cudaMemcpyHostToDevice));
-  for(int M: {1,16,64}){
+  for(int M: {1,16,64,127,128}){
    // Reference: same Hadamard kernels + scalar exact core.
    float*xh=ds,*tm=ds+(size_t)M*sh.K;
    inkwell_exl3_had_in_prefill<<<dim3(sh.K/128,M),128>>>(dx,du,xh,M,sh.K);
@@ -107,7 +107,7 @@ static int test_flash(){
  CK(cudaMemcpy(dK,hk.data(),ks*2,cudaMemcpyHostToDevice));CK(cudaMemcpy(dV,hv.data(),ks*2,cudaMemcpyHostToDevice));CK(cudaMemcpy(dq,hq.data(),qs*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(drr,hr.data(),rs*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dw,hw.data(),ws*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(ds,hs.data(),ss*4,cudaMemcpyHostToDevice));
  float *dbias,*dmask,*dout;CK(cudaMalloc(&dbias,(size_t)24*1600*4));CK(cudaMalloc(&dmask,1601*4));CK(cudaMalloc(&dout,24*128*4));
  const float scale=1.f/sqrtf(128.f);
- bool pass=true;std::pair<int,int> cases[]={{1100,1024},{1500,1024},{700,0}};for(auto cs:cases){
+ bool pass=true;std::pair<int,int> cases[]={{0,1024},{0,0},{64,1024},{1100,1024},{1500,1024},{700,0}};for(auto cs:cases){
   ink_launch_flash_prefill_gqa3(dK,dV,dq,drr,dw,ds,da,C,cs.first,cap,cs.second,scale,nullptr);
   CK(cudaDeviceSynchronize());CK(cudaMemcpy(ha.data(),da,qs*4,cudaMemcpyDeviceToHost));
   float ma=0;int rows[]={0,1,17,31,63};
@@ -162,17 +162,48 @@ static int test_moe(){
  std::vector<uint64_t> hd(128*4);for(int e=0;e<128;e++){hd[4*e]=(uint64_t)(uintptr_t)dw;hd[4*e+3]=ka|(hk<<8);}CK(cudaMalloc(&dd,hd.size()*8));CK(cudaMemcpy(dd,hd.data(),hd.size()*8,cudaMemcpyHostToDevice));
  std::vector<float> hx(P*K);for(auto&x:hx)x=frnd();CK(cudaMalloc(&dx,hx.size()*4));CK(cudaMemcpy(dx,hx.data(),hx.size()*4,cudaMemcpyHostToDevice));
  CK(cudaMalloc(&dy,(size_t)P*N*4));CK(cudaMalloc(&dr,(size_t)P*N*4));CK(cudaMalloc(&dte,4096));CK(cudaMalloc(&dts,4096));CK(cudaMalloc(&dtc,4096));CK(cudaMalloc(&dtn,4));CK(cudaMalloc(&drex,P*4));
- // Balanced routed rows: 32 rows for each of the 128 experts, one full
- // grouped tile per expert. This is the meaningful large-C throughput case.
+ // Mixed routed rows: alternating 24/32+8-sized expert tiles exercise both
+ // the 32-row kernel and the 64-row weight-reuse kernel at realistic partial
+ // tile sizes while keeping the same total expanded row count.
  std::vector<int> ht(128),hs(128),hc(128),hn{128},rex(P);
- for(int e=0;e<128;e++){ht[e]=e;hs[e]=e*32;hc[e]=32;for(int i=0;i<32;i++)rex[e*32+i]=e;}
+ int pos=0;
+ for(int e=0;e<128;e++){
+  ht[e]=e;hs[e]=pos;hc[e]=(e&1)?40:24;
+  for(int i=0;i<hc[e];i++)rex[pos+i]=e;
+  pos+=hc[e];
+ }
+ if(pos!=P){printf("bad mixed row count %d\n",pos);return 1;}
  CK(cudaMemcpy(dte,ht.data(),ht.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dts,hs.data(),hs.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dtc,hc.data(),hc.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dtn,hn.data(),4,cudaMemcpyHostToDevice));CK(cudaMemcpy(drex,rex.data(),P*4,cudaMemcpyHostToDevice));
- dim3 g((N/16+3)/4,P/64+128);inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0);
  ref_group_gemm<<<dim3(tn,P),16>>>(dd,drex,dx,dr,P,tk,tn);CK(cudaDeviceSynchronize());
- std::vector<float>a(P*N),b(P*N);CK(cudaMemcpy(a.data(),dy,a.size()*4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(b.data(),dr,b.size()*4,cudaMemcpyDeviceToHost));
- int bd=0;float ma=0;for(size_t i=0;i<a.size();i++){bd+=memcmp(&a[i],&b[i],4)!=0;ma=fmaxf(ma,fabsf(a[i]-b[i]));}
- double ms=timeit([&]{inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0);});
- double tf=2.0*P*K*N/(ms*1e9);printf("moe grouped bitdiff=%d max=%.2e TF=%.2f\nMOE %s\n",bd,ma,tf,bd?"FAIL":"PASS");return bd!=0;
+ std::vector<float>a(P*N),b(P*N);CK(cudaMemcpy(b.data(),dr,b.size()*4,cudaMemcpyDeviceToHost));
+ dim3 g((N/16+3)/4,P/64+128);
+ bool pass=true;
+ auto check=[&](const char*name,int kind,int mode32,int mode64){
+  CK(cudaMemset(dy,0,(size_t)P*N*4));
+  if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+  else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+  else {
+   inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+   inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+  }
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemcpy(a.data(),dy,a.size()*4,cudaMemcpyDeviceToHost));
+  int bd=0;float ma=0;for(size_t i=0;i<a.size();i++){bd+=memcmp(&a[i],&b[i],4)!=0;ma=fmaxf(ma,fabsf(a[i]-b[i]));}
+  double ms=timeit([&]{
+   if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+   else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+   else {
+    inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
+    inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+   }
+  });
+  double tf=2.0*P*K*N/(ms*1e9);printf("moe %-8s bitdiff=%d max=%.2e TF=%.2f\n",name,bd,ma,tf);
+  pass=pass&&bd==0;
+ };
+ check("group32",0,0,0);
+ check("group64",1,0,0); // mode zero makes the BM64 core process every tile here.
+ check("adaptive",2,1,2);
+ printf("MOE %s\n",pass?"PASS":"FAIL");return pass?0:1;
 }
 
 // Full grouped-MoE pipeline oracle: identical epilogues, but scalar row GEMVs.
@@ -228,6 +259,34 @@ static int test_moe_pipeline(){
  return bd!=0;
 }
 
+// Rel-bias table expand, [16][1025] -> [24][16][1025]. The BF16 source is the
+// production dtype (fused decode sink/relbias keeps the table in BF16).
+static int test_rel(){
+ const int N=1025*16;
+ bool pass=true;
+ float *ds=nullptr,*dd=nullptr;uint16_t* dbs=nullptr;
+ CK(cudaMalloc(&ds,N*4));CK(cudaMalloc(&dd,24*(size_t)N*4));CK(cudaMalloc(&dbs,N*2));
+ std::vector<float> h(N);for(auto&x:h)x=frnd();
+ CK(cudaMemcpy(ds,h.data(),N*4,cudaMemcpyHostToDevice));
+ ink_launch_pf_expand_rel(ds,dd,nullptr);CK(cudaDeviceSynchronize());
+ std::vector<float> o(24*(size_t)N);CK(cudaMemcpy(o.data(),dd,o.size()*4,cudaMemcpyDeviceToHost));
+ int bd=0;for(int hh=0;hh<24;hh++)for(int i=0;i<N;i++)bd+=memcmp(&o[(size_t)hh*N+i],&h[i],4)!=0;
+ printf("expand_rel f32 bitdiff=%d\n",bd);pass=pass&&bd==0;
+ // Finite BF16 patterns only (exponent 1..15) so the conversion is exact.
+ std::vector<uint16_t> hb(N);
+ for(int i=0;i<N;i++)hb[i]=(uint16_t)(((rnd()&1)?0x8000:0)|((uint16_t)(1+rnd()%15)<<7)|(rnd()&0x7f));
+ CK(cudaMemcpy(dbs,hb.data(),N*2,cudaMemcpyHostToDevice));
+ ink_launch_pf_expand_rel_bf16(dbs,dd,nullptr);CK(cudaDeviceSynchronize());
+ CK(cudaMemcpy(o.data(),dd,o.size()*4,cudaMemcpyDeviceToHost));
+ bd=0;for(int hh=0;hh<24;hh++)for(int i=0;i<N;i++){
+  uint32_t u=((uint32_t)hb[i])<<16;float e;memcpy(&e,&u,4);
+  bd+=memcmp(&o[(size_t)hh*N+i],&e,4)!=0;}
+ printf("expand_rel bf16 bitdiff=%d\n",bd);pass=pass&&bd==0;
+ printf("REL %s\n",pass?"PASS":"FAIL");
+ cudaFree(ds);cudaFree(dd);cudaFree(dbs);return pass?0:1;
+}
+
 int main(int argc,char**argv){std::string m=argc>1?argv[1]:"all";int rc=0;
  if(m=="gemm"||m=="all")rc|=test_gemm();if(m=="conv"||m=="all")rc|=test_conv();if(m=="flash"||m=="all")rc|=test_flash();if(m=="moe"||m=="all"){rc|=test_moe();rc|=test_moe_pipeline();}
+ if(m=="rel"||m=="all")rc|=test_rel();
  printf("OVERALL %s\n",rc?"FAIL":"PASS");return rc;}

@@ -1470,6 +1470,7 @@ impl Runner {
                 let dev_margin: usize = std::env::var("INKWELL_DEV_MARGIN_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1300);
                 let on_dev = place_plan.as_ref().map_or(true, |p| p[il])
                     && (f_free as usize) > total + (dev_margin << 20);
+                let mut host_base = 0usize;
                 let base = if on_dev {
                     let mut blob = inkwell_cuda::DevBuf::new_bytes(total);
                     blob.write_bytes(&host);
@@ -1481,6 +1482,7 @@ impl Runner {
                     let pb = inkwell_cuda::host_alloc_mapped(total);
                     unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), pb.host, total) };
                     pinned_bytes += total;
+                    host_base = pb.host as usize;
                     let b = pb.dev as u64;
                     pinned.push(pb);
                     b
@@ -1499,6 +1501,8 @@ impl Runner {
                     descs_g: mk(0), descs_u: mk(1), descs_d: mk(2),
                     v2_descs_ok, on_dev, cache: None, max_slot,
                     layer: moe_args_exl3.len() as i32,
+                    descs_host: descs.clone(), expert_host_base: host_base,
+                    expert_dev_base: base as usize, expert_total: total,
                 }));
             }
             l.proj0_off = [-1; 3];
@@ -4130,5 +4134,706 @@ unsafe extern "C" fn dense_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, 
             14 => inkwell_cuda::mmvq_q6_k_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols),
             _ => inkwell_cuda::mmvq_q8_0_i8_async(w.cast_const(), x.cast_const(), y, nrows, ncols),
         }
+    }
+}
+
+// ============ chunked prefill driver (phase 2, direct row-major CUDA path) ============
+
+#[derive(Debug)]
+struct PfArena {
+    buf: Option<inkwell_cuda::DevBuf>,
+    exact_attn_ws: Option<inkwell_cuda::DevBuf>,
+    base: *mut u8,
+    c: usize,
+    off: HashMap<&'static str, usize>,
+    bytes: usize,
+}
+
+impl PfArena {
+    fn layout(c: usize) -> (HashMap<&'static str, usize>, usize) {
+        let mut off = HashMap::new();
+        let mut o = 0usize;
+        let mut put = |name: &'static str, bytes: usize, off: &mut HashMap<&'static str, usize>, o: &mut usize| {
+            *o = (*o + 255) & !255;
+            off.insert(name, *o);
+            *o += bytes;
+        };
+        let h = c * 2304 * 4;
+        for name in ["cur","x0","x1","x2","fcur","moe_out","tmp2","head","prelude","bankout","cn","cm","cg"] {
+            put(name, h, &mut off, &mut o);
+        }
+        put("cat", h * 2, &mut off, &mut o);
+        put("ctrlg", h * 2, &mut off, &mut o);
+        for name in ["blk0","blk1","blk2","blk3","bank"] {
+            put(name, h, &mut off, &mut o);
+        }
+        put("mixbuf", h * 3, &mut off, &mut o);
+        put("msgbuf", h * 4, &mut off, &mut o);
+        put("q", c * 3072 * 4, &mut off, &mut o);
+        put("gate", c * 3072 * 4, &mut off, &mut o);
+        put("attn", c * 3072 * 4, &mut off, &mut o);
+        put("wo", c * 2304 * 4, &mut off, &mut o);
+        put("k", c * 1024 * 4, &mut off, &mut o);
+        put("v", c * 1024 * 4, &mut off, &mut o);
+        put("r", c * 384 * 4, &mut off, &mut o);
+        put("kout", c * 1024 * 4, &mut off, &mut o);
+        put("ksnap", c * 1024 * 2, &mut off, &mut o);
+        put("vsnap", c * 1024 * 2, &mut off, &mut o);
+        put("vout", c * 1024 * 4, &mut off, &mut o);
+        put("woout", c * 2304 * 4, &mut off, &mut o);
+        put("ffnout", c * 2304 * 4, &mut off, &mut o);
+        put("kdyn", c * 32 * 4, &mut off, &mut o);
+        put("vdyn", c * 32 * 4, &mut off, &mut o);
+        put("sink", c * 24 * 4, &mut off, &mut o);
+        put("router", c * 128 * 4, &mut off, &mut o);
+        put("ids", c * 8 * 4, &mut off, &mut o);
+        put("wts", c * 8 * 4, &mut off, &mut o);
+        put("tokids", c * 4, &mut off, &mut o);
+        put("rel", 24 * 1025 * 16 * 4, &mut off, &mut o);
+        put("sort", c * 8 * 8 * 4 + 8192, &mut off, &mut o);
+        let p = c * 8;
+        put("moews", p * 6912 * 4 + p * 4 + 256, &mut off, &mut o);
+        put("scratch", c * (3072 + 3072) * 4, &mut off, &mut o);
+        put("logits", 201024 * 4 + 256, &mut off, &mut o);
+        (off, o)
+    }
+    fn new(c: usize) -> Self {
+        let (off, bytes) = Self::layout(c);
+        let buf = inkwell_cuda::DevBuf::new_bytes(bytes);
+        let base = buf.dev_ptr().cast();
+        Self { buf: Some(buf), exact_attn_ws: None, base, c, off, bytes }
+    }
+    /// Borrow an already allocated device buffer. The caller guarantees that
+    /// it remains alive for the whole encode and is not otherwise in use.
+    fn borrowed(c: usize, base: *mut u8) -> Self {
+        let (off, bytes) = Self::layout(c);
+        Self { buf: None, exact_attn_ws: None, base, c, off, bytes }
+    }
+    fn ptr(&self, name: &'static str) -> *mut f32 {
+        unsafe { self.base.add(self.off[name]).cast() }
+    }
+}
+
+struct PfExpertStageBuf {
+    buf: inkwell_cuda::DevBuf,
+    dg: inkwell_cuda::DevBuf,
+    du: inkwell_cuda::DevBuf,
+    dd: inkwell_cuda::DevBuf,
+    reuse_event: *mut std::ffi::c_void,
+    done_event: *mut std::ffi::c_void,
+    layer: i32,
+}
+
+struct PfExpertStage {
+    bufs: Vec<PfExpertStageBuf>,
+    next: usize,
+    table_keepalive: Vec<Vec<u64>>,
+}
+
+type PfMoeDescs = (*const std::ffi::c_void, *const std::ffi::c_void, *const std::ffi::c_void, *mut std::ffi::c_void);
+
+impl PfExpertStage {
+    fn new(bytes: usize) -> Option<Self> {
+        let mut bufs = Vec::new();
+        for _ in 0..2 {
+            bufs.push(PfExpertStageBuf {
+                buf: inkwell_cuda::DevBuf::try_new_bytes(bytes)?,
+                dg: inkwell_cuda::DevBuf::new_bytes(4096),
+                du: inkwell_cuda::DevBuf::new_bytes(4096),
+                dd: inkwell_cuda::DevBuf::new_bytes(4096),
+                reuse_event: inkwell_cuda::new_event(),
+                done_event: inkwell_cuda::new_event(),
+                layer: -1,
+            });
+        }
+        Some(Self { bufs, next: 0, table_keepalive: Vec::new() })
+    }
+}
+
+fn pf_stream_experts_enabled() -> bool {
+    std::env::var("INKWELL_PF_STREAM_EXPERTS").ok().as_deref() != Some("0")
+}
+
+/// Releasing a decode expert cache wipes it, and the experts it held then have
+/// to come back over PCIe during decode. Keep every cache the prefill arena
+/// and expert stage do not need (killswitch: INKWELL_PF_KEEP_CACHE=0).
+fn pf_keep_cache_enabled() -> bool {
+    std::env::var("INKWELL_PF_KEEP_CACHE").ok().as_deref() != Some("0")
+}
+
+fn pf_host_experts(r: &Runner, il: usize) -> Option<&crate::moe::MoeArgsExl3> {
+    let mi = r.layers[il].moe_exl3?;
+    let m = &r.moe_args_exl3[mi];
+    (!m.on_dev && m.expert_host_base != 0 && m.expert_total != 0).then_some(m)
+}
+
+/// Start an asynchronous side-stream copy of one host-backed layer into the
+/// next double-buffer slot.  The reuse event is recorded before the caller
+/// enqueues the current layer's compute, so the copy overlaps that compute but
+/// cannot overwrite the slot before all previously enqueued consumers retire.
+fn pf_prepare_experts(r: &Runner, stage: &mut PfExpertStage, il: usize) -> Option<usize> {
+    let m = pf_host_experts(r, il)?;
+    // Repeated loop layers revisit identical weights with only the other loop
+    // layer interleaved.  If either double-buffer slot already holds this
+    // layer, reuse it instead of streaming hundreds of MiB again.
+    if let Some(hit) = stage.bufs.iter().position(|b| b.layer == il as i32) {
+        return Some(hit);
+    }
+    let bi = stage.next;
+    stage.next ^= 1;
+    let b = &mut stage.bufs[bi];
+    if m.expert_total > b.buf.len * 4 { return None; }
+    unsafe {
+        inkwell_cuda::event_record_current(b.reuse_event);
+        inkwell_cuda::side_wait_event(b.reuse_event);
+        inkwell_cuda::memcpy_h2d_async_side(b.buf.dev_ptr(), m.expert_host_base as *const std::ffi::c_void, m.expert_total);
+    }
+    let stage_base = b.buf.dev_ptr() as u64;
+    let old_base = m.expert_dev_base as u64;
+    let mut table = Vec::with_capacity(3 * 512);
+    for pi in 0..3 {
+        for e in 0..128 {
+            for j in 0..4 {
+                let v = m.descs_host[pi * 512 + e * 4 + j];
+                table.push(if j < 3 { v - old_base + stage_base } else { v });
+            }
+        }
+    }
+    unsafe {
+        for (pi, dst) in [&b.dg, &b.du, &b.dd].into_iter().enumerate() {
+            let src = table.as_ptr().add(pi * 512).cast::<std::ffi::c_void>();
+            inkwell_cuda::memcpy_h2d_async_side(dst.dev_ptr(), src, 4096);
+        }
+        inkwell_cuda::event_record(b.done_event, inkwell_cuda::side_stream_raw());
+    }
+    stage.table_keepalive.push(table);
+    b.layer = il as i32;
+    Some(bi)
+}
+
+fn pf_stage_ready(stage: &PfExpertStage, map: &[Option<usize>], pos: usize) -> Option<PfMoeDescs> {
+    let bi = (*map.get(pos)?)?;
+    let b = &stage.bufs[bi];
+    Some((b.dg.dev_ptr() as *const std::ffi::c_void,
+        b.du.dev_ptr() as *const std::ffi::c_void,
+        b.dd.dev_ptr() as *const std::ffi::c_void,
+        b.done_event))
+}
+
+fn tdata(x: Ptr) -> *mut f32 { unsafe { inkwell_ggml::ink_tensor_data(x.0).cast() } }
+fn ttype(x: Ptr) -> i32 { unsafe { inkwell_ggml::ink_tensor_type(x.0) } }
+
+fn pf_dense_exact_layout(w: Ptr, n: usize, k: usize) -> bool {
+    if k & 1 != 0 { return false; }
+    let ts: i64 = match ttype(w) {
+        BF16 => 2,
+        F32 => 4,
+        _ => return false,
+    };
+    let pair = 2 * ts;
+    unsafe {
+        inkwell_ggml::ink_tensor_ne(w.0, 0) == k as i64
+            && inkwell_ggml::ink_tensor_ne(w.0, 1) == n as i64
+            && inkwell_ggml::ink_tensor_nb(w.0, 0) == ts
+            && inkwell_ggml::ink_tensor_nb(w.0, 1) == k as i64 * ts
+            && (inkwell_ggml::ink_tensor_data(w.0) as usize) % (pair as usize) == 0
+            && inkwell_ggml::ink_tensor_nb(w.0, 2) % pair == 0
+            && inkwell_ggml::ink_tensor_nb(w.0, 3) % pair == 0
+    }
+}
+
+fn pf_copy(dst: *mut f32, src: *const f32, bytes: usize) {
+    unsafe { inkwell_cuda::memcpy_d2d_async(dst.cast(), src.cast(), bytes) };
+}
+fn pf_exl3(e: &Exl3W, x: *const f32, y: *mut f32, c: usize, scratch: *mut f32) {
+    unsafe {
+        inkwell_cuda::exl3_gemm_smem_async(e.trel.dev_ptr().cast_const(), e.suh.dev_ptr().cast_const(),
+            e.svh.dev_ptr().cast_const(), x, y, c as i32, e.k, e.n, e.ka, e.halfk, scratch);
+    }
+}
+
+fn pf_exact_attn_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("INKWELL_PF_EXACT_ATTN").is_ok_and(|v| v == "1"))
+}
+
+fn pf_dbg(name: &str, x: *const f32, n: usize) {
+    if std::env::var_os("INKWELL_PFDBG").is_none() { return; }
+    let mut v = vec![0f32; n];
+    unsafe {
+        inkwell_cuda::memcpy_d2h_async(v.as_mut_ptr().cast(), x.cast(), n * 4);
+        inkwell_cuda::DevBuf::sync();
+    }
+    eprintln!("PFDBG {name} sum={:.6} first8={:?}", v.iter().sum::<f32>(), &v[..8.min(n)]);
+}
+
+impl Runner {
+    fn pf_norm(&self, x: *mut f32, w: Ptr, rows: usize, n: usize) {
+        unsafe { inkwell_cuda::pf_rmsnorm_async(x, tdata(w).cast_const(), rows as i32, n as i32, 1e-6) };
+    }
+    fn pf_dense(&self, x: *const f32, w: Ptr, y: *mut f32, c: usize, n: usize, k: usize) {
+        let bf = i32::from(ttype(w) == BF16);
+        unsafe {
+            if pf_dense_exact_layout(w, n, k) && (x as usize) % 8 == 0 {
+                inkwell_cuda::pf_dense_gemm_exact_async(x, tdata(w).cast(), y, c as i32, n as i32, k as i32, bf);
+            } else {
+                inkwell_cuda::pf_dense_gemm_tiled_async(x, tdata(w).cast(), y, c as i32, n as i32, k as i32, bf);
+            }
+        }
+    }
+    fn pf_mix_run(&self, states: &[*const f32], query: Ptr, out: *mut f32, c: usize, qcols: usize) {
+        let mut ps = [std::ptr::null::<std::ffi::c_void>(); 8];
+        for (i, s) in states.iter().enumerate() { ps[i] = (*s).cast(); }
+        unsafe {
+            inkwell_cuda::pf_mix_async(ps.as_ptr(), states.len() as i32, tdata(query).cast_const(),
+                out, c as i32, 2304, qcols as i32, 1.0 / (2304f32).sqrt(), 1e-6);
+        }
+    }
+    #[expect(clippy::too_many_arguments)]
+    fn pf_control(&self, a: &PfArena, cur: *mut f32, msg: *const f32, l: &L, ctrl: usize) {
+        let c = a.c;
+        let (n, h) = (2304usize, c * 2304);
+        let (x0, x1, cat, gate, gain) =
+            (a.ptr("cn"), a.ptr("cm"), a.ptr("cat"), a.ptr("cg"), a.ptr("ctrlg"));
+        let dn = l.ctrl_down[ctrl].expect("ctrl_down");
+        if let Some(gfcat) = l.ctrl_gf_cat[ctrl] {
+            let [go, fo] = l.ctrl_gf_off[ctrl];
+            let exact = unsafe {
+                inkwell_ggml::ink_tensor_type(dn.0) == BF16
+                    && inkwell_ggml::ink_tensor_type(gfcat.0) == BF16
+                    && inkwell_ggml::ink_tensor_ne(dn.0, 0) == 2 * n as i64
+                    && inkwell_ggml::ink_tensor_ne(dn.0, 1) == 64
+                    && inkwell_ggml::ink_tensor_ne(gfcat.0, 0) == 64
+                    && go == 0 && fo == n as i64
+                    && inkwell_ggml::ink_tensor_ne(gfcat.0, 1) - fo == n as i64
+            };
+            if exact {
+                unsafe {
+                    inkwell_cuda::pf_ctrl_exact_async(cur.cast_const(), msg, tdata(dn).cast(),
+                        tdata(gfcat).cast(), gate, cur, c as i32, n as i32, 64, 1e-6, fo as i32);
+                }
+                return;
+            }
+        }
+        pf_copy(x0, cur, h * 4);
+        pf_copy(x1, msg, h * 4);
+        unsafe {
+            inkwell_cuda::pf_rmsnorm_async(x0, std::ptr::null(), c as i32, n as i32, 1e-6);
+            inkwell_cuda::pf_rmsnorm_async(x1, std::ptr::null(), c as i32, n as i32, 1e-6);
+            for j in 0..c {
+                inkwell_cuda::memcpy_d2d_async(cat.add(j * 2 * n).cast(), x0.add(j * n).cast_const().cast(), n * 4);
+                inkwell_cuda::memcpy_d2d_async(cat.add(j * 2 * n + n).cast(), x1.add(j * n).cast_const().cast(), n * 4);
+            }
+        }
+        self.pf_dense(cat.cast_const(), dn, gate, c, 64, 2 * n);
+        if let Some(gfcat) = l.ctrl_gf_cat[ctrl] {
+            self.pf_dense(gate.cast_const(), gfcat, gain, c, 2 * n, 64);
+            unsafe { inkwell_cuda::pf_ctrl_apply_cat_async(gain.cast_const(), cur, msg, c as i32, n as i32) };
+        } else {
+            self.pf_dense(gate.cast_const(), l.ctrl_gain[ctrl].expect("ctrl_gain"), gain, c, n, 64);
+            self.pf_dense(gate.cast_const(), l.ctrl_forget[ctrl].expect("ctrl_forget"), unsafe{gain.add(c*n)}, c, n, 64);
+            unsafe { inkwell_cuda::pf_ctrl_apply_async(gain.cast_const(), unsafe{gain.add(c*n)}.cast_const(), cur, msg, (h) as i64) };
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn pf_layer(&self, a: &PfArena, il: usize, ip: usize, slot: usize, pass: usize,
+        blocks: &mut Vec<usize>, cur_name: &'static str, messages: bool, pos0: i64,
+        moe_descs: Option<PfMoeDescs>) {
+        let c = a.c;
+        let l = &self.layers[il];
+        let is_swa = self.is_swa_layer(il);
+        let n = 2304usize;
+        let hbytes = c * n * 4;
+        let cur = a.ptr(cur_name);
+        let inp_sa = a.ptr("tmp2");
+        pf_copy(inp_sa, cur, hbytes);
+
+        // Residual-stack attention queries (q/k/v input selectors).
+        let mut inputs = [cur, cur, cur];
+        if let Some(rq) = l.attn_res_query {
+            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([cur.cast_const()]).collect();
+            self.pf_mix_run(&states, rq, a.ptr("mixbuf"), c, if is_swa {1} else {3});
+            inputs = if is_swa { [a.ptr("mixbuf"), a.ptr("mixbuf"), a.ptr("mixbuf")] } else { [a.ptr("mixbuf"), unsafe{a.ptr("mixbuf").add(c*n)}, unsafe{a.ptr("mixbuf").add(2*c*n)}] };
+        }
+        // Loop-pass controller messages. The message tensor rows are materialized by mixbuf.
+        if messages {
+            let states: Vec<*const f32> = [a.ptr("bank").cast_const(), a.ptr("bankout").cast_const()].into_iter().collect();
+            self.pf_mix_run(&states, l.msg_query.expect("msg_query"), a.ptr("msgbuf"), c, 4);
+            for j in 0..3 {
+                let dst = a.ptr(match j {0=>"x0",1=>"x1",_=>"x2"});
+                pf_copy(dst, inputs[j], hbytes);
+                self.pf_control(a, dst, unsafe{a.ptr("msgbuf").add(j*c*n)}.cast_const(), l, j);
+                inputs[j] = dst;
+            }
+        }
+        if il == 0 { pf_dbg("inputs0", inputs[0], 8.min(c*n).max(8)); }
+        let (x0,x1,x2) = (a.ptr("x0"),a.ptr("x1"),a.ptr("x2"));
+        if is_swa && messages {
+            for (z,x) in [x0,x1,x2].into_iter().enumerate() { let _=z; self.pf_norm(x, l.attn_norm.expect("attn_norm"), c, n); inputs = match z {0=>[x,x1,x2],1=>[x0,x,x2],_=>[x0,x1,x]}; }
+        } else if is_swa {
+            pf_copy(x0, inputs[0], hbytes);
+            self.pf_norm(x0, l.attn_norm.expect("attn_norm"), c, n);
+            inputs = [x0,x0,x0];
+        } else {
+            for (j,x) in [x0,x1,x2].into_iter().enumerate() {
+                pf_copy(x, inputs[j], hbytes);
+                self.pf_norm(x, [l.attn_q_inp_norm,l.attn_k_inp_norm,l.attn_v_inp_norm][j].expect("full norm"), c, n);
+                inputs[j] = x;
+            }
+        }
+
+        let (q,gate,r,kbuf,vbuf,scratch) = (a.ptr("q"),a.ptr("gate"),a.ptr("r"),a.ptr("k"),a.ptr("v"),a.ptr("scratch"));
+        for (key,x,y) in [("wq",inputs[0],q),("gate",inputs[0],gate),("rel",inputs[0],r),("wk",inputs[1],kbuf),("wv",inputs[2],vbuf)] {
+            let e = &*self.exl3_w[l.exl3[key]];
+            pf_exl3(e, x.cast_const(), y, c, scratch);
+        }
+        if !is_swa {
+            self.pf_dense(inputs[1].cast_const(), l.attn_k_conv_proj.expect("kcp"), a.ptr("kdyn"), c, 32, n);
+            self.pf_dense(inputs[2].cast_const(), l.attn_v_conv_proj.expect("vcp"), a.ptr("vdyn"), c, 32, n);
+        }
+        let scale_static = 1.0 / 5f32.sqrt();
+        let scale_dyn = 1.0 / 3.0f32;
+        let conv_state = unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0).cast::<f32>() };
+        unsafe {
+            inkwell_cuda::conv_prefill_async(kbuf.cast_const(), conv_state, 0, tdata(l.attn_k_conv.expect("kconv")).cast_const(),
+                if is_swa {std::ptr::null()} else {a.ptr("kdyn").cast_const()}, c as i32, 1024, if is_swa {0} else {8}, if is_swa {scale_static} else {scale_dyn}, a.ptr("kout"));
+            inkwell_cuda::conv_prefill_async(vbuf.cast_const(), conv_state, 1024, tdata(l.attn_v_conv.expect("vconv")).cast_const(),
+                if is_swa {std::ptr::null()} else {a.ptr("vdyn").cast_const()}, c as i32, 1024, if is_swa {0} else {8}, if is_swa {scale_static} else {scale_dyn}, a.ptr("vout"));
+            inkwell_cuda::pf_clip_async(q, tdata(l.attn_q_clip.expect("qclip")).cast_const(), c as i32, 24, 128, self.cfg.qk_clip);
+            inkwell_cuda::pf_clip_async(a.ptr("kout"), std::ptr::null(), c as i32, 8, 128, self.cfg.qk_clip);
+            inkwell_cuda::pf_rmsnorm_async(a.ptr("vout"), std::ptr::null(), c as i32 * 8, 128, 1e-6);
+            inkwell_cuda::pf_clip_async(r, tdata(l.attn_rel_clip.expect("rclip")).cast_const(), c as i32, 24, 16, self.cfg.rel_clip);
+        }
+        if il == 0 { pf_dbg("Qcur-0", q, 8); pf_dbg("Kcur-0", a.ptr("kout"), 8); pf_dbg("Vcur-0", a.ptr("vout"), 8); pf_dbg("Rcur-0", r, 8); }
+        if !is_swa {
+            unsafe { inkwell_cuda::pf_tau_qr_async(q, r, c as i32, self.cfg.log_scale_alpha, self.cfg.log_scale_floor as f32, pos0 as i32) };
+        }
+        self.pf_dense(inputs[0].cast_const(), l.attn_sink_proj.expect("sink"), a.ptr("sink"), c, 24, n);
+        unsafe {
+            // `attn_rel_bias_pad` is BF16 while the fused decode sink/relbias
+            // path is active (m3a, default on). Reinterpreting those bytes as
+            // FP32 silently corrupts every prefill attention bias, so dispatch
+            // on the real tensor type.
+            let rb = l.attn_rel_bias_pad.or(l.attn_rel_bias).expect("relbias");
+            if inkwell_ggml::ink_tensor_type(rb.0) == BF16 {
+                inkwell_cuda::pf_expand_rel_bf16_async(tdata(rb).cast(), a.ptr("rel"));
+            } else {
+                inkwell_cuda::pf_expand_rel_async(tdata(rb).cast_const(), a.ptr("rel"));
+            }
+            let kd = inkwell_ggml::ink_tensor_data(self.k_arena[slot].0);
+            let vd = inkwell_ggml::ink_tensor_data(self.v_arena[slot].0);
+            let cap = if is_swa { self.swa_capacity() } else { self.max_ctx };
+            let swa = if is_swa { self.swa as i32 } else { 0 };
+            let (snap_start, snap_len) = if is_swa {
+                let start = (pos0 - self.swa).max(0) as i32;
+                let end = pos0 as i32 + c as i32 - swa;
+                (start, (end - start).max(0))
+            } else { (0, 0) };
+            if snap_len > 0 {
+                inkwell_cuda::pf_snapshot_kv_async(kd.cast_const(), vd.cast_const(), a.ptr("ksnap").cast(), a.ptr("vsnap").cast(),
+                    snap_start, snap_len, cap as i32, swa);
+            }
+            inkwell_cuda::pf_write_kv_async(a.ptr("kout").cast_const(), a.ptr("vout").cast_const(), kd, vd, c as i32, pos0 as i32, cap as i32, swa);
+            if let Some(ws) = a.exact_attn_ws.as_ref().filter(|_| pf_exact_attn_enabled()) {
+                inkwell_cuda::pf_exact_attn_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+                    a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), ws.dev_ptr().cast::<f32>(),
+                    self.max_ctx as i32, c as i32, pos0 as i32, cap as i32, swa, 1.0 / (128f32).sqrt(),
+                    a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            } else {
+                inkwell_cuda::flash_prefill_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+                    a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), c as i32, pos0 as i32,
+                    cap as i32, swa, 1.0 / (128f32).sqrt(), a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            }
+            if il == 0 { pf_dbg("kqv_out-0", a.ptr("attn"), 8); }
+            inkwell_cuda::pf_mul_sigmoid_async(a.ptr("attn"), gate.cast_const(), (c * 3072) as i64);
+        }
+        let ewo = &*self.exl3_w[l.exl3["wo"]];
+        pf_exl3(ewo, a.ptr("attn").cast_const(), a.ptr("wo"), c, scratch);
+        unsafe {
+            inkwell_cuda::conv_prefill_async(a.ptr("wo").cast_const(), conv_state, 2048, tdata(l.attn_post_conv.expect("postconv")).cast_const(),
+                std::ptr::null(), c as i32, 2304, 0, scale_static, a.ptr("woout"));
+            if il == 0 { pf_dbg("attn_post-0", a.ptr("woout"), 8); }
+        }
+        if ip % (self.cfg.attn_res_block_size as usize) == 0 {
+            let bi = blocks.len().min(3);
+            pf_copy(a.ptr(match bi {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}), inp_sa, hbytes);
+            blocks.push(bi);
+            pf_copy(cur, a.ptr("woout"), hbytes);
+        } else {
+            unsafe { inkwell_cuda::pf_add_async(a.ptr("woout"), inp_sa, (c*n) as i64) };
+            pf_copy(cur, a.ptr("woout"), hbytes);
+        }
+        // FFN input mix/control/norm.
+        let fcur = a.ptr("fcur");
+        if let Some(fq) = l.ffn_res_query {
+            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([cur.cast_const()]).collect();
+            self.pf_mix_run(&states, fq, fcur, c, 1);
+        } else { pf_copy(fcur, cur, hbytes); }
+        if messages {
+            self.pf_control(a, fcur, unsafe{a.ptr("msgbuf").add(3*c*n)}.cast_const(), l, 3);
+        }
+        self.pf_norm(fcur, l.ffn_norm.expect("ffn_norm"), c, n);
+        if il == 0 { pf_dbg("ffn_inp-0", cur, 8); pf_dbg("moe_in-0", fcur, 8); }
+        self.pf_dense(fcur.cast_const(), l.ffn_gate_inp.expect("gate"), a.ptr("router"), c, 128, n);
+        unsafe {
+            inkwell_cuda::pf_router8_async(a.ptr("router").cast_const(), tdata(l.ffn_exp_probs_b.expect("pb")).cast_const(), c as i32,
+                self.cfg.expert_weights_scale, 6.103515625e-5, a.ptr("ids").cast(), a.ptr("wts"));
+        }
+        let p = c * 8;
+        let so = a.ptr("sort");
+        let (eo, stok, sslot, sw, inv, te, ts, tc, tn) = unsafe {
+            (so.cast::<i32>(), so.add(129).cast::<i32>(), so.add(129+p).cast::<i32>(), so.add(129+2*p).cast::<f32>().cast::<i32>(),
+             so.add(129+3*p).cast::<i32>(), so.add(129+4*p).cast::<i32>(), so.add(129+5*p).cast::<i32>(), so.add(129+6*p).cast::<i32>(), so.add(129+7*p).cast::<i32>())
+        };
+        let mi = l.moe_exl3.expect("moe exl3");
+        let m = &self.moe_args_exl3[mi];
+        let (dg, du, dd, copy_done) = moe_descs.unwrap_or((m.descs_g.dev(), m.descs_u.dev(), m.descs_d.dev(), std::ptr::null_mut()));
+        unsafe {
+            if il == 0 { pf_dbg("router-0", a.ptr("router"), 8); }
+            inkwell_cuda::exl3_moe_group_sort_async(a.ptr("ids").cast(), a.ptr("wts").cast(), c as i32,
+                eo, stok, sslot, sw.cast(), inv, te, ts, tc, tn);
+            if !copy_done.is_null() { inkwell_cuda::stream_wait_current(copy_done); }
+            inkwell_cuda::exl3_moe_grouped_gemm_async(dg, du, dd,
+                fcur.cast_const(), c as i32, stok, te, ts, tc, tn, sw.cast(), inv,
+                a.ptr("moews"), a.ptr("moe_out"));
+            inkwell_cuda::conv_prefill_async(a.ptr("moe_out").cast_const(), conv_state, 2048 + 2304,
+                tdata(l.ffn_post_conv.expect("fpc")).cast_const(), std::ptr::null(), c as i32, 2304, 0, scale_static, a.ptr("ffnout"));
+            if il == 0 { pf_dbg("ffn_out-0", a.ptr("ffnout"), 8); }
+            inkwell_cuda::pf_add_async(a.ptr("ffnout"), cur, (c*n) as i64);
+        }
+        pf_copy(cur, a.ptr("ffnout"), hbytes);
+        if matches!(il, 0|1|2|5|6|11|12|17|18|23) {
+            let name = format!("l_out-{il}");
+            pf_dbg(&name, cur, 8);
+            if c > 1 {
+                let last = format!("llast_out-{il}");
+                pf_dbg(&last, unsafe { cur.add((c - 1) * n) }, 8);
+            }
+        }
+    }
+
+    /// Encode token ids in chunks through the batched prefill path. Returns the
+    /// final row's unpadded logits. State writes match serial teacher forcing.
+    pub fn prefill_chunked(&mut self, ids: &[u32], pos0: i64) -> Vec<f32> {
+        let cmax = std::env::var("INKWELL_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64).clamp(1, 512);
+        let need = PfArena::layout(cmax).1;
+        let stream_experts = pf_stream_experts_enabled();
+        let stage_max = if stream_experts {
+            self.moe_args_exl3.iter()
+                .filter(|m| !m.on_dev && m.expert_host_base != 0)
+                .map(|m| m.expert_total).max().unwrap_or(0)
+        } else { 0 };
+        // Reuse the largest decode expert-cache arena while encoding. The
+        // direct driver reads expert weights from their resident/pinned source
+        // instead of those caches; cache metadata is invalidated before decode.
+        let borrow = if stage_max == 0 {
+            self.moe_args_exl3.iter()
+                .filter_map(|m| m.cache.as_ref().map(|c| (m.layer, c.buf.dev_ptr().cast::<u8>(), c.buf.len * 4)))
+                .filter(|&(_, _, bytes)| bytes >= need)
+                .max_by_key(|&(_, _, bytes)| bytes)
+        } else { None };
+        let mut released_caches: Vec<(i32, usize)> = Vec::new();
+        let (mut a, borrowed_layer) = if let Some((layer, base, _)) = borrow {
+            (PfArena::borrowed(cmax, base), Some(layer))
+        } else {
+            let mut candidates: Vec<(i32, usize)> = self.moe_args_exl3.iter()
+                .filter_map(|m| m.cache.as_ref().map(|c| (m.layer, c.buf.len * 4)))
+                .collect();
+            candidates.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
+            let n_cand = candidates.len();
+            let total: usize = candidates.iter().map(|&(_, bytes)| bytes).sum();
+            if stage_max > 0 || total >= need {
+                // Old behaviour released every cache whenever the expert stage
+                // was in play; that wiped the whole decode cache for a few
+                // hundred MiB. Free only what the arena and stage need.
+                let target = if pf_keep_cache_enabled() {
+                    need.saturating_add(stage_max)
+                } else if stage_max == 0 {
+                    need
+                } else {
+                    usize::MAX
+                };
+                let mut have = 0usize;
+                for (layer, bytes) in candidates {
+                    if have >= target { break; }
+                    if let Some(m) = self.moe_args_exl3.iter_mut().find(|m| m.layer == layer) {
+                        if let Some(c) = &mut m.cache {
+                            let old = std::mem::replace(&mut c.buf, inkwell_cuda::DevBuf::new_bytes(8));
+                            drop(old);
+                            released_caches.push((layer, bytes));
+                            have += bytes;
+                        }
+                    }
+                }
+                eprintln!("prefill arena: released {} of {} caches, {} MiB (need {} MiB)",
+                    released_caches.len(), n_cand, have >> 20, target >> 20);
+            }
+            (PfArena::new(cmax), None)
+        };
+        let mut expert_stage = if stage_max > 0 { PfExpertStage::new(stage_max) } else { None };
+        if stage_max > 0 && expert_stage.is_none() {
+            eprintln!("prefill experts: stage allocation {} MiB failed; using direct expert memory", stage_max >> 20);
+        }
+        if pf_exact_attn_enabled() {
+            a.exact_attn_ws = Some(inkwell_cuda::DevBuf::new(24 * self.max_ctx as usize));
+        }
+        eprintln!("prefill arena: {} MiB chunk={cmax}{}", a.bytes >> 20,
+            borrowed_layer.map_or(String::new(), |l| format!(" borrowed=L{l}")));
+        let mut pos = pos0;
+        let mut out_logits = Vec::new();
+        let seq: Vec<usize> = (0..6)
+            .chain((0..3).flat_map(|_| 6..18))
+            .chain(18..24)
+            .collect();
+        let host_positions: Vec<usize> = seq.iter().enumerate()
+            .filter_map(|(pos, &il)| pf_host_experts(self, il).map(|_| pos))
+            .collect();
+        for chunk in ids.chunks(cmax) {
+            let c = chunk.len();
+            a.c = c;
+            let host_ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
+            unsafe {
+                inkwell_cuda::memcpy_h2d_async(a.ptr("tokids").cast(), host_ids.as_ptr().cast(), c*4);
+                let embd_dev: *const u8 = if self.embd_dev.is_null() { self.embd_src.0 } else { self.embd_dev.cast() };
+                inkwell_cuda::pf_embed_async(embd_dev.cast(), a.ptr("tokids").cast(), a.ptr("cur"), c as i32, 2304, self.embd_src.2 as i64);
+                inkwell_cuda::pf_rmsnorm_async(a.ptr("cur"), tdata(self.tok_norm).cast_const(), c as i32, 2304, 1e-6);
+            }
+            let mut blocks: Vec<usize> = Vec::new();
+            let mut vi = 0usize;
+            let mut staged_pos = vec![None; seq.len()];
+            let mut seq_pos = 0usize;
+            let mut prep_idx = 0usize;
+            if let Some(st) = expert_stage.as_mut() {
+                if let Some(&hp) = host_positions.first() {
+                    if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                        staged_pos[hp] = Some(bi);
+                    }
+                    prep_idx = 1;
+                }
+            }
+            for il in 0..6 {
+                let md = expert_stage.as_ref().and_then(|st| pf_stage_ready(st, &staged_pos, seq_pos));
+                if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
+                    let hp = host_positions[prep_idx];
+                    prep_idx += 1;
+                    if let Some(st) = expert_stage.as_mut() {
+                        if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                            staged_pos[hp] = Some(bi);
+                        }
+                    }
+                }
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md);
+                vi += 1;
+                seq_pos += 1;
+            }
+            pf_copy(a.ptr("prelude"), a.ptr("cur"), c*2304*4);
+            let prelude_blocks = blocks.clone();
+            for pass in 0..3 {
+                if pass > 0 {
+                    // The loop message bank is the layer-12 residual checkpoint of the
+                    // previous pass; bank_out is that pass's final loop output.
+                    pf_copy(a.ptr("bank"), a.ptr("blk2"), c*2304*4);
+                    pf_copy(a.ptr("bankout"), a.ptr("cur"), c*2304*4);
+                    pf_copy(a.ptr("cur"), a.ptr("prelude"), c*2304*4);
+                    blocks = prelude_blocks.clone();
+                }
+                for ip in 6..18 {
+                    let md = expert_stage.as_ref().and_then(|st| pf_stage_ready(st, &staged_pos, seq_pos));
+                    if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
+                        let hp = host_positions[prep_idx];
+                        prep_idx += 1;
+                        if let Some(st) = expert_stage.as_mut() {
+                            if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                                staged_pos[hp] = Some(bi);
+                            }
+                        }
+                    }
+                    self.pf_layer(&a, ip, ip, self.visits[vi].1, pass, &mut blocks, "cur", pass > 0, pos, md);
+                    vi += 1;
+                    seq_pos += 1;
+                }
+            }
+            for il in 18..24 {
+                let md = expert_stage.as_ref().and_then(|st| pf_stage_ready(st, &staged_pos, seq_pos));
+                if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
+                    let hp = host_positions[prep_idx];
+                    prep_idx += 1;
+                    if let Some(st) = expert_stage.as_mut() {
+                        if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                            staged_pos[hp] = Some(bi);
+                        }
+                    }
+                }
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md);
+                vi += 1;
+                seq_pos += 1;
+            }
+            // final mix + norm; compute lm_head only for the last row of the final chunk.
+            let is_last_chunk = pos + c as i64 == pos0 + ids.len() as i64;
+            let states: Vec<*const f32> = blocks.iter().rev().map(|&b| a.ptr(match b {0=>"blk0",1=>"blk1",2=>"blk2",_=>"blk3"}).cast_const()).chain([a.ptr("cur").cast_const()]).collect();
+            if is_last_chunk {
+            self.pf_mix_run(&states, self.output_res_query, a.ptr("head"), c, 1);
+            self.pf_norm(a.ptr("head"), self.output_norm, c, 2304);
+            let last = unsafe { a.ptr("head").add((c-1)*2304) };
+            if let Some(oi) = self.output_exl3 {
+                let e = &*self.exl3_w[oi];
+                pf_exl3(e, last.cast_const(), a.ptr("logits"), 1, a.ptr("scratch"));
+                let mut logits = vec![0f32; self.cfg.vocab_unpadded as usize];
+                if self.cfg.softcap != 0.0 {
+                    unsafe { inkwell_cuda::pf_softcap_async(a.ptr("logits"), logits.len() as i32, self.cfg.softcap) };
+                }
+                unsafe { inkwell_cuda::memcpy_d2h_sync(logits.as_mut_ptr().cast(), a.ptr("logits").cast_const().cast(), logits.len()*4) };
+                out_logits = logits;
+            }
+            }
+            pos += c as i64;
+        }
+        inkwell_cuda::DevBuf::sync();
+        if let Some(layer) = borrowed_layer {
+            if let Some(m) = self.moe_args_exl3.iter_mut().find(|m| m.layer == layer) {
+                if let Some(c) = &mut m.cache {
+                    c.tag.write_bytes(&vec![0xFFu8; c.k as usize * 4]);
+                    c.cnt.write_bytes(&vec![0u8; 128 * 4]);
+                    c.hm.write_bytes(&[0u8; 8]);
+                    if let Some(soff) = &mut c.soff {
+                        soff.write_bytes(&vec![0u8; 3 * c.k as usize * 8]);
+                    }
+                    if let Some(fl) = &mut c.fl {
+                        let mut fl_h = vec![0i32; 513];
+                        fl_h[0] = 1;
+                        fl_h[257] = (c.buf.len * 4 / 6912) as i32;
+                        fl.write_bytes(unsafe { std::slice::from_raw_parts(fl_h.as_ptr().cast::<u8>(), 513 * 4) });
+                    }
+                }
+            }
+            eprintln!("prefill arena: invalidated borrowed cache L{layer}");
+        }
+        if !released_caches.is_empty() {
+            drop(a);
+            drop(expert_stage);
+            for (layer, bytes) in released_caches {
+                if let Some(m) = self.moe_args_exl3.iter_mut().find(|m| m.layer == layer) {
+                    if let Some(c) = &mut m.cache {
+                        let old = std::mem::replace(&mut c.buf, inkwell_cuda::DevBuf::new_bytes(bytes));
+                        drop(old);
+                        c.tag.write_bytes(&vec![0xFFu8; c.k as usize * 4]);
+                        c.cnt.write_bytes(&vec![0u8; 128 * 4]);
+                        c.hm.write_bytes(&[0u8; 8]);
+                        if let Some(soff) = &mut c.soff {
+                            soff.write_bytes(&vec![0u8; 3 * c.k as usize * 8]);
+                        }
+                        if let Some(fl) = &mut c.fl {
+                            let mut fl_h = vec![0i32; 513];
+                            fl_h[0] = 1;
+                            fl_h[257] = (bytes / 6912) as i32;
+                            fl.write_bytes(unsafe { std::slice::from_raw_parts(fl_h.as_ptr().cast::<u8>(), 513 * 4) });
+                        }
+                    }
+                }
+                eprintln!("prefill arena: restored released cache L{layer}");
+            }
+        }
+        out_logits
     }
 }

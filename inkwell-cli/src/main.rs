@@ -335,14 +335,21 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         pos = ids.len() as i64 - 1;
         eprintln!("state loaded; skipped encode of {} tok", ids.len() - 1);
     } else {
-        for &id in &ids[..ids.len() - 1] {
-            // Prompt rows before the final row never need logits, so run only
-            // the state-update graph and omit lm_head/logits entirely.
-            r.step_prompt_state(id, pos);
-            pos += 1;
+        let prompt = &ids[..ids.len() - 1];
+        let use_prefill = prompt.len() >= 16 && std::env::var_os("INKWELL_NO_PREFILL").is_none();
+        if use_prefill {
+            let _ = r.prefill_chunked(prompt, 0);
+            pos = prompt.len() as i64;
+        } else {
+            for &id in prompt {
+                // Prompt rows before the final row never need logits, so run only
+                // the state-update graph and omit lm_head/logits entirely.
+                r.step_prompt_state(id, pos);
+                pos += 1;
+            }
+            if !use_prefill { eprintln!("prompt lm_head/logits skipped for non-final encode rows"); }
         }
-        eprintln!("encode {} tok in {:?}", ids.len() - 1, t0.elapsed());
-        eprintln!("prompt lm_head/logits skipped for non-final encode rows");
+        eprintln!("encode {} tok in {:?} ({})", prompt.len(), t0.elapsed(), if use_prefill {"chunked"} else {"serial"});
         r.clear_step_cache();
     }
     if let Some(state) = std::env::var_os("INKWELL_STATE_SAVE") {
