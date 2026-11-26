@@ -2417,3 +2417,24 @@ The 8K residual is decode drift, not prefill: the serial dumps alone differ by 1
 **lb4prod experiment** (pitch8 + `__launch_bounds__(256,4)`, stash `stash@{0}`, files in `~/.cache/inkwell-prefill/exp-lb4prod/`): harness bit-exact (group32/64/adaptive bitdiff 0 twice), but encode 127 1.936 vs 2.223 s (+14.8%), 512 4.950 vs 4.834 (-2.4%), 2K 21.572 vs 20.978 (-2.8%), 4K 47.130 vs 44.359 (-6.2%). Rejected, not committed.
 
 **Session drift / cost.** Absolute tok/s here run 4–14% below the 08:40 baseline while decode-only runs of the two binaries in the same session scatter -2.6% to +8.6% in both directions, so cross-session speeds are not comparable; use the serial/prefill ratios. No matched cost A/B was completed: the interleaved clean-vs-fix job failed in its own harness (`local tag=$1 od=$OUT/$tag` expands before `tag` is bound) while the GPU was busy with foreign high-priority work, and it was not re-run. The change is inert on the decode path and adds one host-side `ink_tensor_type` call plus a 32 KiB (was 64 KiB) table read per layer visit.
+
+## t3/chunked-prefill-driver — keep the decode expert caches across prefill (6e01cf4)
+
+**The reported +0.639 ms/tok decode regression does not reproduce at that size, but a small cost is real.** `ab_rw.sh` uses the default 4-token prompt, and the branch only takes its chunked path from 16 tokens, so both arms encode serially and the gate compares decode code that is unchanged — the embedded decode cubin is byte-identical (1,596,304 B) and `runner.rs` adds no calls to the step path (`issue_moe_prefetch` and the rest predate the branch). Three runs of that comparison: +0.639 (7/16, brain), +0.145 (6/16 on 6e01cf4), −1.8 (6/9, partial session). A null A/B with the control in both arms (16 pairs) gives `delta=-0.006 wins=9/16 md5=['5cbe8e06']`, so the harness resolves about 0.05 ms/tok: the +0.145 is a real but small (0.5%) short-prompt cost. The likely carrier is the 48 B of new fields added to `MoeArgsExl3` rather than any new per-token work; not fixed here.
+
+**What was actually wrong is the prefill→decode handoff.** 512-token prompt, 8 decode tokens, ctx 1024, shipping chunk 64:
+
+| encoder | encode s | decode ms/tok |
+|---|---:|---:|
+| serial (`INKWELL_NO_PREFILL=1`) | 15.7 | 38.4 |
+| chunked + expert streaming (ships) | 11.7 | 49.2 |
+| chunked + streaming, old release policy | 11.8 | 56.8 |
+| chunked, streaming off | 13.7 | 39.1 |
+
+`prefill_chunked` frees decode expert caches to place its arena and expert stage, then restores each one empty. When the stage is in play (`stage_max > 0`), the release loop's break condition `if (stage_max == 0 && have >= need)` never fires, so it frees every cache — 940 MiB, all 14 layers — to find about 400 MiB. Decode then re-gathers those experts over PCIe until each cache refills.
+
+`6e01cf4` releases only `need + stage_max` bytes, largest caches first, so 4 of 14 caches go cold instead of 14: 56.8 -> 49.2 ms/tok at the same prompt. Killswitch `INKWELL_PF_KEEP_CACHE=0` restores the old behaviour. Numerics are untouched: 512-token KLD mean 3.67e-4, max 3.33e-3, top-1 1.0; decode md5 `5cbe8e06`; peak 5,048 MiB.
+
+**Residual tradeoff.** Streaming buys 2.0 s of encode and costs 10.8 ms/tok of decode over 8 tokens; with streaming off the handoff is free (39.1 vs 38.4). The stage is one layer's whole expert blob (~360 MiB) and the VRAM slack is ~254 MiB, so some caches must be released. Shrinking the stage is the lever that would make the handoff free while keeping streaming's encode win; the 64-token check (is the residual a one-time gather or per-token) is queued, not answered.
+
+**Tooling note.** `main.rs` prints `decode 8 tok in …` with the count hardcoded; the real count is `INKWELL_GENS`, so scripts must divide by that, not by 8.
