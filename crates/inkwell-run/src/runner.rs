@@ -4142,6 +4142,7 @@ unsafe extern "C" fn dense_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, 
 #[derive(Debug)]
 struct PfArena {
     buf: Option<inkwell_cuda::DevBuf>,
+    exact_attn_ws: Option<inkwell_cuda::DevBuf>,
     base: *mut u8,
     c: usize,
     off: HashMap<&'static str, usize>,
@@ -4200,13 +4201,13 @@ impl PfArena {
         let (off, bytes) = Self::layout(c);
         let buf = inkwell_cuda::DevBuf::new_bytes(bytes);
         let base = buf.dev_ptr().cast();
-        Self { buf: Some(buf), base, c, off, bytes }
+        Self { buf: Some(buf), exact_attn_ws: None, base, c, off, bytes }
     }
     /// Borrow an already allocated device buffer. The caller guarantees that
     /// it remains alive for the whole encode and is not otherwise in use.
     fn borrowed(c: usize, base: *mut u8) -> Self {
         let (off, bytes) = Self::layout(c);
-        Self { buf: None, base, c, off, bytes }
+        Self { buf: None, exact_attn_ws: None, base, c, off, bytes }
     }
     fn ptr(&self, name: &'static str) -> *mut f32 {
         unsafe { self.base.add(self.off[name]).cast() }
@@ -4243,6 +4244,11 @@ fn pf_exl3(e: &Exl3W, x: *const f32, y: *mut f32, c: usize, scratch: *mut f32) {
         inkwell_cuda::exl3_gemm_smem_async(e.trel.dev_ptr().cast_const(), e.suh.dev_ptr().cast_const(),
             e.svh.dev_ptr().cast_const(), x, y, c as i32, e.k, e.n, e.ka, e.halfk, scratch);
     }
+}
+
+fn pf_exact_attn_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("INKWELL_PF_EXACT_ATTN").is_ok_and(|v| v == "1"))
 }
 
 fn pf_dbg(name: &str, x: *const f32, n: usize) {
@@ -4413,9 +4419,16 @@ impl Runner {
                     snap_start, snap_len, cap as i32, swa);
             }
             inkwell_cuda::pf_write_kv_async(a.ptr("kout").cast_const(), a.ptr("vout").cast_const(), kd, vd, c as i32, pos0 as i32, cap as i32, swa);
-            inkwell_cuda::flash_prefill_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
-                a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), c as i32, pos0 as i32,
-                cap as i32, swa, 1.0 / (128f32).sqrt(), a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            if let Some(ws) = a.exact_attn_ws.as_ref().filter(|_| pf_exact_attn_enabled()) {
+                inkwell_cuda::pf_exact_attn_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+                    a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), ws.dev_ptr().cast::<f32>(),
+                    self.max_ctx as i32, c as i32, pos0 as i32, cap as i32, swa, 1.0 / (128f32).sqrt(),
+                    a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            } else {
+                inkwell_cuda::flash_prefill_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+                    a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), c as i32, pos0 as i32,
+                    cap as i32, swa, 1.0 / (128f32).sqrt(), a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            }
             if il == 0 { pf_dbg("kqv_out-0", a.ptr("attn"), 8); }
             inkwell_cuda::pf_mul_sigmoid_async(a.ptr("attn"), gate.cast_const(), (c * 3072) as i64);
         }
@@ -4499,6 +4512,9 @@ impl Runner {
         } else {
             (PfArena::new(cmax), None)
         };
+        if pf_exact_attn_enabled() {
+            a.exact_attn_ws = Some(inkwell_cuda::DevBuf::new(24 * self.max_ctx as usize));
+        }
         eprintln!("prefill arena: {} MiB chunk={cmax}{}", a.bytes >> 20,
             borrowed_layer.map_or(String::new(), |l| format!(" borrowed=L{l}")));
         let mut pos = pos0;

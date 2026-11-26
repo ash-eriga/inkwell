@@ -1464,6 +1464,10 @@ extern "C" {
         r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
         c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32,
         ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32, stream: *mut c_void);
+    fn ink_launch_pf_exact_attn_gqa3_snap(k: *const c_void, v: *const c_void, q: *const f32,
+        r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+        work: *mut f32, work_stride: i32, c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32,
+        ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32, stream: *mut c_void);
     fn ink_launch_pf_snapshot_kv(kd: *const c_void, vd: *const c_void, ks: *mut c_void, vs: *mut c_void,
         snap_start: i32, snap_len: i32, cap: i32, swa: i32, stream: *mut c_void);
 }
@@ -1480,6 +1484,23 @@ pub unsafe fn flash_prefill_gqa3_snap_async(k: *const c_void, v: *const c_void, 
     unsafe {
         ink_launch_flash_prefill_gqa3_snap(k, v, q, r, rel_w, sinks, out, c, pos0, kv_cap,
             swa_win, scale, ks, vs, snap_start, snap_len, stream());
+    }
+}
+
+/// Exact-reference prefill attention with a snapshot of overwritten ring rows.
+///
+/// `work` must contain at least `24 * work_stride` floats.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pf_exact_attn_gqa3_snap_async(k: *const c_void, v: *const c_void, q: *const f32,
+    r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+    work: *mut f32, work_stride: i32, c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32,
+    ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32) {
+    unsafe {
+        ink_launch_pf_exact_attn_gqa3_snap(k, v, q, r, rel_w, sinks, out, work, work_stride,
+            c, pos0, kv_cap, swa_win, scale, ks, vs, snap_start, snap_len, stream());
     }
 }
 

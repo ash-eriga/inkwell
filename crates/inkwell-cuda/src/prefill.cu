@@ -1147,6 +1147,263 @@ extern "C" void ink_launch_flash_prefill_gqa3_snap(const void* K, const void* V,
         (const __half*)KS, (const __half*)VS, snap_start, snap_len);
 }
 
+// Exact-reference attention for one query token.  This follows the non-split
+// GQA-3 decode kernel in kernels.cu: the same lane-strided QK reduction, a
+// materialized relative-bias table, full-score max/denominator, and serial-key
+// V accumulation.  work must have 3*work_stride floats per KV head.
+__device__ __forceinline__ void pf_exact_keymap(int j, int qp, int swa,
+        int& logical, int& slot, int& dist) {
+    if (swa > 0) {
+        dist = (qp - j) % swa;
+        logical = qp - dist;
+        slot = j;
+    } else {
+        dist = qp - j;
+        logical = j;
+        slot = j;
+    }
+}
+
+__device__ __forceinline__ const __half* pf_exact_kv_row(
+        const __half* __restrict__ base, const __half* __restrict__ snap,
+        int hk, int kv_cap, int logical, int slot, int snap_start, int snap_len) {
+    const bool osnap = snap && logical >= snap_start && logical < snap_start + snap_len;
+    if (osnap) return snap + ((size_t)hk * snap_len + (logical - snap_start)) * 128;
+    return base + ((size_t)hk * kv_cap + slot) * 128;
+}
+
+extern "C" __global__ void __launch_bounds__(256) inkwell_pf_exact_attn_gqa3(
+        const __half* __restrict__ K, const __half* __restrict__ V,
+        const float* __restrict__ Q, const float* __restrict__ r,
+        const float* __restrict__ rel_w, const float* __restrict__ sinks,
+        float* __restrict__ out, float* __restrict__ work, int work_stride,
+        int qrow, int pos0, int kv_cap, int swa_win, float scale,
+        const __half* __restrict__ KS, const __half* __restrict__ VS,
+        int snap_start, int snap_len) {
+    constexpr int VTILE = 128;
+    __shared__ float qs[384];
+    __shared__ float btab[3][1025];
+    __shared__ float red[3][32];
+    __shared__ uint2 kvbuf[VTILE][32];
+
+    const int hk = blockIdx.x;
+    const int h0 = hk * 3;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int w = tid >> 5;
+    const int qp = pos0 + qrow;
+    const int nkv = (swa_win > 0) ? min(qp + 1, swa_win) : qp + 1;
+    float* score0 = work + (size_t)hk * 3 * work_stride;
+    float* score1 = score0 + work_stride;
+    float* score2 = score1 + work_stride;
+
+    for (int i = tid; i < 384; i += 256) {
+        const int g = i >> 7;
+        const int d = i & 127;
+        qs[i] = Q[((size_t)qrow * 24 + h0 + g) * 128 + d];
+    }
+
+    // Materialize table[head][dist] once for this token before gathering it per
+    // key.  K=16 is small enough that each output uses one ascending FMA chain.
+    for (int i = tid; i < 3 * 1025; i += 256) {
+        const int g = i / 1025;
+        const int dist = i - g * 1025;
+        const int h = h0 + g;
+        const float* rp = r + ((size_t)qrow * 24 + h) * 16;
+        const float* rw = rel_w + ((size_t)h * 1025 + dist) * 16;
+        float a = 0.f;
+#pragma unroll
+        for (int z = 0; z < 16; ++z) a += rp[z] * rw[z];
+        btab[g][dist] = a;
+    }
+    __syncthreads();
+
+    for (int base = 0; base < nkv; base += VTILE) {
+        const int cnt = min(VTILE, nkv - base);
+        for (int rr = w; rr < cnt; rr += 8) {
+            int logical, slot, dist;
+            pf_exact_keymap(base + rr, qp, swa_win, logical, slot, dist);
+            const __half* kj = pf_exact_kv_row(K, KS, hk, kv_cap, logical, slot,
+                snap_start, snap_len);
+            kvbuf[rr][lane] = __ldcs((const uint2*)(kj + lane * 4));
+        }
+        __syncthreads();
+        for (int rr = w; rr < cnt; rr += 8) {
+            const int j = base + rr;
+            const __half* kh = (const __half*)kvbuf[rr];
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int d = lane + 32 * t;
+                const float kv = __half2float(kh[d]);
+                a0 += qs[d] * kv;
+                a1 += qs[128 + d] * kv;
+                a2 += qs[256 + d] * kv;
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                a0 += __shfl_down_sync(0xffffffffu, a0, o);
+                a1 += __shfl_down_sync(0xffffffffu, a1, o);
+                a2 += __shfl_down_sync(0xffffffffu, a2, o);
+            }
+            if (lane == 0) {
+                score0[j] = a0;
+                score1[j] = a1;
+                score2[j] = a2;
+            }
+        }
+        __syncthreads();
+    }
+
+    const float snk0 = sinks[(size_t)qrow * 24 + h0];
+    const float snk1 = sinks[(size_t)qrow * 24 + h0 + 1];
+    const float snk2 = sinks[(size_t)qrow * 24 + h0 + 2];
+    float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f;
+    for (int j = tid; j < nkv; j += 256) {
+        int logical, slot, dist;
+        pf_exact_keymap(j, qp, swa_win, logical, slot, dist);
+        dist = min(dist, 1024);
+        const float b0 = __fsub_rn(btab[0][dist], snk0);
+        const float b1 = __fsub_rn(btab[1][dist], snk1);
+        const float b2 = __fsub_rn(btab[2][dist], snk2);
+        const float s0 = score0[j] * scale + b0;
+        const float s1 = score1[j] * scale + b1;
+        const float s2 = score2[j] * scale + b2;
+        score0[j] = s0;
+        score1[j] = s1;
+        score2[j] = s2;
+        m0 = fmaxf(m0, s0);
+        m1 = fmaxf(m1, s1);
+        m2 = fmaxf(m2, s2);
+    }
+    const float msink = 0.f;
+    m0 = fmaxf(m0, msink);
+    m1 = fmaxf(m1, msink);
+    m2 = fmaxf(m2, msink);
+    for (int o = 16; o > 0; o >>= 1) {
+        m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, o));
+        m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, o));
+        m2 = fmaxf(m2, __shfl_xor_sync(0xffffffffu, m2, o));
+    }
+    if (lane == 0) {
+        red[0][w] = m0;
+        red[1][w] = m1;
+        red[2][w] = m2;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float mm0 = -1e30f, mm1 = -1e30f, mm2 = -1e30f;
+        for (int i = lane; i < 8; i += 32) {
+            mm0 = fmaxf(mm0, red[0][i]);
+            mm1 = fmaxf(mm1, red[1][i]);
+            mm2 = fmaxf(mm2, red[2][i]);
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            mm0 = fmaxf(mm0, __shfl_xor_sync(0xffffffffu, mm0, o));
+            mm1 = fmaxf(mm1, __shfl_xor_sync(0xffffffffu, mm1, o));
+            mm2 = fmaxf(mm2, __shfl_xor_sync(0xffffffffu, mm2, o));
+        }
+        if (lane == 0) {
+            red[0][0] = mm0;
+            red[1][0] = mm1;
+            red[2][0] = mm2;
+        }
+    }
+    __syncthreads();
+    const float mx0 = red[0][0], mx1 = red[1][0], mx2 = red[2][0];
+
+    float den0 = 0.f, den1 = 0.f, den2 = 0.f;
+    for (int j = tid; j < nkv; j += 256) {
+        const float e0 = __expf(score0[j] - mx0);
+        const float e1 = __expf(score1[j] - mx1);
+        const float e2 = __expf(score2[j] - mx2);
+        score0[j] = e0;
+        score1[j] = e1;
+        score2[j] = e2;
+        den0 += e0;
+        den1 += e1;
+        den2 += e2;
+    }
+    if (tid == 0) {
+        den0 += __expf(msink - mx0);
+        den1 += __expf(msink - mx1);
+        den2 += __expf(msink - mx2);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        den0 += __shfl_xor_sync(0xffffffffu, den0, o);
+        den1 += __shfl_xor_sync(0xffffffffu, den1, o);
+        den2 += __shfl_xor_sync(0xffffffffu, den2, o);
+    }
+    if (lane == 0) {
+        red[0][w] = den0;
+        red[1][w] = den1;
+        red[2][w] = den2;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float dd0 = 0.f, dd1 = 0.f, dd2 = 0.f;
+        for (int i = lane; i < 8; i += 32) {
+            dd0 += red[0][i];
+            dd1 += red[1][i];
+            dd2 += red[2][i];
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            dd0 += __shfl_xor_sync(0xffffffffu, dd0, o);
+            dd1 += __shfl_xor_sync(0xffffffffu, dd1, o);
+            dd2 += __shfl_xor_sync(0xffffffffu, dd2, o);
+        }
+        if (lane == 0) {
+            red[0][0] = dd0;
+            red[1][0] = dd1;
+            red[2][0] = dd2;
+        }
+    }
+    __syncthreads();
+    const float inv0 = 1.f / red[0][0];
+    const float inv1 = 1.f / red[1][0];
+    const float inv2 = 1.f / red[2][0];
+
+    const int d = tid;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f;
+    for (int base = 0; base < nkv; base += VTILE) {
+        const int cnt = min(VTILE, nkv - base);
+        for (int rr = w; rr < cnt; rr += 8) {
+            int logical, slot, dist;
+            pf_exact_keymap(base + rr, qp, swa_win, logical, slot, dist);
+            const __half* vj = pf_exact_kv_row(V, VS, hk, kv_cap, logical, slot,
+                snap_start, snap_len);
+            kvbuf[rr][lane] = __ldcs((const uint2*)(vj + lane * 4));
+        }
+        __syncthreads();
+        if (tid < 128) {
+            for (int rr = 0; rr < cnt; ++rr) {
+                const int j = base + rr;
+                const float vv = __half2float(((const __half*)kvbuf[rr])[d]);
+                acc0 += score0[j] * vv;
+                acc1 += score1[j] * vv;
+                acc2 += score2[j] * vv;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < 128) {
+        float* dst = out + ((size_t)qrow * 24 + h0) * 128 + d;
+        dst[0] = acc0 * inv0;
+        dst[128] = acc1 * inv1;
+        dst[256] = acc2 * inv2;
+    }
+}
+
+extern "C" void ink_launch_pf_exact_attn_gqa3_snap(const void* K, const void* V, const float* Q,
+        const float* r, const float* rel_w, const float* sinks, float* out,
+        float* work, int work_stride, int C, int pos0, int kv_cap, int swa_win, float scale,
+        const void* KS, const void* VS, int snap_start, int snap_len, void* stream) {
+    for (int qrow = 0; qrow < C; ++qrow) {
+        inkwell_pf_exact_attn_gqa3<<<dim3(8), 256, 0, (cudaStream_t)stream>>>((const __half*)K,
+            (const __half*)V, Q, r, rel_w, sinks, out, work, work_stride, qrow, pos0,
+            kv_cap, swa_win, scale, (const __half*)KS, (const __half*)VS, snap_start, snap_len);
+    }
+}
+
 extern "C" __global__ void inkwell_pf_snapshot_kv(const void* __restrict__ kd,
         const void* __restrict__ vd, void* __restrict__ ks, void* __restrict__ vs,
         int snap_start, int snap_len, int cap, int swa) {
