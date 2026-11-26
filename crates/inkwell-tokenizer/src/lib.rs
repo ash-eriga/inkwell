@@ -34,6 +34,8 @@ pub struct Tokenizer {
     byte_to_char: HashMap<u8, char>,
     char_to_byte: HashMap<char, u8>,
     split_re: Regex,
+    eos_id: u32,
+    special_tokens: Vec<(String, u32)>,
 }
 
 fn meta_arr<'a>(g: &'a GgufFile, key: &'static str) -> Result<&'a [MetaValue], TokError> {
@@ -107,6 +109,25 @@ impl Tokenizer {
             }
         }
         let (byte_to_char, char_to_byte) = byte_map();
+        let eos_id = match g.meta.get("tokenizer.ggml.eos_token_id") {
+            Some(MetaValue::U32(id)) => *id,
+            _ => token_to_id
+                .get("<|content_model_end_sampling|>")
+                .copied()
+                .unwrap_or(200_006),
+        };
+        let mut special_tokens: Vec<(String, u32)> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                if s.starts_with("<|") && s.ends_with("|>") {
+                    Some((s.clone(), u32::try_from(i).expect("vocab < 4G")))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         Ok(Self {
             tokens,
             token_to_id,
@@ -114,7 +135,70 @@ impl Tokenizer {
             byte_to_char,
             char_to_byte,
             split_re: Regex::new(GPT4O_PATTERN).map_err(|e| TokError::Regex(Box::new(e)))?,
+            eos_id,
+            special_tokens,
         })
+    }
+
+    /// End-of-sequence / end-of-turn token id.
+    #[must_use]
+    pub fn eos_id(&self) -> u32 {
+        self.eos_id
+    }
+
+    /// Look up an exact vocabulary token string (including special tokens).
+    #[must_use]
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.token_to_id.get(token).copied()
+    }
+
+    /// Encode text while recognizing `<|...|>` special tokens verbatim.
+    #[must_use]
+    pub fn encode_with_special(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut next_match: Option<(usize, usize, u32)> = None;
+            for (tok, id) in &self.special_tokens {
+                if let Some(pos) = rest.find(tok.as_str()) {
+                    let better = match next_match {
+                        None => true,
+                        Some((best_pos, best_len, _)) => {
+                            pos < best_pos || (pos == best_pos && tok.len() > best_len)
+                        }
+                    };
+                    if better {
+                        next_match = Some((pos, tok.len(), *id));
+                    }
+                }
+            }
+            match next_match {
+                Some((pos, len, id)) => {
+                    if pos > 0 {
+                        out.extend(self.encode(&rest[..pos]));
+                    }
+                    out.push(id);
+                    rest = &rest[pos + len..];
+                }
+                None => {
+                    out.extend(self.encode(rest));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode a single token id into raw UTF-8 bytes (for streaming decoders).
+    ///
+    /// # Errors
+    /// `BadId` when `id` is out of range.
+    pub fn decode_bytes(&self, id: u32) -> Result<Vec<u8>, TokError> {
+        let tok = self.tokens.get(id as usize).ok_or(TokError::BadId(id))?;
+        Ok(tok
+            .chars()
+            .filter_map(|c| self.char_to_byte.get(&c).copied())
+            .collect())
     }
 
     /// Vocabulary size.

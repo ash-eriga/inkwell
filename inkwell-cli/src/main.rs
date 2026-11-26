@@ -1,14 +1,182 @@
-//! `inkwell` CLI: inspect a GGUF and print the Inkling-2 model config.
+//! `inkwell` CLI: run, chat, serve (OpenAI-compatible), and benchmark Inkling-2 EXL3/GGUF models.
+
+mod chat_template;
+mod cli_ui;
+mod engine;
+mod server;
 
 use inkwell_core::InklingConfig;
 use inkwell_gguf::GgufFile;
 use inkwell_tokenizer::Tokenizer;
 
+const HELP_TEXT: &str = "\
+inkwell 0.1.0 — local EXL3/GGUF inference engine for Inkling-2
+
+USAGE:
+  inkwell serve <model> [OPTIONS]       Start OpenAI-compatible HTTP/SSE server
+  inkwell chat  <model> [OPTIONS]       Interactive multi-turn terminal chat
+  inkwell run   <model> -p <prompt>     One-shot streaming generation
+  inkwell <model> --run                 Legacy benchmark harness
+
+SERVE OPTIONS:
+  --host <addr>           Bind address (default: 127.0.0.1)
+  --port <port>           Bind port (default: 8080)
+  --ctx <tokens>          Max context length (default: 4096)
+  --effort <level>        Default reasoning effort: none|minimal|low|medium|high|max (default: none)
+
+CHAT / RUN OPTIONS:
+  -p, --prompt <text>     Prompt text (required for `run`)
+  --system <text>         System prompt
+  --ctx <tokens>          Max context length (default: 4096)
+  --max-tokens <n>        Max generated tokens (default: 512)
+  --temp <f32>            Sampling temperature, 0.0 = greedy (default: 0.0)
+  --top-p <f32>           Nucleus sampling threshold (default: 0.95)
+  --top-k <n>             Top-k sampling cap (default: 40)
+  --effort <level>        Reasoning effort: none|minimal|low|medium|high|max (default: none)
+  --raw                   Skip chat template (`run` only)
+";
+
+fn run_on_big_stack<F>(f: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(f)
+        .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+        .join()
+        .map_err(|_| "worker thread panicked".to_owned())?
+}
+
+fn next_val(args: &mut std::iter::Skip<std::env::Args>, flag: &str) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+fn parse_serve_and_run(mut args: std::iter::Skip<std::env::Args>) -> Result<(), String> {
+    let model = args
+        .next()
+        .ok_or_else(|| "usage: inkwell serve <model> [--host 127.0.0.1] [--port 8080] [--ctx 4096]".to_owned())?;
+    let mut opts = server::ServeOpts {
+        model,
+        host: "127.0.0.1".to_owned(),
+        port: 8080,
+        ctx: 4096,
+        default_effort: "none".to_owned(),
+    };
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--host" => opts.host = next_val(&mut args, "--host")?,
+            "--port" => {
+                let v = next_val(&mut args, "--port")?;
+                opts.port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+            }
+            "--ctx" => {
+                let v = next_val(&mut args, "--ctx")?;
+                opts.ctx = v.parse().map_err(|_| format!("invalid ctx: {v}"))?;
+            }
+            "--effort" => opts.default_effort = next_val(&mut args, "--effort")?,
+            "-h" | "--help" => {
+                print!("{HELP_TEXT}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown option for serve: {other}")),
+        }
+    }
+    run_on_big_stack(move || server::run_server(&opts))
+}
+
+fn parse_cli_opts(
+    mut args: std::iter::Skip<std::env::Args>,
+    cmd: &str,
+) -> Result<cli_ui::CliRunOpts, String> {
+    let model = args
+        .next()
+        .ok_or_else(|| format!("usage: inkwell {cmd} <model> [OPTIONS]"))?;
+    let mut opts = cli_ui::CliRunOpts {
+        model,
+        ..cli_ui::CliRunOpts::default()
+    };
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "-p" | "--prompt" => opts.prompt = Some(next_val(&mut args, &flag)?),
+            "--system" => opts.system = Some(next_val(&mut args, "--system")?),
+            "--ctx" => {
+                let v = next_val(&mut args, "--ctx")?;
+                opts.ctx = v.parse().map_err(|_| format!("invalid ctx: {v}"))?;
+            }
+            "--max-tokens" => {
+                let v = next_val(&mut args, "--max-tokens")?;
+                opts.max_tokens = v.parse().map_err(|_| format!("invalid max-tokens: {v}"))?;
+            }
+            "--temp" | "--temperature" => {
+                let v = next_val(&mut args, &flag)?;
+                opts.temperature = v.parse().map_err(|_| format!("invalid temp: {v}"))?;
+            }
+            "--top-p" => {
+                let v = next_val(&mut args, "--top-p")?;
+                opts.top_p = v.parse().map_err(|_| format!("invalid top-p: {v}"))?;
+            }
+            "--top-k" => {
+                let v = next_val(&mut args, "--top-k")?;
+                opts.top_k = v.parse().map_err(|_| format!("invalid top-k: {v}"))?;
+            }
+            "--effort" => opts.effort = next_val(&mut args, "--effort")?,
+            "--raw" => opts.raw = true,
+            "-h" | "--help" => {
+                print!("{HELP_TEXT}");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown option for {cmd}: {other}")),
+        }
+    }
+    Ok(opts)
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args
-        .next()
-        .expect("usage: inkwell <model.gguf> [--tok <text>]");
+    let Some(first) = args.next() else {
+        print!("{HELP_TEXT}");
+        return;
+    };
+    match first.as_str() {
+        "-h" | "--help" | "help" => {
+            print!("{HELP_TEXT}");
+            return;
+        }
+        "-V" | "--version" => {
+            println!("inkwell {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        "serve" => {
+            if let Err(e) = parse_serve_and_run(args) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        "chat" => {
+            let res = parse_cli_opts(args, "chat")
+                .and_then(|opts| run_on_big_stack(move || cli_ui::run_chat(&opts)));
+            if let Err(e) = res {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        "run" => {
+            let res = parse_cli_opts(args, "run")
+                .and_then(|opts| run_on_big_stack(move || cli_ui::run_oneshot(&opts)));
+            if let Err(e) = res {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let path = first;
     let st_dir = std::path::Path::new(&path).is_dir();
     let g = if st_dir {
         // tokenizer still lives in the GGUF sidecar

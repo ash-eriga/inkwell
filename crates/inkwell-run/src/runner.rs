@@ -3773,6 +3773,25 @@ impl Runner {
         }
     }
 
+    /// Reset per-sequence state (zero conv states and clear cached step graph)
+    /// so the runner can serve a fresh prompt from position 0 without reloading weights.
+    pub fn reset(&mut self) {
+        self.clear_step_cache();
+        for s in &self.conv_state {
+            unsafe {
+                let n = t::ne(*s, 0) as usize * t::ne(*s, 1) as usize;
+                let zeros = vec![0f32; n];
+                t::set(*s, zeros.as_ptr().cast(), 0, n * 4);
+            }
+        }
+    }
+
+    /// Configured maximum context length in tokens.
+    #[must_use]
+    pub fn max_ctx(&self) -> i64 {
+        self.max_ctx
+    }
+
     /// Save all persistent decode state tensors (KV arenas + conv states).
     pub fn save_state(&self, path: &str) {
         let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter()).copied().collect();
