@@ -82,6 +82,7 @@ extern "C" {
         hist: *const i32, tag: *const i32, bank: *mut c_void, ptag: *mut i32, pready: *mut i32,
         pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void);
     fn ink_launch_exl3_copy8(src: *const c_void, dst: *mut c_void, stream: *mut c_void);
+    fn ink_device_info(major: *mut i32, minor: *mut i32, name: *mut std::ffi::c_char, name_cap: i32) -> i32;
     fn ink_ch2nopless_startup() -> i32;
     fn ink_ch2dense_startup() -> i32;
     fn ink_launch_exl3_stage(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, staging: *mut c_void, sg: *mut c_void, su: *mut c_void, sd: *mut c_void, stream: *mut c_void);
@@ -1015,6 +1016,36 @@ pub unsafe fn exl3_gemv_mz_async(trel: &[*const c_void], suh: &[*const c_void], 
     k: &[i64], n: &[i64], ka: &[i64], halfk: &[i64]) {
     unsafe { ink_launch_exl3_gemv_mz(trel.as_ptr(), suh.as_ptr(), svh.as_ptr(), x.as_ptr(),
         y, ystride, scr.as_ptr().cast(), k.as_ptr(), n.as_ptr(), ka.as_ptr(), halfk.as_ptr(), trel.len() as i32, stream()) };
+}
+
+/// Query active CUDA device `(sm_major, sm_minor, name)`.
+pub fn device_info() -> Option<(i32, i32, String)> {
+    let mut major = 0i32;
+    let mut minor = 0i32;
+    let mut buf = [0u8; 256];
+    let ok = unsafe {
+        ink_device_info(&raw mut major, &raw mut minor, buf.as_mut_ptr().cast(), buf.len() as i32)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..len]).into_owned();
+    Some((major, minor, name))
+}
+
+/// Emit a one-time warning when running on non-Pascal GPUs (experimental in v0.1).
+pub fn warn_if_non_pascal() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        if let Some((major, minor, name)) = device_info() {
+            if major != 6 {
+                eprintln!(
+                    "inkwell: warning: {name} (sm_{major}{minor}) — non-Pascal GPUs are experimental in v0.1 (tuned for Pascal sm_61)"
+                );
+            }
+        }
+    });
 }
 
 /// Run the one-time CH2 NOP-less module load and bitwise self-test.

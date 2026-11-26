@@ -4634,12 +4634,28 @@ done:
     return ok;
 }
 
+extern "C" int ink_device_info(int* major, int* minor, char* name, int name_cap) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 0;
+    if (major) *major = prop.major;
+    if (minor) *minor = prop.minor;
+    if (name && name_cap > 0) {
+        snprintf(name, (size_t)name_cap, "%s", prop.name);
+    }
+    return 1;
+}
+
 extern "C" int ink_ch2nopless_startup() {
     if (g_ch2np.state) return g_ch2np.state == 1;
     g_ch2np.state = 2;
     if (!ch2np_requested()) return 0;
     const size_t bytes = (size_t)(ink_ch2nopless_cubin_end - ink_ch2nopless_cubin_start);
     if (bytes == 0) return 0;
+
+    int maj = 0, min = 0;
+    if (!ink_device_info(&maj, &min, nullptr, 0) || maj != 6 || min != 1) return 0;
 
     cudaFree(0);   // ensure the runtime primary context exists before module load
     cuInit(0);
@@ -4797,6 +4813,8 @@ extern "C" int ink_ch2dense_startup() {
     if (!ch2dense_requested()) return 0;
     const size_t bytes = (size_t)(ink_ch2nopless_cubin_end - ink_ch2nopless_cubin_start);
     if (bytes == 0) return 0;
+    int maj = 0, min = 0;
+    if (!ink_device_info(&maj, &min, nullptr, 0) || maj != 6 || min != 1) return 0;
     cudaFree(0);
     cuInit(0);
     CUresult r = cuModuleLoadData(&g_ch2dense.mod, (const void*)ink_ch2nopless_cubin_start);

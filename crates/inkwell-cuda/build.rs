@@ -39,18 +39,36 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ch2dir.join("reasm_augment_repos.py").display());
     println!("cargo:rerun-if-changed={}", ch2dir.join("reasm_assemble_with_repos.py").display());
     println!("cargo:rerun-if-env-changed=INKWELL_NVCC_DEFS");
+    println!("cargo:rerun-if-env-changed=INKWELL_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=INKWELL_CUASM_ROOT");
     println!("cargo:rerun-if-env-changed=CUASMROOT");
     println!("cargo:rerun-if-env-changed=INKWELL_CUASM_PYTHON");
     println!("cargo:rerun-if-env-changed=VENVPY");
+
+    // Multi-architecture CUDA fatbin: Pascal (sm_61, primary/tuned) plus
+    // experimental Turing/Ampere/Ada/Hopper CUBINs and PTX forward-compat.
+    let archs_s = env("INKWELL_CUDA_ARCHS", "61,75,80,86,89,90");
+    let mut gencodes: Vec<String> = Vec::new();
+    let mut max_arch: u32 = 61;
+    for tok in archs_s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(a) = tok.parse::<u32>() {
+            if a > max_arch { max_arch = a; }
+        }
+        gencodes.push("-gencode".into());
+        gencodes.push(format!("arch=compute_{tok},code=sm_{tok}"));
+    }
+    // Emit PTX for the highest target so newer GPUs (e.g. Blackwell) can JIT.
+    gencodes.push("-gencode".into());
+    gencodes.push(format!("arch=compute_{max_arch},code=compute_{max_arch}"));
+
     let obj = format!("{out}/kernels.o");
     let status = Command::new(&nvcc)
         .args([
             "-O3", "-std=c++17", "--use_fast_math",
             "-ccbin", gxx.to_str().expect("gxx path"),
-            "-gencode", "arch=compute_61,code=sm_61",
-            "-c", &src.to_string_lossy(), "-o", &obj,
         ])
+        .args(&gencodes)
+        .args(["-c", &src.to_string_lossy(), "-o", &obj])
         .args(std::env::var("INKWELL_NVCC_DEFS").map(|d| d.split(',').map(|x| format!("-D{}", x)).collect::<Vec<_>>()).unwrap_or_default())
         .status()
         .expect("nvcc");
@@ -61,9 +79,9 @@ fn main() {
         .args([
             "-O3", "-std=c++17", "--use_fast_math",
             "-ccbin", gxx.to_str().expect("gxx path"),
-            "-gencode", "arch=compute_61,code=sm_61",
-            "-c", &prefill_src.to_string_lossy(), "-o", &prefill_obj,
         ])
+        .args(&gencodes)
+        .args(["-c", &prefill_src.to_string_lossy(), "-o", &prefill_obj])
         .status()
         .expect("nvcc prefill");
     assert!(status.success(), "nvcc prefill failed");

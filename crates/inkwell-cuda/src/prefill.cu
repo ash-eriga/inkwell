@@ -934,7 +934,7 @@ extern "C" void ink_launch_exl3_moe_grouped_gemm(
     int* row_expert = (int*)(tg + (size_t)P * (2 * NG));
     // row_expert is derived on-device: one row per expanded selection.
     // tile_start/count are inclusive contiguous ranges; expand them with a tiny kernel below.
-    inkwell_moe_fill_row_expert<<<1, 128, 0, st>>>(tile_expert, tile_start, tile_count, tile_n, row_expert);
+    inkwell_moe_fill_row_expert<<<256, 64, 0, st>>>(tile_expert, tile_start, tile_count, tile_n, row_expert);
 
     dim3 hig(KG / 128, P), hug(KG / 128, P);
     inkwell_moe_had_in_rows<<<hig, 128, 0, st>>>((const uint64_t*)descs_g, row_expert, sorted_token, x, xhg, P, KG);
@@ -965,10 +965,14 @@ extern "C" void ink_launch_exl3_moe_grouped_gemm(
 
 __global__ void inkwell_moe_fill_row_expert(const int* tile_expert, const int* tile_start,
         const int* tile_count, const int* tile_n, int* row_expert) {
-    if (threadIdx.x != 0) return;
-    for (int t = 0; t < *tile_n; ++t)
-        for (int i = 0; i < tile_count[t]; ++i)
-            row_expert[tile_start[t] + i] = tile_expert[t];
+    const int tn = *tile_n;
+    for (int t = blockIdx.x; t < tn; t += gridDim.x) {
+        const int ex = tile_expert[t];
+        const int st = tile_start[t];
+        const int cnt = tile_count[t];
+        for (int i = threadIdx.x; i < cnt; i += blockDim.x)
+            row_expert[st + i] = ex;
+    }
 }
 
 __global__ void inkwell_moe_had_out_pair_rows(const uint64_t* descs_g, const uint64_t* descs_u,
@@ -1825,65 +1829,81 @@ template <typename T, int R, int BLOCK>
 __global__ void inkwell_pf_dense_mmvf_exact(const float* __restrict__ x,
         const T* __restrict__ w, float* __restrict__ y, int M, int N, int K) {
     constexpr int NW = BLOCK / 32;
+    constexpr int TM = 4;
     static_assert(R <= NW, "rows use one reduction warp each");
     __shared__ float buf[R][32];
-    const int tok = blockIdx.y;
+    const int tok0 = blockIdx.y * TM;
     const int r0 = blockIdx.x * R;
     const int tid = threadIdx.x;
     const int wid = tid >> 5, lane = tid & 31;
     const int k2 = K >> 1;
-    if (tid < 32) {
-#pragma unroll
-        for (int r = 0; r < R; ++r) buf[r][tid] = 0.0f;
-    }
-    __syncthreads();
+    const int nt = (M - tok0) < TM ? (M - tok0) : TM;
+    if (nt <= 0) return;
 
-    const float2* x2 = (const float2*)(x + (size_t)tok * K);
     const T* wr0 = w + (size_t)r0 * K;
-    float sum[R];
+    float sum[TM][R];
 #pragma unroll
-    for (int r = 0; r < R; ++r) sum[r] = 0.0f;
+    for (int dt = 0; dt < TM; ++dt) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) sum[dt][r] = 0.0f;
+    }
 
     for (int col2 = tid; col2 < k2; col2 += BLOCK) {
-        const float2 xv = x2[col2];
+        float2 xv[TM];
+#pragma unroll
+        for (int dt = 0; dt < TM; ++dt) {
+            xv[dt] = (dt < nt)
+                ? __ldg(&((const float2*)(x + (size_t)(tok0 + dt) * K))[col2])
+                : make_float2(0.0f, 0.0f);
+        }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (r0 + r < N) {
                 const float2 wv = pf_dense_wload2(wr0 + (size_t)r * K, (size_t)col2);
-                sum[r] += wv.x * xv.x;
-                sum[r] += wv.y * xv.y;
+#pragma unroll
+                for (int dt = 0; dt < TM; ++dt) {
+                    sum[dt][r] += wv.x * xv[dt].x;
+                    sum[dt][r] += wv.y * xv[dt].y;
+                }
             }
         }
     }
 
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-#pragma unroll
-        for (int m = 16; m > 0; m >>= 1) sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], m);
-    }
-
-    if constexpr (BLOCK == 32) {
-        if (tid == 0) {
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                if (r0 + r < N) y[(size_t)tok * N + r0 + r] = sum[r];
-            }
-        }
-    } else {
+    for (int dt = 0; dt < nt; ++dt) {
+        const int tok = tok0 + dt;
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            if (lane == 0) buf[r][wid] = sum[r];
-        }
-        __syncthreads();
-        if (wid < R) {
-            const int r = wid;
-            float v = buf[r][lane];
 #pragma unroll
-            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-            if (lane == 0 && r0 + r < N) y[(size_t)tok * N + r0 + r] = v;
+            for (int m = 16; m > 0; m >>= 1) sum[dt][r] += __shfl_xor_sync(0xffffffffu, sum[dt][r], m);
+        }
+        if constexpr (BLOCK == 32) {
+            if (tid == 0) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (r0 + r < N) y[(size_t)tok * N + r0 + r] = sum[dt][r];
+                }
+            }
+        } else {
+            if (tid < 32) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) buf[r][tid] = 0.0f;
+            }
+            __syncthreads();
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (lane == 0) buf[r][wid] = sum[dt][r];
+            }
+            __syncthreads();
+            if (wid < R) {
+                const int r = wid;
+                float v = buf[r][lane];
+#pragma unroll
+                for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+                if (lane == 0 && r0 + r < N) y[(size_t)tok * N + r0 + r] = v;
+            }
+            __syncthreads();
         }
     }
-    (void)M;
 }
 
 static int pf_mmvf_block_size(int k) {
@@ -1903,7 +1923,7 @@ template <typename T, int BLOCK>
 static void pf_launch_dense_exact_block(const float* x, const T* w, float* y,
         int M, int N, int K, cudaStream_t stream) {
     constexpr int R = BLOCK / 32 < 4 ? BLOCK / 32 : 4;
-    dim3 g((unsigned)((N + R - 1) / R), (unsigned)M);
+    dim3 g((unsigned)((N + R - 1) / R), (unsigned)((M + 3) / 4));
     inkwell_pf_dense_mmvf_exact<T, R, BLOCK><<<g, BLOCK, 0, stream>>>(x, w, y, M, N, K);
 }
 
@@ -1943,120 +1963,153 @@ extern "C" void ink_launch_pf_dense_gemm(const float* x, const void* w, float* y
 }
 
 // Batched loop-controller chain in the reduction order of the serial fused
-// rms2down + gf_apply kernels. blockIdx.y is the token row.
+// rms2down + gf_apply kernels, tiled over tokens to amortize BF16 weight loads.
 __global__ void inkwell_pf_ctrl_rms2down(const float* __restrict__ cur,
         const float* __restrict__ msg, const __nv_bfloat16* __restrict__ w,
-        float* __restrict__ gate, int n, int rows, float eps) {
+        float* __restrict__ gate, int C, int n, int rows, float eps) {
+    constexpr int TM = 4;
     __shared__ float s_sum[32];
     __shared__ float s_buf[4][32];
-    const int tok = blockIdx.y;
-    const float* __restrict__ x0 = cur + (size_t)tok * n;
-    const float* __restrict__ x1 = msg + (size_t)tok * n;
-    float* __restrict__ dst = gate + (size_t)tok * rows;
+    const int tok0 = blockIdx.y * TM;
+    const int nt = (C - tok0) < TM ? (C - tok0) : TM;
+    if (nt <= 0) return;
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     const int n4 = n >> 2;
     if (tid >= 24 && tid < 32) s_sum[tid] = 0.0f;
 
-    float scales[2];
+    float scales[TM][2];
+    for (int dt = 0; dt < nt; ++dt) {
+        const int tok = tok0 + dt;
+        const float* __restrict__ x0 = cur + (size_t)tok * n;
+        const float* __restrict__ x1 = msg + (size_t)tok * n;
 #pragma unroll
-    for (int bx = 0; bx < 2; ++bx) {
-        const float* x = bx ? x1 : x0;
-        float p[3];
+        for (int bx = 0; bx < 2; ++bx) {
+            const float* x = bx ? x1 : x0;
+            float p[3];
 #pragma unroll
-        for (int k = 0; k < 3; ++k) {
-            const int vt = tid + k * 256;
-            if (vt < n4) {
-                const float4 q = __ldg(&((const float4*)x)[vt]);
-                p[k] = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-            } else {
-                p[k] = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                const int vt = tid + k * 256;
+                if (vt < n4) {
+                    const float4 q = __ldg(&((const float4*)x)[vt]);
+                    p[k] = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+                } else {
+                    p[k] = 0.0f;
+                }
             }
+            __syncthreads();
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                float v = p[k];
+#pragma unroll
+                for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+                if (lane == 0) s_sum[wid + 8 * k] = v;
+            }
+            __syncthreads();
+            float t = s_sum[lane];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) t += __shfl_xor_sync(0xffffffffu, t, m);
+            scales[dt][bx] = rsqrtf(__fdiv_rn(t, (float)n) + eps);
         }
-        __syncthreads();
-#pragma unroll
-        for (int k = 0; k < 3; ++k) {
-            float v = p[k];
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-            if (lane == 0) s_sum[wid + 8 * k] = v;
-        }
-        __syncthreads();
-        float t = s_sum[lane];
-#pragma unroll
-        for (int m = 16; m > 0; m >>= 1) t += __shfl_xor_sync(0xffffffffu, t, m);
-        scales[bx] = rsqrtf(__fdiv_rn(t, (float)n) + eps);
     }
-
-    if (tid < 32) {
-#pragma unroll
-        for (int r = 0; r < 4; ++r) s_buf[r][tid] = 0.0f;
-    }
-    __syncthreads();
 
     const int r0 = blockIdx.x * 4;
     const size_t stride2 = (size_t)n;
     const __nv_bfloat162* wbase = (const __nv_bfloat162*)w + (size_t)r0 * stride2;
-    const float2* x0_2 = (const float2*)x0;
-    const float2* x1_2 = (const float2*)x1;
     const int half2 = n >> 1;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    float acc[TM][4];
+#pragma unroll
+    for (int dt = 0; dt < TM; ++dt) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) acc[dt][r] = 0.0f;
+    }
 
     for (int c = tid; c < n; c += 256) {
         const bool in0 = c < half2;
-        const float2 raw = in0 ? __ldg(&x0_2[c]) : __ldg(&x1_2[c - half2]);
-        const float sc = in0 ? scales[0] : scales[1];
-        const float2 tg = make_float2(__fmul_rn(sc, raw.x), __fmul_rn(sc, raw.y));
+        float2 tg[TM];
+#pragma unroll
+        for (int dt = 0; dt < TM; ++dt) {
+            if (dt < nt) {
+                const int tok = tok0 + dt;
+                const float2* x0_2 = (const float2*)(cur + (size_t)tok * n);
+                const float2* x1_2 = (const float2*)(msg + (size_t)tok * n);
+                const float2 raw = in0 ? __ldg(&x0_2[c]) : __ldg(&x1_2[c - half2]);
+                const float sc = in0 ? scales[dt][0] : scales[dt][1];
+                tg[dt] = make_float2(__fmul_rn(sc, raw.x), __fmul_rn(sc, raw.y));
+            } else {
+                tg[dt] = make_float2(0.0f, 0.0f);
+            }
+        }
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
             const __nv_bfloat162 tw = wbase[(size_t)r * stride2 + c];
-            acc[r] += __bfloat162float(tw.x) * tg.x;
-            acc[r] += __bfloat162float(tw.y) * tg.y;
+            const float wx = __bfloat162float(tw.x);
+            const float wy = __bfloat162float(tw.y);
+#pragma unroll
+            for (int dt = 0; dt < TM; ++dt) {
+                acc[dt][r] += wx * tg[dt].x;
+                acc[dt][r] += wy * tg[dt].y;
+            }
         }
     }
+
+    for (int dt = 0; dt < nt; ++dt) {
+        float* __restrict__ dst = gate + (size_t)(tok0 + dt) * rows;
+        if (tid < 32) {
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < 4; ++r) s_buf[r][tid] = 0.0f;
+        }
+        __syncthreads();
 #pragma unroll
-        for (int m = 16; m > 0; m >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], m);
-        if (lane == 0) s_buf[r][wid] = acc[r];
-    }
-    __syncthreads();
-    if (wid < 4) {
-        const int r = wid;
-        float v = s_buf[r][lane];
+        for (int r = 0; r < 4; ++r) {
 #pragma unroll
-        for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-        if (lane == 0 && r0 + r < rows) dst[r0 + r] = v;
+            for (int m = 16; m > 0; m >>= 1) acc[dt][r] += __shfl_xor_sync(0xffffffffu, acc[dt][r], m);
+            if (lane == 0) s_buf[r][wid] = acc[dt][r];
+        }
+        __syncthreads();
+        if (wid < 4) {
+            const int r = wid;
+            float v = s_buf[r][lane];
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
+            if (lane == 0 && r0 + r < rows) dst[r0 + r] = v;
+        }
+        __syncthreads();
     }
 }
 
 __global__ void inkwell_pf_ctrl_gf_apply(const __nv_bfloat16* __restrict__ w,
         const float* __restrict__ gate, const float* __restrict__ cur,
-        const float* __restrict__ msg, float* __restrict__ dst, int n, int fo) {
-    const int tok = blockIdx.y;
-    const float* __restrict__ y = gate + (size_t)tok * 64;
-    const float* __restrict__ cr = cur + (size_t)tok * n;
-    const float* __restrict__ mr = msg + (size_t)tok * n;
-    float* __restrict__ dr = dst + (size_t)tok * n;
+        const float* __restrict__ msg, float* __restrict__ dst, int C, int n, int fo) {
+    constexpr int TM = 16;
     const int wtid = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int i = blockIdx.x * 8 + wtid;
     if (i >= n) return;
-    const float2 t = __ldg(&((const float2*)y)[lane]);
     const __nv_bfloat162 vg = ((const __nv_bfloat162*)(w + (size_t)i * 64))[lane];
     const __nv_bfloat162 vf = ((const __nv_bfloat162*)(w + (size_t)(fo + i) * 64))[lane];
-    float g = 0.0f, f = 0.0f;
-    g += __bfloat162float(vg.x) * t.x;
-    g += __bfloat162float(vg.y) * t.y;
-    f += __bfloat162float(vf.x) * t.x;
-    f += __bfloat162float(vf.y) * t.y;
+    const float vgx = __bfloat162float(vg.x), vgy = __bfloat162float(vg.y);
+    const float vfx = __bfloat162float(vf.x), vfy = __bfloat162float(vf.y);
+    const int tok0 = blockIdx.y * TM;
+    for (int dt = 0; dt < TM; ++dt) {
+        const int tok = tok0 + dt;
+        if (tok >= C) break;
+        const float2 t = __ldg(&((const float2*)(gate + (size_t)tok * 64))[lane]);
+        float g = 0.0f, f = 0.0f;
+        g += vgx * t.x;
+        g += vgy * t.y;
+        f += vfx * t.x;
+        f += vfy * t.y;
 #pragma unroll
-    for (int m = 16; m > 0; m >>= 1) {
-        g += __shfl_xor_sync(0xffffffffu, g, m);
-        f += __shfl_xor_sync(0xffffffffu, f, m);
-    }
-    if (lane == 0) {
-        const float gn = tanhf(g), fg = tanhf(f);
-        const float r = __fsub_rn(cr[i], __fmul_rn(fg, cr[i]));
-        dr[i] = __fadd_rn(r, __fmul_rn(gn, mr[i]));
+        for (int m = 16; m > 0; m >>= 1) {
+            g += __shfl_xor_sync(0xffffffffu, g, m);
+            f += __shfl_xor_sync(0xffffffffu, f, m);
+        }
+        if (lane == 0) {
+            const float gn = tanhf(g), fg = tanhf(f);
+            const float cv = cur[(size_t)tok * n + i];
+            const float mv = msg[(size_t)tok * n + i];
+            const float r = __fsub_rn(cv, __fmul_rn(fg, cv));
+            dst[(size_t)tok * n + i] = __fadd_rn(r, __fmul_rn(gn, mv));
+        }
     }
 }
 
@@ -2064,10 +2117,10 @@ extern "C" void ink_launch_pf_ctrl_exact(const float* cur, const float* msg,
         const void* down, const void* gf, float* gate, float* dst,
         int C, int n, int rows, float eps, int fo, void* stream) {
     const cudaStream_t st = (cudaStream_t)stream;
-    inkwell_pf_ctrl_rms2down<<<dim3((unsigned)(rows / 4), (unsigned)C), 256, 0, st>>>(
-        cur, msg, (const __nv_bfloat16*)down, gate, n, rows, eps);
-    inkwell_pf_ctrl_gf_apply<<<dim3((unsigned)((n + 7) / 8), (unsigned)C), 256, 0, st>>>(
-        (const __nv_bfloat16*)gf, gate, cur, msg, dst, n, fo);
+    inkwell_pf_ctrl_rms2down<<<dim3((unsigned)(rows / 4), (unsigned)((C + 3) / 4)), 256, 0, st>>>(
+        cur, msg, (const __nv_bfloat16*)down, gate, C, n, rows, eps);
+    inkwell_pf_ctrl_gf_apply<<<dim3((unsigned)((n + 7) / 8), (unsigned)((C + 15) / 16)), 256, 0, st>>>(
+        (const __nv_bfloat16*)gf, gate, cur, msg, dst, C, n, fo);
 }
 
 extern "C" __global__ void inkwell_pf_ctrl_apply(const float* __restrict__ gain,
@@ -2243,15 +2296,15 @@ extern "C" __global__ void inkwell_pf_mix(PfMixStates states,
 #define PF_MIX_NPL 72
 
 // Batched equivalent of inkwell_mix_fused: same lane-strided associations,
-// xor-shuffle trees, sequential softmax, and row accumulation order.  Grid
-// z is the token; states are token-major [C,n] planes.
+// xor-shuffle trees, sequential softmax, and row accumulation order.  One CTA
+// per (qcol, token) avoids redundant rms/dot recomputation across embd tiles.
 __global__ void __launch_bounds__(256) inkwell_pf_mix_exact(PfMixStates states,
         int rows, const float* __restrict__ q, float* __restrict__ out,
         int C, int embd, float scale) {
     __shared__ float s_rms[64];
     __shared__ float s_p[64];
-    const int token = blockIdx.z;
-    const int qc = blockIdx.y;
+    const int qc = blockIdx.x;
+    const int token = blockIdx.y;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
     float qq[PF_MIX_NPL];
 #pragma unroll
@@ -2281,17 +2334,17 @@ __global__ void __launch_bounds__(256) inkwell_pf_mix_exact(PfMixStates states,
         for (int j = 0; j < rows; ++j) s_p[j] /= d;
     }
     __syncthreads();
-    const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= embd) return;
-    float a = 0.f;
-    for (int j0 = 0; j0 < rows; j0 += 8) {
-        float v[8];
+    for (int e = threadIdx.x; e < embd; e += blockDim.x) {
+        float a = 0.f;
+        for (int j0 = 0; j0 < rows; j0 += 8) {
+            float v[8];
 #pragma unroll
-        for (int u = 0; u < 8; ++u) v[u] = (j0 + u < rows) ? states.p[j0 + u][(size_t)token * embd + e] : 0.f;
+            for (int u = 0; u < 8; ++u) v[u] = (j0 + u < rows) ? states.p[j0 + u][(size_t)token * embd + e] : 0.f;
 #pragma unroll
-        for (int u = 0; u < 8; ++u) if (j0 + u < rows) a += v[u] / s_rms[j0 + u] * s_p[j0 + u];
+            for (int u = 0; u < 8; ++u) if (j0 + u < rows) a += v[u] / s_rms[j0 + u] * s_p[j0 + u];
+        }
+        out[((size_t)qc * C + token) * embd + e] = a;
     }
-    out[((size_t)qc * C + token) * embd + e] = a;
 }
 
 extern "C" void ink_launch_pf_mix(const void* const* states, int rows, const float* query,
@@ -2299,7 +2352,7 @@ extern "C" void ink_launch_pf_mix(const void* const* states, int rows, const flo
     PfMixStates tmp{};
     for (int i = 0; i < rows && i < 8; ++i) tmp.p[i] = (const float*)states[i];
     if (n == 32 * PF_MIX_NPL && rows <= 64) {
-        dim3 g((n + 255) / 256, qcols, C);
+        dim3 g((unsigned)qcols, (unsigned)C);
         inkwell_pf_mix_exact<<<g, 256, 0, (cudaStream_t)stream>>>(tmp, rows, query, out, C, n, scale);
     } else {
         inkwell_pf_mix<<<C * qcols, 256, 0, (cudaStream_t)stream>>>(tmp, rows, query, out, C, n, qcols, scale, eps);
