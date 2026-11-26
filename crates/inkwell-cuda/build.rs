@@ -14,17 +14,50 @@ fn exists_or_env(envs: &[&str], default: &Path) -> PathBuf {
     default.to_path_buf()
 }
 
+fn first_existing(envs: &[&str], candidates: &[PathBuf], fallback: &str) -> PathBuf {
+    for e in envs {
+        println!("cargo:rerun-if-env-changed={e}");
+        if let Ok(v) = std::env::var(e) {
+            if !v.is_empty() {
+                return PathBuf::from(v);
+            }
+        }
+    }
+    for c in candidates {
+        if c.exists() {
+            return c.clone();
+        }
+    }
+    PathBuf::from(fallback)
+}
+
 fn main() {
-    // Overridable for other build hosts (see third_party/ggml/README.md).
+    // Overridable via env vars (see third_party/ggml/README.md).
     let env = |k: &str, d: &str| {
         println!("cargo:rerun-if-env-changed={k}");
         std::env::var(k).unwrap_or_else(|_| d.to_string())
     };
-    let cuda_s = env("INKWELL_CUDA_HOME", "/home/ash/lfm-gtx1060-bench/cuda-12.6");
-    let gxx_s = env("INKWELL_CXX", "/home/ash/.local/share/mise/installs/conda-gxx-linux-64/13.4.0/bin/x86_64-conda-linux-gnu-g++");
-    let cuda = Path::new(&cuda_s);
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let cuda = first_existing(
+        &["INKWELL_CUDA_HOME", "CUDA_HOME", "CUDA_PATH"],
+        &[
+            home.join("lfm-gtx1060-bench/cuda-12.6"),
+            PathBuf::from("/usr/local/cuda"),
+            PathBuf::from("/opt/cuda"),
+        ],
+        "/usr/local/cuda",
+    );
+    let gxx = first_existing(
+        &["INKWELL_CXX", "CXX"],
+        &[home.join(".local/share/mise/installs/conda-gxx-linux-64/13.4.0/bin/x86_64-conda-linux-gnu-g++")],
+        "g++",
+    );
     let nvcc = cuda.join("bin/nvcc");
-    let gxx = Path::new(&gxx_s);
+    assert!(
+        nvcc.is_file(),
+        "nvcc not found at {} — install CUDA Toolkit 12.x or set INKWELL_CUDA_HOME",
+        nvcc.display()
+    );
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let outdir = Path::new(&out);
     let src = Path::new("src/kernels.cu");
@@ -92,9 +125,8 @@ fn main() {
     // payload below disables the runtime path.
     let real_cubin = outdir.join("ch2nopless.real.cubin");
     let _ = std::fs::remove_file(&real_cubin);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ash".into());
-    let cuasm_root = exists_or_env(&["INKWELL_CUASM_ROOT", "CUASMROOT"], &Path::new(&home).join(".cache/inkwell-sass-reasm/CuAssembler"));
-    let cuasm_py = exists_or_env(&["INKWELL_CUASM_PYTHON", "VENVPY"], &Path::new(&home).join(".cache/inkwell-sass-reasm/cuasm-venv/bin/python"));
+    let cuasm_root = exists_or_env(&["INKWELL_CUASM_ROOT", "CUASMROOT"], &home.join(".cache/inkwell-sass-reasm/CuAssembler"));
+    let cuasm_py = exists_or_env(&["INKWELL_CUASM_PYTHON", "VENVPY"], &home.join(".cache/inkwell-sass-reasm/cuasm-venv/bin/python"));
     if !cuasm_root.join("bin/cuasm.py").is_file() || !cuasm_py.is_file() {
         println!("cargo:warning=ch2nopless: CuAssembler unavailable; using the normal ptxas kernel (set INKWELL_CUASM_ROOT/INKWELL_CUASM_PYTHON or populate ~/.cache/inkwell-sass-reasm)");
     } else {

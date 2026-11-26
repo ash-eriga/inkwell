@@ -36,11 +36,33 @@ Comparing **Inkwell v0.1** (`EXL3 2.26 bpw`, zero-config) against upstream **`ll
 
 *(Validated up to 16k on 6 GB VRAM in v0.1.)*
 
-## Build
+## Build from Source
+
+**Requirements:** Linux x86_64, NVIDIA GPU (`sm_61` Pascal tuned; `sm_75+` Turing/Ampere/Ada/Hopper experimental), CUDA Toolkit 12.x, Rust toolchain (`cargo`), and `cmake`.
+
+1. Build the patched `ggml` dependency (see [third_party/ggml/README.md](third_party/ggml/README.md) for full details):
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp.git third_party/ggml/ggml-src
+cd third_party/ggml/ggml-src
+git checkout cbb1c1c50bba81929387dea473873d1df87a6212
+git am ../patches/000[1-8]-*.patch
+git apply ../patches/0009-uncommitted-ggml-cuda.patch
+cmake -B build-inkwell-dp4a -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="61;75;80;86;89;90" -DGGML_CUDA_FA=ON -DGGML_CUDA_GRAPHS=ON
+cmake --build build-inkwell-dp4a -j --target ggml ggml-base ggml-cuda ggml-cpu
+cd ../../..
+```
+
+2. Build Inkwell:
 
 ```bash
 cargo build --release
+# Optional: compile only for your GPU arch for faster builds (e.g. sm_61 or sm_86)
+# INKWELL_CUDA_ARCHS=61 cargo build --release
 ```
+
+The compiled binary is at `target/release/inkwell`. Add `third_party/ggml/ggml-src/build-inkwell-dp4a/bin` (and CUDA `lib64` if non-standard) to `LD_LIBRARY_PATH`, or install a small wrapper script in `~/.local/bin/inkwell`.
 
 ## Quick Start
 

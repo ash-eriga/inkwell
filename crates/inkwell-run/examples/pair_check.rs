@@ -1,6 +1,10 @@
 // 2 gemvs on 2 streams vs serial on 1 stream — does pairing overlap?
 fn main() {
-    let repo = inkwell_st::StRepo::open("/home/ash/models/inkling").unwrap();
+    let model = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("INKWELL_MODEL").ok())
+        .unwrap_or_else(|| format!("{}/models/inkling", std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+    let repo = inkwell_st::StRepo::open(&model).unwrap();
     let base = std::env::var("W").unwrap_or("model.llm.layers.0.attn.wk_dv".into());
     let base2 = std::env::var("W2").unwrap_or("model.llm.layers.0.attn.wv_dv".into());
     let load = |b: &str| {

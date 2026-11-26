@@ -1,6 +1,10 @@
 // ntok gemv vs per-token gemv on a real REXL3 weight.
 fn main() {
-    let repo = inkwell_st::StRepo::open("/home/ash/models/inkling").unwrap();
+    let model = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("INKWELL_MODEL").ok())
+        .unwrap_or_else(|| format!("{}/models/inkling", std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+    let repo = inkwell_st::StRepo::open(&model).unwrap();
     let base = std::env::var("W").unwrap_or("model.llm.layers.0.attn.wo".into());
     let tr = repo.tensor(&format!("{base}.trellis")).expect("trellis");
     let (k, n) = ((tr.shape[0] * 16) as usize, (tr.shape[1] * 16) as usize);
