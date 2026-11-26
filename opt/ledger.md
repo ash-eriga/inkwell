@@ -2376,3 +2376,22 @@ The cached-MoE bulk miss copy was split into per-projection side-stream launches
 
 Changed the four CH2 expert loops from `#pragma unroll 4` to `#pragma unroll 8` and updated the fail-closed SASS pipeline for 64-weight loop bodies. The generator succeeded structurally: expert loops were reduced from 215/219/223/211 to 423/431/439/415 instructions per 64 weights (a 3.5-instruction saving per 32 weights), with dense CH2 shapes 444/452/427 per 64. However the patched cubin grew from 1,596,304 to 1,670,416 bytes and the whole-model validation was already slower: candidate 27.740 ms/tok vs control 27.210 ms/tok. The interleaved A/B was stopped early after a consistent large regression; complete rows were control 26.980/27.036/27.096 ms/tok vs candidate 27.544/27.613/27.387 ms/tok, all md5 `5cbe8e06`, peak 5,048 MiB. Likely causes are I-cache/branch/scheduling cost from the doubled body and imperfect NOP-control transfer, outweighing the small loop-count saving. Not committed; experiment tree and binary remain under `/home/ash/.cache/inkwell-dec25/t7tree` and `/home/ash/.cache/inkwell-dec25/target-t7u8`.
 - Brain validation (gpu-run -p high), 3 runs of the same binary (sha 1f268f07): 27.525 / 27.125 / 27.116 ms/tok, md5 5cbe8e06 in all 3 runs, peak 5,048 MiB, ch2nopless enabled. Merged into master. The new decode control is this binary.
+
+## Prefill phase 2 (t3/chunked-prefill-driver @ e024bb6): brain check, NOT merged
+
+Clean build (sha 3540fe2c), `bench_encode.sh` with chunk 512. Serial is INKWELL_NO_PREFILL=1.
+
+| prompt | serial tok/s | chunked tok/s | speedup | mean KLD | top-1 | peak MiB |
+|---|---|---|---|---|---|---|
+| 127 | 30.9 | 57.1 | 1.85× | 3.7e-6 | 1.0 | 5,028 |
+| 512 | 30.3 | 105.9 | 3.49× | 4.4e-4 | 1.0 | 5,048 |
+| 2K | 29.9 | 97.6 | 3.27× | 2.8e-4 | 1.0 | 4,854 |
+| 4K | 27.7 | 92.3 | 3.34× | 4.0e-4 | 1.0 | 4,918 |
+| 8K | 25.5 | 86.7 | 3.40× | 4.9e-4 | 1.0 | 5,046 |
+
+- **Blocker:** default decode stays bit-exact (md5 5cbe8e06), but it is slower. In an interleaved validate.sh run (2×3 each) against the HADVEC master control, the control measured 27.07–27.55 ms/tok at peak 5,048, and the branch 28.09–28.69 at peak 5,060, slower in 6/6.
+  - The branch lacks HADVEC, which accounts for ~0.21 ms.
+  - That leaves ~+0.7–0.8 ms of its own regression. Suspect commit: 1f43dbe (arena borrows decode cache memory).
+  - The agent must fix this before merge.
+- **Tooling bug:** bench_encode.sh never creates `$OUT/$n`; fixed in the validation copy only.
+- **Target:** 150 tok/s. The gap is 1.4× at 512 and 1.7× at 8K, and throughput falls with prompt length.
