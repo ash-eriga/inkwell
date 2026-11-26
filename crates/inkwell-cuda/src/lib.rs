@@ -779,6 +779,30 @@ pub unsafe fn side_sync_to_main() {
     assert_eq!(unsafe { cudaStreamWaitEvent(std::ptr::null_mut(), e, 0) }, 0);
 }
 
+/// Record `e` on the current inkwell compute stream.
+///
+/// # Safety
+/// Stream/event plumbing only.
+pub unsafe fn event_record_current(e: *mut c_void) {
+    assert_eq!(unsafe { cudaEventRecord(e, stream()) }, 0, "event record current");
+}
+
+/// Make the current inkwell compute stream wait on `e`.
+///
+/// # Safety
+/// Stream/event plumbing only.
+pub unsafe fn stream_wait_current(e: *mut c_void) {
+    assert_eq!(unsafe { cudaStreamWaitEvent(stream(), e, 0) }, 0, "stream wait current");
+}
+
+/// Make the side stream wait on `e`.
+///
+/// # Safety
+/// Stream/event plumbing only.
+pub unsafe fn side_wait_event(e: *mut c_void) {
+    assert_eq!(unsafe { cudaStreamWaitEvent(side_stream(), e, 0) }, 0, "side wait event");
+}
+
 extern "C" {
     fn ink_launch_moe_resolve(ids: *const i32, map: *const i32,
         lru: *mut u64, stamp: *const u64,

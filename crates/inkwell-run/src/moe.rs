@@ -356,6 +356,8 @@ pub struct MoeArgsExl3 {
     /// host and device base addresses of the packed expert blob
     pub expert_host_base: usize,
     pub expert_dev_base: usize,
+    /// bytes in the contiguous packed expert blob for this layer
+    pub expert_total: usize,
 }
 
 /// Expert-usage histograms: HIST[layer][expert] counts, only when

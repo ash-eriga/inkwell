@@ -21,7 +21,7 @@ def short(i):
 ev = [(s, e, short(n)) for s, e, n in rows]
 pref = lambda n: (n.startswith('inkwell_pf_') or n.startswith('inkwell_flash_prefill')
     or n.startswith('inkwell_exl3_gemm') or n.startswith('inkwell_exl3_had_in_prefill')
-    or n.startswith('inkwell_exl3_had_out_prefill') or n.startswith('inkwell_exl3_moe')
+    or n.startswith('inkwell_exl3_had_out_prefill') or n.startswith('inkwell_exl3_moe_grouped') or n.startswith('inkwell_exl3_moe_group_sort')
     or n.startswith('inkwell_moe_') or n.startswith('inkwell_conv_prefill'))
 idx = [i for i, x in enumerate(ev) if pref(x[2])]
 if not idx:

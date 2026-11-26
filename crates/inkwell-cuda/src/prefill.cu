@@ -682,6 +682,148 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
     }
 }
 
+
+// Experimental 64-row grouped core.  It keeps one decoded weight tile in
+// shared memory live for both 32-row halves of a tile instead of rereading the
+// compressed weights for the second half.  The launch contract and output
+// order are the same as inkwell_exl3_moe_grouped_gemm_kernel.
+__global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
+        const uint64_t* __restrict__ descs,
+        const int* __restrict__ tile_expert, const int* __restrict__ tile_start,
+        const int* __restrict__ tile_count, const int* __restrict__ tile_n,
+        const float* __restrict__ xh, float* __restrict__ y,
+        int tk, int tn, int tile_base_index) {
+    if (blockIdx.x & 1) return;
+    constexpr int BM = 64, BN = 128, RM = 4, RN = 4;
+    const int mt = tile_base_index + blockIdx.y;
+    if (mt >= *tile_n) return;
+    const int ex = tile_expert[mt];
+    const int row0 = tile_start[mt];
+    const int rows = tile_count[mt];
+    const uint64_t* d = descs + ex * 4;
+    const uint32_t* trel = (const uint32_t*)(uintptr_t)d[0];
+    const int ka = (int)(d[3] & 0xff);
+    const int hk = (int)((d[3] >> 8) & 1);
+    const int tid = threadIdx.x;
+    const int tn0 = blockIdx.x * 4;
+    const int w = pf_rbits_words(ka, hk);
+    const int r_bits = hk ? 256 * ka + 128 : 256 * ka;
+    const int nw = r_bits >> 5;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    __shared__ float Ws[16][BN + 1];
+    __shared__ float Xs[16][BM + 1];
+    __shared__ uint32_t rings[8][80];
+
+    const int dtile = tid >> 5;
+    const int du = tid & 31;
+    const int dc = du >> 1;
+    const int dm = du & 1;
+    PfDecodePlan plan[2];
+#pragma unroll
+    for (int z = 0; z < 2; ++z) {
+        const int dmz = dm + 2 * z;
+        const int i0 = 32 * (dc & 7) + 8 * dmz + 4 * (dc >> 3);
+        plan[z] = pf_decode_plan(i0, ka, hk, r_bits, nw);
+    }
+
+    const int ty = tid >> 5;
+    const int tx = tid & 31;
+    const int K = tk * 16;
+    const int N = tn * 16;
+    for (int rbase = 0; rbase < rows; rbase += BM) {
+        const int rcnt = min(BM, rows - rbase);
+        float acc[2][RM][RN];
+        float sx[2][RM];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int im = 0; im < RM; ++im) {
+                sx[h][im] = 0.f;
+#pragma unroll
+                for (int in = 0; in < RN; ++in) acc[h][im][in] = 0.f;
+            }
+        for (int tk_i = 0; tk_i < tk; ++tk_i) {
+            const int tn_i = tn0 + dtile;
+            if (tn_i < tn) {
+                for (int u = du; u < w; u += 32) {
+                    rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
+                }
+            }
+            for (int idx = tid; idx < 16 * BM; idx += 256) {
+                const int mm = idx >> 4;
+                const int rr = idx & 15;
+                Xs[rr][mm] = (mm < rcnt) ? xh[(size_t)(row0 + rbase + mm) * K + tk_i * 16 + rr] : 0.f;
+            }
+            __syncthreads();
+            if (tn_i < tn) {
+                const uint32_t* rg = rings[dtile];
+                const int col = dtile * 16 + dc;
+#pragma unroll
+                for (int z = 0; z < 2; ++z) {
+                    const int dmz = dm + 2 * z;
+                    float f0, f1, f2, f3;
+                    pf_decode4(rg, plan[z], f0, f1, f2, f3);
+                    Ws[2 * dmz][col] = f0;
+                    Ws[2 * dmz + 1][col] = f1;
+                    Ws[2 * dmz + 8][col] = f2;
+                    Ws[2 * dmz + 9][col] = f3;
+                }
+            }
+            __syncthreads();
+            if (rcnt > 32) {
+#pragma unroll
+                for (int r = 0; r < 16; ++r) {
+                    float wv[RN];
+                    for (int in = 0; in < RN; ++in) wv[in] = Ws[r][tx + in * 32];
+#pragma unroll
+                    for (int im = 0; im < RM; ++im) {
+                        const float x0 = Xs[r][ty * RM + im];
+                        const float x1 = Xs[r][32 + ty * RM + im];
+                        sx[0][im] += x0;
+                        sx[1][im] += x1;
+#pragma unroll
+                        for (int in = 0; in < RN; ++in) {
+                            acc[0][im][in] = fmaf(x0, wv[in], acc[0][im][in]);
+                            acc[1][im][in] = fmaf(x1, wv[in], acc[1][im][in]);
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int r = 0; r < 16; ++r) {
+                    float wv[RN];
+                    for (int in = 0; in < RN; ++in) wv[in] = Ws[r][tx + in * 32];
+#pragma unroll
+                    for (int im = 0; im < RM; ++im) {
+                        const float x0 = Xs[r][ty * RM + im];
+                        sx[0][im] += x0;
+#pragma unroll
+                        for (int in = 0; in < RN; ++in)
+                            acc[0][im][in] = fmaf(x0, wv[in], acc[0][im][in]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+#pragma unroll
+            for (int im = 0; im < RM; ++im) {
+                const int lr = rbase + h * 32 + ty * RM + im;
+                if (lr < rows) {
+                    const float off = KOFF * sx[h][im];
+#pragma unroll
+                    for (int in = 0; in < RN; ++in) {
+                        const int gn = tn0 * 16 + tx + in * 32;
+                        if (gn < N) y[(size_t)(row0 + lr) * N + gn] = fmaf(KINV, acc[h][im][in], off);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // SiTU followed by the down-projection input Hadamard.  gu is [P,2,ncols]
 // with gate in the first half and up in the second.
 extern "C" __global__ void inkwell_moe_situ_had_rows(

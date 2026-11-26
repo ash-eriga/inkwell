@@ -1502,7 +1502,7 @@ impl Runner {
                     v2_descs_ok, on_dev, cache: None, max_slot,
                     layer: moe_args_exl3.len() as i32,
                     descs_host: descs.clone(), expert_host_base: host_base,
-                    expert_dev_base: base as usize,
+                    expert_dev_base: base as usize, expert_total: total,
                 }));
             }
             l.proj0_off = [-1; 3];
@@ -4214,6 +4214,96 @@ impl PfArena {
     }
 }
 
+struct PfExpertStageBuf {
+    buf: inkwell_cuda::DevBuf,
+    dg: inkwell_cuda::DevBuf,
+    du: inkwell_cuda::DevBuf,
+    dd: inkwell_cuda::DevBuf,
+    reuse_event: *mut std::ffi::c_void,
+    done_event: *mut std::ffi::c_void,
+}
+
+struct PfExpertStage {
+    bufs: Vec<PfExpertStageBuf>,
+    next: usize,
+    table_keepalive: Vec<Vec<u64>>,
+}
+
+type PfMoeDescs = (*const std::ffi::c_void, *const std::ffi::c_void, *const std::ffi::c_void, *mut std::ffi::c_void);
+
+impl PfExpertStage {
+    fn new(bytes: usize) -> Option<Self> {
+        let mut bufs = Vec::new();
+        for _ in 0..2 {
+            bufs.push(PfExpertStageBuf {
+                buf: inkwell_cuda::DevBuf::try_new_bytes(bytes)?,
+                dg: inkwell_cuda::DevBuf::new_bytes(4096),
+                du: inkwell_cuda::DevBuf::new_bytes(4096),
+                dd: inkwell_cuda::DevBuf::new_bytes(4096),
+                reuse_event: inkwell_cuda::new_event(),
+                done_event: inkwell_cuda::new_event(),
+            });
+        }
+        Some(Self { bufs, next: 0, table_keepalive: Vec::new() })
+    }
+}
+
+fn pf_stream_experts_enabled() -> bool {
+    std::env::var("INKWELL_PF_STREAM_EXPERTS").ok().as_deref() != Some("0")
+}
+
+fn pf_host_experts(r: &Runner, il: usize) -> Option<&crate::moe::MoeArgsExl3> {
+    let mi = r.layers[il].moe_exl3?;
+    let m = &r.moe_args_exl3[mi];
+    (!m.on_dev && m.expert_host_base != 0 && m.expert_total != 0).then_some(m)
+}
+
+/// Start an asynchronous side-stream copy of one host-backed layer into the
+/// next double-buffer slot.  The reuse event is recorded before the caller
+/// enqueues the current layer's compute, so the copy overlaps that compute but
+/// cannot overwrite the slot before all previously enqueued consumers retire.
+fn pf_prepare_experts(r: &Runner, stage: &mut PfExpertStage, il: usize) -> Option<usize> {
+    let m = pf_host_experts(r, il)?;
+    let bi = stage.next;
+    stage.next ^= 1;
+    let b = &mut stage.bufs[bi];
+    if m.expert_total > b.buf.len * 4 { return None; }
+    unsafe {
+        inkwell_cuda::event_record_current(b.reuse_event);
+        inkwell_cuda::side_wait_event(b.reuse_event);
+        inkwell_cuda::memcpy_h2d_async_side(b.buf.dev_ptr(), m.expert_host_base as *const std::ffi::c_void, m.expert_total);
+    }
+    let stage_base = b.buf.dev_ptr() as u64;
+    let old_base = m.expert_dev_base as u64;
+    let mut table = Vec::with_capacity(3 * 512);
+    for pi in 0..3 {
+        for e in 0..128 {
+            for j in 0..4 {
+                let v = m.descs_host[pi * 512 + e * 4 + j];
+                table.push(if j < 3 { v - old_base + stage_base } else { v });
+            }
+        }
+    }
+    unsafe {
+        for (pi, dst) in [&b.dg, &b.du, &b.dd].into_iter().enumerate() {
+            let src = table.as_ptr().add(pi * 512).cast::<std::ffi::c_void>();
+            inkwell_cuda::memcpy_h2d_async_side(dst.dev_ptr(), src, 4096);
+        }
+        inkwell_cuda::event_record(b.done_event, inkwell_cuda::side_stream_raw());
+    }
+    stage.table_keepalive.push(table);
+    Some(bi)
+}
+
+fn pf_stage_ready(stage: &PfExpertStage, map: &[Option<usize>], pos: usize) -> Option<PfMoeDescs> {
+    let bi = (*map.get(pos)?)?;
+    let b = &stage.bufs[bi];
+    Some((b.dg.dev_ptr() as *const std::ffi::c_void,
+        b.du.dev_ptr() as *const std::ffi::c_void,
+        b.dd.dev_ptr() as *const std::ffi::c_void,
+        b.done_event))
+}
+
 fn tdata(x: Ptr) -> *mut f32 { unsafe { inkwell_ggml::ink_tensor_data(x.0).cast() } }
 fn ttype(x: Ptr) -> i32 { unsafe { inkwell_ggml::ink_tensor_type(x.0) } }
 
@@ -4332,7 +4422,8 @@ impl Runner {
 
     #[expect(clippy::too_many_arguments)]
     fn pf_layer(&self, a: &PfArena, il: usize, ip: usize, slot: usize, pass: usize,
-        blocks: &mut Vec<usize>, cur_name: &'static str, messages: bool, pos0: i64) {
+        blocks: &mut Vec<usize>, cur_name: &'static str, messages: bool, pos0: i64,
+        moe_descs: Option<PfMoeDescs>) {
         let c = a.c;
         let l = &self.layers[il];
         let is_swa = self.is_swa_layer(il);
@@ -4472,11 +4563,13 @@ impl Runner {
         };
         let mi = l.moe_exl3.expect("moe exl3");
         let m = &self.moe_args_exl3[mi];
+        let (dg, du, dd, copy_done) = moe_descs.unwrap_or((m.descs_g.dev(), m.descs_u.dev(), m.descs_d.dev(), std::ptr::null_mut()));
         unsafe {
             if il == 0 { pf_dbg("router-0", a.ptr("router"), 8); }
             inkwell_cuda::exl3_moe_group_sort_async(a.ptr("ids").cast(), a.ptr("wts").cast(), c as i32,
                 eo, stok, sslot, sw.cast(), inv, te, ts, tc, tn);
-            inkwell_cuda::exl3_moe_grouped_gemm_async(m.descs_g.dev(), m.descs_u.dev(), m.descs_d.dev(),
+            if !copy_done.is_null() { inkwell_cuda::stream_wait_current(copy_done); }
+            inkwell_cuda::exl3_moe_grouped_gemm_async(dg, du, dd,
                 fcur.cast_const(), c as i32, stok, te, ts, tc, tn, sw.cast(), inv,
                 a.ptr("moews"), a.ptr("moe_out"));
             inkwell_cuda::conv_prefill_async(a.ptr("moe_out").cast_const(), conv_state, 2048 + 2304,
@@ -4500,18 +4593,49 @@ impl Runner {
     pub fn prefill_chunked(&mut self, ids: &[u32], pos0: i64) -> Vec<f32> {
         let cmax = std::env::var("INKWELL_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64).clamp(1, 512);
         let need = PfArena::layout(cmax).1;
+        let stream_experts = pf_stream_experts_enabled();
+        let stage_max = if stream_experts {
+            self.moe_args_exl3.iter()
+                .filter(|m| !m.on_dev && m.expert_host_base != 0)
+                .map(|m| m.expert_total).max().unwrap_or(0)
+        } else { 0 };
         // Reuse the largest decode expert-cache arena while encoding. The
         // direct driver reads expert weights from their resident/pinned source
         // instead of those caches; cache metadata is invalidated before decode.
-        let borrow = self.moe_args_exl3.iter()
-            .filter_map(|m| m.cache.as_ref().map(|c| (m.layer, c.buf.dev_ptr().cast::<u8>(), c.buf.len * 4)))
-            .filter(|&(_, _, bytes)| bytes >= need)
-            .max_by_key(|&(_, _, bytes)| bytes);
+        let borrow = if stage_max == 0 {
+            self.moe_args_exl3.iter()
+                .filter_map(|m| m.cache.as_ref().map(|c| (m.layer, c.buf.dev_ptr().cast::<u8>(), c.buf.len * 4)))
+                .filter(|&(_, _, bytes)| bytes >= need)
+                .max_by_key(|&(_, _, bytes)| bytes)
+        } else { None };
+        let mut released_caches: Vec<(i32, usize)> = Vec::new();
         let (mut a, borrowed_layer) = if let Some((layer, base, _)) = borrow {
             (PfArena::borrowed(cmax, base), Some(layer))
         } else {
+            let mut candidates: Vec<(i32, usize)> = self.moe_args_exl3.iter()
+                .filter_map(|m| m.cache.as_ref().map(|c| (m.layer, c.buf.len * 4)))
+                .collect();
+            candidates.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
+            if stage_max > 0 || candidates.iter().map(|&(_, bytes)| bytes).sum::<usize>() >= need {
+                let mut have = 0usize;
+                for (layer, bytes) in candidates {
+                    if stage_max == 0 && have >= need { break; }
+                    if let Some(m) = self.moe_args_exl3.iter_mut().find(|m| m.layer == layer) {
+                        if let Some(c) = &mut m.cache {
+                            let old = std::mem::replace(&mut c.buf, inkwell_cuda::DevBuf::new_bytes(8));
+                            drop(old);
+                            released_caches.push((layer, bytes));
+                            have += bytes;
+                        }
+                    }
+                }
+            }
             (PfArena::new(cmax), None)
         };
+        let mut expert_stage = if stage_max > 0 { PfExpertStage::new(stage_max) } else { None };
+        if stage_max > 0 && expert_stage.is_none() {
+            eprintln!("prefill experts: stage allocation {} MiB failed; using direct expert memory", stage_max >> 20);
+        }
         if pf_exact_attn_enabled() {
             a.exact_attn_ws = Some(inkwell_cuda::DevBuf::new(24 * self.max_ctx as usize));
         }
@@ -4519,6 +4643,13 @@ impl Runner {
             borrowed_layer.map_or(String::new(), |l| format!(" borrowed=L{l}")));
         let mut pos = pos0;
         let mut out_logits = Vec::new();
+        let seq: Vec<usize> = (0..6)
+            .chain((0..3).flat_map(|_| 6..18))
+            .chain(18..24)
+            .collect();
+        let host_positions: Vec<usize> = seq.iter().enumerate()
+            .filter_map(|(pos, &il)| pf_host_experts(self, il).map(|_| pos))
+            .collect();
         for chunk in ids.chunks(cmax) {
             let c = chunk.len();
             a.c = c;
@@ -4531,9 +4662,31 @@ impl Runner {
             }
             let mut blocks: Vec<usize> = Vec::new();
             let mut vi = 0usize;
+            let mut staged_pos = vec![None; seq.len()];
+            let mut seq_pos = 0usize;
+            let mut prep_idx = 0usize;
+            if let Some(st) = expert_stage.as_mut() {
+                if let Some(&hp) = host_positions.first() {
+                    if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                        staged_pos[hp] = Some(bi);
+                    }
+                    prep_idx = 1;
+                }
+            }
             for il in 0..6 {
-                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos);
+                let md = expert_stage.as_ref().and_then(|st| pf_stage_ready(st, &staged_pos, seq_pos));
+                if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
+                    let hp = host_positions[prep_idx];
+                    prep_idx += 1;
+                    if let Some(st) = expert_stage.as_mut() {
+                        if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                            staged_pos[hp] = Some(bi);
+                        }
+                    }
+                }
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md);
                 vi += 1;
+                seq_pos += 1;
             }
             pf_copy(a.ptr("prelude"), a.ptr("cur"), c*2304*4);
             let prelude_blocks = blocks.clone();
@@ -4547,13 +4700,35 @@ impl Runner {
                     blocks = prelude_blocks.clone();
                 }
                 for ip in 6..18 {
-                    self.pf_layer(&a, ip, ip, self.visits[vi].1, pass, &mut blocks, "cur", pass > 0, pos);
+                    let md = expert_stage.as_ref().and_then(|st| pf_stage_ready(st, &staged_pos, seq_pos));
+                    if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
+                        let hp = host_positions[prep_idx];
+                        prep_idx += 1;
+                        if let Some(st) = expert_stage.as_mut() {
+                            if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                                staged_pos[hp] = Some(bi);
+                            }
+                        }
+                    }
+                    self.pf_layer(&a, ip, ip, self.visits[vi].1, pass, &mut blocks, "cur", pass > 0, pos, md);
                     vi += 1;
+                    seq_pos += 1;
                 }
             }
             for il in 18..24 {
-                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos);
+                let md = expert_stage.as_ref().and_then(|st| pf_stage_ready(st, &staged_pos, seq_pos));
+                if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
+                    let hp = host_positions[prep_idx];
+                    prep_idx += 1;
+                    if let Some(st) = expert_stage.as_mut() {
+                        if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                            staged_pos[hp] = Some(bi);
+                        }
+                    }
+                }
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md);
                 vi += 1;
+                seq_pos += 1;
             }
             // final mix + norm; compute lm_head only for the last row of the final chunk.
             let is_last_chunk = pos + c as i64 == pos0 + ids.len() as i64;
@@ -4594,6 +4769,31 @@ impl Runner {
                 }
             }
             eprintln!("prefill arena: invalidated borrowed cache L{layer}");
+        }
+        if !released_caches.is_empty() {
+            drop(a);
+            drop(expert_stage);
+            for (layer, bytes) in released_caches {
+                if let Some(m) = self.moe_args_exl3.iter_mut().find(|m| m.layer == layer) {
+                    if let Some(c) = &mut m.cache {
+                        let old = std::mem::replace(&mut c.buf, inkwell_cuda::DevBuf::new_bytes(bytes));
+                        drop(old);
+                        c.tag.write_bytes(&vec![0xFFu8; c.k as usize * 4]);
+                        c.cnt.write_bytes(&vec![0u8; 128 * 4]);
+                        c.hm.write_bytes(&[0u8; 8]);
+                        if let Some(soff) = &mut c.soff {
+                            soff.write_bytes(&vec![0u8; 3 * c.k as usize * 8]);
+                        }
+                        if let Some(fl) = &mut c.fl {
+                            let mut fl_h = vec![0i32; 513];
+                            fl_h[0] = 1;
+                            fl_h[257] = (bytes / 6912) as i32;
+                            fl.write_bytes(unsafe { std::slice::from_raw_parts(fl_h.as_ptr().cast::<u8>(), 513 * 4) });
+                        }
+                    }
+                }
+                eprintln!("prefill arena: restored released cache L{layer}");
+            }
         }
         out_logits
     }
