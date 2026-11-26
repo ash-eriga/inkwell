@@ -223,9 +223,9 @@ fn render_catalog(local: &[LocalModel], available: &[&HfPreset], vision_enabled:
     let tty = io::stdout().is_terminal();
     let root = models_dir();
     let v_tag = if vision_enabled {
-        format!("{}vision: ON{}", color(tty, GREEN), color(tty, DIM))
+        format!("{}[vision: ON]{}", color(tty, GREEN), color(tty, RESET))
     } else {
-        "vision: OFF".to_owned()
+        format!("{}[vision: OFF]{}", color(tty, DIM), color(tty, RESET))
     };
 
     println!(
@@ -252,7 +252,7 @@ fn render_catalog(local: &[LocalModel], available: &[&HfPreset], vision_enabled:
                 .matched_preset
                 .map_or("EXL3", |p| p.detail.split(" · ").next().unwrap_or("EXL3"));
             println!(
-                "  {}[{}]{} {:<30} {}{} · {} · {v_tag} · {}{}",
+                "  {}[{}]{} {:<30} {}{} · {} · {}{}  {v_tag}",
                 color(tty, GREEN),
                 i + 1,
                 color(tty, RESET),
@@ -274,14 +274,14 @@ fn render_catalog(local: &[LocalModel], available: &[&HfPreset], vision_enabled:
         );
         for (j, p) in available.iter().enumerate() {
             println!(
-                "  {}[{}]{} {:<44} {}{} · {v_tag} · {}{}",
+                "  {}[{}]{} {:<44} {}{} · {}{}  {v_tag}",
                 color(tty, CYAN),
                 local.len() + j + 1,
                 color(tty, RESET),
                 p.repo_id,
                 color(tty, DIM),
-                p.size_label,
                 p.detail,
+                p.size_label,
                 color(tty, RESET)
             );
         }

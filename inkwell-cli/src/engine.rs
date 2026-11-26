@@ -35,7 +35,7 @@ pub struct GenParams {
 impl Default for GenParams {
     fn default() -> Self {
         Self {
-            max_tokens: 512,
+            max_tokens: 2048,
             temperature: 0.0,
             top_p: 0.95,
             top_k: 40,

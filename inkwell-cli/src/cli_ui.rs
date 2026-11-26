@@ -42,7 +42,7 @@ impl Default for CliRunOpts {
         Self {
             model: String::new(),
             ctx: 4096,
-            max_tokens: 512,
+            max_tokens: 2048,
             temperature: 0.0,
             top_p: 0.95,
             top_k: 40,
@@ -600,8 +600,13 @@ pub fn run_chat_with_engine(engine: &mut Engine, opts: &CliRunOpts) -> Result<()
                 }
                 let _ = writeln!(out);
                 drop(out);
+                let trunc = if stats.finish_reason == "length" {
+                    " · truncated (max_tokens)"
+                } else {
+                    ""
+                };
                 println!(
-                    "{}prefill {} tok ({:.1} tok/s) · decode {} tok ({:.1} tok/s){}\n",
+                    "{}prefill {} tok ({:.1} tok/s) · decode {} tok ({:.1} tok/s){trunc}{}\n",
                     color(tty, DIM),
                     stats.prompt_tokens,
                     stats.prefill_tps(),

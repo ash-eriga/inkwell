@@ -31,7 +31,7 @@ CHAT / RUN OPTIONS:
   -p, --prompt <text>     Prompt text (required for `run`)
   --system <text>         System prompt
   --ctx <tokens>          Max context length (default: 4096)
-  --max-tokens <n>        Max generated tokens (default: 512)
+  --max-tokens <n>        Max generated tokens (default: 2048)
   --temp <f32>            Sampling temperature, 0.0 = greedy (default: 0.0)
   --top-p <f32>           Nucleus sampling threshold (default: 0.95)
   --top-k <n>             Top-k sampling cap (default: 40)

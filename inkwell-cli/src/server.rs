@@ -444,7 +444,7 @@ fn handle_chat(stream: &mut TcpStream, body: &[u8], state: &ServerInfo) -> Resul
     };
 
     let params = GenParams {
-        max_tokens: req.max_completion_tokens.or(req.max_tokens).unwrap_or(512),
+        max_tokens: req.max_completion_tokens.or(req.max_tokens).unwrap_or(2048),
         temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(0.95),
         top_k: req.top_k.unwrap_or(40),
