@@ -573,7 +573,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
         const int* __restrict__ tile_expert, const int* __restrict__ tile_start,
         const int* __restrict__ tile_count, const int* __restrict__ tile_n,
         const float* __restrict__ xh, float* __restrict__ y,
-        int tk, int tn, int tile_base_index) {
+        int tk, int tn, int tile_base_index, int tile_mode) {
     if (blockIdx.x & 1) return;
     constexpr int BM = 32, BN = 128, RM = 4, RN = 4;
     const int mt = tile_base_index + blockIdx.y;
@@ -581,6 +581,8 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
     const int ex = tile_expert[mt];
     const int row0 = tile_start[mt];
     const int rows = tile_count[mt];
+    if (tile_mode == 1 && rows > 32) return;
+    if (tile_mode == 2 && rows <= 32) return;
     const uint64_t* d = descs + ex * 4;
     const uint32_t* trel = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff);
@@ -693,7 +695,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
         const int* __restrict__ tile_expert, const int* __restrict__ tile_start,
         const int* __restrict__ tile_count, const int* __restrict__ tile_n,
         const float* __restrict__ xh, float* __restrict__ y,
-        int tk, int tn, int tile_base_index) {
+        int tk, int tn, int tile_base_index, int tile_mode) {
     if (blockIdx.x & 1) return;
     constexpr int BM = 64, BN = 128, RM = 4, RN = 4;
     const int mt = tile_base_index + blockIdx.y;
@@ -701,6 +703,8 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
     const int ex = tile_expert[mt];
     const int row0 = tile_start[mt];
     const int rows = tile_count[mt];
+    if (tile_mode == 1 && rows > 32) return;
+    if (tile_mode == 2 && rows <= 32) return;
     const uint64_t* d = descs + ex * 4;
     const uint32_t* trel = (const uint32_t*)(uintptr_t)d[0];
     const int ka = (int)(d[3] & 0xff);
@@ -887,11 +891,19 @@ static void pf_launch_grouped_gemm_kernel(bool bm64, dim3 g, const void* descs,
         const int* tile_expert, const int* tile_start, const int* tile_count, const int* tile_n,
         const float* xh, float* y, int tk, int tn, cudaStream_t st) {
     if (bm64) {
-        inkwell_exl3_moe_grouped_gemm64_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
-            tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0);
+        const char* ae = getenv("INKWELL_PF_MOE_ADAPT");
+        if (ae == nullptr || ae[0] != '0') {
+            inkwell_exl3_moe_grouped_gemm_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+                tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 1);
+            inkwell_exl3_moe_grouped_gemm64_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+                tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 2);
+        } else {
+            inkwell_exl3_moe_grouped_gemm64_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+                tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 0);
+        }
     } else {
         inkwell_exl3_moe_grouped_gemm_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
-            tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0);
+            tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 0);
     }
 }
 
