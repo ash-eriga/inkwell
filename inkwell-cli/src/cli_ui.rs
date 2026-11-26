@@ -83,7 +83,7 @@ impl RawTtyGuard {
             return None;
         }
         let mut raw = orig;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
@@ -116,9 +116,28 @@ fn stdin_has_more(timeout_ms: i32) -> bool {
     unsafe { libc::poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & libc::POLLIN) != 0 }
 }
 
+#[cfg(unix)]
+fn read_fd0_byte() -> Result<Option<u8>, String> {
+    let mut b = 0u8;
+    loop {
+        let n = unsafe { libc::read(0, (&mut b as *mut u8).cast(), 1) };
+        if n == 1 {
+            return Ok(Some(b));
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(format!("stdin read error: {err}"));
+    }
+}
+
 /// Read one user turn from stdin.
-/// On a Unix TTY, enables bracketed paste (`\x1b[?2004h`) and a short burst check
-/// so pasting multi-line text never triggers premature sends before the user presses Enter.
+/// On a Unix TTY, reads unbuffered from fd 0 with bracketed paste (`\x1b[?2004h`)
+/// so `Ctrl+Shift+V` (single or multi-line) and `Ctrl+C` behave cleanly without premature sends.
 fn read_chat_turn(tty_out: bool) -> Result<Option<String>, String> {
     if !io::stdin().is_terminal() {
         let mut line = String::new();
@@ -134,51 +153,51 @@ fn read_chat_turn(tty_out: bool) -> Result<Option<String>, String> {
 
     #[cfg(unix)]
     {
-        use std::io::Read as _;
         flush_stdin_tty();
         let _guard = RawTtyGuard::enter();
-        let mut stdin = io::stdin().lock();
         let mut out = io::stdout();
         let mut buf: Vec<u8> = Vec::new();
         let mut in_paste = false;
+        let mut paste_buf: Vec<u8> = Vec::new();
         let mut paste_lines = 0usize;
-        let mut b = [0u8; 1];
 
         loop {
-            let n = stdin
-                .read(&mut b)
-                .map_err(|e| format!("stdin read error: {e}"))?;
-            if n == 0 {
+            let Some(byte) = read_fd0_byte()? else {
                 return Ok(None);
-            }
-            let byte = b[0];
+            };
 
             // Escape sequence handling (bracketed paste start/end, arrow keys)
             if byte == 0x1b {
                 let mut seq = vec![0x1b];
-                if stdin_has_more(25) && stdin.read(&mut b).unwrap_or(0) == 1 {
-                    seq.push(b[0]);
-                    if b[0] == b'[' {
-                        while seq.len() < 12 && stdin_has_more(15) {
-                            if stdin.read(&mut b).unwrap_or(0) == 1 {
-                                seq.push(b[0]);
-                                if (0x40..=0x7e).contains(&b[0]) {
+                if stdin_has_more(30) {
+                    if let Some(next) = read_fd0_byte()? {
+                        seq.push(next);
+                        if next == b'[' {
+                            while seq.len() < 12 && stdin_has_more(20) {
+                                if let Some(ch) = read_fd0_byte()? {
+                                    seq.push(ch);
+                                    if (0x40..=0x7e).contains(&ch) {
+                                        break;
+                                    }
+                                } else {
                                     break;
                                 }
-                            } else {
-                                break;
                             }
                         }
                     }
                 }
                 if seq == b"\x1b[200~" {
                     in_paste = true;
+                    paste_buf.clear();
                     paste_lines = 0;
                     continue;
                 }
                 if seq == b"\x1b[201~" {
                     in_paste = false;
-                    if paste_lines > 0 {
+                    buf.extend_from_slice(&paste_buf);
+                    if paste_lines == 0 {
+                        let _ = out.write_all(&paste_buf);
+                    } else {
                         let _ = write!(
                             out,
                             "{}[pasted {} lines — press Enter to send]{} ",
@@ -186,16 +205,33 @@ fn read_chat_turn(tty_out: bool) -> Result<Option<String>, String> {
                             paste_lines + 1,
                             color(tty_out, RESET)
                         );
-                        let _ = out.flush();
                     }
+                    paste_buf.clear();
+                    let _ = out.flush();
                     continue;
                 }
-                // Ignore other CSI sequences (arrows, home/end) cleanly
                 continue;
             }
 
             if !in_paste {
                 match byte {
+                    // Ctrl+C: clear current input if non-empty, else exit chat cleanly (into 4s warm handoff)
+                    3 => {
+                        if buf.is_empty() {
+                            let _ = writeln!(out, "^C");
+                            let _ = out.flush();
+                            return Ok(None);
+                        }
+                        buf.clear();
+                        let _ = write!(
+                            out,
+                            "^C\n{}{}you ›{} ",
+                            color(tty_out, BOLD),
+                            color(tty_out, GREEN),
+                            color(tty_out, RESET)
+                        );
+                        let _ = out.flush();
+                    }
                     // Ctrl+D on empty line -> EOF
                     4 if buf.is_empty() => {
                         let _ = writeln!(out);
@@ -204,8 +240,8 @@ fn read_chat_turn(tty_out: bool) -> Result<Option<String>, String> {
                     // Enter
                     b'\r' | b'\n' => {
                         // Fallback for terminals without bracketed paste: if more bytes
-                        // arrive immediately (<15ms), treat as multi-line paste continuation.
-                        if stdin_has_more(15) {
+                        // arrive immediately (<20ms), treat as multi-line paste continuation.
+                        if stdin_has_more(20) {
                             buf.push(b'\n');
                             let _ = write!(out, "\n");
                             let _ = out.flush();
@@ -218,7 +254,6 @@ fn read_chat_turn(tty_out: bool) -> Result<Option<String>, String> {
                     // Backspace / DEL
                     0x7f | 0x08 => {
                         if let Some(last) = buf.pop() {
-                            // Pop remaining UTF-8 continuation bytes if multi-byte char
                             if (last & 0xC0) == 0x80 {
                                 while let Some(&prev) = buf.last() {
                                     buf.pop();
@@ -234,10 +269,9 @@ fn read_chat_turn(tty_out: bool) -> Result<Option<String>, String> {
                     // Ctrl+U: clear current input
                     21 => {
                         buf.clear();
-                        let _ = write!(out, "\r\x1b[2K");
                         let _ = write!(
                             out,
-                            "{}{}you ›{} ",
+                            "\r\x1b[2K{}{}you ›{} ",
                             color(tty_out, BOLD),
                             color(tty_out, GREEN),
                             color(tty_out, RESET)
@@ -251,17 +285,17 @@ fn read_chat_turn(tty_out: bool) -> Result<Option<String>, String> {
                     }
                 }
             } else {
-                // Inside bracketed paste: accumulate everything verbatim, normalize CR/CRLF -> LF
+                // Inside bracketed paste: normalize CR/CRLF -> LF
                 if byte == b'\r' {
-                    buf.push(b'\n');
+                    paste_buf.push(b'\n');
                     paste_lines += 1;
                 } else if byte == b'\n' {
-                    if buf.last() != Some(&b'\n') {
-                        buf.push(b'\n');
+                    if paste_buf.last() != Some(&b'\n') {
+                        paste_buf.push(b'\n');
                         paste_lines += 1;
                     }
                 } else {
-                    buf.push(byte);
+                    paste_buf.push(byte);
                 }
             }
         }
