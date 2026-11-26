@@ -2311,3 +2311,19 @@ Base `e5dea6c`; branch `t3/m3a-sink-relbias-port`. Ports the M3a `sink_relbias_f
 ## t3/m3a-sink-relbias-port (1441a23) — brain validation — ACCEPTED, merged (fast-forward)
 - Agent A/B vs ctl-master-f46f37f: 28.079 → 27.445 ms/tok (−0.634), 16/16, md5 5cbe8e06 all runs, peak 5,048 MiB (−12 MiB vs master). Gate A: KLD 8.0e-4 vs noise-floor 1.06e-3, top-1 disagreement 1.12% vs 0.73%, PPL Δ +0.045%; all 95% CIs overlap over 2,048 teacher-forced tokens.
 - Brain validate on the same binary (gpu-run -p high), 3 runs: 27.475 / 27.267 / 27.404 ms/tok, md5 5cbe8e06 ×3, peak 5,048 MiB. Killswitch INKWELL_NO_SINKRELBIAS=1. Build warnings 64 (at limit).
+
+## Challenge 9 (Devbox, SWE-2.1 max): parametric INT8 family. Fidelity PASS, no speed win at 3e-5.
+- **What it is:** a single candidate (`cand_c9.c`, sha256 b2ba6e21…), parameterised by fidelity target (`C9_TARGET`) and by M. It comes with a selection rule, a T* surface over M ∈ {1..128} × 8 shapes, and a Lean build with no sorry or custom axioms.
+- **Real rows, run locally** (harness4 `-f -r`, 5 layers × {attn, moe_gu} and moe_dn):
+
+  | target | Q1 attn+moe_gu | Q1 moe_dn | result |
+  |---|---|---|---|
+  | robust | 2.3742e-5 | 2.3825e-5 | PASS |
+  | Q-A | 2.6739e-5 | 2.6022e-5 | PASS |
+  | Q-B | 4.24e-5 | 4.26e-5 | FAIL at 3e-5 (expected) |
+
+- **Speed (cost model, not silicon):** Ch9 found that the integer-ALU and shift work serialises.
+  - Under that floor, robust INT8 vs FP32 on moe_gu is 0.995× at m=1, 0.53× at m=8, 0.79× at m=32, 0.85× at m=128. Q-A peaks at 1.03× at m=1 and is 0.80–0.88× at m=32–128.
+  - Only Q-B with G64 crosses FP32, at m ≈ 59–66.
+  - This withdraws C7's modelled 128.8/135.2 at m=32/128 as an envelope prediction.
+- **Verdict:** nothing to port. Challenge 10 is looking for a way past the floor and will deliver sm_61 micro-benchmarks to test the cost model on the real GPU.
