@@ -215,6 +215,7 @@ impl Engine {
             InklingConfig::rexl3()
         } else {
             InklingConfig::from_gguf(&gg)
+                .map_err(|e| format!("invalid GGUF config: {e}"))?
         };
         let model_id = p
             .file_name()
