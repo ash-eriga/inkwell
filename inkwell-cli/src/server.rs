@@ -626,7 +626,7 @@ fn handle_chat(stream: &mut TcpStream, body: &[u8], state: &ServerInfo) -> Resul
                     let _ = stream.flush();
                     eprintln!(
                         "POST /v1/chat/completions stream=true prompt={} ({:.1} tok/s) gen={} ({:.1} tok/s) finish={}",
-                        stats.prompt_tokens,
+                        stats.prefilled_tokens,
                         stats.prefill_tps(),
                         stats.completion_tokens,
                         stats.decode_tps(),
@@ -669,7 +669,7 @@ fn handle_chat(stream: &mut TcpStream, body: &[u8], state: &ServerInfo) -> Resul
 
     eprintln!(
         "POST /v1/chat/completions stream=false prompt={} ({:.1} tok/s) gen={} ({:.1} tok/s) finish={}",
-        stats.prompt_tokens,
+        stats.prefilled_tokens,
         stats.prefill_tps(),
         stats.completion_tokens,
         stats.decode_tps(),

@@ -397,7 +397,7 @@ pub fn run_oneshot(opts: &CliRunOpts) -> Result<(), String> {
     eprintln!(
         "{}prefill {} tok ({:.1} tok/s) · decode {} tok ({:.1} tok/s) · finish={}{}",
         color(tty_err, DIM),
-        stats.prompt_tokens,
+        stats.prefilled_tokens,
         stats.prefill_tps(),
         stats.completion_tokens,
         stats.decode_tps(),
@@ -608,7 +608,7 @@ pub fn run_chat_with_engine(engine: &mut Engine, opts: &CliRunOpts) -> Result<()
                 println!(
                     "{}prefill {} tok ({:.1} tok/s) · decode {} tok ({:.1} tok/s){trunc}{}\n",
                     color(tty, DIM),
-                    stats.prompt_tokens,
+                    stats.prefilled_tokens,
                     stats.prefill_tps(),
                     stats.completion_tokens,
                     stats.decode_tps(),
