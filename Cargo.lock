@@ -84,6 +84,7 @@ name = "inkwell-gguf"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "inkwell-ggml",
  "memmap2",
  "thiserror",
 ]
