@@ -70,7 +70,7 @@ set -eu
 ROOT="$DATA_ROOT/current"
 CUDA_LIB=""
 for d in "\${INKWELL_CUDA_HOME:-}/lib64" "\${CUDA_HOME:-}/lib64" "\$HOME/lfm-gtx1060-bench/cuda-12.6/lib64" /usr/local/cuda/lib64 /opt/cuda/lib64; do
-  if [ -n "\$d" ] && [ -d "\$d" ]; then CUDA_LIB="\$d"; break; fi
+  if [ -f "\$d/libcudart.so.12" ]; then CUDA_LIB="\$d"; break; fi
 done
 export LD_LIBRARY_PATH="\$ROOT/lib\${CUDA_LIB:+:\$CUDA_LIB}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export GGML_PASCAL_GRAPHS="\${GGML_PASCAL_GRAPHS:-1}"
