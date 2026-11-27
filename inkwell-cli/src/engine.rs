@@ -60,8 +60,10 @@ pub enum GenChunk {
 /// Completed generation summary.
 #[derive(Debug, Clone)]
 pub struct GenStats {
-    /// Number of prompt tokens processed.
+    /// Full prompt length in tokens (API usage accounting).
     pub prompt_tokens: usize,
+    /// Prompt tokens newly processed during this call after KV-prefix reuse.
+    pub prefilled_tokens: usize,
     /// Number of tokens generated.
     pub completion_tokens: usize,
     /// Wall-clock prefill time in milliseconds.
@@ -77,7 +79,7 @@ impl GenStats {
     #[must_use]
     pub fn prefill_tps(&self) -> f64 {
         if self.prefill_ms > 0.0 {
-            self.prompt_tokens as f64 / (self.prefill_ms * 1e-3)
+            self.prefilled_tokens as f64 / (self.prefill_ms * 1e-3)
         } else {
             0.0
         }
@@ -213,6 +215,7 @@ impl Engine {
             InklingConfig::rexl3()
         } else {
             InklingConfig::from_gguf(&gg)
+                .map_err(|e| format!("invalid GGUF config: {e}"))?
         };
         let model_id = p
             .file_name()
@@ -438,7 +441,8 @@ impl Engine {
 
         let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
         Ok(GenStats {
-            prompt_tokens: prefilled_tokens,
+            prompt_tokens: prompt_len,
+            prefilled_tokens,
             completion_tokens,
             prefill_ms,
             decode_ms,
@@ -449,7 +453,21 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::stop_prefix_len;
+    use super::{stop_prefix_len, GenStats};
+
+    #[test]
+    fn usage_prompt_tokens_is_full_prompt_while_prefill_rate_uses_delta() {
+        let stats = GenStats {
+            prompt_tokens: 120,
+            prefilled_tokens: 30,
+            completion_tokens: 7,
+            prefill_ms: 10.0,
+            decode_ms: 14.0,
+            finish_reason: "stop",
+        };
+        assert_eq!(stats.prompt_tokens, 120);
+        assert!((stats.prefill_tps() - 3000.0).abs() < 1e-9);
+    }
 
     #[test]
     fn stop_string_can_end_inside_a_token_chunk() {

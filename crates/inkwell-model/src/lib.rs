@@ -13,6 +13,9 @@ pub enum ModelError {
     /// a tensor the architecture requires is absent from the file
     #[error("missing tensor {0}")]
     MissingTensor(String),
+    /// malformed architecture metadata
+    #[error("invalid model config: {0}")]
+    Config(#[from] inkwell_core::ConfigError),
 }
 
 /// Tensor names that repeat per logical layer (`blk.N.` prefix).
@@ -116,12 +119,12 @@ impl<'a> ModelWeights<'a> {
     /// Resolve all tensors for `inkling2_loop`.
     ///
     /// # Errors
-    /// `MissingTensor` if any required tensor is absent.
+    /// `MissingTensor` if any required tensor is absent, or `Config` if architecture metadata is malformed.
     ///
     /// # Panics
     /// If `LAYER_TENSORS` grows past the per-layer search path (won't).
     pub fn from_gguf(g: &'a GgufFile) -> Result<Self, ModelError> {
-        let cfg = InklingConfig::from_gguf(g);
+        let cfg = InklingConfig::from_gguf(g)?;
         let find = |name: &str| -> Result<&'a TensorInfo, ModelError> {
             g.tensors
                 .get(name)

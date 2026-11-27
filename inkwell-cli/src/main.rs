@@ -432,7 +432,17 @@ fn main() {
     };
     drop(_g_gguf);
     inkwell_run::prof::mark("gguf_done");
-    let cfg = if st_dir { InklingConfig::rexl3() } else { InklingConfig::from_gguf(&g) };
+    let cfg = if st_dir {
+        InklingConfig::rexl3()
+    } else {
+        match InklingConfig::from_gguf(&g) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("error: invalid GGUF config: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
     println!("{cfg:?}");
     println!("visits/token: {}", cfg.n_visits());
     let mut total = 0u64;
