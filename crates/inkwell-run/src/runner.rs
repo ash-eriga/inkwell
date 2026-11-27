@@ -1881,8 +1881,12 @@ impl Runner {
             let mut cache_allocated = 0usize;
             for (i, a) in moe_args_exl3.iter_mut().enumerate() {
                 if a.on_dev || a.max_slot == 0 { continue; }
-                let cbytes = per_l(a.layer).map_or(ck * 3 * a.max_slot, |mb| mb << 20);
+                let mut cbytes = per_l(a.layer).map_or(ck * 3 * a.max_slot, |mb| mb << 20);
                 if cbytes == 0 { continue; }
+                if !kslot && cbytes / (3 * a.max_slot) > 64 {
+                    eprintln!("uniform EXL3 cache L{}: clamping k={} to 64 (eviction mask is u64)", a.layer, cbytes / (3 * a.max_slot));
+                    cbytes = 64 * 3 * a.max_slot;
+                }
                 let (f, _) = inkwell_cuda::mem_info();
                 if vramcap {
                     let (used_now, _) = process_vram_bytes(vram_baseline_free);
