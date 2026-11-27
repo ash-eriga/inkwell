@@ -31,3 +31,7 @@ opt/kbench/prefill/prefill_tests
 .internal/
 brand/
 third_party/ggml/ggml-src/
+
+# local benchmark builds and run output
+.target-*/
+/*.log
