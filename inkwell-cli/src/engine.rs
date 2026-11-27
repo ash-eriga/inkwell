@@ -94,6 +94,24 @@ impl GenStats {
     }
 }
 
+/// Bytes of the current chunk that precede the first stop-string occurrence
+/// in the accumulated tail. `current_text` has not been emitted yet, while the
+/// earlier tail bytes have; therefore a match starting in those earlier bytes
+/// leaves zero bytes to emit from this chunk.
+fn stop_prefix_len(content_tail: &str, current_text: &str, stops: &[String]) -> Option<usize> {
+    let hit = stops
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| content_tail.find(s.as_str()).map(|pos| (pos, s.len())))
+        .min_by_key(|(pos, _)| *pos)?;
+    let current_start = content_tail.len().saturating_sub(current_text.len());
+    let mut keep = hit.0.saturating_sub(current_start).min(current_text.len());
+    while keep > 0 && !current_text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    Some(keep)
+}
+
 /// Incremental UTF-8 decoder that buffers incomplete multi-byte sequences across tokens.
 #[derive(Debug, Default)]
 struct Utf8StreamDecoder {
@@ -285,8 +303,7 @@ impl Engine {
         let mut pos: i64 = start_pos as i64;
         if start_pos < prompt_len - 1 {
             let delta = &prompt_ids[start_pos..prompt_len - 1];
-            let use_chunked =
-                std::env::var_os("INKWELL_NO_PREFILL").is_none() && delta.len() >= 64;
+            let use_chunked = std::env::var_os("INKWELL_NO_PREFILL").is_none() && delta.len() >= 64;
             if use_chunked {
                 let _ = self.runner.prefill_chunked(delta, pos);
                 pos += delta.len() as i64;
@@ -381,15 +398,7 @@ impl Engine {
                     }
                     if channel == StreamChannel::Content && !params.stop.is_empty() {
                         content_tail.push_str(&text);
-                        if let Some(stop_s) = params
-                            .stop
-                            .iter()
-                            .find(|s| !s.is_empty() && content_tail.ends_with(s.as_str()))
-                        {
-                            let mut keep = text.len().saturating_sub(stop_s.len());
-                            while keep > 0 && !text.is_char_boundary(keep) {
-                                keep -= 1;
-                            }
+                        if let Some(keep) = stop_prefix_len(&content_tail, &text, &params.stop) {
                             if keep > 0 && !on_chunk(GenChunk::Content(text[..keep].to_owned())) {
                                 finish_reason = "stop";
                                 break;
@@ -435,5 +444,34 @@ impl Engine {
             decode_ms,
             finish_reason,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stop_prefix_len;
+
+    #[test]
+    fn stop_string_can_end_inside_a_token_chunk() {
+        let tail = "hello STOP extra";
+        assert_eq!(
+            stop_prefix_len(tail, "lo STOP extra", &["STOP".to_owned()]),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn stop_string_spanning_chunks_emits_no_extra_text() {
+        let tail = "abc STOPxyz";
+        assert_eq!(
+            stop_prefix_len(tail, "OPxyz", &["STOP".to_owned()]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn no_stop_string_keeps_streaming() {
+        let tail = "abcdef";
+        assert_eq!(stop_prefix_len(tail, "def", &["STOP".to_owned()]), None);
     }
 }
