@@ -419,4 +419,44 @@ mod tests {
             .count();
         assert_eq!(plain_occurrences, 4);
     }
+
+    /// Real-tokenizer equivalence: set `INKWELL_TOK_GGUF` to an Inkling GGUF.
+    /// Ordinary prompts must encode to the same ids as the legacy
+    /// render-then-`encode_with_special` path.
+    #[test]
+    fn real_tokenizer_structured_matches_legacy() {
+        let Some(path) = std::env::var_os("INKWELL_TOK_GGUF") else {
+            return;
+        };
+        let gguf = GgufFile::open(&path).expect("open INKWELL_TOK_GGUF");
+        let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+        let m = |role: &str, content: &str, rc: Option<&str>| ChatMessage {
+            role: role.to_owned(),
+            content: content.to_owned(),
+            reasoning_content: rc.map(str::to_owned),
+        };
+        let convs: Vec<Vec<ChatMessage>> = vec![
+            vec![m("user", "Hello!", None)],
+            vec![
+                m("system", "You are a helpful assistant. Answer in Portuguese.", None),
+                m("user", "Explique trellis quantization em 3 tópicos.", None),
+            ],
+            vec![
+                m("user", "def f(x):\n    return x**2  # ok?\n\n```rust\nfn main() {}\n```", None),
+                m("assistant", "Sure — here is the fix:\n\tindent\n", Some("The user wants code. Let me think…")),
+                m("user", "  leading spaces, trailing  ", None),
+                m("tool", "{\"result\": [1, 2, 3], \"emoji\": \"🚀\"}", None),
+                m("user", "日本語のテキストと数字 12345 678", None),
+            ],
+            vec![m("developer", "Be terse.", None), m("user", "?!...\r\n", None)],
+        ];
+        for conv in &convs {
+            for effort in [0.0f32, 0.2, 0.5, 0.99] {
+                let legacy = tok.encode_with_special(&render_chat_prompt(conv, effort).expect("render"));
+                let structured = encode_chat_prompt(&tok, conv, effort).expect("encode");
+                assert_eq!(legacy, structured, "effort {effort} conv {conv:?}");
+            }
+        }
+    }
+
 }

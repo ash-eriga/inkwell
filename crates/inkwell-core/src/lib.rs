@@ -367,4 +367,17 @@ mod tests {
             matches!(err, ConfigError::EmptyArray(k) if k == "inkling2_loop.attention.head_count")
         );
     }
+
+    /// Set `INKWELL_TOK_GGUF` to a real Inkling GGUF: its config must parse
+    /// with the same values as the built-in REXL3 config.
+    #[test]
+    fn real_gguf_config_parses() {
+        let Some(path) = std::env::var_os("INKWELL_TOK_GGUF") else {
+            return;
+        };
+        let g = GgufFile::open(&path).expect("open INKWELL_TOK_GGUF");
+        let cfg = InklingConfig::from_gguf(&g).expect("real config parses");
+        assert_eq!(format!("{cfg:?}"), format!("{:?}", InklingConfig::rexl3()));
+    }
+
 }
