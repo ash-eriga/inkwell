@@ -49,7 +49,7 @@ rm -rf "$STAGING"
 mkdir -p "$STAGING" "$DATA_ROOT/versions" "$BIN_DIR"
 
 echo "Downloading $ASSET..."
-curl -fL# --connect-timeout 15 --max-time 300 -o "$STAGING/$ASSET" "$BASE_URL/$ASSET"
+curl -fL# --connect-timeout 15 --speed-limit 1024 --speed-time 60 -o "$STAGING/$ASSET" "$BASE_URL/$ASSET"
 curl -fsSL --connect-timeout 15 --max-time 60 -o "$STAGING/SHA256SUMS" "$BASE_URL/SHA256SUMS"
 
 echo "Verifying SHA-256..."

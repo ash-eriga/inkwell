@@ -85,7 +85,7 @@ fn download_file(url: &str, dst: &Path, show_progress: bool) -> Result<(), Strin
         cmd.arg("-fsSL");
     }
     let status = cmd
-        .args(["--connect-timeout", "15", "--max-time", "300", "-o"])
+        .args(["--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60", "-o"])
         .arg(dst)
         .arg(url)
         .status()

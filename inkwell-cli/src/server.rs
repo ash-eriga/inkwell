@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,7 +78,7 @@ enum JobEvent {
 struct InferJob {
     prompt: PromptInput,
     params: GenParams,
-    reply: SyncSender<JobEvent>,
+    reply: Sender<JobEvent>,
 }
 
 struct ServerInfo {
@@ -545,7 +545,7 @@ fn handle_chat(stream: &mut TcpStream, body: &[u8], state: &ServerInfo) -> Resul
     let id = next_id("chatcmpl");
     let created = unix_secs();
 
-    let (ev_tx, ev_rx) = mpsc::sync_channel(256);
+    let (ev_tx, ev_rx) = mpsc::channel();
     if state
         .jobs
         .try_send(InferJob {
@@ -733,7 +733,7 @@ fn handle_completions(
     let id = next_id("cmpl");
     let created = unix_secs();
 
-    let (ev_tx, ev_rx) = mpsc::sync_channel(256);
+    let (ev_tx, ev_rx) = mpsc::channel();
     if state
         .jobs
         .try_send(InferJob {

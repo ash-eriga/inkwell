@@ -150,28 +150,29 @@ impl StFile {
                 )));
             }
             let nbytes = end - begin;
-            if nbytes > data_len || begin > data_len {
+            if end > data_len {
                 return Err(StError::Malformed(format!(
                     "{name}: data range outside file"
                 )));
             }
-            let elem_size = dtype_size(&ent.dtype).ok_or_else(|| {
-                StError::Malformed(format!("{name}: unsupported dtype {}", ent.dtype))
-            })?;
-            let elems = ent
-                .shape
-                .iter()
-                .try_fold(1u64, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| {
-                    StError::Malformed(format!("{name}: shape element count overflow"))
-                })?;
-            let expected = elems
-                .checked_mul(elem_size)
-                .ok_or_else(|| StError::Malformed(format!("{name}: byte size overflow")))?;
-            if expected != nbytes {
-                return Err(StError::Malformed(format!(
-                    "{name}: shape/dtype implies {expected} bytes, range has {nbytes}"
-                )));
+            // Unknown dtypes (e.g. new packed formats) skip the size check
+            // instead of failing the whole load; the range is already bounded.
+            if let Some(elem_size) = dtype_size(&ent.dtype) {
+                let elems = ent
+                    .shape
+                    .iter()
+                    .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(|| {
+                        StError::Malformed(format!("{name}: shape element count overflow"))
+                    })?;
+                let expected = elems
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| StError::Malformed(format!("{name}: byte size overflow")))?;
+                if expected != nbytes {
+                    return Err(StError::Malformed(format!(
+                        "{name}: shape/dtype implies {expected} bytes, range has {nbytes}"
+                    )));
+                }
             }
             tensors.insert(
                 name.clone(),
@@ -312,6 +313,15 @@ mod tests {
         let path = write_tmp("valid", &st_bytes(&[2], [0, 2], b"ab"));
         let f = StFile::open(&path).expect("valid safetensors");
         assert_eq!(f.data(&f.tensors["x"]), b"ab");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_range_straddling_end_of_file() {
+        // begin is inside the 2-byte data section, end is past it
+        let path = write_tmp("straddle", &st_bytes(&[2], [1, 3], b"ab"));
+        let err = StFile::open(&path).expect_err("range past end of file must be rejected");
+        assert!(matches!(err, StError::Malformed(_)));
         let _ = std::fs::remove_file(path);
     }
 
