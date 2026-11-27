@@ -225,6 +225,71 @@ fn read_line_bounded<R: BufRead>(
     Ok(n)
 }
 
+fn parse_chunk_size(line: &str) -> Result<usize, String> {
+    let without_lf = line
+        .strip_suffix('\n')
+        .ok_or_else(|| "truncated chunk-size line".to_owned())?;
+    let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+    let size = line.split(';').next().unwrap_or("").trim();
+    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("malformed chunk size".to_owned());
+    }
+    usize::from_str_radix(size, 16).map_err(|_| "malformed chunk size".to_owned())
+}
+
+fn discard_chunk_trailers<R: BufRead>(reader: &mut R) -> Result<(), String> {
+    let mut trailer_bytes = 0usize;
+    for _ in 0..128 {
+        let mut line = String::new();
+        let n = read_line_bounded(reader, 8192, &mut line)?;
+        if n == 0 {
+            return Err("truncated chunk trailers".to_owned());
+        }
+        if line == "\r\n" || line == "\n" {
+            return Ok(());
+        }
+        if !line.ends_with('\n') {
+            return Err("truncated chunk trailers".to_owned());
+        }
+        trailer_bytes += n;
+        if trailer_bytes > 64 * 1024 {
+            return Err("chunk trailers exceed 64 KiB".to_owned());
+        }
+    }
+    Err("too many chunk trailers".to_owned())
+}
+
+fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
+    const MAX_BODY: usize = 16 * 1024 * 1024;
+    let mut body = Vec::new();
+    loop {
+        let mut line = String::new();
+        if read_line_bounded(reader, 8192, &mut line)? == 0 {
+            return Err("truncated chunk-size line".to_owned());
+        }
+        let size = parse_chunk_size(&line)?;
+        if size == 0 {
+            discard_chunk_trailers(reader)?;
+            return Ok(body);
+        }
+        if size > MAX_BODY - body.len() {
+            return Err("request body exceeds 16 MiB".to_owned());
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader
+            .read_exact(&mut body[start..])
+            .map_err(|_| "truncated chunk data".to_owned())?;
+        let mut ending = [0u8; 2];
+        reader
+            .read_exact(&mut ending)
+            .map_err(|_| "truncated chunk terminator".to_owned())?;
+        if ending != *b"\r\n" {
+            return Err("malformed chunk terminator".to_owned());
+        }
+    }
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
@@ -264,9 +329,14 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
                         .parse()
                         .map_err(|_| "invalid content-length header".to_owned())?,
                 );
-            } else if k.trim().eq_ignore_ascii_case("transfer-encoding")
-                && v.trim().eq_ignore_ascii_case("chunked")
-            {
+            } else if k.trim().eq_ignore_ascii_case("transfer-encoding") {
+                if chunked {
+                    return Err("duplicate transfer-encoding header".to_owned());
+                }
+                let codings: Vec<&str> = v.split(',').map(str::trim).collect();
+                if codings.len() != 1 || !codings[0].eq_ignore_ascii_case("chunked") {
+                    return Err("unsupported transfer-encoding".to_owned());
+                }
                 chunked = true;
             }
         }
@@ -274,8 +344,13 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     if !terminated {
         return Err("too many headers or missing header terminator".to_owned());
     }
+    if chunked && content_len.is_some() {
+        return Err("content-length with chunked transfer-encoding".to_owned());
+    }
+
     if chunked {
-        return Err("chunked request bodies are not supported".to_owned());
+        let body = read_chunked_body(&mut reader)?;
+        return Ok(HttpRequest { method, path, body });
     }
 
     let content_len = content_len.unwrap_or(0);
@@ -897,13 +972,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_or_chunked_framing() {
+    fn rejects_conflicting_or_combined_framing() {
         assert!(parse_request_bytes(
             b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"
         )
         .is_err());
         assert!(parse_request_bytes(
-            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            b"POST / HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_valid_multi_chunk_body_and_ignores_trailers() {
+        let req = parse_request_bytes(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Checksum: ignored\r\n\r\n",
+        )
+        .expect("valid chunked request");
+        assert_eq!(req.body, b"Wikipedia");
+    }
+
+    #[test]
+    fn parses_chunk_extensions() {
+        let req = parse_request_bytes(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n4;foo=bar;baz\r\nWiki\r\n0\r\n\r\n",
+        )
+        .expect("chunk extensions");
+        assert_eq!(req.body, b"Wiki");
+    }
+
+    #[test]
+    fn rejects_chunked_body_over_cap_before_reading_it() {
+        let bytes = format!(
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            16 * 1024 * 1024 + 1
+        );
+        assert!(parse_request_bytes(bytes.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_chunk_size() {
+        assert!(parse_request_bytes(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nWiki\r\n0\r\n\r\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_chunked_body() {
+        assert!(parse_request_bytes(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWi"
+        )
+        .is_err());
+        assert!(parse_request_bytes(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki"
         )
         .is_err());
     }
