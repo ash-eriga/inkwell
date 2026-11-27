@@ -28,6 +28,12 @@ pub enum GgufError {
     /// element count not a multiple of the block size
     #[error("unaligned tensor {0}")]
     Unaligned(String),
+    /// size arithmetic overflowed while indexing the file
+    #[error("size overflow in {0}")]
+    SizeOverflow(String),
+    /// tensor data range extends outside the file
+    #[error("tensor {0} data range extends outside the file")]
+    TensorOutOfBounds(String),
 }
 
 /// A GGUF metadata value (single scalar or homogeneous array).
@@ -188,17 +194,24 @@ impl GgufFile {
         let n_tensors = usize::try_from(r.u64()?).map_err(|_| GgufError::Truncated(r.pos))?;
         let n_kv = usize::try_from(r.u64()?).map_err(|_| GgufError::Truncated(r.pos))?;
 
-        let mut meta = HashMap::with_capacity(n_kv);
+        // Count fields are attacker-controlled when opening an untrusted
+        // checkpoint. Do not preallocate their full claimed count: every KV
+        // entry needs at least a string length, type tag, and scalar payload,
+        // so a truncated small file cannot legitimately contain many entries.
+        let meta_cap = n_kv.min((r.b.len().saturating_sub(r.pos)) / 12 + 1);
+        let mut meta = HashMap::with_capacity(meta_cap);
         for _ in 0..n_kv {
             let key = r.str()?;
             meta.insert(key, Self::value(&mut r)?);
         }
 
-        let mut tensors = HashMap::with_capacity(n_tensors);
+        let tensor_cap = n_tensors.min((r.b.len().saturating_sub(r.pos)) / 32 + 1);
+        let mut tensor_list = Vec::with_capacity(tensor_cap);
         for _ in 0..n_tensors {
             let name = r.str()?;
             let n_dims = r.u32()? as usize;
-            let mut dims = Vec::with_capacity(n_dims);
+            let dim_cap = n_dims.min((r.b.len().saturating_sub(r.pos)) / 8 + 1);
+            let mut dims = Vec::with_capacity(dim_cap);
             for _ in 0..n_dims {
                 dims.push(r.u64()?);
             }
@@ -207,23 +220,45 @@ impl GgufFile {
             let Some((blk, bpb)) = type_block(ggml_type) else {
                 return Err(GgufError::UnknownType(ggml_type));
             };
-            let elems: u64 = dims.iter().product();
+            let elems = dims
+                .iter()
+                .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| GgufError::SizeOverflow(format!("tensor {name} element count")))?;
             if !elems.is_multiple_of(blk) {
                 return Err(GgufError::Unaligned(name));
             }
-            let nbytes = elems / blk * bpb;
-            tensors.insert(
-                name.clone(),
-                TensorInfo {
-                    name,
-                    dims,
-                    ggml_type,
-                    offset,
-                    nbytes,
-                },
-            );
+            let nbytes = (elems / blk)
+                .checked_mul(bpb)
+                .ok_or_else(|| GgufError::SizeOverflow(format!("tensor {name} byte size")))?;
+            tensor_list.push(TensorInfo {
+                name,
+                dims,
+                ggml_type,
+                offset,
+                nbytes,
+            });
         }
-        let data_start = (r.pos as u64 + 31) & !31;
+        let data_start = (r.pos as u64)
+            .checked_add(31)
+            .ok_or_else(|| GgufError::SizeOverflow("tensor data alignment".to_owned()))?
+            & !31;
+        if data_start > mmap.len() as u64 {
+            return Err(GgufError::Truncated(r.pos));
+        }
+        let mut tensors = HashMap::with_capacity(tensor_list.len());
+        for t in tensor_list {
+            let rel_end = t
+                .offset
+                .checked_add(t.nbytes)
+                .ok_or_else(|| GgufError::SizeOverflow(format!("tensor {} data range", t.name)))?;
+            let abs_end = data_start
+                .checked_add(rel_end)
+                .ok_or_else(|| GgufError::SizeOverflow(format!("tensor {} data range", t.name)))?;
+            if abs_end > mmap.len() as u64 {
+                return Err(GgufError::TensorOutOfBounds(t.name));
+            }
+            tensors.insert(t.name.clone(), t);
+        }
         Ok(GgufFile {
             mmap,
             meta,
@@ -261,7 +296,11 @@ impl GgufFile {
             9 => {
                 let elem_ty = r.u32()?;
                 let n = usize::try_from(r.u64()?).map_err(|_| GgufError::Truncated(r.pos))?;
-                let mut items = Vec::with_capacity(n);
+                // Every scalar is at least one byte. Capping the reserve at
+                // the remaining file size keeps a forged length from causing
+                // a huge allocation before the first bounds check.
+                let cap = n.min(r.b.len().saturating_sub(r.pos) + 1);
+                let mut items = Vec::with_capacity(cap);
                 for _ in 0..n {
                     items.push(Self::scalar(r, elem_ty)?);
                 }
@@ -300,5 +339,69 @@ impl GgufFile {
             )),
             t => return Err(GgufError::Version(t)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn gguf_with_tensor(dims: &[u64], ggml_type: u32, offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = b"GGUF".to_vec();
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        push_str(&mut out, "x");
+        out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for &d in dims {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out.extend_from_slice(&ggml_type.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn write_tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("inkwell-gguf-test-{name}-{}", std::process::id()));
+        std::fs::write(&path, bytes).expect("write test gguf");
+        path
+    }
+
+    #[test]
+    fn rejects_tensor_element_count_overflow() {
+        let bytes = gguf_with_tensor(&[u64::MAX, u64::MAX], 0, 0, &[]);
+        let path = write_tmp("overflow", &bytes);
+        let err =
+            GgufFile::open(&path).expect_err("overflowing tensor dimensions must be rejected");
+        assert!(matches!(err, GgufError::SizeOverflow(_)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_tensor_data_past_end_of_file() {
+        let bytes = gguf_with_tensor(&[1024], 0, 0, &[]);
+        let path = write_tmp("out-of-bounds", &bytes);
+        let err = GgufFile::open(&path).expect_err("tensor outside file must be rejected");
+        assert!(matches!(err, GgufError::TensorOutOfBounds(_)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepts_minimal_valid_tensor() {
+        let bytes = gguf_with_tensor(&[1], 0, 0, &0f32.to_le_bytes());
+        let path = write_tmp("valid", &bytes);
+        let g = GgufFile::open(&path).expect("valid gguf");
+        assert_eq!(g.tensors["x"].nbytes, 4);
+        let _ = std::fs::remove_file(path);
     }
 }
