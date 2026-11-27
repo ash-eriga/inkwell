@@ -2013,6 +2013,14 @@ impl Runner {
 // ============ forward ============
 
 impl Runner {
+    /// Reject batch positions that would index outside the allocated KV arenas.
+    fn check_ctx_span(&self, pos: i64, n: i64, what: &str) {
+        let end = pos.checked_add(n).expect("context position overflow");
+        assert!(pos >= 0 && n >= 0 && end <= self.max_ctx,
+            "{what} positions [{pos}, {end}) exceed max_ctx {}; encode/decode must stop at the configured context cap",
+            self.max_ctx);
+    }
+
     /// layer helpers
     fn is_swa_layer(&self, il: usize) -> bool { il % 6 != 5 }
 
@@ -2878,6 +2886,7 @@ impl Runner {
 
     fn step_impl_mode(&mut self, id: u32, pos: i64, dump_selection: bool,
         skip_head: bool, need_logits: bool) -> Vec<f32> {
+        self.check_ctx_span(pos, 1, "decode");
         let tb0 = std::time::Instant::now();
         // per-visit max n_kv this step, padded to a bucket multiple so tensor
         // shapes stay constant across steps (CUDA-graph replayable). The
@@ -3440,6 +3449,7 @@ impl Runner {
     /// # Panics
     /// On sched compute failure.
     pub fn step_id(&mut self, id: u32, pos: i64) -> u32 {
+        self.check_ctx_span(pos, 1, "decode");
         static NO_GA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *NO_GA.get_or_init(|| std::env::var_os("INKWELL_NO_GARGMAX").is_some()) {
             return host_argmax(&self.step_impl(id, pos, true));
@@ -3511,6 +3521,7 @@ impl Runner {
     /// only for rows whose logits are never consumed; state updates are the
     /// same graph nodes in the same order.
     pub fn step_prompt_state(&mut self, id: u32, pos: i64) {
+        self.check_ctx_span(pos, 1, "prompt decode");
         static CACHING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let caching = *CACHING.get_or_init(|| std::env::var_os("INKWELL_NO_GCACHE").is_none());
         if caching {
@@ -4075,6 +4086,7 @@ impl Runner {
     /// # Panics
     /// On graph/alloc/compute failure.
     pub fn step_block(&mut self, ids: &[u32; NT], pos: i64) -> Vec<f32> {
+        self.check_ctx_span(pos, NT as i64, "speculative decode");
         if self.block_feats.is_none() {
             self.block_feats = Some(inkwell_cuda::DevBuf::new_bytes(4 * NT * 2304 * 4));
         }
@@ -4888,6 +4900,7 @@ impl Runner {
     /// Encode token ids in chunks through the batched prefill path. Returns the
     /// final row's unpadded logits. State writes match serial teacher forcing.
     pub fn prefill_chunked(&mut self, ids: &[u32], pos0: i64) -> Vec<f32> {
+        self.check_ctx_span(pos0, ids.len() as i64, "prefill");
         let cmax = std::env::var("INKWELL_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64).clamp(1, 512);
         let need = PfArena::layout(cmax).1;
         let stream_experts = pf_stream_experts_enabled();
