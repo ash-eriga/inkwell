@@ -1881,8 +1881,12 @@ impl Runner {
             let mut cache_allocated = 0usize;
             for (i, a) in moe_args_exl3.iter_mut().enumerate() {
                 if a.on_dev || a.max_slot == 0 { continue; }
-                let cbytes = per_l(a.layer).map_or(ck * 3 * a.max_slot, |mb| mb << 20);
+                let mut cbytes = per_l(a.layer).map_or(ck * 3 * a.max_slot, |mb| mb << 20);
                 if cbytes == 0 { continue; }
+                if !kslot && cbytes / (3 * a.max_slot) > 64 {
+                    eprintln!("uniform EXL3 cache L{}: clamping k={} to 64 (eviction mask is u64)", a.layer, cbytes / (3 * a.max_slot));
+                    cbytes = 64 * 3 * a.max_slot;
+                }
                 let (f, _) = inkwell_cuda::mem_info();
                 if vramcap {
                     let (used_now, _) = process_vram_bytes(vram_baseline_free);
@@ -3225,6 +3229,28 @@ impl Runner {
     /// Issue this token's expert prefetch on the side stream.
     fn issue_moe_prefetch(&mut self, pos: i64) {
         let pfstat = pos % 7 == 6 && std::env::var_os("INKWELL_PF_STAT").is_some();
+        let active = self.moe_args_exl3.iter().any(|a|
+            a.cache.as_ref().is_some_and(|c| c.prefetch.is_some()));
+        let mut reuse_event = std::ptr::null_mut();
+        if active {
+            static REUSE_EV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            static CLEAR_EV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            reuse_event = *REUSE_EV.get_or_init(|| inkwell_cuda::new_event() as usize)
+                as *mut std::ffi::c_void;
+            let clear_event = *CLEAR_EV.get_or_init(|| inkwell_cuda::new_event() as usize)
+                as *mut std::ffi::c_void;
+            unsafe {
+                inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+                inkwell_cuda::event_record_current(reuse_event);
+                for a in &mut self.moe_args_exl3 {
+                    let Some(c) = &a.cache else { continue };
+                    let Some(pf) = &c.prefetch else { continue };
+                    inkwell_cuda::exl3_prefetch_clear_async(pf.pready.dev_ptr().cast());
+                }
+                inkwell_cuda::event_record(clear_event, inkwell_cuda::side_stream_raw());
+                inkwell_cuda::stream_wait_current(clear_event);
+            }
+        }
         for a in &mut self.moe_args_exl3 {
             let Some(c) = &mut a.cache else { continue };
             if pfstat {
@@ -3241,7 +3267,8 @@ impl Runner {
                     pf.hist.dev_ptr().cast(), c.tag.dev_ptr().cast(),
                     pf.bank.dev_ptr(), pf.ptag.dev_ptr().cast(),
                     pf.pready.dev_ptr().cast(), pf.pf_map.dev_ptr().cast(),
-                    pf.pf_miss.dev_ptr().cast(), 8, c.k, c.slot as i64);
+                    pf.pf_miss.dev_ptr().cast(), 8, c.k, c.slot as i64,
+                    reuse_event);
             }
         }
     }

@@ -468,10 +468,10 @@ impl Exl3Prefetch {
     #[must_use]
     pub fn new(slot: usize) -> Option<Self> {
         Some(Self {
-            hist: cu::DevBuf::try_new_bytes(32)?,
+            hist: { let mut d = cu::DevBuf::try_new_bytes(32)?; d.write_bytes(&[0u8; 32]); d },
             bank: cu::DevBuf::try_new_bytes(8 * 3 * slot)?,
             ptag: { let mut d = cu::DevBuf::try_new_bytes(32)?; d.write_bytes(&[0xFFu8; 32]); d },
-            pready: cu::DevBuf::try_new_bytes(4)?,
+            pready: { let mut d = cu::DevBuf::try_new_bytes(4)?; d.write_bytes(&[0u8; 4]); d },
             pf_map: cu::DevBuf::try_new_bytes(32)?,
             pf_miss: { let mut d = cu::DevBuf::try_new_bytes(40)?; d.write_bytes(&[0u8; 40]); d },
         })
