@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use memmap2::Mmap;
 use serde::de::{self, MapAccess, Visitor};
@@ -109,6 +109,16 @@ pub struct StFile {
     pub data_start: u64,
 }
 
+fn dtype_size(dtype: &str) -> Option<u64> {
+    Some(match dtype {
+        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" => 1,
+        "U16" | "I16" | "F16" | "BF16" => 2,
+        "U32" | "I32" | "F32" => 4,
+        "U64" | "I64" | "F64" => 8,
+        _ => return None,
+    })
+}
+
 impl StFile {
     /// Open and index a safetensors file.
     ///
@@ -129,16 +139,48 @@ impl StFile {
         // DOM. The first shard's 4.5 MB header has ~37k entries; avoiding the
         // DOM removes millions of temporary allocations at startup.
         let hdr: TensorHeader = serde_json::from_slice(&mmap[hstart..hend])?;
+        let data_len = (mmap.len() - hend) as u64;
         let mut tensors = HashMap::with_capacity(hdr.0.len());
         for (name, ent) in hdr.0 {
+            let begin = ent.data_offsets[0];
+            let end = ent.data_offsets[1];
+            if end < begin {
+                return Err(StError::Malformed(format!(
+                    "{name}: end offset before begin"
+                )));
+            }
+            let nbytes = end - begin;
+            if nbytes > data_len || begin > data_len {
+                return Err(StError::Malformed(format!(
+                    "{name}: data range outside file"
+                )));
+            }
+            let elem_size = dtype_size(&ent.dtype).ok_or_else(|| {
+                StError::Malformed(format!("{name}: unsupported dtype {}", ent.dtype))
+            })?;
+            let elems = ent
+                .shape
+                .iter()
+                .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| {
+                    StError::Malformed(format!("{name}: shape element count overflow"))
+                })?;
+            let expected = elems
+                .checked_mul(elem_size)
+                .ok_or_else(|| StError::Malformed(format!("{name}: byte size overflow")))?;
+            if expected != nbytes {
+                return Err(StError::Malformed(format!(
+                    "{name}: shape/dtype implies {expected} bytes, range has {nbytes}"
+                )));
+            }
             tensors.insert(
                 name.clone(),
                 StTensor {
                     name,
                     dtype: ent.dtype,
                     shape: ent.shape,
-                    begin: ent.data_offsets[0],
-                    end: ent.data_offsets[1],
+                    begin,
+                    end,
                 },
             );
         }
@@ -204,7 +246,20 @@ impl StRepo {
         let mut files = Vec::with_capacity(shards.len());
         let mut tensors = HashMap::with_capacity(wm.len());
         for (i, s) in shards.iter().enumerate() {
-            let f = StFile::open(path.join(s))?;
+            let rel = Path::new(s);
+            if rel.is_absolute()
+                || rel.components().any(|c| {
+                    matches!(
+                        c,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(StError::Malformed(format!(
+                    "unsafe shard path in index: {s}"
+                )));
+            }
+            let f = StFile::open(path.join(rel))?;
             for (n, t) in &f.tensors {
                 tensors.insert(n.clone(), (i, t.clone()));
             }
@@ -222,5 +277,71 @@ impl StRepo {
     #[must_use]
     pub fn tensor(&self, name: &str) -> Option<&StTensor> {
         self.tensors.get(name).map(|(_, t)| t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st_bytes(shape: &[u64], offsets: [u64; 2], data: &[u8]) -> Vec<u8> {
+        let shape_s = shape
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let hdr = format!(
+            "{{\"x\":{{\"dtype\":\"U8\",\"shape\":[{shape_s}],\"data_offsets\":[{},{}]}}}}",
+            offsets[0], offsets[1]
+        );
+        let mut out = (hdr.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(hdr.as_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn write_tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("inkwell-st-test-{name}-{}", std::process::id()));
+        std::fs::write(&path, bytes).expect("write test safetensors");
+        path
+    }
+
+    #[test]
+    fn accepts_valid_tensor() {
+        let path = write_tmp("valid", &st_bytes(&[2], [0, 2], b"ab"));
+        let f = StFile::open(&path).expect("valid safetensors");
+        assert_eq!(f.data(&f.tensors["x"]), b"ab");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_shape_size_mismatch() {
+        let path = write_tmp("mismatch", &st_bytes(&[3], [0, 2], b"ab"));
+        let err = StFile::open(&path).expect_err("mismatched byte length must be rejected");
+        assert!(matches!(err, StError::Malformed(_)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_data_range_outside_file() {
+        let path = write_tmp("bounds", &st_bytes(&[2], [0, 3], b"ab"));
+        let err = StFile::open(&path).expect_err("out-of-bounds range must be rejected");
+        assert!(matches!(err, StError::Malformed(_)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_parent_directory_shard_paths() {
+        let dir = std::env::temp_dir().join(format!("inkwell-st-repo-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create repo test dir");
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"x":"../outside.safetensors"}}"#,
+        )
+        .expect("write index");
+        let err = StRepo::open(&dir).expect_err("parent shard path must be rejected");
+        assert!(matches!(err, StError::Malformed(_)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
