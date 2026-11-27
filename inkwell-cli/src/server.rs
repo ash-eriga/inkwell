@@ -1,6 +1,6 @@
 //! OpenAI-compatible HTTP/1.1 + SSE inference server (`inkwell serve`).
 
-use crate::chat_template::{parse_effort, render_chat_prompt, ChatMessage};
+use crate::chat_template::{encode_chat_prompt, parse_effort, render_chat_prompt, ChatMessage};
 use crate::engine::{Engine, GenChunk, GenParams, GenStats};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -65,7 +65,7 @@ fn next_id(prefix: &str) -> String {
 }
 
 enum PromptInput {
-    Chat(String),
+    Chat { messages: Vec<ChatMessage>, effort: f32 },
     Raw(String),
 }
 
@@ -165,7 +165,15 @@ pub fn run_server_with_engine(engine: &mut Engine, opts: &ServeOpts) -> Result<(
         match job_rx.recv_timeout(Duration::from_millis(60)) {
             Ok(job) => {
                 let ids = match &job.prompt {
-                    PromptInput::Chat(s) => engine.tokenizer().encode_with_special(s),
+                    PromptInput::Chat { messages, effort } => {
+                        match encode_chat_prompt(engine.tokenizer(), messages, *effort) {
+                            Ok(ids) => ids,
+                            Err(e) => {
+                                let _ = job.reply.send(JobEvent::Err(e));
+                                continue;
+                            }
+                        }
+                    }
                     PromptInput::Raw(s) => engine.tokenizer().encode(s),
                 };
                 let reply = job.reply;
@@ -524,10 +532,9 @@ fn handle_chat(stream: &mut TcpStream, body: &[u8], state: &ServerInfo) -> Resul
         })
         .collect();
 
-    let rendered = match render_chat_prompt(&msgs, effort) {
-        Ok(s) => s,
-        Err(e) => return write_error(stream, 400, "Bad Request", &e),
-    };
+    if let Err(e) = render_chat_prompt(&msgs, effort) {
+        return write_error(stream, 400, "Bad Request", &e);
+    }
 
     let params = GenParams {
         max_tokens: req.max_completion_tokens.or(req.max_tokens).unwrap_or(2048),
@@ -549,7 +556,10 @@ fn handle_chat(stream: &mut TcpStream, body: &[u8], state: &ServerInfo) -> Resul
     if state
         .jobs
         .try_send(InferJob {
-            prompt: PromptInput::Chat(rendered),
+            prompt: PromptInput::Chat {
+                messages: msgs,
+                effort,
+            },
             params,
             reply: ev_tx,
         })

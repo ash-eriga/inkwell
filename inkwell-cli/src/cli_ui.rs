@@ -1,6 +1,6 @@
 //! Terminal UI/UX for `inkwell run` (one-shot) and `inkwell chat` (interactive REPL).
 
-use crate::chat_template::{parse_effort, render_chat_prompt, ChatMessage};
+use crate::chat_template::{encode_chat_prompt, parse_effort, ChatMessage};
 use crate::engine::{Engine, GenChunk, GenParams};
 use std::io::{self, BufRead, IsTerminal, Write};
 
@@ -350,8 +350,7 @@ pub fn run_oneshot(opts: &CliRunOpts) -> Result<(), String> {
             content: prompt.to_owned(),
             reasoning_content: None,
         });
-        let rendered = render_chat_prompt(&msgs, effort)?;
-        engine.tokenizer().encode_with_special(&rendered)
+        encode_chat_prompt(engine.tokenizer(), &msgs, effort)?
     };
 
     let params = GenParams {
@@ -540,8 +539,7 @@ pub fn run_chat_with_engine(engine: &mut Engine, opts: &CliRunOpts) -> Result<()
             reasoning_content: None,
         });
 
-        let rendered = render_chat_prompt(&history, effort)?;
-        let ids = engine.tokenizer().encode_with_special(&rendered);
+        let ids = encode_chat_prompt(engine.tokenizer(), &history, effort)?;
         let params = GenParams {
             max_tokens: opts.max_tokens,
             temperature,
