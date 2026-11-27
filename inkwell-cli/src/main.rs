@@ -5,6 +5,7 @@ mod cli_ui;
 mod engine;
 mod models;
 mod server;
+mod update;
 
 use inkwell_core::InklingConfig;
 use inkwell_gguf::GgufFile;
@@ -18,6 +19,7 @@ USAGE:
   inkwell chat  [model] [OPTIONS]       Interactive multi-turn terminal chat (interactive picker if model omitted)
   inkwell run   <model> -p <prompt>     One-shot streaming generation
   inkwell models                        List local EXL3 models and Hugging Face EXL3 presets
+  inkwell update [--check|--rollback]   Update inkwell from GitHub Releases (SHA-256 verified)
   inkwell <model> --run                 Legacy benchmark harness
 
 SERVE OPTIONS:
@@ -375,6 +377,13 @@ fn main() {
         }
         "models" => {
             models::print_model_catalog();
+            return;
+        }
+        "update" => {
+            if let Err(e) = update::run_update(args) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
             return;
         }
         "serve" => {

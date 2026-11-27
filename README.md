@@ -36,6 +36,20 @@ Comparing **Inkwell v0.1** (`EXL3 2.26 bpw`, zero-config) against upstream **`ll
 
 *(Validated up to 16k on 6 GB VRAM in v0.1.)*
 
+## Quick Install (Linux x86_64 · CUDA 12)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ash-eriga/inkwell/master/install.sh | sh
+```
+
+Requires an NVIDIA driver + CUDA 12 runtime (`libcudart.so.12`, `libcublas.so.12`). Updates and rollbacks are built in:
+
+```bash
+inkwell update              # download latest release, verify SHA-256, swap atomically
+inkwell update --check      # check for updates without installing
+inkwell update --rollback   # switch back to the previous installed version
+```
+
 ## Build from Source
 
 **Requirements:** Linux x86_64, NVIDIA GPU (`sm_61` Pascal tuned; `sm_75+` Turing/Ampere/Ada/Hopper experimental), CUDA Toolkit 12.x, Rust toolchain (`cargo`), and `cmake`.
