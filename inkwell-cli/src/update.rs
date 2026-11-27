@@ -12,6 +12,21 @@ const REPO: &str = "ash-eriga/inkwell";
 const CURRENT_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const ASSET_SUFFIX: &str = "linux-x86_64-cuda12.tar.gz";
 
+fn validate_tag(tag: &str) -> Result<(), String> {
+    if !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Ok(());
+    }
+    Err(format!("unsafe release tag: {tag}"))
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\''"))
+}
+
 fn home_dir() -> Result<PathBuf, String> {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -70,7 +85,7 @@ fn download_file(url: &str, dst: &Path, show_progress: bool) -> Result<(), Strin
         cmd.arg("-fsSL");
     }
     let status = cmd
-        .args(["--connect-timeout", "15", "-o"])
+        .args(["--connect-timeout", "15", "--max-time", "300", "-o"])
         .arg(dst)
         .arg(url)
         .status()
@@ -82,8 +97,8 @@ fn download_file(url: &str, dst: &Path, show_progress: bool) -> Result<(), Strin
 }
 
 fn verify_sha256(tarball: &Path, sums_path: &Path, asset_name: &str) -> Result<(), String> {
-    let sums = fs::read_to_string(sums_path)
-        .map_err(|e| format!("failed to read SHA256SUMS: {e}"))?;
+    let sums =
+        fs::read_to_string(sums_path).map_err(|e| format!("failed to read SHA256SUMS: {e}"))?;
     let expected = sums
         .lines()
         .find_map(|line| {
@@ -121,8 +136,7 @@ fn atomic_swap_current(root: &Path, target_rel: &Path) -> Result<(), String> {
     #[cfg(unix)]
     std::os::unix::fs::symlink(target_rel, &tmp_link)
         .map_err(|e| format!("failed to create symlink: {e}"))?;
-    fs::rename(&tmp_link, &current)
-        .map_err(|e| format!("failed to swap current symlink: {e}"))?;
+    fs::rename(&tmp_link, &current).map_err(|e| format!("failed to swap current symlink: {e}"))?;
     Ok(())
 }
 
@@ -132,11 +146,11 @@ fn write_wrapper(root: &Path) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
-    let root_s = root.display();
+    let root_s = sh_quote(&root.join("current").to_string_lossy());
     let script = format!(
         "#!/usr/bin/env sh\n\
          set -eu\n\
-         ROOT=\"{root_s}/current\"\n\
+         ROOT={root_s}\n\
          CUDA_LIB=\"\"\n\
          for d in \"${{INKWELL_CUDA_HOME:-}}/lib64\" \"${{CUDA_HOME:-}}/lib64\" \"$HOME/lfm-gtx1060-bench/cuda-12.6/lib64\" /usr/local/cuda/lib64 /opt/cuda/lib64; do\n\
            if [ -f \"$d/libcudart.so.12\" ]; then CUDA_LIB=\"$d\"; break; fi\n\
@@ -194,7 +208,9 @@ fn rollback(root: &Path) -> Result<(), String> {
 
 fn prune_old_versions(root: &Path, keep_tag: &str) {
     let versions_dir = root.join("versions");
-    let Ok(entries) = fs::read_dir(&versions_dir) else { return };
+    let Ok(entries) = fs::read_dir(&versions_dir) else {
+        return;
+    };
     let mut list: Vec<(std::time::SystemTime, PathBuf, String)> = Vec::new();
     for entry in entries.flatten() {
         let p = entry.path();
@@ -234,7 +250,11 @@ pub fn run_update(mut args: std::vec::IntoIter<String>) -> Result<(), String> {
                 let v = args
                     .next()
                     .ok_or_else(|| "missing value for --version".to_owned())?;
-                target_tag = Some(if v.starts_with('v') { v } else { format!("v{v}") });
+                target_tag = Some(if v.starts_with('v') {
+                    v
+                } else {
+                    format!("v{v}")
+                });
             }
             "-h" | "--help" => {
                 println!(
@@ -260,6 +280,7 @@ pub fn run_update(mut args: std::vec::IntoIter<String>) -> Result<(), String> {
         Some(t) => t,
         None => fetch_latest_tag()?,
     };
+    validate_tag(&tag)?;
 
     if check_only {
         if tag == CURRENT_VERSION {
@@ -279,8 +300,7 @@ pub fn run_update(mut args: std::vec::IntoIter<String>) -> Result<(), String> {
     let base_url = format!("https://github.com/{REPO}/releases/download/{tag}");
     let staging = root.join("staging").join(&tag);
     let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging)
-        .map_err(|e| format!("failed to create staging dir: {e}"))?;
+    fs::create_dir_all(&staging).map_err(|e| format!("failed to create staging dir: {e}"))?;
 
     let tarball = staging.join(&asset);
     let sums = staging.join("SHA256SUMS");
@@ -292,25 +312,46 @@ pub fn run_update(mut args: std::vec::IntoIter<String>) -> Result<(), String> {
     println!("Verifying SHA-256...");
     verify_sha256(&tarball, &sums, &asset)?;
 
-    let dest = root.join("versions").join(&tag);
-    let _ = fs::remove_dir_all(&dest);
-    fs::create_dir_all(&dest).map_err(|e| format!("failed to create {}: {e}", dest.display()))?;
+    let versions = root.join("versions");
+    fs::create_dir_all(&versions)
+        .map_err(|e| format!("failed to create {}: {e}", versions.display()))?;
+    let dest = versions.join(&tag);
+    let tmp_dest = versions.join(format!(".{tag}.tmp-{}", std::process::id()));
+    let backup_dest = versions.join(format!(".{tag}.old-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_dest);
+    let _ = fs::remove_dir_all(&backup_dest);
+    fs::create_dir_all(&tmp_dest)
+        .map_err(|e| format!("failed to create {}: {e}", tmp_dest.display()))?;
 
     let status = Command::new("tar")
         .args(["-xzf"])
         .arg(&tarball)
         .args(["-C"])
-        .arg(&dest)
+        .arg(&tmp_dest)
         .status()
         .map_err(|e| format!("failed to run tar: {e}"))?;
     if !status.success() {
-        let _ = fs::remove_dir_all(&dest);
+        let _ = fs::remove_dir_all(&tmp_dest);
         return Err("failed to extract release archive".to_owned());
     }
-    if !dest.join("inkwell").is_file() {
-        let _ = fs::remove_dir_all(&dest);
+    if !tmp_dest.join("inkwell").is_file() {
+        let _ = fs::remove_dir_all(&tmp_dest);
         return Err("invalid release archive: missing inkwell binary".to_owned());
     }
+
+    // The verified bundle is complete before it appears at versions/<tag>.
+    // Keep any prior install in a backup until the replacement rename succeeds.
+    if dest.exists() {
+        fs::rename(&dest, &backup_dest)
+            .map_err(|e| format!("failed to move aside existing install: {e}"))?;
+    }
+    if let Err(e) = fs::rename(&tmp_dest, &dest) {
+        if backup_dest.exists() {
+            let _ = fs::rename(&backup_dest, &dest);
+        }
+        return Err(format!("failed to install verified release: {e}"));
+    }
+    let _ = fs::remove_dir_all(&backup_dest);
 
     atomic_swap_current(&root, &PathBuf::from("versions").join(&tag))?;
     write_wrapper(&root)?;
@@ -319,4 +360,23 @@ pub fn run_update(mut args: std::vec::IntoIter<String>) -> Result<(), String> {
 
     println!("Updated inkwell to {tag} ({}).", dest.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sh_quote, validate_tag};
+
+    #[test]
+    fn validate_tag_rejects_path_separators() {
+        assert!(validate_tag("v0.1.0").is_ok());
+        assert!(validate_tag("../v0.1.0").is_err());
+        assert!(validate_tag("v0.1.0/evil").is_err());
+        assert!(validate_tag("").is_err());
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(sh_quote("/plain/path"), "'/plain/path'");
+        assert_eq!(sh_quote("/a'b/c"), "'/a'\''b/c'");
+    }
 }
