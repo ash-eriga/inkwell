@@ -78,9 +78,11 @@ extern "C" {
     fn ink_launch_exl3_moe(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, staging: *mut c_void, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, on_dev: i32, v2_descs_ok: i32);
     fn ink_launch_exl3_moe_cached(dg: *const c_void, du: *const c_void, dd: *const c_void, ids: *const i32, x: *const f32, xh: *mut f32, gu: *mut f32, hid: *mut f32, dn: *mut f32, w: *const f32, out: *mut f32, nslots: i32, stream: *mut c_void, cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, cnt: *mut i32, k: i32, slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, v2_descs_ok: i32, ptag: *const i32, pready: *const i32, bank: *mut c_void, pf_hit: *mut i32, hm: *mut i32, gexp: *const i32, soff: *mut u64, fl: *mut i32);
     fn ink_launch_exl3_moe_ntok(dg: *const c_void, du: *const c_void, dd: *const c_void, x8: *const f32, ids8: *const i32, w8: *const f32, out8: *mut f32, xh_e: *mut f32, gu_e: *mut f32, hid_e: *mut f32, dn_e: *mut f32, uids: *mut i32, eids: *mut i32, euni: *mut i32, etok: *mut i32, estart: *mut i32, epos: *mut i32, unexp: *mut i32, cache: *mut c_void, tag: *mut i32, map: *mut i32, miss: *mut i32, cnt: *mut i32, k: i32, slot_proj: i64, sdescs_g: *mut c_void, sdescs_u: *mut c_void, sdescs_d: *mut c_void, on_dev: i32, v2_descs_ok: i32, stream: *mut c_void, key_base: i32, nslots: i32, hm: *mut i32, gexp: *const i32, soff: *mut u64, fl: *mut i32);
+    fn ink_launch_exl3_pf_clear(pready: *mut i32, side: *mut c_void);
     fn ink_launch_exl3_prefetch2(dg: *const c_void, du: *const c_void, dd: *const c_void,
         hist: *const i32, tag: *const i32, bank: *mut c_void, ptag: *mut i32, pready: *mut i32,
-        pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void);
+        pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64, side: *mut c_void,
+        reuse_event: *mut c_void);
     fn ink_launch_exl3_copy8(src: *const c_void, dst: *mut c_void, stream: *mut c_void);
     fn ink_device_info(major: *mut i32, minor: *mut i32, name: *mut std::ffi::c_char, name_cap: i32) -> i32;
     fn ink_ch2nopless_startup() -> i32;
@@ -1119,15 +1121,26 @@ pub fn new_event() -> *mut c_void {
     e
 }
 
-/// Host-issued prefetch of predicted experts into a layer's bank, side stream.
+/// Clear a prefetch bank's ready flag on the side stream.
 ///
 /// # Safety
-/// Buffers sized as documented; issue after compute returns.
+/// `pready` is one device i32.
+pub unsafe fn exl3_prefetch_clear_async(pready: *mut i32) {
+    unsafe { ink_launch_exl3_pf_clear(pready, side_stream()) };
+}
+
+/// Host-issued prefetch of predicted experts into a layer's bank, side stream.
+/// The copy waits for `reuse_event` so no already-resolved reader of the bank
+/// is still in flight.
+///
+/// # Safety
+/// Buffers sized as documented; `reuse_event` is a CUDA event.
 #[expect(clippy::too_many_arguments)]
 pub unsafe fn exl3_prefetch2_async(dg: *const c_void, du: *const c_void, dd: *const c_void,
     hist: *const i32, tag: *const i32, bank: *mut c_void, ptag: *mut i32, pready: *mut i32,
-    pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64) {
-    unsafe { ink_launch_exl3_prefetch2(dg, du, dd, hist, tag, bank, ptag, pready, pf_map, pf_miss, nslots, k, slot_proj, side_stream()) };
+    pf_map: *mut i32, pf_miss: *mut i32, nslots: i32, k: i32, slot_proj: i64,
+    reuse_event: *mut c_void) {
+    unsafe { ink_launch_exl3_prefetch2(dg, du, dd, hist, tag, bank, ptag, pready, pf_map, pf_miss, nslots, k, slot_proj, side_stream(), reuse_event) };
 }
 
 fn stream() -> *mut c_void { INK_STREAM.load(std::sync::atomic::Ordering::Relaxed) }

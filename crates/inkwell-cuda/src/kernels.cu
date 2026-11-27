@@ -5739,11 +5739,16 @@ __global__ void inkwell_exl3_pf_tag(const int* __restrict__ hist_ids,
             if (pf_map[s] >= 0) ptag[pf_map[s]] = hist_ids[s];
     __threadfence();
 }
+extern "C" void ink_launch_exl3_pf_clear(int* pready, void* side) {
+    inkwell_exl3_pf_flag<<<1, 1, 0, (cudaStream_t)side>>>(pready, 0);
+}
+
 extern "C" void ink_launch_exl3_prefetch2(const void* descs_g, const void* descs_u, const void* descs_d,
         const int* hist_ids, const int* tag, void* bank, int* ptag, int* pready,
-        int* pf_map, int* pf_miss, int nslots, int k, long long slot_proj, void* side) {
+        int* pf_map, int* pf_miss, int nslots, int k, long long slot_proj, void* side,
+        void* reuse_event) {
     const cudaStream_t ss = (cudaStream_t)side;
-    inkwell_exl3_pf_flag<<<1, 1, 0, ss>>>(pready, 0);
+    cudaStreamWaitEvent(ss, (cudaEvent_t)reuse_event, 0);
     inkwell_exl3_pf_resolve<<<1, 32, 0, ss>>>(hist_ids, tag, pf_map, pf_miss, k, nslots);
     // copy each predicted miss into its bank slot — reuse moe_ccopy with the
     // private map (map[s] = bank slot or -1); write through `bank`.
