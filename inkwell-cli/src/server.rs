@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,12 @@ extern "C" fn handle_sigint(_sig: libc::c_int) {
 #[cfg(unix)]
 fn install_sigint_handler() -> libc::sighandler_t {
     STOP_SERVER.store(false, Ordering::SeqCst);
-    unsafe { libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t) }
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        )
+    }
 }
 
 #[cfg(unix)]
@@ -73,7 +78,7 @@ enum JobEvent {
 struct InferJob {
     prompt: PromptInput,
     params: GenParams,
-    reply: Sender<JobEvent>,
+    reply: SyncSender<JobEvent>,
 }
 
 struct ServerInfo {
@@ -81,14 +86,18 @@ struct ServerInfo {
     max_ctx: usize,
     default_effort: String,
     created: u64,
-    jobs: Sender<InferJob>,
+    jobs: SyncSender<InferJob>,
+    active_conns: AtomicU64,
 }
 
 /// Start the OpenAI-compatible HTTP server, loading the model and returning the
 /// warm [`Engine`] when stopped via Ctrl+C so the caller can switch modes without reloading.
 pub fn run_server(opts: &ServeOpts) -> Result<Engine, String> {
     let _ = parse_effort(Some(&opts.default_effort))?;
-    eprintln!("inkwell serve: loading {} (ctx={})...", opts.model, opts.ctx);
+    eprintln!(
+        "inkwell serve: loading {} (ctx={})...",
+        opts.model, opts.ctx
+    );
     let mut engine = Engine::load(&opts.model, opts.ctx)?;
     run_server_with_engine(&mut engine, opts)?;
     Ok(engine)
@@ -102,8 +111,7 @@ pub fn run_server_with_engine(engine: &mut Engine, opts: &ServeOpts) -> Result<(
     let max_ctx = engine.max_ctx();
 
     let addr = format!("{}:{}", opts.host, opts.port);
-    let listener =
-        TcpListener::bind(&addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    let listener = TcpListener::bind(&addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("failed to configure listener: {e}"))?;
@@ -111,13 +119,15 @@ pub fn run_server_with_engine(engine: &mut Engine, opts: &ServeOpts) -> Result<(
     #[cfg(unix)]
     let prev_sig = install_sigint_handler();
 
-    let (job_tx, job_rx) = mpsc::channel::<InferJob>();
+    const MAX_PENDING_JOBS: usize = 64;
+    let (job_tx, job_rx) = mpsc::sync_channel::<InferJob>(MAX_PENDING_JOBS);
     let info = Arc::new(ServerInfo {
         model_id: model_id.clone(),
         max_ctx,
         default_effort: opts.default_effort.clone(),
         created: unix_secs(),
         jobs: job_tx,
+        active_conns: AtomicU64::new(0),
     });
 
     eprintln!(
@@ -129,10 +139,18 @@ pub fn run_server_with_engine(engine: &mut Engine, opts: &ServeOpts) -> Result<(
         while !STOP_SERVER.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    const MAX_ACTIVE_CONNS: u64 = 256;
+                    let prev = accept_info.active_conns.fetch_add(1, Ordering::Relaxed);
+                    if prev >= MAX_ACTIVE_CONNS {
+                        accept_info.active_conns.fetch_sub(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    }
                     let _ = stream.set_nonblocking(false);
                     let st = Arc::clone(&accept_info);
                     std::thread::spawn(move || {
                         let _ = handle_conn(stream, &st);
+                        st.active_conns.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -182,28 +200,46 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+    out: &mut String,
+) -> Result<usize, String> {
+    out.clear();
+    let n = reader
+        .by_ref()
+        .take((limit + 1) as u64)
+        .read_line(out)
+        .map_err(|e| e.to_string())?;
+    if n > limit {
+        return Err("line exceeds length limit".to_owned());
+    }
+    Ok(n)
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut req_line = String::new();
-    let n = reader.read_line(&mut req_line).map_err(|e| e.to_string())?;
+    let n = read_line_bounded(&mut reader, 8192, &mut req_line)?;
     if n == 0 {
         return Err("empty request".to_owned());
-    }
-    if n > 8192 {
-        return Err("request line too long".to_owned());
     }
     let mut parts = req_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_owned();
     let raw_path = parts.next().unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/").to_owned();
 
-    let mut content_len = 0usize;
+    let mut content_len: Option<usize> = None;
+    let mut chunked = false;
     let mut header_bytes = 0usize;
+    let mut terminated = false;
     for _ in 0..128 {
         let mut hline = String::new();
-        let hn = reader.read_line(&mut hline).map_err(|e| e.to_string())?;
+        let hn = read_line_bounded(&mut reader, 8192, &mut hline)?;
         if hn == 0 || hline == "\r\n" || hline == "\n" {
+            terminated = true;
             break;
         }
         header_bytes += hn;
@@ -212,28 +248,60 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         }
         if let Some((k, v)) = hline.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
-                content_len = v.trim().parse().unwrap_or(0);
+                if content_len.is_some() {
+                    return Err("duplicate content-length header".to_owned());
+                }
+                content_len = Some(
+                    v.trim()
+                        .parse()
+                        .map_err(|_| "invalid content-length header".to_owned())?,
+                );
+            } else if k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.trim().eq_ignore_ascii_case("chunked")
+            {
+                chunked = true;
             }
         }
     }
+    if !terminated {
+        return Err("too many headers or missing header terminator".to_owned());
+    }
+    if chunked {
+        return Err("chunked request bodies are not supported".to_owned());
+    }
 
+    let content_len = content_len.unwrap_or(0);
     if content_len > 16 * 1024 * 1024 {
         return Err("request body exceeds 16 MiB".to_owned());
     }
-    let mut body = vec![0u8; content_len];
+    let mut body = Vec::new();
     if content_len > 0 {
-        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+        let got = reader
+            .by_ref()
+            .take(content_len as u64)
+            .read_to_end(&mut body)
+            .map_err(|e| e.to_string())?;
+        if got != content_len {
+            return Err("request body truncated".to_owned());
+        }
     }
     Ok(HttpRequest { method, path, body })
 }
 
-fn write_json(stream: &mut TcpStream, status: u16, reason: &str, val: &Value) -> Result<(), String> {
+fn write_json(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    val: &Value,
+) -> Result<(), String> {
     let payload = serde_json::to_vec(val).map_err(|e| e.to_string())?;
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n",
         payload.len()
     );
-    stream.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(header.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.write_all(&payload).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())
 }
@@ -255,12 +323,16 @@ fn write_error(stream: &mut TcpStream, status: u16, reason: &str, msg: &str) -> 
 
 fn write_sse_headers(stream: &mut TcpStream) -> Result<(), String> {
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n";
-    stream.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(header.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())
 }
 
 fn write_sse_event(stream: &mut TcpStream, val: &Value) -> bool {
-    let Ok(s) = serde_json::to_string(val) else { return false };
+    let Ok(s) = serde_json::to_string(val) else {
+        return false;
+    };
     stream
         .write_all(format!("data: {s}\n\n").as_bytes())
         .and_then(|()| stream.flush())
@@ -268,10 +340,15 @@ fn write_sse_event(stream: &mut TcpStream, val: &Value) -> bool {
 }
 
 fn handle_conn(mut stream: TcpStream, state: &ServerInfo) -> Result<(), String> {
-    let req = read_request(&mut stream)?;
+    let req = match read_request(&mut stream) {
+        Ok(req) => req,
+        Err(e) => return write_error(&mut stream, 400, "Bad Request", &e),
+    };
     if req.method == "OPTIONS" {
         let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n";
-        stream.write_all(resp.as_bytes()).map_err(|e| e.to_string())?;
+        stream
+            .write_all(resp.as_bytes())
+            .map_err(|e| e.to_string())?;
         return Ok(());
     }
 
@@ -468,15 +545,23 @@ fn handle_chat(stream: &mut TcpStream, body: &[u8], state: &ServerInfo) -> Resul
     let id = next_id("chatcmpl");
     let created = unix_secs();
 
-    let (ev_tx, ev_rx) = mpsc::channel();
-    state
+    let (ev_tx, ev_rx) = mpsc::sync_channel(256);
+    if state
         .jobs
-        .send(InferJob {
+        .try_send(InferJob {
             prompt: PromptInput::Chat(rendered),
             params,
             reply: ev_tx,
         })
-        .map_err(|_| "engine worker closed".to_owned())?;
+        .is_err()
+    {
+        return write_error(
+            stream,
+            503,
+            "Service Unavailable",
+            "inference queue is full",
+        );
+    }
 
     if req.stream {
         write_sse_headers(stream)?;
@@ -625,11 +710,7 @@ fn handle_completions(
     };
     let prompt_text = match &req.prompt {
         Value::String(s) => s.clone(),
-        Value::Array(arr) => arr
-            .first()
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
+        Value::Array(arr) => arr.first().and_then(Value::as_str).unwrap_or("").to_owned(),
         _ => return write_error(stream, 400, "Bad Request", "prompt must be a string"),
     };
     if prompt_text.is_empty() {
@@ -652,15 +733,23 @@ fn handle_completions(
     let id = next_id("cmpl");
     let created = unix_secs();
 
-    let (ev_tx, ev_rx) = mpsc::channel();
-    state
+    let (ev_tx, ev_rx) = mpsc::sync_channel(256);
+    if state
         .jobs
-        .send(InferJob {
+        .try_send(InferJob {
             prompt: PromptInput::Raw(prompt_text),
             params,
             reply: ev_tx,
         })
-        .map_err(|_| "engine worker closed".to_owned())?;
+        .is_err()
+    {
+        return write_error(
+            stream,
+            503,
+            "Service Unavailable",
+            "inference queue is full",
+        );
+    }
 
     if req.stream {
         write_sse_headers(stream)?;
@@ -750,4 +839,62 @@ fn handle_completions(
             },
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Shutdown;
+
+    fn parse_request_bytes(bytes: &[u8]) -> Result<HttpRequest, String> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let mut client = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        let (mut server_side, _) = listener.accept().map_err(|e| e.to_string())?;
+        client.write_all(bytes).map_err(|e| e.to_string())?;
+        client
+            .shutdown(Shutdown::Write)
+            .map_err(|e| e.to_string())?;
+        read_request(&mut server_side)
+    }
+
+    #[test]
+    fn parses_bounded_valid_request() {
+        let req = parse_request_bytes(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .expect("valid request");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/chat/completions");
+        assert_eq!(req.body, b"{}");
+    }
+
+    #[test]
+    fn rejects_overlong_request_line_without_allocating_it() {
+        let mut bytes = b"GET /".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', 9000));
+        bytes.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+        assert!(parse_request_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_unterminated_header_block() {
+        let mut bytes = b"POST / HTTP/1.1\r\n".to_vec();
+        for i in 0..128 {
+            bytes.extend_from_slice(format!("x-{i}: y\r\n").as_bytes());
+        }
+        assert!(parse_request_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_conflicting_or_chunked_framing() {
+        assert!(parse_request_bytes(
+            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"
+        )
+        .is_err());
+        assert!(parse_request_bytes(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        )
+        .is_err());
+    }
 }
