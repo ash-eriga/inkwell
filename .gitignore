@@ -1,4 +1,5 @@
 /target
+.target/
 opt/rexl3/exl3-src
 # kbench built binaries (keep sources + ids)
 opt/kbench/probe_*
@@ -30,3 +31,7 @@ opt/kbench/prefill/prefill_tests
 .internal/
 brand/
 third_party/ggml/ggml-src/
+
+# local benchmark builds and run output
+.target-*/
+/*.log

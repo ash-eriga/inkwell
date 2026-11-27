@@ -92,23 +92,29 @@ fn parse_merge_chunk(
             MetaValue::Str(s) => {
                 // "first second" — split on the space after the first byte
                 // (byte 1 may sit inside a multi-byte char; search bytes).
-                let sep = s.as_bytes()[1..]
+                let bytes = s.as_bytes();
+                if bytes.len() < 3 {
+                    return Err(TokError::BadMerge);
+                }
+                let sep = bytes[1..]
                     .iter()
                     .position(|&b| b == b' ')
-                    .map(|p| p + 1);
-                if let Some(sep) = sep {
-                    let (a, b) = (&s[..sep], &s[sep + 1..]);
-                    let aid = *token_to_id.get(a).ok_or(TokError::BadMerge)?;
-                    let bid = *token_to_id.get(b).ok_or(TokError::BadMerge)?;
-                    merged.clear();
-                    merged.push_str(a);
-                    merged.push_str(b);
-                    let out = *token_to_id.get(merged.as_str()).ok_or(TokError::BadMerge)?;
-                    entries.push((
-                        (aid, bid),
-                        (u32::try_from(base + j).expect("merges < 4G"), out),
-                    ));
+                    .map(|p| p + 1)
+                    .ok_or(TokError::BadMerge)?;
+                let (a, b) = (&s[..sep], &s[sep + 1..]);
+                if b.is_empty() {
+                    return Err(TokError::BadMerge);
                 }
+                let aid = *token_to_id.get(a).ok_or(TokError::BadMerge)?;
+                let bid = *token_to_id.get(b).ok_or(TokError::BadMerge)?;
+                merged.clear();
+                merged.push_str(a);
+                merged.push_str(b);
+                let out = *token_to_id.get(merged.as_str()).ok_or(TokError::BadMerge)?;
+                entries.push((
+                    (aid, bid),
+                    (u32::try_from(base + j).expect("merges < 4G"), out),
+                ));
             }
             _ => return Err(TokError::BadKey("tokenizer.ggml.merges")),
         }
@@ -399,6 +405,16 @@ mod tests {
         for b in 0usize..256 {
             let c = b2c[b];
             assert_eq!(c2b[c as usize], b as u16);
+        }
+    }
+
+    #[test]
+    fn malformed_short_merge_is_error_not_panic() {
+        let map = FxHashMap::default();
+        for bad in ["", "x", "x "] {
+            let err = parse_merge_chunk(&map, &[MetaValue::Str(bad.to_owned())], 0)
+                .expect_err("short merge must be rejected");
+            assert!(matches!(err, TokError::BadMerge));
         }
     }
 }

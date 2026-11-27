@@ -36,6 +36,10 @@ else
   [ -n "$TAG" ] || die "could not determine latest release tag"
 fi
 
+case "$TAG" in
+  ""|*[!A-Za-z0-9._-]*) die "unsafe release tag: $TAG" ;;
+esac
+
 ASSET="inkwell-${TAG}-${ASSET_SUFFIX}"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 STAGING="$DATA_ROOT/staging/$TAG"
@@ -45,8 +49,8 @@ rm -rf "$STAGING"
 mkdir -p "$STAGING" "$DATA_ROOT/versions" "$BIN_DIR"
 
 echo "Downloading $ASSET..."
-curl -fL# -o "$STAGING/$ASSET" "$BASE_URL/$ASSET"
-curl -fsSL -o "$STAGING/SHA256SUMS" "$BASE_URL/SHA256SUMS"
+curl -fL# --connect-timeout 15 --speed-limit 1024 --speed-time 60 -o "$STAGING/$ASSET" "$BASE_URL/$ASSET"
+curl -fsSL --connect-timeout 15 --max-time 60 -o "$STAGING/SHA256SUMS" "$BASE_URL/SHA256SUMS"
 
 echo "Verifying SHA-256..."
 (
@@ -55,11 +59,22 @@ echo "Verifying SHA-256..."
   sha256sum -c SHA256SUMS.one >/dev/null
 )
 
-rm -rf "$DEST"
-mkdir -p "$DEST"
-tar -xzf "$STAGING/$ASSET" -C "$DEST"
-[ -f "$DEST/inkwell" ] || die "archive missing inkwell binary"
-chmod 755 "$DEST/inkwell"
+EXTRACT="$STAGING/unpack"
+BACKUP="$DATA_ROOT/versions/.${TAG}.old-$$"
+mkdir -p "$EXTRACT"
+tar -xzf "$STAGING/$ASSET" -C "$EXTRACT"
+[ -f "$EXTRACT/inkwell" ] || die "archive missing inkwell binary"
+chmod 755 "$EXTRACT/inkwell"
+
+rm -rf "$BACKUP"
+if [ -d "$DEST" ]; then
+  mv -T "$DEST" "$BACKUP" || die "could not move aside existing install"
+fi
+if ! mv -T "$EXTRACT" "$DEST"; then
+  if [ -d "$BACKUP" ]; then mv -T "$BACKUP" "$DEST"; fi
+  die "could not install verified archive"
+fi
+rm -rf "$BACKUP"
 
 ln -sfn "versions/$TAG" "$DATA_ROOT/.current.tmp"
 mv -Tf "$DATA_ROOT/.current.tmp" "$DATA_ROOT/current"

@@ -1784,6 +1784,19 @@ __global__ void inkwell_attn_decode_gqa3_exact(const void* __restrict__ K, const
 // heads sharing one KV head. Partials are [m, l, acc(hd)] per (chunk, q head);
 // the reduce kernel adds the same zero-logit sink as the single-block kernel.
 #define INKWELL_ATTN_MAX_SPLIT 512
+
+// Keep the fixed split grid inside the partials table.  A user-supplied small
+// chunk length otherwise makes the split launcher fail at long context and the
+// dispatcher falls back to a single-block kernel whose dynamic shared-memory
+// request is impossible to launch.
+static inline int inkwell_attn_effective_chunk(int chunk_len, long long span) {
+    if (chunk_len < 32) chunk_len = 32;
+    const long long chunks = (span + chunk_len - 1) / chunk_len;
+    if (chunks <= INKWELL_ATTN_MAX_SPLIT) return chunk_len;
+    long long c = (span + INKWELL_ATTN_MAX_SPLIT - 1) / INKWELL_ATTN_MAX_SPLIT;
+    c = (c + 31) & ~31LL;
+    return (int)c;
+}
 #define INKWELL_ATTN_MAX_QG 3
 
 // Warp-split variant: each warp owns a strided slice of the chunk and keeps
@@ -2544,6 +2557,7 @@ extern "C" int ink_launch_attn_decode_split(const void* K, const void* V, const 
                                             int chunk_len, void* stream) {
     const cudaStream_t st = (cudaStream_t)stream;
     const int ratio = (int)(nh / hkv);
+    chunk_len = inkwell_attn_effective_chunk(chunk_len, n_kv);
     const int nchunks = (int)((n_kv + chunk_len - 1) / chunk_len);
     if (nchunks > INKWELL_ATTN_MAX_SPLIT) return 0;
     float* part = inkwell_attn_partbuf((size_t)INKWELL_ATTN_MAX_SPLIT * nh * (hd + 2));
@@ -2592,6 +2606,7 @@ extern "C" void ink_launch_attn_decode(const void* K, const void* V, const void*
 
     int use_chunk = chunk_len;
     if (use_chunk == 0) use_chunk = n_kv <= 16384 ? 32 : 256;
+    use_chunk = inkwell_attn_effective_chunk(use_chunk, n_kv);
     const int ratio = hkv > 0 ? (int)(nh / hkv) : 0;
     const bool shape_ok = hkv > 0 && nh % hkv == 0 && ratio > 0 && hd == 128 &&
         (kv16 ? (k_s1 % 8 == 0 && v_s1 % 16 == 0) : (k_s1 % 16 == 0 && v_s1 % 16 == 0));
@@ -2660,6 +2675,7 @@ extern "C" int ink_launch_attn_decode_split_dyn(const void* K, const void* V, co
                                                 int chunk_len, void* stream) {
     const cudaStream_t st = (cudaStream_t)stream;
     const int ratio = (int)(nh / hkv);
+    chunk_len = inkwell_attn_effective_chunk(chunk_len, cap);
     const int max_chunks = (int)((cap + chunk_len - 1) / chunk_len);
     if (max_chunks > INKWELL_ATTN_MAX_SPLIT) return 0;
     float* part = inkwell_attn_partbuf((size_t)INKWELL_ATTN_MAX_SPLIT * nh * (hd + 2));
@@ -5723,11 +5739,16 @@ __global__ void inkwell_exl3_pf_tag(const int* __restrict__ hist_ids,
             if (pf_map[s] >= 0) ptag[pf_map[s]] = hist_ids[s];
     __threadfence();
 }
+extern "C" void ink_launch_exl3_pf_clear(int* pready, void* side) {
+    inkwell_exl3_pf_flag<<<1, 1, 0, (cudaStream_t)side>>>(pready, 0);
+}
+
 extern "C" void ink_launch_exl3_prefetch2(const void* descs_g, const void* descs_u, const void* descs_d,
         const int* hist_ids, const int* tag, void* bank, int* ptag, int* pready,
-        int* pf_map, int* pf_miss, int nslots, int k, long long slot_proj, void* side) {
+        int* pf_map, int* pf_miss, int nslots, int k, long long slot_proj, void* side,
+        void* reuse_event) {
     const cudaStream_t ss = (cudaStream_t)side;
-    inkwell_exl3_pf_flag<<<1, 1, 0, ss>>>(pready, 0);
+    cudaStreamWaitEvent(ss, (cudaEvent_t)reuse_event, 0);
     inkwell_exl3_pf_resolve<<<1, 32, 0, ss>>>(hist_ids, tag, pf_map, pf_miss, k, nslots);
     // copy each predicted miss into its bank slot — reuse moe_ccopy with the
     // private map (map[s] = bank slot or -1); write through `bank`.
