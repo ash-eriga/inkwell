@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstdlib>
+#include "gpu_caps.cuh"
 
 #define PF_INV_SQRT128 0.08838834764831845f
 
@@ -30,6 +31,26 @@ __device__ __forceinline__ float pf_bs_f32(uint32_t w16) {
     return (float)(int)__dp4a(w16 * 0x83DCD12Du, 0x01010101u, 0u);
 }
 
+// Rounded EXL3 byte-sum in exact uint8 range.  bytesum is at most 1020, so
+// (bytesum + 2) >> 2 needs no clamp; the +2 rides free in dp4a's accumulator.
+__device__ __forceinline__ uint32_t pf_bs_u8(uint32_t w16) {
+    return __dp4a(w16 * 0x83DCD12Du, 0x01010101u, 2u) >> 2;
+}
+
+__device__ __forceinline__ int pf_dp4a_s32_s32(int x, uint32_t w, int acc) {
+    asm("dp4a.s32.s32 %0, %1, %2, %0;" : "+r"(acc) : "r"(x), "r"(w));
+    return acc;
+}
+
+__device__ __forceinline__ uint32_t pf_pack_q8(int q0, int q1, int q2, int q3) {
+    return (uint32_t)(q0 & 0xff) | ((uint32_t)(q1 & 0xff) << 8)
+        | ((uint32_t)(q2 & 0xff) << 16) | ((uint32_t)(q3 & 0xff) << 24);
+}
+
+__device__ __forceinline__ int pf_quant_i8(float x, float inv_scale) {
+    return max(-127, min(127, __float2int_rn(x * inv_scale)));
+}
+
 // Exact 128-point Hadamard in the same pairwise order as inkwell_exl3_had_in.
 __device__ __forceinline__ void pf_had128_smem(float* sm, int t) {
     for (int s = 1; s < 128; s <<= 1) {
@@ -37,6 +58,29 @@ __device__ __forceinline__ void pf_had128_smem(float* sm, int t) {
         __syncthreads();
         sm[t] = u;
         __syncthreads();
+    }
+}
+
+// 128-dim Hadamard via four in-register elements per lane plus five warp
+// shuffle levels.  This is the same butterfly order as pf_had128_smem.
+__device__ __forceinline__ void pf_had128_warp(float* __restrict__ v, int ebase) {
+#pragma unroll
+    for (int s = 1; s < 4; s <<= 1) {
+        float u[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            u[i] = (i & s) ? __fsub_rn(v[i ^ s], v[i]) : __fadd_rn(v[i], v[i ^ s]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = u[i];
+    }
+#pragma unroll
+    for (int s = 4; s < 128; s <<= 1) {
+        const int mask = s >> 2;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[i], mask);
+            v[i] = ((ebase + i) & s) ? __fsub_rn(o, v[i]) : __fadd_rn(v[i], o);
+        }
     }
 }
 
@@ -100,6 +144,30 @@ __device__ __forceinline__ void pf_decode4(const uint32_t* __restrict__ rg, PfDe
     f1 = pf_bs_f32((x >> (16 - p.s1)) & 0xffffu);
     f2 = pf_bs_f32((x >> (16 - p.s2)) & 0xffffu);
     f3 = pf_bs_f32((x >> (16 - p.s3)) & 0xffffu);
+}
+
+// Two-word form used by tiled GEMM kernels.  Each decode lane needs only the
+// ring words at m0w/m1w; loading those directly avoids staging the whole ring
+// in shared memory and removes one barrier per k tile.
+__device__ __forceinline__ void pf_decode4_words(uint32_t r0, uint32_t r1, PfDecodePlan p,
+        float& f0, float& f1, float& f2, float& f3) {
+    const uint32_t x = __funnelshift_l(r1, r0, p.shd);
+    f0 = pf_bs_f32(x >> 16);
+    f1 = pf_bs_f32((x >> (16 - p.s1)) & 0xffffu);
+    f2 = pf_bs_f32((x >> (16 - p.s2)) & 0xffffu);
+    f3 = pf_bs_f32((x >> (16 - p.s3)) & 0xffffu);
+}
+
+
+// Decode the same four trellis outputs as pf_decode4_words, but round each
+// byte-sum once into uint8 and pack them in ascending output order.
+__device__ __forceinline__ uint32_t pf_decode4_words_q8(uint32_t r0, uint32_t r1, PfDecodePlan p) {
+    const uint32_t x = __funnelshift_l(r1, r0, p.shd);
+    const uint32_t b0 = pf_bs_u8(x >> 16);
+    const uint32_t b1 = pf_bs_u8((x >> (16 - p.s1)) & 0xffffu);
+    const uint32_t b2 = pf_bs_u8((x >> (16 - p.s2)) & 0xffffu);
+    const uint32_t b3 = pf_bs_u8((x >> (16 - p.s3)) & 0xffffu);
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) ^ 0x80808080u;
 }
 
 // Register-tiled EXL3 GEMM core, adapted from the Phase-0 microbenchmark.
@@ -233,9 +301,8 @@ __global__ void __launch_bounds__(128) inkwell_exl3_gemm_wide_core(
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
 
-    __shared__ float Ws[16][BN + 1];
-    __shared__ float Xs[16][BM + 1];
-    __shared__ uint32_t rings[NTILE][80];
+    __shared__ __align__(16) float Ws[2][16][BN + 4];
+    __shared__ __align__(16) float Xs[2][16][BM + 4];
 
     const int dtile = tid >> 5;
     const int du = tid & 31;
@@ -260,51 +327,80 @@ __global__ void __launch_bounds__(128) inkwell_exl3_gemm_wide_core(
         for (int in = 0; in < RN; ++in) acc[im][in] = 0.f;
     }
 
-    for (int tk_i = 0; tk_i < tk; ++tk_i) {
+    float4 xreg[2];
+    uint32_t rw[2][2];
+    auto load_tile = [&](int tk_i) {
         const int tn_i = tn0 + dtile;
+#pragma unroll
+        for (int ii = 0; ii < 2; ++ii) {
+            const int idx = tid + ii * 128;
+            const int mm = idx >> 2;
+            const int rq = idx & 3;
+            const int gm = m0 + mm;
+            xreg[ii] = (gm < M)
+                ? *(const float4*)(x + (size_t)gm * tk * 16 + tk_i * 16 + rq * 4)
+                : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
         if (tn_i < tn) {
-            for (int u = du; u < w; u += 32) {
-                rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
+            const uint32_t* tile_ring = trel + ((size_t)tk_i * tn + tn_i) * (size_t)w;
+#pragma unroll
+            for (int z = 0; z < 2; ++z) {
+                rw[z][0] = __ldg(tile_ring + plan[z].m0w);
+                rw[z][1] = __ldg(tile_ring + plan[z].m1w);
             }
         }
-        for (int idx = tid; idx < 16 * BM; idx += 128) {
-            const int mm = idx >> 4;
-            const int rr = idx & 15;
-            const int gm = m0 + mm;
-            Xs[rr][mm] = (gm < M) ? x[(size_t)gm * tk * 16 + tk_i * 16 + rr] : 0.f;
+    };
+    auto store_tile = [&](int tk_i, int buf) {
+        const int tn_i = tn0 + dtile;
+#pragma unroll
+        for (int ii = 0; ii < 2; ++ii) {
+            const int idx = tid + ii * 128;
+            const int mm = idx >> 2;
+            const int rq = idx & 3;
+            Xs[buf][rq * 4][mm] = xreg[ii].x;
+            Xs[buf][rq * 4 + 1][mm] = xreg[ii].y;
+            Xs[buf][rq * 4 + 2][mm] = xreg[ii].z;
+            Xs[buf][rq * 4 + 3][mm] = xreg[ii].w;
         }
-        __syncthreads();
         if (tn_i < tn) {
-            const uint32_t* rg = rings[dtile];
             const int col = dtile * 16 + dc;
+            const int wcol = (col & 7) + (col >> 3) * 4 + ((col & 4) ? 28 : 0);
 #pragma unroll
             for (int z = 0; z < 2; ++z) {
                 const int dmz = dm + 2 * z;
                 float f0, f1, f2, f3;
-                pf_decode4(rg, plan[z], f0, f1, f2, f3);
-                Ws[2 * dmz][col] = f0;
-                Ws[2 * dmz + 1][col] = f1;
-                Ws[2 * dmz + 8][col] = f2;
-                Ws[2 * dmz + 9][col] = f3;
+                pf_decode4_words(rw[z][0], rw[z][1], plan[z], f0, f1, f2, f3);
+                Ws[buf][2 * dmz][wcol] = f0;
+                Ws[buf][2 * dmz + 1][wcol] = f1;
+                Ws[buf][2 * dmz + 8][wcol] = f2;
+                Ws[buf][2 * dmz + 9][wcol] = f3;
             }
         }
-        __syncthreads();
+    };
+
+    load_tile(0);
+    store_tile(0, 0);
+    __syncthreads();
+    for (int tk_i = 0; tk_i < tk; ++tk_i) {
+        const int cur = tk_i & 1;
+        const bool have_next = tk_i + 1 < tk;
+        if (have_next) load_tile(tk_i + 1);
 #pragma unroll
         for (int r = 0; r < 16; ++r) {
-            float xv[RM];
+            const float4 xv4 = *(const float4*)&Xs[cur][r][ty * RM];
+            const float xv[RM] = {xv4.x, xv4.y, xv4.z, xv4.w};
 #pragma unroll
-            for (int im = 0; im < RM; ++im) {
-                xv[im] = Xs[r][ty * RM + im];
-                sx[im] += xv[im];
-            }
-            float wv[RN];
-            for (int in = 0; in < RN; ++in) wv[in] = Ws[r][tx + in * 8];
+            for (int im = 0; im < RM; ++im) sx[im] += xv[im];
+            const float4 wa4 = *(const float4*)&Ws[cur][r][tx * 4];
+            const float4 wb4 = *(const float4*)&Ws[cur][r][32 + tx * 4];
+            const float wv[RN] = {wa4.x, wa4.y, wa4.z, wa4.w, wb4.x, wb4.y, wb4.z, wb4.w};
 #pragma unroll
             for (int im = 0; im < RM; ++im)
 #pragma unroll
                 for (int in = 0; in < RN; ++in)
                     acc[im][in] = fmaf(xv[im], wv[in], acc[im][in]);
         }
+        if (have_next) store_tile(tk_i + 1, cur ^ 1);
         __syncthreads();
     }
 
@@ -316,7 +412,7 @@ __global__ void __launch_bounds__(128) inkwell_exl3_gemm_wide_core(
             const float off = KOFF * sx[im];
 #pragma unroll
             for (int in = 0; in < RN; ++in) {
-                const int gn = tn0 * 16 + tx + in * 8;
+                const int gn = tn0 * 16 + tx * RN + in;
                 if (gn < N) y[(size_t)gm * N + gn] = fmaf(KINV, acc[im][in], off);
             }
         }
@@ -371,26 +467,20 @@ __global__ void __launch_bounds__(128) inkwell_exl3_gemm_narrow_core(
 
     for (int tk_i = 0; tk_i < tk; ++tk_i) {
         const int tn_i = tn0 + dtile;
-        if (tn_i < tn) {
-            for (int u = du; u < w; u += 32) {
-                rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
-            }
-        }
+        const uint32_t* tile_ring = trel + ((size_t)tk_i * tn + tn_i) * (size_t)w;
         for (int idx = tid; idx < 16 * BM; idx += 128) {
             const int mm = idx >> 4;
             const int rr = idx & 15;
             const int gm = m0 + mm;
             Xs[rr][mm] = (gm < M) ? x[(size_t)gm * tk * 16 + tk_i * 16 + rr] : 0.f;
         }
-        __syncthreads();
         if (tn_i < tn) {
-            const uint32_t* rg = rings[dtile];
             const int col = dtile * 16 + dc;
 #pragma unroll
             for (int z = 0; z < 2; ++z) {
                 const int dmz = dm + 2 * z;
                 float f0, f1, f2, f3;
-                pf_decode4(rg, plan[z], f0, f1, f2, f3);
+                pf_decode4_words(__ldg(tile_ring + plan[z].m0w), __ldg(tile_ring + plan[z].m1w), plan[z], f0, f1, f2, f3);
                 Ws[2 * dmz][col] = f0;
                 Ws[2 * dmz + 1][col] = f1;
                 Ws[2 * dmz + 8][col] = f2;
@@ -433,6 +523,336 @@ __global__ void __launch_bounds__(128) inkwell_exl3_gemm_narrow_core(
 }
 
 
+
+// Fused dense Hadamard-input quantization.  The output activation layout is
+// one int32 word per four K positions, ordered in the same {r, r+1, r+8, r+9}
+// groups that the EXL3 tile decoder emits.  Each 128-element Hadamard block
+// has one scale in xscale and contributes one rowsum atomically.
+extern "C" __global__ void inkwell_exl3_had_in_q8(
+        const float* __restrict__ x, const uint16_t* __restrict__ suh,
+        int32_t* __restrict__ xq, float* __restrict__ xscale,
+        float* __restrict__ rowsum, int m, int k) {
+    __shared__ float sm[128];
+    __shared__ float rmax[128];
+    __shared__ float rsum[128];
+    const int row = blockIdx.y;
+    const int seg = blockIdx.x;
+    const int base = seg * 128;
+    const int t = threadIdx.x;
+    const int e = base + t;
+    if (row >= m) return;
+    sm[t] = (e < k) ? x[(size_t)row * k + e] * __half2float(__ushort_as_half(suh[e])) : 0.f;
+    __syncthreads();
+    pf_had128_smem(sm, t);
+    const float v = sm[t] * PF_INV_SQRT128;
+    sm[t] = v;
+    rmax[t] = fabsf(v);
+    rsum[t] = v;
+    __syncthreads();
+    for (int st = 64; st > 0; st >>= 1) {
+        if (t < st) {
+            rmax[t] = fmaxf(rmax[t], rmax[t + st]);
+            rsum[t] = rsum[t] + rsum[t + st];
+        }
+        __syncthreads();
+    }
+    const float amax = rmax[0];
+    const float scale = amax * (1.0f / 127.0f);
+    const float inv = amax > 0.f ? 127.0f / amax : 0.f;
+    if (t == 0) {
+        xscale[(size_t)row * (k / 128) + seg] = scale;
+        atomicAdd(rowsum + row, rsum[0]);
+    }
+    if (t < 32) {
+        const int sub = t >> 2;
+        const int dmz = t & 3;
+        const int p0 = 16 * sub + 2 * dmz;
+        const int p1 = p0 + 1;
+        const int p2 = p0 + 8;
+        const int p3 = p0 + 9;
+        const uint32_t pack = pf_pack_q8(
+            pf_quant_i8(sm[p0], inv), pf_quant_i8(sm[p1], inv),
+            pf_quant_i8(sm[p2], inv), pf_quant_i8(sm[p3], inv));
+        xq[(size_t)row * (k >> 2) + seg * 32 + t] = (int32_t)pack;
+    }
+}
+
+// Wide dense-tile INT8 EXL3 core.  It keeps the FP32 core's BM=64/BN=64,
+// 4x8 register geometry and double-buffered ring/activation prefetch, but the
+// 16-position K tile is four packed dp4a steps instead of sixteen scalar FMA steps.
+__global__ void __launch_bounds__(128) inkwell_exl3_gemm_dp4a_wide_core(
+        const uint32_t* __restrict__ trel,
+        const int32_t* __restrict__ xq, const float* __restrict__ xscale,
+        const float* __restrict__ rowsum, float* __restrict__ y,
+        int M, int tk, int tn, int ka, int hk) {
+    constexpr int BM = 64, BN = 64, RM = 4, RN = 8;
+    constexpr int NTILE = BN / 16;
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * BM;
+    const int tn0 = blockIdx.x * NTILE;
+    const int w = pf_rbits_words(ka, hk);
+    const int r_bits = hk ? 256 * ka + 128 : 256 * ka;
+    const int nw = r_bits >> 5;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF_C = 1024.f * KINV + __half2float(__ushort_as_half(0xc931)) + 512.f * KINV;
+    const int kb = tk >> 3;
+
+    __shared__ __align__(16) uint32_t Ws[2][4][BN + 4];
+    __shared__ __align__(16) int32_t Xs[2][4][BM + 4];
+
+    const int dtile = tid >> 5;
+    const int du = tid & 31;
+    const int dc = du >> 1;
+    const int dm = du & 1;
+    PfDecodePlan plan[2];
+#pragma unroll
+    for (int z = 0; z < 2; ++z) {
+        const int dmz = dm + 2 * z;
+        const int i0 = 32 * (dc & 7) + 8 * dmz + 4 * (dc >> 3);
+        plan[z] = pf_decode_plan(i0, ka, hk, r_bits, nw);
+    }
+
+    const int ty = tid >> 3;
+    const int tx = tid & 7;
+    float acc[RM][RN];
+    int iacc[RM][RN];
+#pragma unroll
+    for (int im = 0; im < RM; ++im)
+#pragma unroll
+        for (int in = 0; in < RN; ++in) {
+            acc[im][in] = 0.f;
+            iacc[im][in] = 0;
+        }
+
+    uint4 xreg = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t rw[2][2];
+    auto load_tile = [&](int tk_i) {
+        const int tn_i = tn0 + dtile;
+        if (tid < BM) {
+            const int gm = m0 + tid;
+            xreg = (gm < M)
+                ? *(const uint4*)(xq + (size_t)gm * (tk * 4) + tk_i * 4)
+                : make_uint4(0u, 0u, 0u, 0u);
+        }
+        if (tn_i < tn) {
+            const uint32_t* tile_ring = trel + ((size_t)tk_i * tn + tn_i) * (size_t)w;
+#pragma unroll
+            for (int z = 0; z < 2; ++z) {
+                rw[z][0] = __ldg(tile_ring + plan[z].m0w);
+                rw[z][1] = __ldg(tile_ring + plan[z].m1w);
+            }
+        }
+    };
+    auto store_tile = [&](int buf) {
+        const int tn_i = tn0 + dtile;
+        if (tid < BM) {
+            const int mm = tid;
+            Xs[buf][0][mm] = (int32_t)xreg.x;
+            Xs[buf][1][mm] = (int32_t)xreg.y;
+            Xs[buf][2][mm] = (int32_t)xreg.z;
+            Xs[buf][3][mm] = (int32_t)xreg.w;
+        }
+        if (tn_i < tn) {
+            const int col = dtile * 16 + dc;
+            const int wcol = (col & 7) + (col >> 3) * 4 + ((col & 4) ? 28 : 0);
+#pragma unroll
+            for (int z = 0; z < 2; ++z) {
+                const int dmz = dm + 2 * z;
+                Ws[buf][dmz][wcol] = pf_decode4_words_q8(rw[z][0], rw[z][1], plan[z]);
+            }
+        }
+    };
+
+    load_tile(0);
+    store_tile(0);
+    __syncthreads();
+    for (int tk_i = 0; tk_i < tk; ++tk_i) {
+        const int cur = tk_i & 1;
+        const bool have_next = tk_i + 1 < tk;
+        if (have_next) load_tile(tk_i + 1);
+#pragma unroll
+        for (int k4 = 0; k4 < 4; ++k4) {
+            const int4 xv4 = *(const int4*)&Xs[cur][k4][ty * RM];
+            const int xv[RM] = {xv4.x, xv4.y, xv4.z, xv4.w};
+            const int4 wa4 = *(const int4*)&Ws[cur][k4][tx * 4];
+            const int4 wb4 = *(const int4*)&Ws[cur][k4][32 + tx * 4];
+            const uint32_t wv[RN] = {
+                (uint32_t)wa4.x, (uint32_t)wa4.y, (uint32_t)wa4.z, (uint32_t)wa4.w,
+                (uint32_t)wb4.x, (uint32_t)wb4.y, (uint32_t)wb4.z, (uint32_t)wb4.w
+            };
+#pragma unroll
+            for (int im = 0; im < RM; ++im)
+#pragma unroll
+                for (int in = 0; in < RN; ++in)
+                    iacc[im][in] = pf_dp4a_s32_s32(xv[im], wv[in], iacc[im][in]);
+        }
+        if ((tk_i & 7) == 7) {
+            const int b128 = tk_i >> 3;
+#pragma unroll
+            for (int im = 0; im < RM; ++im) {
+                const int gm = m0 + ty * RM + im;
+                const float sc = (gm < M) ? xscale[(size_t)gm * kb + b128] : 0.f;
+#pragma unroll
+                for (int in = 0; in < RN; ++in) {
+                    acc[im][in] = fmaf((float)iacc[im][in], sc, acc[im][in]);
+                    iacc[im][in] = 0;
+                }
+            }
+        }
+        if (have_next) store_tile(cur ^ 1);
+        __syncthreads();
+    }
+
+    const int N = tn * 16;
+#pragma unroll
+    for (int im = 0; im < RM; ++im) {
+        const int gm = m0 + ty * RM + im;
+        if (gm < M) {
+            const float off = KOFF_C * rowsum[gm];
+#pragma unroll
+            for (int in = 0; in < RN; ++in) {
+                const int gn = tn0 * 16 + tx * RN + in;
+                if (gn < N) y[(size_t)gm * N + gn] = fmaf(4.0f * KINV, acc[im][in], off);
+            }
+        }
+    }
+}
+
+// Narrow dense-tile INT8 core for small-N shapes; same arithmetic as the wide
+// core, with BM=32/BN=64 and a 4x4 register tile.
+__global__ void __launch_bounds__(128) inkwell_exl3_gemm_dp4a_narrow_core(
+        const uint32_t* __restrict__ trel,
+        const int32_t* __restrict__ xq, const float* __restrict__ xscale,
+        const float* __restrict__ rowsum, float* __restrict__ y,
+        int M, int tk, int tn, int ka, int hk) {
+    constexpr int BM = 32, BN = 64, RM = 4, RN = 4;
+    constexpr int NTILE = BN / 16;
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * BM;
+    const int tn0 = blockIdx.x * NTILE;
+    const int w = pf_rbits_words(ka, hk);
+    const int r_bits = hk ? 256 * ka + 128 : 256 * ka;
+    const int nw = r_bits >> 5;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF_C = 1024.f * KINV + __half2float(__ushort_as_half(0xc931)) + 512.f * KINV;
+    const int kb = tk >> 3;
+
+    __shared__ __align__(16) uint32_t Ws[2][4][BN + 4];
+    __shared__ __align__(16) int32_t Xs[2][4][BM + 4];
+
+    const int dtile = tid >> 5;
+    const int du = tid & 31;
+    const int dc = du >> 1;
+    const int dm = du & 1;
+    PfDecodePlan plan[2];
+#pragma unroll
+    for (int z = 0; z < 2; ++z) {
+        const int dmz = dm + 2 * z;
+        const int i0 = 32 * (dc & 7) + 8 * dmz + 4 * (dc >> 3);
+        plan[z] = pf_decode_plan(i0, ka, hk, r_bits, nw);
+    }
+
+    const int ty = tid >> 4;
+    const int tx = tid & 15;
+    float acc[RM][RN];
+    int iacc[RM][RN];
+#pragma unroll
+    for (int im = 0; im < RM; ++im)
+#pragma unroll
+        for (int in = 0; in < RN; ++in) {
+            acc[im][in] = 0.f;
+            iacc[im][in] = 0;
+        }
+
+    uint4 xreg = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t rw[2][2];
+    auto load_tile = [&](int tk_i) {
+        const int tn_i = tn0 + dtile;
+        if (tid < BM) {
+            const int gm = m0 + tid;
+            xreg = (gm < M)
+                ? *(const uint4*)(xq + (size_t)gm * (tk * 4) + tk_i * 4)
+                : make_uint4(0u, 0u, 0u, 0u);
+        }
+        if (tn_i < tn) {
+            const uint32_t* tile_ring = trel + ((size_t)tk_i * tn + tn_i) * (size_t)w;
+#pragma unroll
+            for (int z = 0; z < 2; ++z) {
+                rw[z][0] = __ldg(tile_ring + plan[z].m0w);
+                rw[z][1] = __ldg(tile_ring + plan[z].m1w);
+            }
+        }
+    };
+    auto store_tile = [&](int buf) {
+        const int tn_i = tn0 + dtile;
+        if (tid < BM) {
+            const int mm = tid;
+            Xs[buf][0][mm] = (int32_t)xreg.x;
+            Xs[buf][1][mm] = (int32_t)xreg.y;
+            Xs[buf][2][mm] = (int32_t)xreg.z;
+            Xs[buf][3][mm] = (int32_t)xreg.w;
+        }
+        if (tn_i < tn) {
+            const int col = dtile * 16 + dc;
+#pragma unroll
+            for (int z = 0; z < 2; ++z) {
+                const int dmz = dm + 2 * z;
+                Ws[buf][dmz][col] = pf_decode4_words_q8(rw[z][0], rw[z][1], plan[z]);
+            }
+        }
+    };
+
+    load_tile(0);
+    store_tile(0);
+    __syncthreads();
+    for (int tk_i = 0; tk_i < tk; ++tk_i) {
+        const int cur = tk_i & 1;
+        const bool have_next = tk_i + 1 < tk;
+        if (have_next) load_tile(tk_i + 1);
+#pragma unroll
+        for (int k4 = 0; k4 < 4; ++k4) {
+            const int4 xv4 = *(const int4*)&Xs[cur][k4][ty * RM];
+            const int xv[RM] = {xv4.x, xv4.y, xv4.z, xv4.w};
+            const int4 wq4 = *(const int4*)&Ws[cur][k4][tx * 4];
+            const uint32_t wv[RN] = {(uint32_t)wq4.x, (uint32_t)wq4.y, (uint32_t)wq4.z, (uint32_t)wq4.w};
+#pragma unroll
+            for (int im = 0; im < RM; ++im)
+#pragma unroll
+                for (int in = 0; in < RN; ++in)
+                    iacc[im][in] = pf_dp4a_s32_s32(xv[im], wv[in], iacc[im][in]);
+        }
+        if ((tk_i & 7) == 7) {
+            const int b128 = tk_i >> 3;
+#pragma unroll
+            for (int im = 0; im < RM; ++im) {
+                const int gm = m0 + ty * RM + im;
+                const float sc = (gm < M) ? xscale[(size_t)gm * kb + b128] : 0.f;
+#pragma unroll
+                for (int in = 0; in < RN; ++in) {
+                    acc[im][in] = fmaf((float)iacc[im][in], sc, acc[im][in]);
+                    iacc[im][in] = 0;
+                }
+            }
+        }
+        if (have_next) store_tile(cur ^ 1);
+        __syncthreads();
+    }
+
+    const int N = tn * 16;
+#pragma unroll
+    for (int im = 0; im < RM; ++im) {
+        const int gm = m0 + ty * RM + im;
+        if (gm < M) {
+            const float off = KOFF_C * rowsum[gm];
+#pragma unroll
+            for (int in = 0; in < RN; ++in) {
+                const int gn = tn0 * 16 + tx * RN + in;
+                if (gn < N) y[(size_t)gm * N + gn] = fmaf(4.0f * KINV, acc[im][in], off);
+            }
+        }
+    }
+}
+
 template<int BM>
 static inline void pf_launch_gemm_core(const uint32_t* trel, const float* xh, float* t,
         int M, int tk, int tn, int ka, int hk, cudaStream_t st) {
@@ -449,8 +869,23 @@ extern "C" void ink_launch_exl3_gemm_smem(const void* trel, const void* suh, con
     float* xh = scratch;
     float* t = scratch + (size_t)M * k;
     dim3 gi((unsigned)(k / 128), (unsigned)M);
-    inkwell_exl3_had_in_prefill<<<gi, 128, 0, st>>>(x, (const uint16_t*)suh, xh, M, (int)k);
     const int tk = (int)(k / 16), tn = (int)(n / 16);
+    const bool q8 = ink_pf_int8_enabled() && M > 32 && (k & 127) == 0;
+    if (q8) {
+        int32_t* xq = (int32_t*)scratch;
+        float* xscale = scratch + (size_t)M * k / 4;
+        float* rowsum = xscale + (size_t)M * (k / 128);
+        cudaMemsetAsync(rowsum, 0, (size_t)M * 4, st);
+        inkwell_exl3_had_in_q8<<<gi, 128, 0, st>>>(x, (const uint16_t*)suh, xq, xscale, rowsum, M, (int)k);
+        if (tn <= 72) {
+            dim3 g((tn + 3) / 4, (M + 31) / 32);
+            inkwell_exl3_gemm_dp4a_narrow_core<<<g, 128, 0, st>>>((const uint32_t*)trel, xq, xscale, rowsum, t, M, tk, tn, (int)ka, (int)halfk);
+        } else {
+            dim3 g((tn + 3) / 4, (M + 63) / 64);
+            inkwell_exl3_gemm_dp4a_wide_core<<<g, 128, 0, st>>>((const uint32_t*)trel, xq, xscale, rowsum, t, M, tk, tn, (int)ka, (int)halfk);
+        }
+    } else {
+    inkwell_exl3_had_in_prefill<<<gi, 128, 0, st>>>(x, (const uint16_t*)suh, xh, M, (int)k);
     if (M <= 4) pf_launch_gemm_core<4>((const uint32_t*)trel, xh, t, M, tk, tn, (int)ka, (int)halfk, st);
     else if (M <= 8) pf_launch_gemm_core<8>((const uint32_t*)trel, xh, t, M, tk, tn, (int)ka, (int)halfk, st);
     else if (M <= 16) pf_launch_gemm_core<16>((const uint32_t*)trel, xh, t, M, tk, tn, (int)ka, (int)halfk, st);
@@ -459,12 +894,11 @@ extern "C" void ink_launch_exl3_gemm_smem(const void* trel, const void* suh, con
         if (tn <= 72) {
             dim3 g((tn + 3) / 4, (M + 31) / 32);
             inkwell_exl3_gemm_narrow_core<<<g, 128, 0, st>>>((const uint32_t*)trel, xh, t, M, tk, tn, (int)ka, (int)halfk);
-        } else if ((int)ka >= 3 && (int)halfk) {
-            pf_launch_gemm_core<64>((const uint32_t*)trel, xh, t, M, tk, tn, (int)ka, (int)halfk, st);
         } else {
             dim3 g((tn + 3) / 4, (M + 63) / 64);
             inkwell_exl3_gemm_wide_core<<<g, 128, 0, st>>>((const uint32_t*)trel, xh, t, M, tk, tn, (int)ka, (int)halfk);
         }
+    }
     }
     dim3 go((unsigned)(n / 128), (unsigned)M);
     inkwell_exl3_had_out_prefill<<<go, 128, 0, st>>>(t, (const uint16_t*)svh, y, M, (int)n);
@@ -528,40 +962,222 @@ extern "C" __global__ void inkwell_exl3_moe_group_sort(
     }
 }
 
-// Expanded-row Hadamard input for one expert descriptor table.
+// Expanded-row Hadamard input for one expert descriptor table.  One warp
+// owns each 128-column segment; each lane owns four contiguous elements.
 extern "C" __global__ void inkwell_moe_had_in_rows(
         const uint64_t* __restrict__ descs, const int* __restrict__ tile_expert_id,
         const int* __restrict__ sorted_token, const float* __restrict__ x,
-        float* __restrict__ xh, int P, int k) {
-    __shared__ float sm[128];
-    const int row = blockIdx.y;
-    const int base = blockIdx.x * 128;
-    const int t = threadIdx.x;
-    const int e = base + t;
+        float* __restrict__ xh, int row_base, int P, int k) {
+    const int row = row_base + blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int seg = blockIdx.x * (blockDim.x >> 5) + wid;
+    const int base = seg * 128;
+    if (blockIdx.y >= P || base >= k) return;
     const int ex = tile_expert_id[row];
     const uint16_t* suh = (const uint16_t*)(uintptr_t)descs[ex * 4 + 1];
-    const float xv = (row < P && e < k) ? x[(size_t)sorted_token[row] * k + e] : 0.f;
-    sm[t] = (row < P && e < k) ? xv * __half2float(__ushort_as_half(suh[e])) : 0.f;
-    __syncthreads();
-    pf_had128_smem(sm, t);
-    if (row < P && e < k) xh[(size_t)row * k + e] = sm[t] * PF_INV_SQRT128;
+    const int e0 = base + lane * 4;
+    const float4 xv = *(const float4*)(x + (size_t)sorted_token[row] * k + e0);
+    const uint2 sv = *(const uint2*)(suh + e0);
+    float v[4];
+    v[0] = __fmul_rn(xv.x, __half2float(__ushort_as_half((uint16_t)(sv.x & 0xffffu))));
+    v[1] = __fmul_rn(xv.y, __half2float(__ushort_as_half((uint16_t)(sv.x >> 16))));
+    v[2] = __fmul_rn(xv.z, __half2float(__ushort_as_half((uint16_t)(sv.y & 0xffffu))));
+    v[3] = __fmul_rn(xv.w, __half2float(__ushort_as_half((uint16_t)(sv.y >> 16))));
+    pf_had128_warp(v, lane * 4);
+    *(float4*)(xh + (size_t)row * k + e0) = make_float4(
+        __fmul_rn(v[0], PF_INV_SQRT128), __fmul_rn(v[1], PF_INV_SQRT128),
+        __fmul_rn(v[2], PF_INV_SQRT128), __fmul_rn(v[3], PF_INV_SQRT128));
+}
+
+
+// Warp-local grouped-MoE Hadamard input with fused per-128-block INT8
+// quantization and rowsum.  xq uses the packed four-position EXL3 order.
+extern "C" __global__ void inkwell_moe_had_in_rows_q8(
+        const uint64_t* __restrict__ descs, const int* __restrict__ row_expert,
+        const int* __restrict__ sorted_token, const float* __restrict__ x,
+        int32_t* __restrict__ xq, float* __restrict__ xscale,
+        float* __restrict__ rowsum, int row_base, int P, int k) {
+    const int row = row_base + blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int seg = blockIdx.x * (blockDim.x >> 5) + wid;
+    const int base = seg * 128;
+    if (blockIdx.y >= P || base >= k) return;
+    const int ex = row_expert[row];
+    const uint16_t* suh = (const uint16_t*)(uintptr_t)descs[ex * 4 + 1];
+    const int e0 = base + lane * 4;
+    const float4 xv = *(const float4*)(x + (size_t)sorted_token[row] * k + e0);
+    const uint2 sv = *(const uint2*)(suh + e0);
+    float v[4];
+    v[0] = __fmul_rn(xv.x, __half2float(__ushort_as_half((uint16_t)(sv.x & 0xffffu))));
+    v[1] = __fmul_rn(xv.y, __half2float(__ushort_as_half((uint16_t)(sv.x >> 16))));
+    v[2] = __fmul_rn(xv.z, __half2float(__ushort_as_half((uint16_t)(sv.y & 0xffffu))));
+    v[3] = __fmul_rn(xv.w, __half2float(__ushort_as_half((uint16_t)(sv.y >> 16))));
+    pf_had128_warp(v, lane * 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = __fmul_rn(v[i], PF_INV_SQRT128);
+    float amax = 0.f, sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        amax = fmaxf(amax, fabsf(v[i]));
+        sum = __fadd_rn(sum, v[i]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    }
+    const float scale = amax * (1.0f / 127.0f);
+    const float inv = amax > 0.f ? 127.0f / amax : 0.f;
+    if (lane == 0) {
+        xscale[(size_t)row * (k / 128) + seg] = scale;
+        atomicAdd(rowsum + row, sum);
+    }
+    __shared__ float qs[4][128];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) qs[wid][lane * 4 + i] = v[i];
+    __syncwarp();
+    const int sub = lane >> 2;
+    const int dmz = lane & 3;
+    const int p0 = 16 * sub + 2 * dmz;
+    const int p1 = p0 + 1;
+    const int p2 = p0 + 8;
+    const int p3 = p0 + 9;
+    const uint32_t pack = pf_pack_q8(
+        pf_quant_i8(qs[wid][p0], inv), pf_quant_i8(qs[wid][p1], inv),
+        pf_quant_i8(qs[wid][p2], inv), pf_quant_i8(qs[wid][p3], inv));
+    xq[(size_t)row * (k >> 2) + seg * 32 + lane] = (int32_t)pack;
+}
+
+// SiTU plus down-projection Hadamard, fused with the same per-block INT8
+// quantization/layout as inkwell_moe_had_in_rows_q8.
+extern "C" __global__ void inkwell_moe_situ_had_rows_q8(
+        const uint64_t* __restrict__ descs_d, const int* __restrict__ row_expert,
+        const float* __restrict__ gu, int32_t* __restrict__ xq,
+        float* __restrict__ xscale, float* __restrict__ rowsum,
+        float beta, float lin_beta, int row_base, int P, int ncols) {
+    const int row = row_base + blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int seg = blockIdx.x * (blockDim.x >> 5) + wid;
+    const int base = seg * 128;
+    if (blockIdx.y >= P || base >= ncols) return;
+    const int ex = row_expert[row];
+    const uint16_t* suh = (const uint16_t*)(uintptr_t)descs_d[ex * 4 + 1];
+    const int e0 = base + lane * 4;
+    const float4 gv = *(const float4*)(gu + (size_t)row * 2 * ncols + e0);
+    const float4 uv = *(const float4*)(gu + (size_t)row * 2 * ncols + ncols + e0);
+    const uint2 sv = *(const uint2*)(suh + e0);
+    const float gf[4] = {gv.x, gv.y, gv.z, gv.w};
+    const float uf[4] = {uv.x, uv.y, uv.z, uv.w};
+    const uint16_t sh[4] = {
+        (uint16_t)(sv.x & 0xffffu), (uint16_t)(sv.x >> 16),
+        (uint16_t)(sv.y & 0xffffu), (uint16_t)(sv.y >> 16)
+    };
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float g = gf[i];
+        const float u = uf[i];
+        const float a = (beta * tanhf(g / beta)) / (1.0f + expf(-g));
+        const float b = lin_beta * tanhf(u / lin_beta);
+        v[i] = __fmul_rn(__fmul_rn(a, b), __half2float(__ushort_as_half(sh[i])));
+    }
+    pf_had128_warp(v, lane * 4);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = __fmul_rn(v[i], PF_INV_SQRT128);
+    float amax = 0.f, sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        amax = fmaxf(amax, fabsf(v[i]));
+        sum = __fadd_rn(sum, v[i]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    }
+    const float scale = amax * (1.0f / 127.0f);
+    const float inv = amax > 0.f ? 127.0f / amax : 0.f;
+    if (lane == 0) {
+        xscale[(size_t)row * (ncols / 128) + seg] = scale;
+        atomicAdd(rowsum + row, sum);
+    }
+    __shared__ float qs[4][128];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) qs[wid][lane * 4 + i] = v[i];
+    __syncwarp();
+    const int sub = lane >> 2;
+    const int dmz = lane & 3;
+    const int p0 = 16 * sub + 2 * dmz;
+    const int p1 = p0 + 1;
+    const int p2 = p0 + 8;
+    const int p3 = p0 + 9;
+    const uint32_t pack = pf_pack_q8(
+        pf_quant_i8(qs[wid][p0], inv), pf_quant_i8(qs[wid][p1], inv),
+        pf_quant_i8(qs[wid][p2], inv), pf_quant_i8(qs[wid][p3], inv));
+    xq[(size_t)row * (ncols >> 2) + seg * 32 + lane] = (int32_t)pack;
 }
 
 extern "C" __global__ void inkwell_moe_had_out_rows(
         const uint64_t* __restrict__ descs, const int* __restrict__ row_expert,
-        const float* __restrict__ tmat, float* __restrict__ y, int P, int n) {
-    __shared__ float sm[128];
-    const int row = blockIdx.y;
-    const int base = blockIdx.x * 128;
-    const int t = threadIdx.x;
-    const int e = base + t;
+        const float* __restrict__ tmat, float* __restrict__ y, int row_base, int P, int n) {
+    const int row = row_base + blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int seg = blockIdx.x * (blockDim.x >> 5) + wid;
+    const int base = seg * 128;
+    if (blockIdx.y >= P || base >= n) return;
     const int ex = row_expert[row];
     const uint16_t* svh = (const uint16_t*)(uintptr_t)descs[ex * 4 + 2];
-    sm[t] = (row < P && e < n) ? tmat[(size_t)row * n + e] : 0.f;
-    __syncthreads();
-    pf_had128_smem(sm, t);
-    if (row < P && e < n) y[(size_t)row * n + e] = sm[t] * PF_INV_SQRT128
-        * __half2float(__ushort_as_half(svh[e]));
+    const int e0 = base + lane * 4;
+    const float4 tv = *(const float4*)(tmat + (size_t)row * n + e0);
+    float v[4] = {tv.x, tv.y, tv.z, tv.w};
+    pf_had128_warp(v, lane * 4);
+    const uint2 sv = *(const uint2*)(svh + e0);
+    *(float4*)(y + (size_t)row * n + e0) = make_float4(
+        __fmul_rn(__fmul_rn(v[0], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.x & 0xffffu)))),
+        __fmul_rn(__fmul_rn(v[1], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.x >> 16)))),
+        __fmul_rn(__fmul_rn(v[2], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.y & 0xffffu)))),
+        __fmul_rn(__fmul_rn(v[3], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.y >> 16)))));
+}
+
+// Row sums for the EXL3 affine offset.  A 32-column tile is staged through
+// shared memory so global loads stay coalesced, but each row is still accumulated
+// in strictly ascending k order with explicit rounding.  That matches the order
+// formerly produced inside the grouped GEMM while computing the sum only once
+// per row instead of once per output-column CTA.
+__global__ void inkwell_moe_rowsum_rows(const float* __restrict__ x,
+        float* __restrict__ rowsum, int row_base, int P, int K) {
+    constexpr int ROWS = 128, KT = 32;
+    __shared__ float xs[KT][ROWS + 1];
+    const int tid = threadIdx.x;
+    const int row0 = row_base + blockIdx.x * ROWS;
+    const int row = row0 + tid;
+    const int row_end = row_base + P;
+    float acc = 0.f;
+    for (int kb = 0; kb < K; kb += KT) {
+        for (int idx = tid; idx < ROWS * KT; idx += 256) {
+            const int rr = idx >> 5;
+            const int kk = idx & 31;
+            const int gr = row0 + rr;
+            const int gk = kb + kk;
+            xs[kk][rr] = (gr < row_end && gk < K) ? x[(size_t)gr * K + gk] : 0.f;
+        }
+        __syncthreads();
+        if (tid < ROWS && row < row_end) {
+#pragma unroll
+            for (int kk = 0; kk < KT; ++kk)
+                acc = __fadd_rn(acc, xs[kk][tid]);
+        }
+        __syncthreads();
+    }
+    if (tid < ROWS && row < row_end) rowsum[row] = acc;
+}
+
+static void pf_launch_moe_rowsum(const float* x, float* rowsum, int row_base, int P, int K, cudaStream_t st) {
+    inkwell_moe_rowsum_rows<<<dim3((unsigned)((P + 127) / 128)), 256, 0, st>>>(x, rowsum, row_base, P, K);
 }
 
 // Grouped EXL3 core.  The externally visible launch contract still supplies
@@ -572,7 +1188,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
         const uint64_t* __restrict__ descs,
         const int* __restrict__ tile_expert, const int* __restrict__ tile_start,
         const int* __restrict__ tile_count, const int* __restrict__ tile_n,
-        const float* __restrict__ xh, float* __restrict__ y,
+        const float* __restrict__ xh, const float* __restrict__ rowsum, float* __restrict__ y,
         int tk, int tn, int tile_base_index, int tile_mode) {
     if (blockIdx.x & 1) return;
     constexpr int BM = 32, BN = 128, RM = 4, RN = 4;
@@ -594,9 +1210,8 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
     const int nw = r_bits >> 5;
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
-    __shared__ float Ws[16][BN + 1];
-    __shared__ float Xs[16][BM + 1];
-    __shared__ uint32_t rings[8][80];
+    __shared__ __align__(16) float Ws[2][16][BN + 4];
+    __shared__ __align__(16) float Xs[2][16][BM + 4];
 
     const int dtile = tid >> 5;
     const int du = tid & 31;
@@ -616,68 +1231,88 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
     const int N = tn * 16;
     for (int rbase = 0; rbase < rows; rbase += BM) {
         const int rcnt = min(BM, rows - rbase);
-        float acc[RM][RN];
-        float sx[RM];
-#pragma unroll
-        for (int im = 0; im < RM; ++im) {
-            sx[im] = 0.f;
-#pragma unroll
-            for (int in = 0; in < RN; ++in) acc[im][in] = 0.f;
-        }
-        for (int tk_i = 0; tk_i < tk; ++tk_i) {
+        float4 xreg = make_float4(0.f, 0.f, 0.f, 0.f);
+        uint32_t ringv = 0;
+        auto load_tile = [&](int tk_i) {
             const int tn_i = tn0 + dtile;
-            if (tn_i < tn) {
-                for (int u = du; u < w; u += 32) {
-                    rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
-                }
+            ringv = 0;
+            if (tn_i < tn && du < w) {
+                ringv = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + du);
             }
-            for (int idx = tid; idx < 16 * BM; idx += 256) {
-                const int mm = idx >> 4;
-                const int rr = idx & 15;
-                Xs[rr][mm] = (mm < rcnt) ? xh[(size_t)(row0 + rbase + mm) * K + tk_i * 16 + rr] : 0.f;
+            if (tid < 4 * BM) {
+                const int mm = tid >> 2;
+                const int rq = tid & 3;
+                xreg = (mm < rcnt)
+                    ? *(const float4*)(xh + (size_t)(row0 + rbase + mm) * K + tk_i * 16 + rq * 4)
+                    : make_float4(0.f, 0.f, 0.f, 0.f);
             }
-            __syncthreads();
+        };
+        auto store_tile = [&](int buf) {
+            const int tn_i = tn0 + dtile;
+            if (tid < 4 * BM) {
+                const int mm = tid >> 2;
+                const int rq = tid & 3;
+                Xs[buf][rq * 4][mm] = xreg.x;
+                Xs[buf][rq * 4 + 1][mm] = xreg.y;
+                Xs[buf][rq * 4 + 2][mm] = xreg.z;
+                Xs[buf][rq * 4 + 3][mm] = xreg.w;
+            }
             if (tn_i < tn) {
-                const uint32_t* rg = rings[dtile];
                 const int col = dtile * 16 + dc;
 #pragma unroll
                 for (int z = 0; z < 2; ++z) {
                     const int dmz = dm + 2 * z;
                     float f0, f1, f2, f3;
-                    pf_decode4(rg, plan[z], f0, f1, f2, f3);
-                    Ws[2 * dmz][col] = f0;
-                    Ws[2 * dmz + 1][col] = f1;
-                    Ws[2 * dmz + 8][col] = f2;
-                    Ws[2 * dmz + 9][col] = f3;
+                    const uint32_t r0 = __shfl_sync(0xffffffffu, ringv, plan[z].m0w);
+                    const uint32_t r1 = __shfl_sync(0xffffffffu, ringv, plan[z].m1w);
+                    pf_decode4_words(r0, r1, plan[z], f0, f1, f2, f3);
+                    Ws[buf][2 * dmz][col] = f0;
+                    Ws[buf][2 * dmz + 1][col] = f1;
+                    Ws[buf][2 * dmz + 8][col] = f2;
+                    Ws[buf][2 * dmz + 9][col] = f3;
                 }
             }
-            __syncthreads();
+        };
+        float acc[RM][RN];
 #pragma unroll
-            for (int r = 0; r < 16; ++r) {
-                float xv[RM];
+        for (int im = 0; im < RM; ++im) {
 #pragma unroll
-                for (int im = 0; im < RM; ++im) {
-                    xv[im] = Xs[r][ty * RM + im];
-                    sx[im] += xv[im];
+            for (int in = 0; in < RN; ++in) acc[im][in] = 0.f;
+        }
+        load_tile(0);
+        store_tile(0);
+        __syncthreads();
+        for (int tk_i = 0; tk_i < tk; ++tk_i) {
+            const int cur = tk_i & 1;
+            const bool have_next = tk_i + 1 < tk;
+            if (have_next) load_tile(tk_i + 1);
+
+            if (ty * RM < rcnt) {
+#pragma unroll
+                for (int r = 0; r < 16; ++r) {
+                    const float4 xv = *(const float4*)&Xs[cur][r][ty * RM];
+                    const float4 wq = *(const float4*)&Ws[cur][r][tx * 4];
+                    const float wv[RN] = {wq.x, wq.y, wq.z, wq.w};
+#pragma unroll
+                    for (int in = 0; in < RN; ++in) {
+                        acc[0][in] = fmaf(xv.x, wv[in], acc[0][in]);
+                        acc[1][in] = fmaf(xv.y, wv[in], acc[1][in]);
+                        acc[2][in] = fmaf(xv.z, wv[in], acc[2][in]);
+                        acc[3][in] = fmaf(xv.w, wv[in], acc[3][in]);
+                    }
                 }
-                float wv[RN];
-                for (int in = 0; in < RN; ++in) wv[in] = Ws[r][tx + in * 32];
-#pragma unroll
-                for (int im = 0; im < RM; ++im)
-#pragma unroll
-                    for (int in = 0; in < RN; ++in)
-                        acc[im][in] = fmaf(xv[im], wv[in], acc[im][in]);
             }
+            if (have_next) store_tile(cur ^ 1);
             __syncthreads();
         }
 #pragma unroll
         for (int im = 0; im < RM; ++im) {
             const int lr = rbase + ty * RM + im;
             if (lr < rows) {
-                const float off = KOFF * sx[im];
+                const float off = KOFF * rowsum[row0 + lr];
 #pragma unroll
                 for (int in = 0; in < RN; ++in) {
-                    const int gn = tn0 * 16 + tx + in * 32;
+                    const int gn = tn0 * 16 + tx * RN + in;
                     if (gn < N) y[(size_t)(row0 + lr) * N + gn] = fmaf(KINV, acc[im][in], off);
                 }
             }
@@ -686,6 +1321,336 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_kernel(
 }
 
 
+
+// Grouped INT8 EXL3 core.  This is the dp4a counterpart of the 32-row FP32
+// grouped kernel: one uint32 activation word and one uint32 weight word now
+// encode the same four K positions that fp32 processed as four scalar FMAs.
+__global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm_dp4a_kernel(
+        const uint64_t* __restrict__ descs,
+        const int* __restrict__ tile_expert, const int* __restrict__ tile_start,
+        const int* __restrict__ tile_count, const int* __restrict__ tile_n,
+        const int32_t* __restrict__ xq, const float* __restrict__ xscale,
+        const float* __restrict__ rowsum, float* __restrict__ y,
+        int tk, int tn, int tile_base_index, int tile_mode) {
+    if (blockIdx.x & 1) return;
+    constexpr int BM = 32, BN = 128, RM = 4, RN = 4;
+    const int mt = tile_base_index + blockIdx.y;
+    if (mt >= *tile_n) return;
+    const int ex = tile_expert[mt];
+    const int row0 = tile_start[mt];
+    const int rows = tile_count[mt];
+    if (tile_mode == 1 && rows > 32) return;
+    if (tile_mode == 2 && rows <= 32) return;
+    const uint64_t* d = descs + ex * 4;
+    const uint32_t* trel = (const uint32_t*)(uintptr_t)d[0];
+    const int ka = (int)(d[3] & 0xff);
+    const int hk = (int)((d[3] >> 8) & 1);
+    const int tid = threadIdx.x;
+    const int tn0 = blockIdx.x * 4;
+    const int w = pf_rbits_words(ka, hk);
+    const int r_bits = hk ? 256 * ka + 128 : 256 * ka;
+    const int nw = r_bits >> 5;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF_C = 1024.f * KINV + __half2float(__ushort_as_half(0xc931)) + 512.f * KINV;
+    const int K = tk * 16;
+    const int N = tn * 16;
+    const int kb = tk >> 3;
+    __shared__ __align__(16) uint32_t Ws[2][4][BN + 4];
+    __shared__ __align__(16) int32_t Xs[2][4][BM + 4];
+
+    const int dtile = tid >> 5;
+    const int du = tid & 31;
+    const int dc = du >> 1;
+    const int dm = du & 1;
+    PfDecodePlan plan[2];
+#pragma unroll
+    for (int z = 0; z < 2; ++z) {
+        const int dmz = dm + 2 * z;
+        const int i0 = 32 * (dc & 7) + 8 * dmz + 4 * (dc >> 3);
+        plan[z] = pf_decode_plan(i0, ka, hk, r_bits, nw);
+    }
+
+    const int ty = tid >> 5;
+    const int tx = tid & 31;
+    for (int rbase = 0; rbase < rows; rbase += BM) {
+        const int rcnt = min(BM, rows - rbase);
+        uint4 xreg = make_uint4(0u, 0u, 0u, 0u);
+        uint32_t ringv = 0;
+        auto load_tile = [&](int tk_i) {
+            const int tn_i = tn0 + dtile;
+            ringv = 0;
+            if (tn_i < tn && du < w)
+                ringv = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + du);
+            if (tid < BM) {
+                const int mm = tid;
+                xreg = (mm < rcnt)
+                    ? *(const uint4*)(xq + (size_t)(row0 + rbase + mm) * (tk * 4) + tk_i * 4)
+                    : make_uint4(0u, 0u, 0u, 0u);
+            }
+        };
+        auto store_tile = [&](int buf) {
+            const int tn_i = tn0 + dtile;
+            if (tid < BM) {
+                const int mm = tid;
+                Xs[buf][0][mm] = (int32_t)xreg.x;
+                Xs[buf][1][mm] = (int32_t)xreg.y;
+                Xs[buf][2][mm] = (int32_t)xreg.z;
+                Xs[buf][3][mm] = (int32_t)xreg.w;
+            }
+            if (tn_i < tn) {
+                const int col = dtile * 16 + dc;
+#pragma unroll
+                for (int z = 0; z < 2; ++z) {
+                    const int dmz = dm + 2 * z;
+                    const uint32_t r0 = __shfl_sync(0xffffffffu, ringv, plan[z].m0w);
+                    const uint32_t r1 = __shfl_sync(0xffffffffu, ringv, plan[z].m1w);
+                    Ws[buf][dmz][col] = pf_decode4_words_q8(r0, r1, plan[z]);
+                }
+            }
+        };
+        float acc[RM][RN];
+        int iacc[RM][RN];
+#pragma unroll
+        for (int im = 0; im < RM; ++im)
+#pragma unroll
+            for (int in = 0; in < RN; ++in) {
+                acc[im][in] = 0.f;
+                iacc[im][in] = 0;
+            }
+        load_tile(0);
+        store_tile(0);
+        __syncthreads();
+        for (int tk_i = 0; tk_i < tk; ++tk_i) {
+            const int cur = tk_i & 1;
+            const bool have_next = tk_i + 1 < tk;
+            if (have_next) load_tile(tk_i + 1);
+
+            if (ty * RM < rcnt) {
+#pragma unroll
+                for (int k4 = 0; k4 < 4; ++k4) {
+                    const int4 xv = *(const int4*)&Xs[cur][k4][ty * RM];
+                    const int4 wq = *(const int4*)&Ws[cur][k4][tx * 4];
+                    const uint32_t wv[RN] = {(uint32_t)wq.x, (uint32_t)wq.y, (uint32_t)wq.z, (uint32_t)wq.w};
+#pragma unroll
+                    for (int in = 0; in < RN; ++in) {
+                        iacc[0][in] = pf_dp4a_s32_s32(xv.x, wv[in], iacc[0][in]);
+                        iacc[1][in] = pf_dp4a_s32_s32(xv.y, wv[in], iacc[1][in]);
+                        iacc[2][in] = pf_dp4a_s32_s32(xv.z, wv[in], iacc[2][in]);
+                        iacc[3][in] = pf_dp4a_s32_s32(xv.w, wv[in], iacc[3][in]);
+                    }
+                }
+            }
+            if ((tk_i & 7) == 7) {
+                const int b128 = tk_i >> 3;
+#pragma unroll
+                for (int im = 0; im < RM; ++im) {
+                    const int lr = rbase + ty * RM + im;
+                    const float sc = (lr < rows)
+                        ? xscale[(size_t)(row0 + lr) * kb + b128] : 0.f;
+#pragma unroll
+                    for (int in = 0; in < RN; ++in) {
+                        acc[im][in] = fmaf((float)iacc[im][in], sc, acc[im][in]);
+                        iacc[im][in] = 0;
+                    }
+                }
+            }
+            if (have_next) store_tile(cur ^ 1);
+            __syncthreads();
+        }
+#pragma unroll
+        for (int im = 0; im < RM; ++im) {
+            const int lr = rbase + ty * RM + im;
+            if (lr < rows) {
+                const float off = KOFF_C * rowsum[row0 + lr];
+#pragma unroll
+                for (int in = 0; in < RN; ++in) {
+                    const int gn = tn0 * 16 + tx * RN + in;
+                    if (gn < N) y[(size_t)(row0 + lr) * N + gn] = fmaf(4.0f * KINV, acc[im][in], off);
+                }
+            }
+        }
+    }
+}
+
+
+// 64-row grouped INT8 core.  It is the dp4a analogue of the FP32 weight-reuse
+// kernel: both 32-row halves share each decoded packed weight tile.
+__global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_dp4a_kernel(
+        const uint64_t* __restrict__ descs,
+        const int* __restrict__ tile_expert, const int* __restrict__ tile_start,
+        const int* __restrict__ tile_count, const int* __restrict__ tile_n,
+        const int32_t* __restrict__ xq, const float* __restrict__ xscale,
+        const float* __restrict__ rowsum, float* __restrict__ y,
+        int tk, int tn, int tile_base_index, int tile_mode) {
+    if (blockIdx.x & 1) return;
+    constexpr int BM = 64, BN = 128, RM = 4, RN = 4;
+    const int mt = tile_base_index + blockIdx.y;
+    if (mt >= *tile_n) return;
+    const int ex = tile_expert[mt];
+    const int row0 = tile_start[mt];
+    const int rows = tile_count[mt];
+    if (tile_mode == 1 && rows > 32) return;
+    if (tile_mode == 2 && rows <= 32) return;
+    const uint64_t* d = descs + ex * 4;
+    const uint32_t* trel = (const uint32_t*)(uintptr_t)d[0];
+    const int ka = (int)(d[3] & 0xff);
+    const int hk = (int)((d[3] >> 8) & 1);
+    const int tid = threadIdx.x;
+    const int tn0 = blockIdx.x * 4;
+    const int w = pf_rbits_words(ka, hk);
+    const int r_bits = hk ? 256 * ka + 128 : 256 * ka;
+    const int nw = r_bits >> 5;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF_C = 1024.f * KINV + __half2float(__ushort_as_half(0xc931)) + 512.f * KINV;
+    const int N = tn * 16;
+    const int kb = tk >> 3;
+    __shared__ __align__(16) uint32_t Ws[2][4][BN + 4];
+    __shared__ __align__(16) int32_t Xs[2][4][BM + 4];
+
+    const int dtile = tid >> 5;
+    const int du = tid & 31;
+    const int dc = du >> 1;
+    const int dm = du & 1;
+    PfDecodePlan plan[2];
+#pragma unroll
+    for (int z = 0; z < 2; ++z) {
+        const int dmz = dm + 2 * z;
+        const int i0 = 32 * (dc & 7) + 8 * dmz + 4 * (dc >> 3);
+        plan[z] = pf_decode_plan(i0, ka, hk, r_bits, nw);
+    }
+    const int ty = tid >> 5;
+    const int tx = tid & 31;
+    for (int rbase = 0; rbase < rows; rbase += BM) {
+        const int rcnt = min(BM, rows - rbase);
+        uint4 xreg = make_uint4(0u, 0u, 0u, 0u);
+        uint32_t ringv = 0;
+        auto load_tile = [&](int tk_i) {
+            const int tn_i = tn0 + dtile;
+            ringv = 0;
+            if (tn_i < tn && du < w)
+                ringv = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + du);
+            if (tid < BM) {
+                const int mm = tid;
+                xreg = (mm < rcnt)
+                    ? *(const uint4*)(xq + (size_t)(row0 + rbase + mm) * (tk * 4) + tk_i * 4)
+                    : make_uint4(0u, 0u, 0u, 0u);
+            }
+        };
+        auto store_tile = [&](int buf) {
+            const int tn_i = tn0 + dtile;
+            if (tid < BM) {
+                const int mm = tid;
+                Xs[buf][0][mm] = (int32_t)xreg.x;
+                Xs[buf][1][mm] = (int32_t)xreg.y;
+                Xs[buf][2][mm] = (int32_t)xreg.z;
+                Xs[buf][3][mm] = (int32_t)xreg.w;
+            }
+            if (tn_i < tn) {
+                const int col = dtile * 16 + dc;
+#pragma unroll
+                for (int z = 0; z < 2; ++z) {
+                    const int dmz = dm + 2 * z;
+                    const uint32_t r0 = __shfl_sync(0xffffffffu, ringv, plan[z].m0w);
+                    const uint32_t r1 = __shfl_sync(0xffffffffu, ringv, plan[z].m1w);
+                    Ws[buf][dmz][col] = pf_decode4_words_q8(r0, r1, plan[z]);
+                }
+            }
+        };
+        float acc[2][RM][RN];
+        int iacc[2][RM][RN];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int im = 0; im < RM; ++im)
+#pragma unroll
+                for (int in = 0; in < RN; ++in) {
+                    acc[h][im][in] = 0.f;
+                    iacc[h][im][in] = 0;
+                }
+        load_tile(0);
+        store_tile(0);
+        __syncthreads();
+        for (int tk_i = 0; tk_i < tk; ++tk_i) {
+            const int cur = tk_i & 1;
+            const bool have_next = tk_i + 1 < tk;
+            if (have_next) load_tile(tk_i + 1);
+            if (rcnt > 32) {
+                const bool valid1 = 32 + ty * RM < rcnt;
+#pragma unroll
+                for (int k4 = 0; k4 < 4; ++k4) {
+                    const int4 x0v = *(const int4*)&Xs[cur][k4][ty * RM];
+                    const int4 x1v = *(const int4*)&Xs[cur][k4][32 + ty * RM];
+                    const int4 wq = *(const int4*)&Ws[cur][k4][tx * 4];
+                    const uint32_t wv[RN] = {(uint32_t)wq.x, (uint32_t)wq.y, (uint32_t)wq.z, (uint32_t)wq.w};
+#pragma unroll
+                    for (int in = 0; in < RN; ++in) {
+                        iacc[0][0][in] = pf_dp4a_s32_s32(x0v.x, wv[in], iacc[0][0][in]);
+                        iacc[0][1][in] = pf_dp4a_s32_s32(x0v.y, wv[in], iacc[0][1][in]);
+                        iacc[0][2][in] = pf_dp4a_s32_s32(x0v.z, wv[in], iacc[0][2][in]);
+                        iacc[0][3][in] = pf_dp4a_s32_s32(x0v.w, wv[in], iacc[0][3][in]);
+                        if (valid1) {
+                            iacc[1][0][in] = pf_dp4a_s32_s32(x1v.x, wv[in], iacc[1][0][in]);
+                            iacc[1][1][in] = pf_dp4a_s32_s32(x1v.y, wv[in], iacc[1][1][in]);
+                            iacc[1][2][in] = pf_dp4a_s32_s32(x1v.z, wv[in], iacc[1][2][in]);
+                            iacc[1][3][in] = pf_dp4a_s32_s32(x1v.w, wv[in], iacc[1][3][in]);
+                        }
+                    }
+                }
+            } else if (ty * RM < rcnt) {
+#pragma unroll
+                for (int k4 = 0; k4 < 4; ++k4) {
+                    const int4 x0v = *(const int4*)&Xs[cur][k4][ty * RM];
+                    const int4 wq = *(const int4*)&Ws[cur][k4][tx * 4];
+                    const uint32_t wv[RN] = {(uint32_t)wq.x, (uint32_t)wq.y, (uint32_t)wq.z, (uint32_t)wq.w};
+#pragma unroll
+                    for (int in = 0; in < RN; ++in) {
+                        iacc[0][0][in] = pf_dp4a_s32_s32(x0v.x, wv[in], iacc[0][0][in]);
+                        iacc[0][1][in] = pf_dp4a_s32_s32(x0v.y, wv[in], iacc[0][1][in]);
+                        iacc[0][2][in] = pf_dp4a_s32_s32(x0v.z, wv[in], iacc[0][2][in]);
+                        iacc[0][3][in] = pf_dp4a_s32_s32(x0v.w, wv[in], iacc[0][3][in]);
+                    }
+                }
+            }
+            if ((tk_i & 7) == 7) {
+                const int b128 = tk_i >> 3;
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int im = 0; im < RM; ++im) {
+                        const int lr = rbase + h * 32 + ty * RM + im;
+                        const float sc = (lr < rows)
+                            ? xscale[(size_t)(row0 + lr) * kb + b128] : 0.f;
+#pragma unroll
+                        for (int in = 0; in < RN; ++in) {
+                            acc[h][im][in] = fmaf((float)iacc[h][im][in], sc, acc[h][im][in]);
+                            iacc[h][im][in] = 0;
+                        }
+                    }
+            }
+            if (have_next) store_tile(cur ^ 1);
+            __syncthreads();
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int im = 0; im < RM; ++im) {
+                const int lr = rbase + h * 32 + ty * RM + im;
+                if (lr < rows) {
+                    const float off = KOFF_C * rowsum[row0 + lr];
+#pragma unroll
+                    for (int in = 0; in < RN; ++in) {
+                        const int gn = tn0 * 16 + tx * RN + in;
+                        if (gn < N) y[(size_t)(row0 + lr) * N + gn] = fmaf(4.0f * KINV, acc[h][im][in], off);
+                    }
+                }
+            }
+    }
+}
+
+// Experimental 64-row grouped core.  It keeps one decoded weight tile in
+// shared memory live for both 32-row halves of a tile instead of rereading the
+// compressed weights for the second half.  The launch contract and output
+// order are the same as inkwell_exl3_moe_grouped_gemm_kernel.
 // Experimental 64-row grouped core.  It keeps one decoded weight tile in
 // shared memory live for both 32-row halves of a tile instead of rereading the
 // compressed weights for the second half.  The launch contract and output
@@ -694,7 +1659,7 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
         const uint64_t* __restrict__ descs,
         const int* __restrict__ tile_expert, const int* __restrict__ tile_start,
         const int* __restrict__ tile_count, const int* __restrict__ tile_n,
-        const float* __restrict__ xh, float* __restrict__ y,
+        const float* __restrict__ xh, const float* __restrict__ rowsum, float* __restrict__ y,
         int tk, int tn, int tile_base_index, int tile_mode) {
     if (blockIdx.x & 1) return;
     constexpr int BM = 64, BN = 128, RM = 4, RN = 4;
@@ -716,9 +1681,8 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
     const int nw = r_bits >> 5;
     const float KINV = __half2float(__ushort_as_half(0x1eee));
     const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
-    __shared__ float Ws[16][BN + 1];
-    __shared__ float Xs[16][BM + 1];
-    __shared__ uint32_t rings[8][80];
+    __shared__ __align__(16) float Ws[2][16][BN + 4];
+    __shared__ __align__(16) float Xs[2][16][BM + 4];
 
     const int dtile = tid >> 5;
     const int du = tid & 31;
@@ -738,77 +1702,104 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
     const int N = tn * 16;
     for (int rbase = 0; rbase < rows; rbase += BM) {
         const int rcnt = min(BM, rows - rbase);
-        float acc[2][RM][RN];
-        float sx[2][RM];
-#pragma unroll
-        for (int h = 0; h < 2; ++h)
-#pragma unroll
-            for (int im = 0; im < RM; ++im) {
-                sx[h][im] = 0.f;
-#pragma unroll
-                for (int in = 0; in < RN; ++in) acc[h][im][in] = 0.f;
-            }
-        for (int tk_i = 0; tk_i < tk; ++tk_i) {
+        float4 xreg = make_float4(0.f, 0.f, 0.f, 0.f);
+        uint32_t ringv = 0;
+        auto load_tile = [&](int tk_i) {
             const int tn_i = tn0 + dtile;
-            if (tn_i < tn) {
-                for (int u = du; u < w; u += 32) {
-                    rings[dtile][u] = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + u);
-                }
+            ringv = 0;
+            if (tn_i < tn && du < w) {
+                ringv = __ldg(trel + ((size_t)tk_i * tn + tn_i) * (size_t)w + du);
             }
-            for (int idx = tid; idx < 16 * BM; idx += 256) {
-                const int mm = idx >> 4;
-                const int rr = idx & 15;
-                Xs[rr][mm] = (mm < rcnt) ? xh[(size_t)(row0 + rbase + mm) * K + tk_i * 16 + rr] : 0.f;
+            if (tid < 4 * BM) {
+                const int mm = tid >> 2;
+                const int rq = tid & 3;
+                xreg = (mm < rcnt)
+                    ? *(const float4*)(xh + (size_t)(row0 + rbase + mm) * K + tk_i * 16 + rq * 4)
+                    : make_float4(0.f, 0.f, 0.f, 0.f);
             }
-            __syncthreads();
+        };
+        auto store_tile = [&](int buf) {
+            const int tn_i = tn0 + dtile;
+            if (tid < 4 * BM) {
+                const int mm = tid >> 2;
+                const int rq = tid & 3;
+                Xs[buf][rq * 4][mm] = xreg.x;
+                Xs[buf][rq * 4 + 1][mm] = xreg.y;
+                Xs[buf][rq * 4 + 2][mm] = xreg.z;
+                Xs[buf][rq * 4 + 3][mm] = xreg.w;
+            }
             if (tn_i < tn) {
-                const uint32_t* rg = rings[dtile];
                 const int col = dtile * 16 + dc;
 #pragma unroll
                 for (int z = 0; z < 2; ++z) {
                     const int dmz = dm + 2 * z;
                     float f0, f1, f2, f3;
-                    pf_decode4(rg, plan[z], f0, f1, f2, f3);
-                    Ws[2 * dmz][col] = f0;
-                    Ws[2 * dmz + 1][col] = f1;
-                    Ws[2 * dmz + 8][col] = f2;
-                    Ws[2 * dmz + 9][col] = f3;
+                    const uint32_t r0 = __shfl_sync(0xffffffffu, ringv, plan[z].m0w);
+                    const uint32_t r1 = __shfl_sync(0xffffffffu, ringv, plan[z].m1w);
+                    pf_decode4_words(r0, r1, plan[z], f0, f1, f2, f3);
+                    Ws[buf][2 * dmz][col] = f0;
+                    Ws[buf][2 * dmz + 1][col] = f1;
+                    Ws[buf][2 * dmz + 8][col] = f2;
+                    Ws[buf][2 * dmz + 9][col] = f3;
                 }
             }
-            __syncthreads();
+        };
+        float acc[2][RM][RN];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int im = 0; im < RM; ++im) {
+#pragma unroll
+                for (int in = 0; in < RN; ++in) acc[h][im][in] = 0.f;
+            }
+        load_tile(0);
+        store_tile(0);
+        __syncthreads();
+        for (int tk_i = 0; tk_i < tk; ++tk_i) {
+            const int cur = tk_i & 1;
+            const bool have_next = tk_i + 1 < tk;
+            if (have_next) load_tile(tk_i + 1);
+
             if (rcnt > 32) {
+                const bool valid1 = 32 + ty * RM < rcnt;
 #pragma unroll
                 for (int r = 0; r < 16; ++r) {
-                    float wv[RN];
-                    for (int in = 0; in < RN; ++in) wv[in] = Ws[r][tx + in * 32];
+                    const float4 wq = *(const float4*)&Ws[cur][r][tx * 4];
+                    const float wv[RN] = {wq.x, wq.y, wq.z, wq.w};
+                    const float4 x0v = *(const float4*)&Xs[cur][r][ty * RM];
+                    const float4 x1v = *(const float4*)&Xs[cur][r][32 + ty * RM];
 #pragma unroll
                     for (int im = 0; im < RM; ++im) {
-                        const float x0 = Xs[r][ty * RM + im];
-                        const float x1 = Xs[r][32 + ty * RM + im];
-                        sx[0][im] += x0;
-                        sx[1][im] += x1;
+                        const float x0 = (im == 0) ? x0v.x : (im == 1) ? x0v.y : (im == 2) ? x0v.z : x0v.w;
 #pragma unroll
-                        for (int in = 0; in < RN; ++in) {
+                        for (int in = 0; in < RN; ++in)
                             acc[0][im][in] = fmaf(x0, wv[in], acc[0][im][in]);
-                            acc[1][im][in] = fmaf(x1, wv[in], acc[1][im][in]);
+                        if (valid1) {
+                            const float x1 = (im == 0) ? x1v.x : (im == 1) ? x1v.y : (im == 2) ? x1v.z : x1v.w;
+#pragma unroll
+                            for (int in = 0; in < RN; ++in)
+                                acc[1][im][in] = fmaf(x1, wv[in], acc[1][im][in]);
                         }
                     }
                 }
             } else {
+                if (ty * RM < rcnt) {
 #pragma unroll
-                for (int r = 0; r < 16; ++r) {
-                    float wv[RN];
-                    for (int in = 0; in < RN; ++in) wv[in] = Ws[r][tx + in * 32];
+                    for (int r = 0; r < 16; ++r) {
+                        const float4 wq = *(const float4*)&Ws[cur][r][tx * 4];
+                        const float wv[RN] = {wq.x, wq.y, wq.z, wq.w};
+                        const float4 x0v = *(const float4*)&Xs[cur][r][ty * RM];
 #pragma unroll
-                    for (int im = 0; im < RM; ++im) {
-                        const float x0 = Xs[r][ty * RM + im];
-                        sx[0][im] += x0;
+                        for (int im = 0; im < RM; ++im) {
+                            const float x0 = (im == 0) ? x0v.x : (im == 1) ? x0v.y : (im == 2) ? x0v.z : x0v.w;
 #pragma unroll
-                        for (int in = 0; in < RN; ++in)
-                            acc[0][im][in] = fmaf(x0, wv[in], acc[0][im][in]);
+                            for (int in = 0; in < RN; ++in)
+                                acc[0][im][in] = fmaf(x0, wv[in], acc[0][im][in]);
+                        }
                     }
                 }
             }
+            if (have_next) store_tile(cur ^ 1);
             __syncthreads();
         }
 #pragma unroll
@@ -817,10 +1808,10 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
             for (int im = 0; im < RM; ++im) {
                 const int lr = rbase + h * 32 + ty * RM + im;
                 if (lr < rows) {
-                    const float off = KOFF * sx[h][im];
+                    const float off = KOFF * rowsum[row0 + lr];
 #pragma unroll
                     for (int in = 0; in < RN; ++in) {
-                        const int gn = tn0 * 16 + tx + in * 32;
+                        const int gn = tn0 * 16 + tx * RN + in;
                         if (gn < N) y[(size_t)(row0 + lr) * N + gn] = fmaf(KINV, acc[h][im][in], off);
                     }
                 }
@@ -834,26 +1825,38 @@ __global__ void __launch_bounds__(256) inkwell_exl3_moe_grouped_gemm64_kernel(
 extern "C" __global__ void inkwell_moe_situ_had_rows(
         const uint64_t* __restrict__ descs_d, const int* __restrict__ row_expert,
         const float* __restrict__ gu, float* __restrict__ xh,
-        float beta, float lin_beta, int P, int ncols) {
-    __shared__ float sm[128];
-    const int row = blockIdx.y;
-    const int base = blockIdx.x * 128;
-    const int t = threadIdx.x;
-    const int e = base + t;
+        float beta, float lin_beta, int row_base, int P, int ncols) {
+    const int row = row_base + blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int seg = blockIdx.x * (blockDim.x >> 5) + wid;
+    const int base = seg * 128;
+    if (blockIdx.y >= P || base >= ncols) return;
     const int ex = row_expert[row];
     const uint16_t* suh = (const uint16_t*)(uintptr_t)descs_d[ex * 4 + 1];
-    float v = 0.f;
-    if (row < P && e < ncols) {
-        const float g = gu[(size_t)row * 2 * ncols + e];
-        const float u = gu[(size_t)row * 2 * ncols + ncols + e];
+    const int e0 = base + lane * 4;
+    const float4 gv = *(const float4*)(gu + (size_t)row * 2 * ncols + e0);
+    const float4 uv = *(const float4*)(gu + (size_t)row * 2 * ncols + ncols + e0);
+    const uint2 sv = *(const uint2*)(suh + e0);
+    const float gf[4] = {gv.x, gv.y, gv.z, gv.w};
+    const float uf[4] = {uv.x, uv.y, uv.z, uv.w};
+    const uint16_t sh[4] = {
+        (uint16_t)(sv.x & 0xffffu), (uint16_t)(sv.x >> 16),
+        (uint16_t)(sv.y & 0xffffu), (uint16_t)(sv.y >> 16)
+    };
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float g = gf[i];
+        const float u = uf[i];
         const float a = (beta * tanhf(g / beta)) / (1.0f + expf(-g));
         const float b = lin_beta * tanhf(u / lin_beta);
-        v = (a * b) * __half2float(__ushort_as_half(suh[e]));
+        v[i] = __fmul_rn(__fmul_rn(a, b), __half2float(__ushort_as_half(sh[i])));
     }
-    sm[t] = v;
-    __syncthreads();
-    pf_had128_smem(sm, t);
-    if (row < P && e < ncols) xh[(size_t)row * ncols + e] = sm[t] * PF_INV_SQRT128;
+    pf_had128_warp(v, lane * 4);
+    *(float4*)(xh + (size_t)row * ncols + e0) = make_float4(
+        __fmul_rn(v[0], PF_INV_SQRT128), __fmul_rn(v[1], PF_INV_SQRT128),
+        __fmul_rn(v[2], PF_INV_SQRT128), __fmul_rn(v[3], PF_INV_SQRT128));
 }
 
 // Deterministic weighted scatter: each token reduces its eight slots in the
@@ -885,25 +1888,40 @@ extern "C" void ink_launch_exl3_moe_group_sort(const int* ids, const float* weig
 }
 
 __global__ void inkwell_moe_fill_row_expert(const int*, const int*, const int*, const int*, int*);
-__global__ void inkwell_moe_had_out_pair_rows(const uint64_t*, const uint64_t*, const int*, const float*, const float*, float*, int, int);
+__global__ void inkwell_moe_had_out_pair_rows(const uint64_t*, const uint64_t*, const int*, const float*, const float*, float*, int, int, int);
+
+static void pf_launch_grouped_gemm_dp4a(bool bm64, dim3 g, const void* descs,
+        const int* tile_expert, const int* tile_start, const int* tile_count, const int* tile_n,
+        const int32_t* xq, const float* xscale, const float* rowsum, float* y,
+        int tk, int tn, int tile_base, cudaStream_t st) {
+    if (bm64) {
+        inkwell_exl3_moe_grouped_gemm_dp4a_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+            tile_expert, tile_start, tile_count, tile_n, xq, xscale, rowsum, y, tk, tn, tile_base, 1);
+        inkwell_exl3_moe_grouped_gemm64_dp4a_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+            tile_expert, tile_start, tile_count, tile_n, xq, xscale, rowsum, y, tk, tn, tile_base, 2);
+    } else {
+        inkwell_exl3_moe_grouped_gemm_dp4a_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
+            tile_expert, tile_start, tile_count, tile_n, xq, xscale, rowsum, y, tk, tn, tile_base, 0);
+    }
+}
 
 static void pf_launch_grouped_gemm_kernel(bool bm64, dim3 g, const void* descs,
         const int* tile_expert, const int* tile_start, const int* tile_count, const int* tile_n,
-        const float* xh, float* y, int tk, int tn, cudaStream_t st) {
+        const float* xh, const float* rowsum, float* y, int tk, int tn, int tile_base, cudaStream_t st) {
     if (bm64) {
         const char* ae = getenv("INKWELL_PF_MOE_ADAPT");
         if (ae == nullptr || ae[0] != '0') {
             inkwell_exl3_moe_grouped_gemm_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
-                tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 1);
+                tile_expert, tile_start, tile_count, tile_n, xh, rowsum, y, tk, tn, tile_base, 1);
             inkwell_exl3_moe_grouped_gemm64_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
-                tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 2);
+                tile_expert, tile_start, tile_count, tile_n, xh, rowsum, y, tk, tn, tile_base, 2);
         } else {
             inkwell_exl3_moe_grouped_gemm64_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
-                tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 0);
+                tile_expert, tile_start, tile_count, tile_n, xh, rowsum, y, tk, tn, tile_base, 0);
         }
     } else {
         inkwell_exl3_moe_grouped_gemm_kernel<<<g, 256, 0, st>>>((const uint64_t*)descs,
-            tile_expert, tile_start, tile_count, tile_n, xh, y, tk, tn, 0, 0);
+            tile_expert, tile_start, tile_count, tile_n, xh, rowsum, y, tk, tn, tile_base, 0);
     }
 }
 
@@ -913,9 +1931,10 @@ static void pf_launch_grouped_gemm_kernel(bool bm64, dim3 g, const void* descs,
 // share those three regions: xhg=A, xhu=B, tg/tu=T, gu=A, xhd=B, td=A,
 // dn=T.  Peak MoE scratch is therefore 3*P*2304 floats rather than the
 // naive Phase-1 layout; Phase 2 still owns the arena and expert streaming.
-extern "C" void ink_launch_exl3_moe_grouped_gemm(
+extern "C" void ink_launch_exl3_moe_grouped_gemm_batch(
         const void* descs_g, const void* descs_u, const void* descs_d,
-        const float* x, int C,
+        const float* x, int C, int row_base, int batch_rows,
+        int tile_base, int tile_batches, int do_scatter, int separate_dn,
         const int* sorted_token, const int* tile_expert, const int* tile_start,
         const int* tile_count, const int* tile_n,
         const float* sorted_weight, const int* inverse_row,
@@ -930,37 +1949,89 @@ extern "C" void ink_launch_exl3_moe_grouped_gemm(
     float* gu = xhg;
     float* xhd = xhu;
     float* td = xhg;
-    float* dn = tg;
+    float* rowsum = out;
     int* row_expert = (int*)(tg + (size_t)P * (2 * NG));
+    float* dn_sep = (float*)(((uintptr_t)(row_expert + P) + 15) & ~(uintptr_t)15);
+    float* dn = separate_dn ? dn_sep : tg;
     // row_expert is derived on-device: one row per expanded selection.
     // tile_start/count are inclusive contiguous ranges; expand them with a tiny kernel below.
     inkwell_moe_fill_row_expert<<<256, 64, 0, st>>>(tile_expert, tile_start, tile_count, tile_n, row_expert);
-
-    dim3 hig(KG / 128, P), hug(KG / 128, P);
-    inkwell_moe_had_in_rows<<<hig, 128, 0, st>>>((const uint64_t*)descs_g, row_expert, sorted_token, x, xhg, P, KG);
-    inkwell_moe_had_in_rows<<<hug, 128, 0, st>>>((const uint64_t*)descs_u, row_expert, sorted_token, x, xhu, P, KG);
-    const int max_tiles = P / 64 + 128;
+    if (batch_rows > 0 && tile_batches > 0) {
+    dim3 hig((KG / 128 + 3) / 4, batch_rows), hug((KG / 128 + 3) / 4, batch_rows);
     const char* bm64e = getenv("INKWELL_PF_MOE_BM64");
     const bool bm64 = bm64e == nullptr || bm64e[0] != '0';
-    dim3 gg((NG / 16 + 3) / 4, max_tiles);
+    const bool q8 = ink_pf_int8_enabled();
+    dim3 gg((NG / 16 + 3) / 4, tile_batches);
+    dim3 gd((ND / 16 + 3) / 4, tile_batches);
+    if (q8) {
+        int32_t* xqg = (int32_t*)xhg;
+        int32_t* xqu = (int32_t*)xhu;
+        int32_t* xqd = (int32_t*)xhd;
+        float* xsg = xhg + (size_t)P * KG / 4;
+        float* xsu = xhu + (size_t)P * KG / 4;
+        float* xsd = xhu + (size_t)P * NG / 4;
+        cudaMemsetAsync(rowsum + row_base, 0, (size_t)batch_rows * 4, st);
+        inkwell_moe_had_in_rows_q8<<<hig, 128, 0, st>>>((const uint64_t*)descs_g, row_expert, sorted_token, x,
+            xqg, xsg, rowsum, row_base, batch_rows, KG);
+        pf_launch_grouped_gemm_dp4a(bm64, gg, descs_g, tile_expert, tile_start, tile_count, tile_n,
+            xqg, xsg, rowsum, tg, KG / 16, NG / 16, tile_base, st);
+        cudaMemsetAsync(rowsum + row_base, 0, (size_t)batch_rows * 4, st);
+        inkwell_moe_had_in_rows_q8<<<hug, 128, 0, st>>>((const uint64_t*)descs_u, row_expert, sorted_token, x,
+            xqu, xsu, rowsum, row_base, batch_rows, KG);
+        pf_launch_grouped_gemm_dp4a(bm64, gg, descs_u, tile_expert, tile_start, tile_count, tile_n,
+            xqu, xsu, rowsum, tu, KG / 16, NG / 16, tile_base, st);
+        dim3 hog((NG / 128 + 3) / 4, batch_rows, 2);
+        inkwell_moe_had_out_pair_rows<<<hog, 128, 0, st>>>((const uint64_t*)descs_g, (const uint64_t*)descs_u,
+            row_expert, tg, tu, gu, row_base, batch_rows, NG);
+        dim3 hd((NG / 128 + 3) / 4, batch_rows);
+        cudaMemsetAsync(rowsum + row_base, 0, (size_t)batch_rows * 4, st);
+        inkwell_moe_situ_had_rows_q8<<<hd, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, gu,
+            xqd, xsd, rowsum, 4.f, 25.f, row_base, batch_rows, NG);
+        pf_launch_grouped_gemm_dp4a(bm64, gd, descs_d, tile_expert, tile_start, tile_count, tile_n,
+            xqd, xsd, rowsum, td, NG / 16, ND / 16, tile_base, st);
+        dim3 hod((ND / 128 + 3) / 4, batch_rows);
+        inkwell_moe_had_out_rows<<<hod, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, td, dn, row_base, batch_rows, ND);
+    } else {
+    inkwell_moe_had_in_rows<<<hig, 128, 0, st>>>((const uint64_t*)descs_g, row_expert, sorted_token, x, xhg, row_base, batch_rows, KG);
+    pf_launch_moe_rowsum(xhg, rowsum, row_base, batch_rows, KG, st);
     pf_launch_grouped_gemm_kernel(bm64, gg, descs_g,
-        tile_expert, tile_start, tile_count, tile_n, xhg, tg, KG / 16, NG / 16, st);
+        tile_expert, tile_start, tile_count, tile_n, xhg, rowsum, tg, KG / 16, NG / 16, tile_base, st);
+    inkwell_moe_had_in_rows<<<hug, 128, 0, st>>>((const uint64_t*)descs_u, row_expert, sorted_token, x, xhu, row_base, batch_rows, KG);
+    pf_launch_moe_rowsum(xhu, rowsum, row_base, batch_rows, KG, st);
     pf_launch_grouped_gemm_kernel(bm64, gg, descs_u,
-        tile_expert, tile_start, tile_count, tile_n, xhu, tu, KG / 16, NG / 16, st);
-    dim3 hog(NG / 128, P, 2);
+        tile_expert, tile_start, tile_count, tile_n, xhu, rowsum, tu, KG / 16, NG / 16, tile_base, st);
+    dim3 hog((NG / 128 + 3) / 4, batch_rows, 2);
     // Write gate into gu[:,0,:] and up into gu[:,1,:] using a strided temporary layout.
     // tg/tu are contiguous rows; the epilogue kernels below interleave them into gu halves.
     inkwell_moe_had_out_pair_rows<<<hog, 128, 0, st>>>((const uint64_t*)descs_g, (const uint64_t*)descs_u,
-        row_expert, tg, tu, gu, P, NG);
-    dim3 hd(NG / 128, P);
-    inkwell_moe_situ_had_rows<<<hd, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, gu, xhd, 4.f, 25.f, P, NG);
-    dim3 gd((ND / 16 + 3) / 4, max_tiles);
+        row_expert, tg, tu, gu, row_base, batch_rows, NG);
+    dim3 hd((NG / 128 + 3) / 4, batch_rows);
+    inkwell_moe_situ_had_rows<<<hd, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, gu, xhd, 4.f, 25.f, row_base, batch_rows, NG);
+    pf_launch_moe_rowsum(xhd, rowsum, row_base, batch_rows, NG, st);
     pf_launch_grouped_gemm_kernel(bm64, gd, descs_d,
-        tile_expert, tile_start, tile_count, tile_n, xhd, td, NG / 16, ND / 16, st);
-    dim3 hod(ND / 128, P);
-    inkwell_moe_had_out_rows<<<hod, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, td, dn, P, ND);
-    dim3 gs((ND + 255) / 256, C);
-    inkwell_moe_weighted_scatter<<<gs, 256, 0, st>>>(dn, sorted_weight, inverse_row, out, C, ND);
+        tile_expert, tile_start, tile_count, tile_n, xhd, rowsum, td, NG / 16, ND / 16, tile_base, st);
+    dim3 hod((ND / 128 + 3) / 4, batch_rows);
+    inkwell_moe_had_out_rows<<<hod, 128, 0, st>>>((const uint64_t*)descs_d, row_expert, td, dn, row_base, batch_rows, ND);
+    }
+    }
+    if (do_scatter) {
+        dim3 gs((ND + 255) / 256, C);
+        inkwell_moe_weighted_scatter<<<gs, 256, 0, st>>>(dn, sorted_weight, inverse_row, out, C, ND);
+    }
+}
+
+extern "C" void ink_launch_exl3_moe_grouped_gemm(
+        const void* descs_g, const void* descs_u, const void* descs_d,
+        const float* x, int C,
+        const int* sorted_token, const int* tile_expert, const int* tile_start,
+        const int* tile_count, const int* tile_n,
+        const float* sorted_weight, const int* inverse_row,
+        float* workspace, float* out, void* stream) {
+    const int P = C * 8;
+    const int max_tiles = P / 64 + 128;
+    ink_launch_exl3_moe_grouped_gemm_batch(descs_g, descs_u, descs_d, x, C, 0, P,
+        0, max_tiles, 1, 0, sorted_token, tile_expert, tile_start, tile_count, tile_n,
+        sorted_weight, inverse_row, workspace, out, stream);
 }
 
 __global__ void inkwell_moe_fill_row_expert(const int* tile_expert, const int* tile_start,
@@ -976,22 +2047,28 @@ __global__ void inkwell_moe_fill_row_expert(const int* tile_expert, const int* t
 }
 
 __global__ void inkwell_moe_had_out_pair_rows(const uint64_t* descs_g, const uint64_t* descs_u,
-        const int* row_expert, const float* tg, const float* tu, float* gu, int P, int n) {
-    __shared__ float sm[128];
-    const int row = blockIdx.y;
+        const int* row_expert, const float* tg, const float* tu, float* gu, int row_base, int P, int n) {
+    const int row = row_base + blockIdx.y;
     const int half = blockIdx.z;
-    const int base = blockIdx.x * 128;
-    const int t = threadIdx.x;
-    const int e = base + t;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int seg = blockIdx.x * (blockDim.x >> 5) + wid;
+    const int base = seg * 128;
+    if (blockIdx.y >= P || base >= n) return;
     const int ex = row_expert[row];
     const uint64_t* descs = half ? descs_u : descs_g;
     const uint16_t* svh = (const uint16_t*)(uintptr_t)descs[ex * 4 + 2];
     const float* tm = half ? tu : tg;
-    sm[t] = (row < P && e < n) ? tm[(size_t)row * n + e] : 0.f;
-    __syncthreads();
-    pf_had128_smem(sm, t);
-    if (row < P && e < n) gu[(size_t)row * 2 * n + half * n + e] = sm[t] * PF_INV_SQRT128
-        * __half2float(__ushort_as_half(svh[e]));
+    const int e0 = base + lane * 4;
+    const float4 tv = *(const float4*)(tm + (size_t)row * n + e0);
+    float v[4] = {tv.x, tv.y, tv.z, tv.w};
+    pf_had128_warp(v, lane * 4);
+    const uint2 sv = *(const uint2*)(svh + e0);
+    *(float4*)(gu + (size_t)row * 2 * n + half * n + e0) = make_float4(
+        __fmul_rn(__fmul_rn(v[0], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.x & 0xffffu)))),
+        __fmul_rn(__fmul_rn(v[1], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.x >> 16)))),
+        __fmul_rn(__fmul_rn(v[2], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.y & 0xffffu)))),
+        __fmul_rn(__fmul_rn(v[3], PF_INV_SQRT128), __half2float(__ushort_as_half((uint16_t)(sv.y >> 16)))));
 }
 
 // ---------------- parallel causal FIR convolution ----------------
@@ -1962,22 +3039,20 @@ extern "C" void ink_launch_pf_dense_gemm(const float* x, const void* w, float* y
     }
 }
 
-// Batched loop-controller chain in the reduction order of the serial fused
-// rms2down + gf_apply kernels, tiled over tokens to amortize BF16 weight loads.
-__global__ void inkwell_pf_ctrl_rms2down(const float* __restrict__ cur,
-        const float* __restrict__ msg, const __nv_bfloat16* __restrict__ w,
-        float* __restrict__ gate, int C, int n, int rows, float eps) {
+// Compute the two controller RMS scales once per token group.  This is the
+// same reduction sequence formerly repeated by every row tile of rms2down.
+__global__ void inkwell_pf_ctrl_scales(const float* __restrict__ cur,
+        const float* __restrict__ msg, float* __restrict__ scalesg,
+        int C, int n, float eps) {
     constexpr int TM = 4;
     __shared__ float s_sum[32];
-    __shared__ float s_buf[4][32];
-    const int tok0 = blockIdx.y * TM;
+    const int tok0 = blockIdx.x * TM;
     const int nt = (C - tok0) < TM ? (C - tok0) : TM;
     if (nt <= 0) return;
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
     const int n4 = n >> 2;
     if (tid >= 24 && tid < 32) s_sum[tid] = 0.0f;
 
-    float scales[TM][2];
     for (int dt = 0; dt < nt; ++dt) {
         const int tok = tok0 + dt;
         const float* __restrict__ x0 = cur + (size_t)tok * n;
@@ -2008,107 +3083,161 @@ __global__ void inkwell_pf_ctrl_rms2down(const float* __restrict__ cur,
             float t = s_sum[lane];
 #pragma unroll
             for (int m = 16; m > 0; m >>= 1) t += __shfl_xor_sync(0xffffffffu, t, m);
-            scales[dt][bx] = rsqrtf(__fdiv_rn(t, (float)n) + eps);
+            if (tid == 0) scalesg[tok * 2 + bx] = rsqrtf(__fdiv_rn(t, (float)n) + eps);
         }
     }
+}
 
-    const int r0 = blockIdx.x * 4;
-    const size_t stride2 = (size_t)n;
-    const __nv_bfloat162* wbase = (const __nv_bfloat162*)w + (size_t)r0 * stride2;
-    const int half2 = n >> 1;
-    float acc[TM][4];
+// Batched loop-controller chain in the reduction order of the serial fused
+// rms2down + gf_apply kernels, tiled over tokens to amortize BF16 weight loads.
+__global__ void inkwell_pf_ctrl_rms2down(const float* __restrict__ cur,
+        const float* __restrict__ msg, const float* __restrict__ scalesg,
+        const __nv_bfloat16* __restrict__ w,
+        float* __restrict__ gate, int C, int n, int rows, float eps) {
+    constexpr int TK = 64;
+    constexpr int TOKENS = 16;
+    constexpr int TPC = 2;  // tokens per warp; each lane covers two output rows
+    __shared__ float xs[TOKENS][TK + 1];
+    __shared__ float ws[64][TK + 1];
+    __shared__ float sc[TOKENS][2];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    const int tok0 = blockIdx.y * TOKENS;
+    (void)eps;
+
+    if (tid < TOKENS * 2) {
+        const int dt = tid >> 1;
+        const int bx = tid & 1;
+        const int tok = tok0 + dt;
+        sc[dt][bx] = (tok < C) ? __ldg(scalesg + tok * 2 + bx) : 0.0f;
+    }
+    __syncthreads();
+
+    const int out0 = lane;
+    const int out1 = lane + 32;
+    const int t0 = wid * TPC;
+    float acc[TPC][2];
 #pragma unroll
-    for (int dt = 0; dt < TM; ++dt) {
-#pragma unroll
-        for (int r = 0; r < 4; ++r) acc[dt][r] = 0.0f;
+    for (int z = 0; z < TPC; ++z) {
+        acc[z][0] = 0.0f;
+        acc[z][1] = 0.0f;
     }
 
-    for (int c = tid; c < n; c += 256) {
-        const bool in0 = c < half2;
-        float2 tg[TM];
-#pragma unroll
-        for (int dt = 0; dt < TM; ++dt) {
-            if (dt < nt) {
-                const int tok = tok0 + dt;
-                const float2* x0_2 = (const float2*)(cur + (size_t)tok * n);
-                const float2* x1_2 = (const float2*)(msg + (size_t)tok * n);
-                const float2 raw = in0 ? __ldg(&x0_2[c]) : __ldg(&x1_2[c - half2]);
-                const float sc = in0 ? scales[dt][0] : scales[dt][1];
-                tg[dt] = make_float2(__fmul_rn(sc, raw.x), __fmul_rn(sc, raw.y));
+    const int ktot = 2 * n;
+    for (int k0 = 0; k0 < ktot; k0 += TK) {
+        for (int idx = tid; idx < 32 * TK; idx += 256) {
+            const int r = idx >> 5;
+            const int kk = (idx & 31) * 2;
+            const int k = k0 + kk;
+            if (r < rows && k + 1 < ktot) {
+                const float2 wv = pf_dense_wload2(w, ((size_t)r * ktot + k) / 2);
+                ws[r][kk] = wv.x;
+                ws[r][kk + 1] = wv.y;
             } else {
-                tg[dt] = make_float2(0.0f, 0.0f);
+                ws[r][kk] = 0.0f;
+                ws[r][kk + 1] = 0.0f;
             }
         }
+        for (int idx = tid; idx < TOKENS * TK; idx += 256) {
+            const int dt = idx >> 6;
+            const int kk = idx & 63;
+            const int k = k0 + kk;
+            const int tok = tok0 + dt;
+            float v = 0.0f;
+            if (tok < C && k < ktot) {
+                if (k < n) {
+                    v = __fmul_rn(sc[dt][0], __ldg(cur + (size_t)tok * n + k));
+                } else {
+                    v = __fmul_rn(sc[dt][1], __ldg(msg + (size_t)tok * n + (k - n)));
+                }
+            }
+            xs[dt][kk] = v;
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int kk = 0; kk < TK; ++kk) {
+            const float w0 = ws[out0][kk];
+            const float w1 = ws[out1][kk];
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            const __nv_bfloat162 tw = wbase[(size_t)r * stride2 + c];
-            const float wx = __bfloat162float(tw.x);
-            const float wy = __bfloat162float(tw.y);
-#pragma unroll
-            for (int dt = 0; dt < TM; ++dt) {
-                acc[dt][r] += wx * tg[dt].x;
-                acc[dt][r] += wy * tg[dt].y;
+            for (int z = 0; z < TPC; ++z) {
+                const float xv = xs[t0 + z][kk];
+                acc[z][0] = fmaf(xv, w0, acc[z][0]);
+                acc[z][1] = fmaf(xv, w1, acc[z][1]);
             }
         }
+        __syncthreads();
     }
 
-    for (int dt = 0; dt < nt; ++dt) {
-        float* __restrict__ dst = gate + (size_t)(tok0 + dt) * rows;
-        if (tid < 32) {
 #pragma unroll
-            for (int r = 0; r < 4; ++r) s_buf[r][tid] = 0.0f;
+    for (int z = 0; z < TPC; ++z) {
+        const int tok = tok0 + t0 + z;
+        if (tok < C) {
+            if (out0 < rows) gate[(size_t)tok * rows + out0] = acc[z][0];
+            if (out1 < rows) gate[(size_t)tok * rows + out1] = acc[z][1];
         }
-        __syncthreads();
-#pragma unroll
-        for (int r = 0; r < 4; ++r) {
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) acc[dt][r] += __shfl_xor_sync(0xffffffffu, acc[dt][r], m);
-            if (lane == 0) s_buf[r][wid] = acc[dt][r];
-        }
-        __syncthreads();
-        if (wid < 4) {
-            const int r = wid;
-            float v = s_buf[r][lane];
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffffu, v, m);
-            if (lane == 0 && r0 + r < rows) dst[r0 + r] = v;
-        }
-        __syncthreads();
     }
 }
 
 __global__ void inkwell_pf_ctrl_gf_apply(const __nv_bfloat16* __restrict__ w,
         const float* __restrict__ gate, const float* __restrict__ cur,
         const float* __restrict__ msg, float* __restrict__ dst, int C, int n, int fo) {
-    constexpr int TM = 16;
-    const int wtid = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int i = blockIdx.x * 8 + wtid;
-    if (i >= n) return;
-    const __nv_bfloat162 vg = ((const __nv_bfloat162*)(w + (size_t)i * 64))[lane];
-    const __nv_bfloat162 vf = ((const __nv_bfloat162*)(w + (size_t)(fo + i) * 64))[lane];
-    const float vgx = __bfloat162float(vg.x), vgy = __bfloat162float(vg.y);
-    const float vfx = __bfloat162float(vf.x), vfy = __bfloat162float(vf.y);
-    const int tok0 = blockIdx.y * TM;
-    for (int dt = 0; dt < TM; ++dt) {
+    constexpr int K = 64;
+    constexpr int TOKENS = 32;
+    constexpr int TPC = 4;
+    __shared__ float wg[32][K + 1];
+    __shared__ float wf[32][K + 1];
+    __shared__ float gt[TOKENS][K + 1];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    const int o0 = blockIdx.x * 32;
+    const int tok0 = blockIdx.y * TOKENS;
+
+    for (int idx = tid; idx < 32 * K; idx += 256) {
+        const int o = idx >> 6;
+        const int k = idx & 63;
+        const int go = o0 + o;
+        wg[o][k] = (go < n) ? __bfloat162float(w[(size_t)go * K + k]) : 0.0f;
+        wf[o][k] = (go < n) ? __bfloat162float(w[(size_t)(fo + go) * K + k]) : 0.0f;
+    }
+    for (int idx = tid; idx < TOKENS * K; idx += 256) {
+        const int dt = idx >> 6;
+        const int k = idx & 63;
         const int tok = tok0 + dt;
-        if (tok >= C) break;
-        const float2 t = __ldg(&((const float2*)(gate + (size_t)tok * 64))[lane]);
-        float g = 0.0f, f = 0.0f;
-        g += vgx * t.x;
-        g += vgy * t.y;
-        f += vfx * t.x;
-        f += vfy * t.y;
+        gt[dt][k] = (tok < C) ? __ldg(gate + (size_t)tok * K + k) : 0.0f;
+    }
+    __syncthreads();
+
+    const int out = o0 + lane;
+    const int t0 = wid * TPC;
+    float accg[TPC], accf[TPC];
 #pragma unroll
-        for (int m = 16; m > 0; m >>= 1) {
-            g += __shfl_xor_sync(0xffffffffu, g, m);
-            f += __shfl_xor_sync(0xffffffffu, f, m);
+    for (int z = 0; z < TPC; ++z) {
+        accg[z] = 0.0f;
+        accf[z] = 0.0f;
+    }
+#pragma unroll 8
+    for (int k = 0; k < K; ++k) {
+        const float ag = wg[lane][k];
+        const float af = wf[lane][k];
+#pragma unroll
+        for (int z = 0; z < TPC; ++z) {
+            const float x = gt[t0 + z][k];
+            accg[z] = fmaf(x, ag, accg[z]);
+            accf[z] = fmaf(x, af, accf[z]);
         }
-        if (lane == 0) {
-            const float gn = tanhf(g), fg = tanhf(f);
-            const float cv = cur[(size_t)tok * n + i];
-            const float mv = msg[(size_t)tok * n + i];
+    }
+    if (out >= n) return;
+#pragma unroll
+    for (int z = 0; z < TPC; ++z) {
+        const int tok = tok0 + t0 + z;
+        if (tok < C) {
+            const float gn = tanhf(accg[z]), fg = tanhf(accf[z]);
+            const float cv = cur[(size_t)tok * n + out];
+            const float mv = msg[(size_t)tok * n + out];
             const float r = __fsub_rn(cv, __fmul_rn(fg, cv));
-            dst[(size_t)tok * n + i] = __fadd_rn(r, __fmul_rn(gn, mv));
+            dst[(size_t)tok * n + out] = __fadd_rn(r, __fmul_rn(gn, mv));
         }
     }
 }
@@ -2117,9 +3246,12 @@ extern "C" void ink_launch_pf_ctrl_exact(const float* cur, const float* msg,
         const void* down, const void* gf, float* gate, float* dst,
         int C, int n, int rows, float eps, int fo, void* stream) {
     const cudaStream_t st = (cudaStream_t)stream;
-    inkwell_pf_ctrl_rms2down<<<dim3((unsigned)(rows / 4), (unsigned)((C + 3) / 4)), 256, 0, st>>>(
-        cur, msg, (const __nv_bfloat16*)down, gate, C, n, rows, eps);
-    inkwell_pf_ctrl_gf_apply<<<dim3((unsigned)((n + 7) / 8), (unsigned)((C + 15) / 16)), 256, 0, st>>>(
+    float* scalesg = gate + (size_t)rows * C;
+    inkwell_pf_ctrl_scales<<<dim3((unsigned)((C + 3) / 4)), 256, 0, st>>>(
+        cur, msg, scalesg, C, n, eps);
+    inkwell_pf_ctrl_rms2down<<<dim3(1, (unsigned)((C + 15) / 16)), 256, 0, st>>>(
+        cur, msg, scalesg, (const __nv_bfloat16*)down, gate, C, n, rows, eps);
+    inkwell_pf_ctrl_gf_apply<<<dim3((unsigned)((n + 31) / 32), (unsigned)((C + 31) / 32)), 256, 0, st>>>(
         (const __nv_bfloat16*)gf, gate, cur, msg, dst, C, n, fo);
 }
 

@@ -4447,52 +4447,106 @@ struct PfArena {
 
 impl PfArena {
     fn layout(c: usize) -> (HashMap<&'static str, usize>, usize) {
+        fn al(x: usize) -> usize { (x + 255) & !255 }
         let mut off = HashMap::new();
         let mut o = 0usize;
-        let mut put = |name: &'static str, bytes: usize, off: &mut HashMap<&'static str, usize>, o: &mut usize| {
-            *o = (*o + 255) & !255;
-            off.insert(name, *o);
-            *o += bytes;
-        };
+        macro_rules! put_seq {
+            ($name:expr, $bytes:expr) => {{
+                o = al(o);
+                off.insert($name, o);
+                o += $bytes;
+            }};
+        }
+        macro_rules! put_abs {
+            ($name:expr, $pos:expr) => {{ off.insert($name, $pos); }};
+        }
+
         let h = c * 2304 * 4;
-        for name in ["cur","x0","x1","x2","fcur","moe_out","tmp2","head","prelude","bankout","cn","cm","cg"] {
-            put(name, h, &mut off, &mut o);
+        put_seq!("cur", h);
+        put_seq!("prelude", h);
+        let prelude_pos = off["prelude"];
+        put_abs!("head", prelude_pos);
+        for name in ["blk0","blk1","blk2","blk3","bank","bankout"] {
+            put_seq!(name, h);
         }
-        put("cat", h * 2, &mut off, &mut o);
-        put("ctrlg", h * 2, &mut off, &mut o);
-        for name in ["blk0","blk1","blk2","blk3","bank"] {
-            put(name, h, &mut off, &mut o);
+        put_seq!("router", c * 128 * 4);
+        put_seq!("ids", c * 8 * 4);
+        put_seq!("wts", c * 8 * 4);
+        put_seq!("tokids", c * 4);
+        put_seq!("sort", c * 8 * 8 * 4 + 8192);
+
+        let union = al(o);
+        macro_rules! put_rel {
+            ($name:expr, $pos:expr) => {{ off.insert($name, union + $pos); }};
         }
-        put("mixbuf", h * 3, &mut off, &mut o);
-        put("msgbuf", h * 4, &mut off, &mut o);
-        put("q", c * 3072 * 4, &mut off, &mut o);
-        put("gate", c * 3072 * 4, &mut off, &mut o);
-        put("attn", c * 3072 * 4, &mut off, &mut o);
-        put("wo", c * 2304 * 4, &mut off, &mut o);
-        put("k", c * 1024 * 4, &mut off, &mut o);
-        put("v", c * 1024 * 4, &mut off, &mut o);
-        put("r", c * 384 * 4, &mut off, &mut o);
-        put("kout", c * 1024 * 4, &mut off, &mut o);
-        put("ksnap", c * 1024 * 2, &mut off, &mut o);
-        put("vsnap", c * 1024 * 2, &mut off, &mut o);
-        put("vout", c * 1024 * 4, &mut off, &mut o);
-        put("woout", c * 2304 * 4, &mut off, &mut o);
-        put("ffnout", c * 2304 * 4, &mut off, &mut o);
-        put("kdyn", c * 32 * 4, &mut off, &mut o);
-        put("vdyn", c * 32 * 4, &mut off, &mut o);
-        put("sink", c * 24 * 4, &mut off, &mut o);
-        put("router", c * 128 * 4, &mut off, &mut o);
-        put("ids", c * 8 * 4, &mut off, &mut o);
-        put("wts", c * 8 * 4, &mut off, &mut o);
-        put("tokids", c * 4, &mut off, &mut o);
-        put("rel", 24 * 1025 * 16 * 4, &mut off, &mut o);
-        put("sort", c * 8 * 8 * 4 + 8192, &mut off, &mut o);
+
+        put_rel!("tmp2", 0);
+        let mix_pos = h;
+        put_rel!("mixbuf", mix_pos);
+        let kb = c * 1024 * 4;
+        put_rel!("k", mix_pos);
+        put_rel!("v", mix_pos + kb);
+        put_rel!("msgbuf", 4 * h);
+        put_rel!("x0", 8 * h);
+        put_rel!("x1", 9 * h);
+        put_rel!("x2", 10 * h);
+
+        let ctrl = 11 * h;
+        put_rel!("cn", ctrl);
+        put_rel!("cm", ctrl + h);
+        let cat_pos = ctrl + 2 * h;
+        let scratch_bytes = c * (3072 + 3072) * 4;
+        let cat_scratch = 2 * h;
+        put_rel!("cat", cat_pos);
+        put_rel!("ctrlg", cat_pos);
+        let cg_pos = cat_pos + cat_scratch;
+        put_rel!("cg", cg_pos);
+        let ctrl_end = cg_pos + h;
+
+        let qb = c * 3072 * 4;
+        let mut t = ctrl;
+        macro_rules! rel_alloc {
+            ($name:expr, $bytes:expr) => {{
+                t = al(t);
+                off.insert($name, union + t);
+                t += $bytes;
+            }};
+        }
+        let q_pos = t;
+        rel_alloc!("q", qb);
+        let gate_pos = t;
+        rel_alloc!("gate", qb);
+        rel_alloc!("attn", qb);
+        rel_alloc!("r", c * 384 * 4);
+        rel_alloc!("kout", kb);
+        rel_alloc!("vout", kb);
+        rel_alloc!("ksnap", c * 1024 * 2);
+        rel_alloc!("vsnap", c * 1024 * 2);
+        rel_alloc!("kdyn", c * 32 * 4);
+        rel_alloc!("vdyn", c * 32 * 4);
+        rel_alloc!("sink", c * 24 * 4);
+        rel_alloc!("rel", 24 * 1025 * 16 * 4);
+        let transient_end = al(t);
+        put_rel!("scratch", transient_end);
+        let scratch_end = transient_end + scratch_bytes;
+        put_abs!("wo", union + q_pos);
+        put_abs!("woout", union + gate_pos);
+
         let p = c * 8;
-        put("moews", p * 6912 * 4 + p * 4 + 256, &mut off, &mut o);
-        put("scratch", c * (3072 + 3072) * 4, &mut off, &mut o);
-        put("logits", 201024 * 4 + 256, &mut off, &mut o);
+        let moews_bytes = p * (if pf_micro_enabled() { 9216usize } else { 6912usize }) * 4 + p * 4 + 256;
+        put_rel!("moews", 0);
+        let fcur_pos = al(moews_bytes);
+        put_rel!("fcur", fcur_pos);
+        let moeout_pos = fcur_pos + h;
+        put_rel!("moe_out", moeout_pos);
+        put_rel!("ffnout", 0);
+        put_rel!("logits", 0);
+
+        let union_need = std::cmp::max(moeout_pos + h, std::cmp::max(scratch_end, ctrl_end));
+        o = union + union_need;
         (off, o)
     }
+
     fn new(c: usize) -> Self {
         let (off, bytes) = Self::layout(c);
         let buf = inkwell_cuda::DevBuf::new_bytes(bytes);
@@ -4544,6 +4598,119 @@ impl PfExpertStage {
         }
         Some(Self { bufs, next: 0, table_keepalive: Vec::new() })
     }
+}
+
+#[derive(Debug)]
+struct PfMicroSlot {
+    buf: inkwell_cuda::DevBuf,
+    dg: inkwell_cuda::DevBuf,
+    du: inkwell_cuda::DevBuf,
+    dd: inkwell_cuda::DevBuf,
+    reuse_event: *mut std::ffi::c_void,
+    done_event: *mut std::ffi::c_void,
+    layer: i32,
+    batch: i32,
+}
+
+#[derive(Debug)]
+struct PfMicroStage {
+    bufs: Vec<PfMicroSlot>,
+    batch_experts: usize,
+    meta_event: *mut std::ffi::c_void,
+    table_keepalive: Vec<Vec<u64>>,
+}
+
+impl PfMicroStage {
+    fn new(bytes: usize, batch_experts: usize) -> Option<Self> {
+        let mut bufs = Vec::new();
+        for _ in 0..2 {
+            bufs.push(PfMicroSlot {
+                buf: inkwell_cuda::DevBuf::try_new_bytes(bytes)?,
+                dg: inkwell_cuda::DevBuf::new_bytes(4096),
+                du: inkwell_cuda::DevBuf::new_bytes(4096),
+                dd: inkwell_cuda::DevBuf::new_bytes(4096),
+                reuse_event: inkwell_cuda::new_event(),
+                done_event: inkwell_cuda::new_event(),
+                layer: -1,
+                batch: -1,
+            });
+        }
+        Some(Self { bufs, batch_experts, meta_event: inkwell_cuda::new_event(), table_keepalive: Vec::new() })
+    }
+}
+
+fn pf_micro_enabled() -> bool {
+    std::env::var("INKWELL_PF_MICRO_STAGING").ok().as_deref() != Some("0")
+}
+
+fn pf_expert_byte_range(m: &crate::moe::MoeArgsExl3, e0: usize, e1: usize) -> (usize, usize) {
+    let base = m.expert_dev_base as u64;
+    let begin_at = |e: usize| -> usize {
+        let mut v = u64::MAX;
+        for pi in 0..3 {
+            for j in 0..3 {
+                v = v.min(m.descs_host[pi * 512 + e * 4 + j]);
+            }
+        }
+        (v - base) as usize
+    };
+    let start = if e0 == 0 { 0 } else { begin_at(e0) };
+    let end = if e1 >= 128 { m.expert_total } else { begin_at(e1) };
+    (start, end)
+}
+
+fn pf_micro_slot_bytes(r: &Runner, batch_experts: usize) -> usize {
+    let mut out = 0usize;
+    for m in &r.moe_args_exl3 {
+        if m.on_dev || m.expert_host_base == 0 { continue; }
+        for e0 in (0..128).step_by(batch_experts) {
+            let e1 = (e0 + batch_experts).min(128);
+            let (s0, s1) = pf_expert_byte_range(m, e0, e1);
+            out = out.max(s1 - s0);
+        }
+    }
+    out
+}
+
+fn pf_prepare_micro(r: &Runner, stage: &mut PfMicroStage, il: usize, batch: usize) -> Option<usize> {
+    let m = pf_host_experts(r, il)?;
+    let nb = 128usize.div_ceil(stage.batch_experts);
+    if batch >= nb { return None; }
+    let bi = batch & 1;
+    if stage.bufs[bi].layer == il as i32 && stage.bufs[bi].batch == batch as i32 { return Some(bi); }
+    let e0 = batch * stage.batch_experts;
+    let e1 = (e0 + stage.batch_experts).min(128);
+    let (start, end) = pf_expert_byte_range(m, e0, e1);
+    let bytes = end - start;
+    let b = &mut stage.bufs[bi];
+    if bytes > b.buf.len * 4 { return None; }
+    unsafe {
+        if b.layer >= 0 { inkwell_cuda::side_wait_event(b.reuse_event); }
+        inkwell_cuda::memcpy_h2d_async_side(b.buf.dev_ptr(),
+            (m.expert_host_base + start) as *const std::ffi::c_void, bytes);
+    }
+    let stage_base = b.buf.dev_ptr() as u64;
+    let copy_base = m.expert_dev_base as u64 + start as u64;
+    let mut table = Vec::with_capacity(3 * 512);
+    for pi in 0..3 {
+        for e in 0..128 {
+            for j in 0..4 {
+                let v = m.descs_host[pi * 512 + e * 4 + j];
+                table.push(if j < 3 && e >= e0 && e < e1 { v - copy_base + stage_base } else { v });
+            }
+        }
+    }
+    unsafe {
+        for (pi, dst) in [&b.dg, &b.du, &b.dd].into_iter().enumerate() {
+            let src = table.as_ptr().add(pi * 512).cast::<std::ffi::c_void>();
+            inkwell_cuda::memcpy_h2d_async_side(dst.dev_ptr(), src, 4096);
+        }
+        inkwell_cuda::event_record(b.done_event, inkwell_cuda::side_stream_raw());
+    }
+    stage.table_keepalive.push(table);
+    b.layer = il as i32;
+    b.batch = batch as i32;
+    Some(bi)
 }
 
 fn pf_stream_experts_enabled() -> bool {
@@ -4736,7 +4903,7 @@ impl Runner {
     #[expect(clippy::too_many_arguments)]
     fn pf_layer(&self, a: &PfArena, il: usize, ip: usize, slot: usize, pass: usize,
         blocks: &mut Vec<usize>, cur_name: &'static str, messages: bool, pos0: i64,
-        moe_descs: Option<PfMoeDescs>) {
+        moe_descs: Option<PfMoeDescs>, mut micro_stage: Option<&mut PfMicroStage>, next_host: Option<usize>) {
         let c = a.c;
         let l = &self.layers[il];
         let is_swa = self.is_swa_layer(il);
@@ -4904,10 +5071,65 @@ impl Runner {
             if il == 0 { pf_dbg("router-0", a.ptr("router"), 8); }
             inkwell_cuda::exl3_moe_group_sort_async(a.ptr("ids").cast(), a.ptr("wts").cast(), c as i32,
                 eo, stok, sslot, sw.cast(), inv, te, ts, tc, tn);
-            if !copy_done.is_null() { inkwell_cuda::stream_wait_current(copy_done); }
-            inkwell_cuda::exl3_moe_grouped_gemm_async(dg, du, dd,
-                fcur.cast_const(), c as i32, stok, te, ts, tc, tn, sw.cast(), inv,
-                a.ptr("moews"), a.ptr("moe_out"));
+            let mut micro_used = false;
+            if micro_stage.is_some() && pf_host_experts(self, il).is_some() {
+                if let Some(st) = micro_stage.as_deref_mut() {
+                    micro_used = true;
+                    let max_tiles = p / 64 + 128;
+                    let mut eo_h = [0i32; 129];
+                    let mut te_h = vec![0i32; max_tiles];
+                    let mut ts_h = vec![0i32; max_tiles];
+                    let mut tc_h = vec![0i32; max_tiles];
+                    let mut tn_h = [0i32; 1];
+                    inkwell_cuda::memcpy_d2h_async(eo_h.as_mut_ptr().cast(), eo.cast_const().cast(), 129 * 4);
+                    inkwell_cuda::memcpy_d2h_async(te_h.as_mut_ptr().cast(), te.cast_const().cast(), max_tiles * 4);
+                    inkwell_cuda::memcpy_d2h_async(ts_h.as_mut_ptr().cast(), ts.cast_const().cast(), max_tiles * 4);
+                    inkwell_cuda::memcpy_d2h_async(tc_h.as_mut_ptr().cast(), tc.cast_const().cast(), max_tiles * 4);
+                    inkwell_cuda::memcpy_d2h_async(tn_h.as_mut_ptr().cast(), tn.cast_const().cast(), 4);
+                    inkwell_cuda::event_record_current(st.meta_event);
+                    inkwell_cuda::event_sync(st.meta_event);
+                    let nt = tn_h[0] as usize;
+                    let nb = 128usize.div_ceil(st.batch_experts);
+                    // Seed both double-buffer slots before the loop.  Preparing
+                    // batch 2 before batch 1 would otherwise put copy 2 ahead of
+                    // copy 1 on the side stream and break the overlap pipeline.
+                    for batch in 0..nb.min(2) {
+                        let _ = pf_prepare_micro(self, st, il, batch);
+                    }
+                    for batch in 0..nb {
+                        let e0 = batch * st.batch_experts;
+                        let e1 = (e0 + st.batch_experts).min(128);
+                        let row0 = eo_h[e0];
+                        let rows = eo_h[e1] - row0;
+                        let tile_base = (0..nt).position(|i| te_h[i] >= e0 as i32).unwrap_or(nt);
+                        let mut tile_end = tile_base;
+                        while tile_end < nt && te_h[tile_end] < e1 as i32 { tile_end += 1; }
+                        let tile_batches = tile_end - tile_base;
+                        let bi = pf_prepare_micro(self, st, il, batch).expect("micro expert batch stage");
+                        let (bdg, bdu, bdd, done, reuse) = {
+                            let sl = &st.bufs[bi];
+                            (sl.dg.dev_ptr(), sl.du.dev_ptr(), sl.dd.dev_ptr(), sl.done_event, sl.reuse_event)
+                        };
+                        inkwell_cuda::stream_wait_current(done);
+                        inkwell_cuda::exl3_moe_grouped_gemm_batch_async(bdg.cast(), bdu.cast(), bdd.cast(),
+                            fcur.cast_const(), c as i32, row0, rows, tile_base as i32, tile_batches as i32,
+                            i32::from(batch + 1 == nb), 1, stok, te, ts, tc, tn, sw.cast(), inv,
+                            a.ptr("moews"), a.ptr("moe_out"));
+                        inkwell_cuda::event_record_current(reuse);
+                        if batch + 2 < nb {
+                            let _ = pf_prepare_micro(self, st, il, batch + 2);
+                        } else if let Some(nl) = next_host {
+                            let _ = pf_prepare_micro(self, st, nl, batch + 2 - nb);
+                        }
+                    }
+                }
+            }
+            if !micro_used {
+                if !copy_done.is_null() { inkwell_cuda::stream_wait_current(copy_done); }
+                inkwell_cuda::exl3_moe_grouped_gemm_async(dg, du, dd,
+                    fcur.cast_const(), c as i32, stok, te, ts, tc, tn, sw.cast(), inv,
+                    a.ptr("moews"), a.ptr("moe_out"));
+            }
             inkwell_cuda::conv_prefill_async(a.ptr("moe_out").cast_const(), conv_state, 2048 + 2304,
                 tdata(l.ffn_post_conv.expect("fpc")).cast_const(), std::ptr::null(), c as i32, 2304, 0, scale_static, a.ptr("ffnout"));
             if il == 0 { pf_dbg("ffn_out-0", a.ptr("ffnout"), 8); }
@@ -4928,13 +5150,19 @@ impl Runner {
     /// final row's unpadded logits. State writes match serial teacher forcing.
     pub fn prefill_chunked(&mut self, ids: &[u32], pos0: i64) -> Vec<f32> {
         self.check_ctx_span(pos0, ids.len() as i64, "prefill");
-        let cmax = std::env::var("INKWELL_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64).clamp(1, 512);
+        let cmax = std::env::var("INKWELL_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(64).clamp(1, 1024);
         let need = PfArena::layout(cmax).1;
         let stream_experts = pf_stream_experts_enabled();
+        let micro = pf_micro_enabled();
+        let micro_batch = std::env::var("INKWELL_PF_MICRO_BATCH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32).clamp(1, 128);
         let stage_max = if stream_experts {
-            self.moe_args_exl3.iter()
-                .filter(|m| !m.on_dev && m.expert_host_base != 0)
-                .map(|m| m.expert_total).max().unwrap_or(0)
+            if micro {
+                pf_micro_slot_bytes(self, micro_batch)
+            } else {
+                self.moe_args_exl3.iter()
+                    .filter(|m| !m.on_dev && m.expert_host_base != 0)
+                    .map(|m| m.expert_total).max().unwrap_or(0)
+            }
         } else { 0 };
         // Reuse the largest decode expert-cache arena while encoding. The
         // direct driver reads expert weights from their resident/pinned source
@@ -4960,7 +5188,7 @@ impl Runner {
                 // was in play; that wiped the whole decode cache for a few
                 // hundred MiB. Free only what the arena and stage need.
                 let target = if pf_keep_cache_enabled() {
-                    need.saturating_add(stage_max)
+                    need.saturating_add(2 * stage_max)
                 } else if stage_max == 0 {
                     need
                 } else {
@@ -4983,8 +5211,9 @@ impl Runner {
             }
             (PfArena::new(cmax), None)
         };
-        let mut expert_stage = if stage_max > 0 { PfExpertStage::new(stage_max) } else { None };
-        if stage_max > 0 && expert_stage.is_none() {
+        let mut expert_stage = if !micro && stage_max > 0 { PfExpertStage::new(stage_max) } else { None };
+        let mut micro_stage = if micro && stage_max > 0 { PfMicroStage::new(stage_max, micro_batch) } else { None };
+        if stage_max > 0 && expert_stage.is_none() && micro_stage.is_none() {
             vlog!("prefill experts: stage allocation {} MiB failed; using direct expert memory", stage_max >> 20);
         }
         if pf_exact_attn_enabled() {
@@ -5016,12 +5245,14 @@ impl Runner {
             let mut staged_pos = vec![None; seq.len()];
             let mut seq_pos = 0usize;
             let mut prep_idx = 0usize;
-            if let Some(st) = expert_stage.as_mut() {
-                if let Some(&hp) = host_positions.first() {
-                    if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
-                        staged_pos[hp] = Some(bi);
+            if !micro {
+                if let Some(st) = expert_stage.as_mut() {
+                    if let Some(&hp) = host_positions.first() {
+                        if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                            staged_pos[hp] = Some(bi);
+                        }
+                        prep_idx = 1;
                     }
-                    prep_idx = 1;
                 }
             }
             for il in 0..6 {
@@ -5029,13 +5260,16 @@ impl Runner {
                 if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
                     let hp = host_positions[prep_idx];
                     prep_idx += 1;
-                    if let Some(st) = expert_stage.as_mut() {
-                        if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
-                            staged_pos[hp] = Some(bi);
+                    if !micro {
+                        if let Some(st) = expert_stage.as_mut() {
+                            if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                                staged_pos[hp] = Some(bi);
+                            }
                         }
                     }
                 }
-                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md);
+                let next_host = host_positions.iter().copied().find(|&hp| hp > seq_pos).map(|hp| seq[hp]);
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md, micro_stage.as_mut(), next_host);
                 vi += 1;
                 seq_pos += 1;
             }
@@ -5055,13 +5289,16 @@ impl Runner {
                     if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
                         let hp = host_positions[prep_idx];
                         prep_idx += 1;
-                        if let Some(st) = expert_stage.as_mut() {
-                            if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
-                                staged_pos[hp] = Some(bi);
+                        if !micro {
+                            if let Some(st) = expert_stage.as_mut() {
+                                if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                                    staged_pos[hp] = Some(bi);
+                                }
                             }
                         }
                     }
-                    self.pf_layer(&a, ip, ip, self.visits[vi].1, pass, &mut blocks, "cur", pass > 0, pos, md);
+                    let next_host = host_positions.iter().copied().find(|&hp| hp > seq_pos).map(|hp| seq[hp]);
+                    self.pf_layer(&a, ip, ip, self.visits[vi].1, pass, &mut blocks, "cur", pass > 0, pos, md, micro_stage.as_mut(), next_host);
                     vi += 1;
                     seq_pos += 1;
                 }
@@ -5071,13 +5308,16 @@ impl Runner {
                 if host_positions.binary_search(&seq_pos).is_ok() && prep_idx < host_positions.len() {
                     let hp = host_positions[prep_idx];
                     prep_idx += 1;
-                    if let Some(st) = expert_stage.as_mut() {
-                        if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
-                            staged_pos[hp] = Some(bi);
+                    if !micro {
+                        if let Some(st) = expert_stage.as_mut() {
+                            if let Some(bi) = pf_prepare_experts(self, st, seq[hp]) {
+                                staged_pos[hp] = Some(bi);
+                            }
                         }
                     }
                 }
-                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md);
+                let next_host = host_positions.iter().copied().find(|&hp| hp > seq_pos).map(|hp| seq[hp]);
+                self.pf_layer(&a, il, il, self.visits[vi].1, 0, &mut blocks, "cur", false, pos, md, micro_stage.as_mut(), next_host);
                 vi += 1;
                 seq_pos += 1;
             }
