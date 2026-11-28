@@ -2,12 +2,13 @@
 
 **Inkwell** is a standalone Rust + CUDA inference engine for **Inkling-2** MoE models in **EXL3 (Trellis + Hadamard)** and GGUF formats, engineered from scratch to run fast on consumer GPUs without Tensor Cores (including NVIDIA Pascal / GTX 1060 6 GB).
 
-## Highlights (v0.1)
+## Highlights (v0.1.1)
 
 - **Custom EXL3 CUDA kernels** (`crates/inkwell-cuda`):
-  - Exact-track dense and 8-wide MoE GEMV kernels with fail-closed Pascal SASS NOP-stripping (`ch2nopless`, +18% decode) and vectorized Hadamard (`HADVEC`).
-  - Chunked prefill driver with grouped MoE GEMM, adaptive decode expert-cache preservation, and BF16 relative-bias expansion.
-  - Size-aware per-layer expert VRAM cache (`kslot`) with asynchronous PCIe staging for overflow layers.
+  - Exact-track dense and 8-wide MoE GEMV kernels with fail-closed Pascal SASS NOP-stripping (`ch2nopless`), C++/PTX `ch2_mul16_lo`, batched dense attention projections (`gemv_batchf`), vectorized Hadamard (`HADVEC`), and bit-exact micro-kernel launch fusion (`decode_fuse.cuh`).
+  - Vectorized chunked prefill driver with centered INT8 `dp4a` dense and grouped MoE GEMMs (`gpu_caps.cuh` auto-detects native `dp4a` on `sm_61` and `sm_70+`, falling back cleanly to bit-exact FP32 on non-`dp4a` GPUs; `INKWELL_PF_INT8=0` forces FP32).
+  - Quantized KV cache (`K8V4` + `INT8`/`FP8`/`K8V6`/`K4V2`) with single-pass GQA3 decode attention (`attn_kvq_gqa3.cuh`) and 16-row paired head-major `K8V4` layout across decode and flash prefill. Auto-defaults keep `F16` up to `8,192` tokens and switch to `K8V4` + `dp4a` above `8,192` tokens.
+  - Jointly placed resident MoE layers + DP-tuned size-aware per-layer expert VRAM cache (`kslot`, up to `1,264 MiB` ladder) with overlapped split side-stream PCIe staging.
   - Multi-arch CUDA fatbin (`sm_61` primary/tuned; `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90` + `compute_90` PTX experimental).
 - **Fast Rust host pipeline**: AVX2-accelerated sampler (up to 8.3× faster at 131K vocab), parallelized BPE tokenizer, and overlapped direct `mmap → pinned` model startup (~21.1 s warm).
 - **OpenAI-compatible HTTP/SSE server** (`inkwell serve`): `/health`, `/v1/models`, `/v1/chat/completions` (streaming & non-streaming, `reasoning_effort`, `reasoning_content`), and `/v1/completions`.
@@ -15,26 +16,27 @@
 
 ## Measured Performance (GTX 1060 6 GB · Pascal `sm_61`, Inkling-2-Mini EXL3 2.26 bpw)
 
-| Context | Prefill (chunk=512) | Decode (64 tok) | Peak VRAM |
-|---|---:|---:|---:|
-| Short (`base4`) | — | **36.9 tok/s** (27.1 ms/tok) | 5,048 MiB |
-| 512 tok | **116.5 tok/s** | **29.8 tok/s** (33.6 ms/tok) | 5,094 MiB |
-| 4,096 tok | **119.5 tok/s** | **26.8 tok/s** (37.3 ms/tok) | 5,206 MiB |
-| 16,384 tok | **97.4 tok/s** | **19.1 tok/s** (52.4 ms/tok) | 5,314 MiB |
+All Inkwell v0.1.1 numbers measured with default settings (zero KV/DP4A/INT8 flags):
 
-### vs. Upstream `llama.cpp` (`e087c6c`, GTX 1060 6 GB)
+| Context | Prefill (`chunk=512`) | Decode | Peak VRAM | Notes |
+|---|---:|---:|---:|---|
+| Short (`base4`) | — | **40.5 tok/s** (24.7 ms/tok) | 5,024 MiB | Auto-F16 KV, bit-exact `md5 5cbe8e06` |
+| 512 tok | **250.5 tok/s** | — | 4,848 MiB (post-cache) | Auto-INT8 `dp4a` (FP32 fallback: 174.8 tok/s) |
+| 4,096 tok | **232.8 tok/s** | — | 4,952 MiB (post-cache) | Auto-F16 KV + auto-INT8 `dp4a` |
+| 65,536 tok (64K) | — | **25.8 tok/s** (38.7 ms/tok) | 5,156 MiB | Auto-`K8V4` paired head-major + `dp4a` |
 
-Comparing **Inkwell v0.1** (`EXL3 2.26 bpw`, zero-config) against upstream **`llama.cpp`** (`Inkling-2-Mini-UD-IQ2_XXS.gguf`, `2.06 bpw`, tuned `-ngl 99 -ot ".ffn_.*_exps.=CPU" -fa 1 -b 512 -ub 512`; default `-b 2048` and `-ncmoe` OOM on 6 GB VRAM):
+### vs. Inkwell v0.1 and Upstream `llama.cpp` (`e087c6c`, GTX 1060 6 GB)
 
-| Metric | Inkwell v0.1 (`2.26 bpw`) | `llama.cpp` (`2.06 bpw`) | Speedup |
-|---|---:|---:|---:|
-| Short decode | **36.9 tok/s** | 7.5 tok/s | **4.9×** |
-| Decode @ 512 ctx | **29.8 tok/s** | 8.3 tok/s | **3.6×** |
-| Decode @ 4,096 ctx | **26.8 tok/s** | 7.7 tok/s | **3.5×** |
-| Prefill 512 (`pp512`) | **116.5 tok/s** | 108.1 tok/s | **1.08×** |
-| Prefill 4,096 (`pp4096`) | 119.5 tok/s | **164.3 tok/s** | 0.73× |
+Comparing **Inkwell v0.1.1** (`EXL3 2.26 bpw`, default settings) against **Inkwell v0.1** (`2adcf77`) and upstream **`llama.cpp`** (`Inkling-2-Mini-UD-IQ2_XXS.gguf`, `2.06 bpw`, tuned `-ngl 99 -ot ".ffn_.*_exps.=CPU" -fa 1 -b 512 -ub 512`; default `-b 2048` and `-ncmoe` OOM on 6 GB VRAM):
 
-*(Validated up to 16k on 6 GB VRAM in v0.1.)*
+| Metric | Inkwell v0.1.1 (`2.26 bpw`) | Inkwell v0.1 (`2.26 bpw`) | `llama.cpp` (`2.06 bpw`) | v0.1.1 vs `llama.cpp` |
+|---|---:|---:|---:|---:|
+| Short decode | **40.5 tok/s** | 36.9 tok/s | 7.5 tok/s | **5.4×** |
+| Decode @ 64K ctx | **25.8 tok/s** | OOM *(max 16K: 19.1)* | OOM | fits in 5,156 MiB |
+| Prefill 512 (`pp512`) | **250.5 tok/s** | 116.5 tok/s | 108.1 tok/s | **2.3×** |
+| Prefill 4,096 (`pp4096`) | **232.8 tok/s** | 119.5 tok/s | 164.3 tok/s | **1.42×** |
+
+*(Validated up to 64K context on 6 GB VRAM in v0.1.1 with automatic `K8V4` quantization above 8,192 tokens.)*
 
 ## Quick Install (Linux x86_64 · CUDA 12)
 
