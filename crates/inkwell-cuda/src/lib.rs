@@ -1341,6 +1341,12 @@ extern "C" {
         tile_start: *const i32, tile_count: *const i32, tile_n: *const i32,
         sorted_weight: *const f32, inverse_row: *const i32,
         workspace: *mut f32, out: *mut f32, stream: *mut c_void);
+    fn ink_launch_exl3_moe_grouped_gemm_batch(dg: *const c_void, du: *const c_void, dd: *const c_void,
+        x: *const f32, c: i32, row_base: i32, batch_rows: i32, tile_base: i32, tile_batches: i32,
+        do_scatter: i32, separate_dn: i32, sorted_token: *const i32, tile_expert: *const i32,
+        tile_start: *const i32, tile_count: *const i32, tile_n: *const i32,
+        sorted_weight: *const f32, inverse_row: *const i32,
+        workspace: *mut f32, out: *mut f32, stream: *mut c_void);
     fn ink_launch_conv_prefill(x: *const f32, state: *mut f32, region_off: i32,
         w: *const f32, dyn_p: *const f32, c: i32, ch: i32, n_heads: i32,
         scale: f32, out: *mut f32, stream: *mut c_void);
@@ -1384,6 +1390,22 @@ pub unsafe fn exl3_moe_grouped_gemm_async(dg: *const c_void, du: *const c_void, 
     sorted_weight: *const f32, inverse_row: *const i32, workspace: *mut f32, out: *mut f32) {
     unsafe { ink_launch_exl3_moe_grouped_gemm(dg, du, dd, x, c, sorted_token, tile_expert,
         tile_start, tile_count, tile_n, sorted_weight, inverse_row, workspace, out, stream()) };
+}
+
+/// Run one expert-contiguous batch of the deterministic grouped MoE pipeline.
+/// Rows and tile indices are absolute positions in the sorted expansion; the
+/// final weighted scatter runs only when `do_scatter` is nonzero.
+///
+/// # Safety
+/// Device pointers must match the full-layout documented in `prefill.cu`.
+pub unsafe fn exl3_moe_grouped_gemm_batch_async(dg: *const c_void, du: *const c_void, dd: *const c_void,
+    x: *const f32, c: i32, row_base: i32, batch_rows: i32, tile_base: i32, tile_batches: i32,
+    do_scatter: i32, separate_dn: i32, sorted_token: *const i32, tile_expert: *const i32,
+    tile_start: *const i32, tile_count: *const i32, tile_n: *const i32,
+    sorted_weight: *const f32, inverse_row: *const i32, workspace: *mut f32, out: *mut f32) {
+    unsafe { ink_launch_exl3_moe_grouped_gemm_batch(dg, du, dd, x, c, row_base, batch_rows,
+        tile_base, tile_batches, do_scatter, separate_dn, sorted_token, tile_expert, tile_start, tile_count,
+        tile_n, sorted_weight, inverse_row, workspace, out, stream()) };
 }
 
 /// Parallel causal FIR convolution over a prompt chunk.

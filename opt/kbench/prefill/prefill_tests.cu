@@ -53,6 +53,18 @@ static int test_gemm(){
    double ms=timeit([&]{ink_launch_exl3_gemm_smem(dw,du,dv,dx,dy,M,sh.K,sh.N,sh.ka,sh.hk,ds,nullptr);});
    double tf=2.0*M*sh.K*sh.N/(ms*1e9);
    printf("  %-8s M=%2d bitdiff=%d max=%.2e TF=%.2f\n",sh.name,M,bd,ma,tf);
+   if(M>32){
+    setenv("INKWELL_PF_INT8","1",1);
+    ink_launch_exl3_gemm_smem(dw,du,dv,dx,dy,M,sh.K,sh.N,sh.ka,sh.hk,ds,nullptr);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(b.data(),dy,b.size()*4,cudaMemcpyDeviceToHost));
+    unsetenv("INKWELL_PF_INT8");
+    double e2=0.0,r2=0.0;float qma=0;
+    for(size_t i=0;i<a.size();i++){double d=(double)a[i]-b[i];e2+=d*d;r2+=(double)a[i]*a[i];qma=fmaxf(qma,fabsf(a[i]-b[i]));}
+    double qms=timeit([&]{setenv("INKWELL_PF_INT8","1",1);ink_launch_exl3_gemm_smem(dw,du,dv,dx,dy,M,sh.K,sh.N,sh.ka,sh.hk,ds,nullptr);unsetenv("INKWELL_PF_INT8");});
+    double qtf=2.0*M*sh.K*sh.N/(qms*1e9);
+    printf("  %-8s M=%2d dp4a max=%.2e rel_l2=%.3e effTF=%.2f\n",sh.name,M,qma,sqrt(e2/fmax(r2,1e-30)),qtf);
+   }
    if(bd){pass=false;}
   }
   cudaFree(dw);cudaFree(du);cudaFree(dv);cudaFree(dx);cudaFree(dy);cudaFree(dr);cudaFree(ds);
@@ -152,16 +164,37 @@ __global__ void ref_group_gemm(const uint64_t*D,const int*rex,const float*x,floa
  for(int a=0;a<tk;a++){const uint32_t*ring=tr+((size_t)a*tn+tn_i)*w;for(int r=0;r<16;r++){int i=((((c&7)<<2)|((r>>1)&3))<<3)|(r&1)|((r&8)>>2)|((c&8)>>1);float xv=x[(size_t)row*tk*16+a*16+r];s+=xv*pf_bs_f32(pf_exl3_win(ring,i,ka,hk));sx+=xv;}}
  y[(size_t)row*tn*16+tn_i*16+c]=fmaf(KINV,s,KOFF*sx);
 }
+// Host copy of the 128-wide activation quantizer layout used by the dp4a
+// grouped cores.  This is test-only; production quantization stays fused in the
+// Hadamard epilogues.
+static void quant_rows_q8(const std::vector<float>& x,std::vector<int32_t>& xq,
+    std::vector<float>& xscale,std::vector<float>& rowsum,int P,int K){
+ int segN=K/128;xq.assign((size_t)P*K/4,0);xscale.assign((size_t)P*segN,0.f);rowsum.assign(P,0.f);
+ for(int row=0;row<P;row++)for(int seg=0;seg<segN;seg++){
+  const float* xr=x.data()+(size_t)row*K+seg*128;float amax=0.f,sum=0.f;
+  for(int i=0;i<128;i++){amax=fmaxf(amax,fabsf(xr[i]));sum+=xr[i];}
+  const float inv=amax>0.f?127.f/amax:0.f;
+  xscale[(size_t)row*segN+seg]=amax*(1.f/127.f);rowsum[row]+=sum;
+  for(int t=0;t<32;t++){
+   const int sub=t>>2,dmz=t&3,p0=16*sub+2*dmz;
+   int q[4]={(int)lrintf(xr[p0]*inv),(int)lrintf(xr[p0+1]*inv),(int)lrintf(xr[p0+8]*inv),(int)lrintf(xr[p0+9]*inv)};
+   uint32_t pk=0;
+   for(int z=0;z<4;z++){q[z]=std::max(-127,std::min(127,q[z]));pk|=(uint32_t)(q[z]&255)<<(8*z);}
+   xq[(size_t)row*(K/4)+seg*32+t]=(int32_t)pk;
+  }
+ }
+}
+
 static int test_moe(){
  // Grouped-GEMM core exactness on the real down shape, using 4 physical weight
  // blobs recycled through all 128 descriptor entries.
  int C=512,P=C*8,K=1152,N=2304,tk=K/16,tn=N/16,ka=2,hk=1,w=((hk ? 256*ka+128 : 256*ka)/32);
  std::vector<uint32_t> hw((size_t)tk*tn*w);for(auto&x:hw)x=rnd();
- uint32_t*dw;uint64_t*dd;float *dx,*dy,*dr;int *dte,*dts,*dtc,*dtn,*drex;
+ uint32_t*dw;uint64_t*dd;float *dx,*dy,*dr,*drs;int *dte,*dts,*dtc,*dtn,*drex;
  CK(cudaMalloc(&dw,hw.size()*4));CK(cudaMemcpy(dw,hw.data(),hw.size()*4,cudaMemcpyHostToDevice));
  std::vector<uint64_t> hd(128*4);for(int e=0;e<128;e++){hd[4*e]=(uint64_t)(uintptr_t)dw;hd[4*e+3]=ka|(hk<<8);}CK(cudaMalloc(&dd,hd.size()*8));CK(cudaMemcpy(dd,hd.data(),hd.size()*8,cudaMemcpyHostToDevice));
  std::vector<float> hx(P*K);for(auto&x:hx)x=frnd();CK(cudaMalloc(&dx,hx.size()*4));CK(cudaMemcpy(dx,hx.data(),hx.size()*4,cudaMemcpyHostToDevice));
- CK(cudaMalloc(&dy,(size_t)P*N*4));CK(cudaMalloc(&dr,(size_t)P*N*4));CK(cudaMalloc(&dte,4096));CK(cudaMalloc(&dts,4096));CK(cudaMalloc(&dtc,4096));CK(cudaMalloc(&dtn,4));CK(cudaMalloc(&drex,P*4));
+ CK(cudaMalloc(&dy,(size_t)P*N*4));CK(cudaMalloc(&dr,(size_t)P*N*4));CK(cudaMalloc(&drs,(size_t)P*4));CK(cudaMalloc(&dte,4096));CK(cudaMalloc(&dts,4096));CK(cudaMalloc(&dtc,4096));CK(cudaMalloc(&dtn,4));CK(cudaMalloc(&drex,P*4));
  // Mixed routed rows: alternating 24/32+8-sized expert tiles exercise both
  // the 32-row kernel and the 64-row weight-reuse kernel at realistic partial
  // tile sizes while keeping the same total expanded row count.
@@ -174,27 +207,28 @@ static int test_moe(){
  }
  if(pos!=P){printf("bad mixed row count %d\n",pos);return 1;}
  CK(cudaMemcpy(dte,ht.data(),ht.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dts,hs.data(),hs.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dtc,hc.data(),hc.size()*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(dtn,hn.data(),4,cudaMemcpyHostToDevice));CK(cudaMemcpy(drex,rex.data(),P*4,cudaMemcpyHostToDevice));
+ inkwell_moe_rowsum_rows<<<dim3((P+127)/128),256>>>(dx,drs,0,P,K);CK(cudaDeviceSynchronize());
  ref_group_gemm<<<dim3(tn,P),16>>>(dd,drex,dx,dr,P,tk,tn);CK(cudaDeviceSynchronize());
  std::vector<float>a(P*N),b(P*N);CK(cudaMemcpy(b.data(),dr,b.size()*4,cudaMemcpyDeviceToHost));
  dim3 g((N/16+3)/4,P/64+128);
  bool pass=true;
  auto check=[&](const char*name,int kind,int mode32,int mode64){
   CK(cudaMemset(dy,0,(size_t)P*N*4));
-  if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
-  else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+  if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode32);
+  else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode64);
   else {
-   inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
-   inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+   inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode32);
+   inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode64);
   }
   CK(cudaDeviceSynchronize());
   CK(cudaMemcpy(a.data(),dy,a.size()*4,cudaMemcpyDeviceToHost));
   int bd=0;float ma=0;for(size_t i=0;i<a.size();i++){bd+=memcmp(&a[i],&b[i],4)!=0;ma=fmaxf(ma,fabsf(a[i]-b[i]));}
   double ms=timeit([&]{
-   if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
-   else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+   if(kind==0) inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode32);
+   else if(kind==1) inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode64);
    else {
-    inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode32);
-    inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,dy,tk,tn,0,mode64);
+    inkwell_exl3_moe_grouped_gemm_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode32);
+    inkwell_exl3_moe_grouped_gemm64_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dx,drs,dy,tk,tn,0,mode64);
    }
   });
   double tf=2.0*P*K*N/(ms*1e9);printf("moe %-8s bitdiff=%d max=%.2e TF=%.2f\n",name,bd,ma,tf);
@@ -203,6 +237,40 @@ static int test_moe(){
  check("group32",0,0,0);
  check("group64",1,0,0); // mode zero makes the BM64 core process every tile here.
  check("adaptive",2,1,2);
+
+ std::vector<int32_t> hxq;std::vector<float> hxs,hrs;
+ quant_rows_q8(hx,hxq,hxs,hrs,P,K);
+ int32_t*dxq;float*dxs;CK(cudaMalloc(&dxq,hxq.size()*4));CK(cudaMalloc(&dxs,hxs.size()*4));
+ CK(cudaMemcpy(dxq,hxq.data(),hxq.size()*4,cudaMemcpyHostToDevice));
+ CK(cudaMemcpy(dxs,hxs.data(),hxs.size()*4,cudaMemcpyHostToDevice));
+ CK(cudaMemcpy(drs,hrs.data(),hrs.size()*4,cudaMemcpyHostToDevice));
+ auto check_q8=[&](const char*name,int kind,int mode32,int mode64){
+  CK(cudaMemset(dy,0,(size_t)P*N*4));
+  if(kind==0) inkwell_exl3_moe_grouped_gemm_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode32);
+  else if(kind==1) inkwell_exl3_moe_grouped_gemm64_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode64);
+  else {
+   inkwell_exl3_moe_grouped_gemm_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode32);
+   inkwell_exl3_moe_grouped_gemm64_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode64);
+  }
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemcpy(a.data(),dy,a.size()*4,cudaMemcpyDeviceToHost));
+  double e2=0.0,r2=0.0;float qma=0;
+  for(size_t i=0;i<a.size();i++){double d=(double)b[i]-a[i];e2+=d*d;r2+=(double)b[i]*b[i];qma=fmaxf(qma,fabsf(b[i]-a[i]));}
+  double ms=timeit([&]{
+   if(kind==0) inkwell_exl3_moe_grouped_gemm_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode32);
+   else if(kind==1) inkwell_exl3_moe_grouped_gemm64_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode64);
+   else {
+    inkwell_exl3_moe_grouped_gemm_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode32);
+    inkwell_exl3_moe_grouped_gemm64_dp4a_kernel<<<g,256>>>(dd,dte,dts,dtc,dtn,dxq,dxs,drs,dy,tk,tn,0,mode64);
+   }
+  });
+  double tf=2.0*P*K*N/(ms*1e9);
+  printf("moe q8_%-7s max=%.2e rel_l2=%.3e effTF=%.2f\n",name,qma,sqrt(e2/fmax(r2,1e-30)),tf);
+ };
+ check_q8("group32",0,0,0);
+ check_q8("group64",1,0,0);
+ check_q8("adaptive",2,1,2);
+ cudaFree(dxq);cudaFree(dxs);
  printf("MOE %s\n",pass?"PASS":"FAIL");return pass?0:1;
 }
 
@@ -241,22 +309,141 @@ static int test_moe_pipeline(){
  // Reference uses the same deterministic epilogues but scalar per-row GEMVs.
  float*xhg=wsb,*xhu=xhg+(size_t)P*KG,*tg=xhu+(size_t)P*KG,*tu=tg+(size_t)P*NG,*gu=tu+(size_t)P*NG,*xhd=gu+(size_t)P*2*NG,*td=xhd+(size_t)P*NG,*tdn=td+(size_t)P*ND;int*rex=(int*)(tdn+(size_t)P*ND);
  inkwell_moe_fill_row_expert<<<1,128>>>(te,ts,tc,tn,rex);
- inkwell_moe_had_in_rows<<<dim3(KG/128,P),128>>>(dg,rex,stok,dx,xhg,P,KG);
- inkwell_moe_had_in_rows<<<dim3(KG/128,P),128>>>(du,rex,stok,dx,xhu,P,KG);
+ inkwell_moe_had_in_rows<<<dim3(KG/128,P),128>>>(dg,rex,stok,dx,xhg,0,P,KG);
+ inkwell_moe_had_in_rows<<<dim3(KG/128,P),128>>>(du,rex,stok,dx,xhu,0,P,KG);
  ref_group_gemm<<<dim3(tng,P),16>>>(dg,rex,xhg,tg,P,tkg,tng);
  ref_group_gemm<<<dim3(tng,P),16>>>(du,rex,xhu,tu,P,tkg,tng);
- inkwell_moe_had_out_pair_rows<<<dim3(NG/128,P,2),128>>>(dg,du,rex,tg,tu,gu,P,NG);
- inkwell_moe_situ_had_rows<<<dim3(NG/128,P),128>>>(dd,rex,gu,xhd,4.f,25.f,P,NG);
+ inkwell_moe_had_out_pair_rows<<<dim3(NG/128,P,2),128>>>(dg,du,rex,tg,tu,gu,0,P,NG);
+ inkwell_moe_situ_had_rows<<<dim3(NG/128,P),128>>>(dd,rex,gu,xhd,4.f,25.f,0,P,NG);
  ref_group_gemm<<<dim3(tnd,P),16>>>(dd,rex,xhd,td,P,tkd,tnd);
- inkwell_moe_had_out_rows<<<dim3(ND/128,P),128>>>(dd,rex,td,tdn,P,ND);
+ inkwell_moe_had_out_rows<<<dim3(ND/128,P),128>>>(dd,rex,td,tdn,0,P,ND);
  inkwell_moe_weighted_scatter<<<dim3((ND+255)/256,C),256>>>(tdn,dsw,inv,ob,C,ND);
  CK(cudaDeviceSynchronize());
  std::vector<float> va(C*ND),vb(C*ND);CK(cudaMemcpy(va.data(),oa,va.size()*4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(vb.data(),ob,vb.size()*4,cudaMemcpyDeviceToHost));
  int bd=0;float ma=0;for(size_t i=0;i<va.size();i++){bd+=memcmp(&va[i],&vb[i],4)!=0;ma=fmaxf(ma,fabsf(va[i]-vb[i]));}
  printf("moe pipeline bitdiff=%d max=%.2e\nMOE_PIPELINE %s\n",bd,ma,bd?"FAIL":"PASS");
+
+ // Expert-batched pipeline must be bit-identical to the same deterministic
+ // epilogue oracle.  Use tiny four-expert batches so empty experts and many
+ // batch boundaries are exercised even at C=2.
+ float*oc;CK(cudaMalloc(&oc,(size_t)C*ND*4));
+ std::vector<int> heo(129),hte(256),hts(256),htc(256),htn(1);
+ CK(cudaMemcpy(heo.data(),eo,129*4,cudaMemcpyDeviceToHost));
+ CK(cudaMemcpy(hte.data(),te,256*4,cudaMemcpyDeviceToHost));
+ CK(cudaMemcpy(htn.data(),tn,4,cudaMemcpyDeviceToHost));
+ int bbd=0;float bma=0;
+ for(int be0=0;be0<128;be0+=4){
+  int be1=be0+4,row0=heo[be0],rows=heo[be1]-row0;
+  int tb=0;while(tb<htn[0]&&hte[tb]<be0)tb++;
+  int te1=tb;while(te1<htn[0]&&hte[te1]<be1)te1++;
+  ink_launch_exl3_moe_grouped_gemm_batch(dg,du,dd,dx,C,row0,rows,tb,te1-tb,be1==128,1,
+   stok,te,ts,tc,tn,dsw,inv,wsa,oc,nullptr);
+ }
+ CK(cudaDeviceSynchronize());
+ std::vector<float> vc(C*ND);CK(cudaMemcpy(vc.data(),oc,vc.size()*4,cudaMemcpyDeviceToHost));
+ for(size_t i=0;i<vb.size();i++){bbd+=memcmp(&vc[i],&vb[i],4)!=0;bma=fmaxf(bma,fabsf(vc[i]-vb[i]));}
+ printf("moe pipeline batch bitdiff=%d max=%.2e\nMOE_PIPELINE_BATCH %s\n",bbd,bma,bbd?"FAIL":"PASS");
+ bd=bd||bbd;
+
+ setenv("INKWELL_PF_INT8","1",1);
+ ink_launch_exl3_moe_grouped_gemm(dg,du,dd,dx,C,stok,te,ts,tc,tn,dsw,inv,wsa,oa,nullptr);
+ unsetenv("INKWELL_PF_INT8");
+ CK(cudaDeviceSynchronize());
+ CK(cudaMemcpy(va.data(),oa,va.size()*4,cudaMemcpyDeviceToHost));
+ double qe2=0.0,qr2=0.0;float qma=0;
+ for(size_t i=0;i<va.size();i++){double d=(double)va[i]-vb[i];qe2+=d*d;qr2+=(double)vb[i]*vb[i];qma=fmaxf(qma,fabsf(va[i]-vb[i]));}
+ printf("moe pipeline dp4a max=%.2e rel_l2=%.3e\n",qma,sqrt(qe2/fmax(qr2,1e-30)));
+ cudaFree(oc);
  cudaFree(dtg);cudaFree(dtu);cudaFree(dtd);cudaFree(dsug);cudaFree(dsuu);cudaFree(dsvg);cudaFree(dsvu);cudaFree(dsud);cudaFree(dsvd);cudaFree(dg);cudaFree(du);cudaFree(dd);
  cudaFree(dx);cudaFree(dw8);cudaFree(wsa);cudaFree(wsb);cudaFree(oa);cudaFree(ob);cudaFree(dids);cudaFree(eo);cudaFree(stok);cudaFree(sslot);cudaFree(inv);cudaFree(te);cudaFree(ts);cudaFree(tc);cudaFree(tn);cudaFree(dsw);
  return bd!=0;
+}
+
+
+// Scalar controller gain/forget oracle.  The k reduction is ascending, matching
+
+__global__ void ref_ctrl_rms2down(const float* __restrict__ cur,
+        const float* __restrict__ msg, const float* __restrict__ scales,
+        const __nv_bfloat16* __restrict__ w, float* __restrict__ gate,
+        int C, int n, int rows) {
+    const int out = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tok = blockIdx.y;
+    if (out >= rows || tok >= C) return;
+    float acc = 0.0f;
+    for (int k = 0; k < 2 * n; ++k) {
+        float x;
+        if (k < n) x = __fmul_rn(scales[tok * 2], cur[(size_t)tok * n + k]);
+        else x = __fmul_rn(scales[tok * 2 + 1], msg[(size_t)tok * n + k - n]);
+        acc = fmaf(x, __bfloat162float(w[(size_t)out * 2 * n + k]), acc);
+    }
+    gate[(size_t)tok * rows + out] = acc;
+}
+
+// inkwell_pf_ctrl_gf_apply's per-output dependency chain.
+__global__ void ref_ctrl_gf_apply(const __nv_bfloat16* __restrict__ w,
+        const float* __restrict__ gate, const float* __restrict__ cur,
+        const float* __restrict__ msg, float* __restrict__ dst, int C, int n, int fo) {
+    const int out = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tok = blockIdx.y;
+    if (out >= n || tok >= C) return;
+    float g0 = 0.0f, f0 = 0.0f;
+    for (int k = 0; k < 64; ++k) {
+        const float x = gate[(size_t)tok * 64 + k];
+        const float ag = __bfloat162float(w[(size_t)out * 64 + k]);
+        const float af = __bfloat162float(w[(size_t)(fo + out) * 64 + k]);
+        g0 = fmaf(x, ag, g0);
+        f0 = fmaf(x, af, f0);
+    }
+    const float gv = tanhf(g0), fv = tanhf(f0);
+    const float cv = cur[(size_t)tok * n + out];
+    const float mv = msg[(size_t)tok * n + out];
+    const float r = __fsub_rn(cv, __fmul_rn(fv, cv));
+    dst[(size_t)tok * n + out] = __fadd_rn(r, __fmul_rn(gv, mv));
+}
+
+static int test_ctrl(){
+    const int C=512,n=2304,fo=n,K=64;
+    std::vector<uint16_t> hw((size_t)2*n*K);
+    for(auto &x:hw) x=(uint16_t)(0x3800+(rnd()&0x3ff));
+    std::vector<float> hg(C*K),hc(C*n),hm(C*n);
+    for(auto &x:hg)x=frnd()*0.1f; for(auto &x:hc)x=frnd(); for(auto &x:hm)x=frnd();
+    __nv_bfloat16 *dw; float *dg,*dc,*dm,*dy,*dr;
+    CK(cudaMalloc(&dw,hw.size()*2));CK(cudaMemcpy(dw,hw.data(),hw.size()*2,cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dg,hg.size()*4));CK(cudaMemcpy(dg,hg.data(),hg.size()*4,cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dc,hc.size()*4));CK(cudaMemcpy(dc,hc.data(),hc.size()*4,cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dm,hm.size()*4));CK(cudaMemcpy(dm,hm.data(),hm.size()*4,cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dy,(size_t)C*n*4));CK(cudaMalloc(&dr,(size_t)C*n*4));
+    dim3 refg((n+255)/256,C);
+    ref_ctrl_gf_apply<<<refg,256>>>(dw,dg,dc,dm,dr,C,n,fo);
+    dim3 g((n+31)/32,(C+31)/32);
+    inkwell_pf_ctrl_gf_apply<<<g,256>>>(dw,dg,dc,dm,dy,C,n,fo);
+    CK(cudaDeviceSynchronize());
+    std::vector<float> a(C*n),b(C*n);
+    CK(cudaMemcpy(a.data(),dy,a.size()*4,cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(b.data(),dr,b.size()*4,cudaMemcpyDeviceToHost));
+    int bd=0;float ma=0;for(size_t i=0;i<a.size();i++){bd+=memcmp(&a[i],&b[i],4)!=0;ma=fmaxf(ma,fabsf(a[i]-b[i]));}
+    double ms=timeit([&]{ inkwell_pf_ctrl_gf_apply<<<g,256>>>(dw,dg,dc,dm,dy,C,n,fo); });
+    printf("ctrl_gf bitdiff=%d max=%.2e ms=%.3f\n",bd,ma,ms);
+
+    const int rows=64,ktot=2*n;
+    std::vector<uint16_t> hrw((size_t)rows*ktot);
+    for(auto &x:hrw)x=(uint16_t)(0x3800+(rnd()&0x3ff));
+    std::vector<float> hsc(C*2);for(auto &x:hsc)x=0.5f+0.25f*frnd();
+    __nv_bfloat16 *drw;float *dsc,*dg2,*dg2r;
+    CK(cudaMalloc(&drw,hrw.size()*2));CK(cudaMemcpy(drw,hrw.data(),hrw.size()*2,cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dsc,hsc.size()*4));CK(cudaMemcpy(dsc,hsc.data(),hsc.size()*4,cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dg2,(size_t)C*rows*4));CK(cudaMalloc(&dg2r,(size_t)C*rows*4));
+    ref_ctrl_rms2down<<<dim3((rows+255)/256,C),256>>>(dc,dm,dsc,drw,dg2r,C,n,rows);
+    inkwell_pf_ctrl_rms2down<<<dim3(1,(C+15)/16),256>>>(dc,dm,dsc,drw,dg2,C,n,rows,1e-6f);
+    CK(cudaDeviceSynchronize());
+    std::vector<float> g2(C*rows),g2r(C*rows);
+    CK(cudaMemcpy(g2.data(),dg2,g2.size()*4,cudaMemcpyDeviceToHost));CK(cudaMemcpy(g2r.data(),dg2r,g2r.size()*4,cudaMemcpyDeviceToHost));
+    int bd2=0;float ma2=0;for(size_t i=0;i<g2.size();i++){bd2+=memcmp(&g2[i],&g2r[i],4)!=0;ma2=fmaxf(ma2,fabsf(g2[i]-g2r[i]));}
+    double ms2=timeit([&]{ inkwell_pf_ctrl_rms2down<<<dim3(1,(C+15)/16),256>>>(dc,dm,dsc,drw,dg2,C,n,rows,1e-6f); });
+    printf("ctrl_rms2down bitdiff=%d max=%.2e ms=%.3f\nCTRL %s\n",bd2,ma2,ms2,(bd||bd2)?"FAIL":"PASS");
+    cudaFree(drw);cudaFree(dsc);cudaFree(dg2);cudaFree(dg2r);
+    cudaFree(dw);cudaFree(dg);cudaFree(dc);cudaFree(dm);cudaFree(dy);cudaFree(dr);
+    return (bd||bd2)!=0;
 }
 
 // Rel-bias table expand, [16][1025] -> [24][16][1025]. The BF16 source is the
@@ -288,5 +475,5 @@ static int test_rel(){
 
 int main(int argc,char**argv){std::string m=argc>1?argv[1]:"all";int rc=0;
  if(m=="gemm"||m=="all")rc|=test_gemm();if(m=="conv"||m=="all")rc|=test_conv();if(m=="flash"||m=="all")rc|=test_flash();if(m=="moe"||m=="all"){rc|=test_moe();rc|=test_moe_pipeline();}
- if(m=="rel"||m=="all")rc|=test_rel();
+ if(m=="ctrl"||m=="all")rc|=test_ctrl();if(m=="rel"||m=="all")rc|=test_rel();
  printf("OVERALL %s\n",rc?"FAIL":"PASS");return rc;}
