@@ -69,7 +69,7 @@ def loop_rows(sass, kernel='gemv_moe_s'):
         if k == 'unknown':
             if cnt['SHF'] == 24 and cnt['PRMT'] == 8:
                 k = 'K2'
-            elif cnt['SHF'] == 8 and cnt['PRMT'] == 20:
+            elif cnt['SHF'] == 8 and cnt['PRMT'] in (4, 20):
                 k = 'K4'
         rows.append({'start': target, 'end': addr, 'n': len(body), 'psl': psl, 'cnt': cnt,
                      'k': k})
@@ -96,12 +96,16 @@ SHIFT_SETS = {
 LOOP_SHAPE = {
     'K1.5': (215, 32, 4, 4), 'K2': (215, 24, 4, 4),
     'K2.5': (219, 36, 4, 4), 'K3': (219, 36, 4, 4),
-    'K3.5': (223, 36, 4, 8), 'K4': (211, 8, 4, 4),
+    'K3.5': (223, 36, 4, 8), 'K4': (195, 8, 4, 4),
 }
 # Dense uses the generic runtime-stride implementation.  K3.5 is the only
 # dense/generic case that still needs the W2 donor shuffle.
 DENSE_LOOP_SHAPE = {
-    'K3': (223, 36, 4, 4), 'K3.5': (228, 36, 4, 8), 'K4': (216, 8, 4, 4),
+    'K3': (223, 36, 4, 4), 'K3.5': (228, 36, 4, 8), 'K4': (200, 8, 4, 4),
+}
+# The projection-batch wrapper has one extra instruction in its K4 loop.
+BATCH_LOOP_SHAPE = {
+    'K3': (223, 36, 4, 4), 'K3.5': (228, 36, 4, 8), 'K4': (201, 8, 4, 4),
 }
 
 def require_loop_shape(rows, nops, shape=LOOP_SHAPE, label='CH2', copies=1):
@@ -123,7 +127,7 @@ def require_loop_shape(rows, nops, shape=LOOP_SHAPE, label='CH2', copies=1):
                 got = r['psl'] if op == 'PSL' else c[op]
                 if got != want:
                     raise Ch2Fail(f'{name} loop {op} count mismatch: {got} != {want}')
-            want_prmt = {'K2': 8, 'K4': 20}.get(name, 0)
+            want_prmt = {'K2': 8, 'K4': 4}.get(name, 0)
             if c['PRMT'] != want_prmt:
                 raise Ch2Fail(f'{name} loop PRMT count mismatch: {c["PRMT"]} != {want_prmt}')
 
@@ -357,12 +361,13 @@ def generate(obj, outcubin, workdir, cuda_home):
     shutil.copyfile(unpatched, patched)
     pout = run([str(venvpy), str(ch2 / 'patch_sass.py'), str(patched), str(cuobj)], workdir, workdir / 'patch.log', env, capture=True)
     pm = re.search(r'fake=(\d+) lp=(\d+) words=(\d+) hi_d12d=(\d+)', pout)
-    if not pm or tuple(map(int, pm.groups())) != (1078, 1088, 4388, 1086):
+    if not pm or tuple(map(int, pm.groups())) != (1102, 1112, 5906, 1110):
         raise Ch2Fail('patched-with-NOPs baseline pattern mismatch: ' + (pout.strip() or 'no patch output'))
     sassp = run([str(cuobj), '-sass', str(patched)], workdir, workdir / 'patched.sass.stdout', env, capture=True)
     (workdir / 'kernels_patched_nops.sass').write_text(sassp)
     require_loop_shape(loop_rows(sassp), nops=True, copies=2)
     require_loop_shape(loop_rows(sassp, 'gemv_sf_ch2'), nops=True, shape=DENSE_LOOP_SHAPE, label='dense CH2')
+    require_loop_shape(loop_rows(sassp, 'gemv_batchf'), nops=True, shape=BATCH_LOOP_SHAPE, label='batch dense CH2')
 
     run([str(venvpy), str(cuasm / 'bin/cuasm.py'), str(patched), '-o', 'kernels_patched_nops.cuasm'],
         workdir, workdir / 'cuasm_disassemble.log', env)
@@ -370,10 +375,14 @@ def generate(obj, outcubin, workdir, cuda_home):
         workdir, workdir / 'loop_ranges.log', env)
     run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges_dense.json', 'gemv_sf_ch2', '3'],
         workdir, workdir / 'loop_ranges_dense.log', env)
+    run(['python3', str(ch2 / 'reasm_loop_ranges.py'), 'kernels_patched_nops.sass', 'loop_ranges_batch.json', 'gemv_batchf', '3'],
+        workdir, workdir / 'loop_ranges_batch.log', env)
     run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_patched_nops.cuasm', 'kernels_moe_nopless.cuasm', 'loop_ranges.json'],
         workdir, workdir / 'remove_nops.log', env)
-    run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_moe_nopless.cuasm', 'kernels_nopless.cuasm', 'loop_ranges_dense.json', '-', '.text._Z24inkwell_exl3_gemv_sf_ch2'],
+    run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_moe_nopless.cuasm', 'kernels_dense_nopless.cuasm', 'loop_ranges_dense.json', '-', '.text._Z24inkwell_exl3_gemv_sf_ch2'],
         workdir, workdir / 'remove_nops_dense.log', env)
+    run([str(venvpy), str(ch2 / 'reasm_remove_loop_nops.py'), 'kernels_dense_nopless.cuasm', 'kernels_nopless.cuasm', 'loop_ranges_batch.json', '-', '.text._Z24inkwell_exl3_gemv_batchf'],
+        workdir, workdir / 'remove_nops_batch.log', env)
     nopless = workdir / 'kernels_patched_nopless.sm_61.cubin'
     run([str(venvpy), str(ch2 / 'reasm_assemble_with_repos.py'), 'kernels_nopless.cuasm', 'Repos.sm_61.production.txt', str(nopless)],
         workdir, workdir / 'assemble_nopless.log', env)
@@ -382,10 +391,12 @@ def generate(obj, outcubin, workdir, cuda_home):
     rows_n = loop_rows(sassn)
     require_loop_shape(rows_n, nops=False, copies=2)
     require_loop_shape(loop_rows(sassn, 'gemv_sf_ch2'), nops=False, shape=DENSE_LOOP_SHAPE, label='dense CH2')
-    patch_and_verify_nvinfo(nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2'])
-    repair_indirect_branch_tables(patched, sassp, nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2'])
+    require_loop_shape(loop_rows(sassn, 'gemv_batchf'), nops=False, shape=BATCH_LOOP_SHAPE, label='batch dense CH2')
+    patch_and_verify_nvinfo(nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2', 'gemv_batchf'])
+    repair_indirect_branch_tables(patched, sassp, nopless, sassn, ['gemv_moe_s', 'gemv_sf_ch2', 'gemv_batchf'])
     res_usage_ok(cuobj, nopless, 'gemv_moe_s', 40, 9248)
     res_usage_ok(cuobj, nopless, 'gemv_sf_ch2', 40, 12848)
+    res_usage_ok(cuobj, nopless, 'gemv_batchf', 48, 12848)
 
     digest = hashlib.sha256(nopless.read_bytes()).hexdigest()
     tmp = outcubin.with_suffix(outcubin.suffix + '.tmp')

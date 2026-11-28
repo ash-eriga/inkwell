@@ -2476,3 +2476,49 @@ Implemented a warm-cache startup loader restructuring plus instrumentation:
 - `opt/tools/startup_ab.py` is an interleaved warm startup A/B harness measuring external launch→first `stepwall`, md5, decode ms/tok, and peak VRAM.
 
 Verification status: `cargo check --release -p inkwell-cli` and `cargo build --release` pass. No GPU verification has been run in this session because a foreign interactive process `/home/ash/inkwell/target/release/inkwell` (pid 1585228, parent interactive bash 1544767) is holding ~4.9 GiB VRAM on the GTX 1060. Per the shared-GPU rule it was not killed. Baseline/optimized startup, md5/VRAM/decode gates, and CLI smoke remain unmeasured; do not merge until the GPU is free and `opt/tools/gpu-run -p normal python3 opt/tools/startup_ab.py <outdir>` plus the legacy gate complete.
+
+## 2026-11-26 — joint expert placement/cache — ACCEPTED
+
+**Mechanism.** Choose resident expert layers and per-layer cache sizes jointly instead of layering a fixed cache table on top of the old placement. The default resident set is now `[3,6,7,8,10,11,12,14,16,17]` and the matching cache table is `T1164J` (`[100,88,68,0,84,96,0,0,0,112,0,0,0,108,0,128,0,0,52,48,64,72,68,76]` MiB). `INKWELL_NO_JOINTPLACE=1` restores the old placement/cache choice; explicit `INKWELL_DEV_LAYERS`/`INKWELL_DEV_EXPERT_MB` still override the default.
+
+**Why this set.** Exact kslot replay of the short-context routing trace reproduces the old default at `34.7506 MiB/tok` / `17.2647 misses/tok`. The first unconstrained hill climb reached `29.420 MiB/tok` but reduced resident expert bytes by about 250 MiB, shifting those bytes into pinned host RAM on the 16 GiB host. Re-running with resident bytes constrained to at least the old `2,796 MiB` selected the implemented memory-neutral configuration: resident `2,832 MiB`, cache `1,164 MiB`, `30.257 MiB/tok` / `15.54 misses/tok`. This is `-4.494 MiB/tok` (`-12.9%`) of miss traffic while increasing resident device bytes by 36 MiB (therefore not increasing pinned host RAM). Search artifacts: `~/.cache/inkwell-dec25/joint-place-search.out`, `joint-constrained.out`, `joint_place_search.py`, `kslot-curves.pkl`.
+
+**Gate.** The candidate binary also contained the PW16 experiment, so the joint isolation arm ran with `INKWELL_NO_PW16=1`; control and candidate consequently used the same numerics. Interleaved A/B: `runs ctl=16 cand=16 ctl_med=27.151 cand_med=26.937 delta=-0.214 wins=13/16 md5=['5cbe8e06'] peak=5048`. Every control, joint, and killswitch smoke run also produced md5 `5cbe8e06`; peaks were 5,046–5,048 MiB. Accepted as an exact placement/cache win.
+
+## 2026-11-27 — PW16 default-on quality gate — REJECTED
+
+The existing opt-in M=16-Paired C0c core was flipped default-on for a decode-latency experiment. Speed alone was favorable but marginal: interleaved control/candidate A/B `runs ctl=16 cand=16 ctl_med=27.197 cand_med=26.966 delta=-0.230 wins=11/16 md5=['5cbe8e06','7aa1f58b'] peak=5048` (the first candidate sample, 31.067 ms, overlapped a foreign build and was retained in the summary). The changed md5 required the teacher-forced noise-floor gate.
+
+That gate failed decisively on the first ctx512 prompt before the campaign was stopped: mean KLD **3.374558749**, top-1 disagreement **0.73828125**, target-perplexity delta **+2856.452205%**, max logit absolute difference **39.86999607** (256 rows; control vs `inkwell-pw16-default`). This is orders of magnitude outside the measured FP32-noise floor and cannot be justified as reorder noise. The run was terminated after prompt 1 to avoid wasting shared GPU time; pw16 remains opt-in and default-off. Audit clues for any future repair: enabling the global pw16 mask disables the validated dense-CH2 driver for every dense shape (`ch2dense_try_launch` rejects any nonzero mask), while the MoE CH2 path takes priority over pw16 for tn=72/144, so the current integration may exercise different paths from the original gold tests.
+
+## t3/decode-latency-25ms-1 — depth-stack message batching + wide mix — ACCEPTED
+
+Rebased the parked `t3/mix-rework` change onto the joint-placement head. The 12 middle layers' four message queries are packed into one `[2304,48]` tensor; passes 1/2 evaluate all 48 queries in one wide reduce/apply mix, and each layer consumes a zero-copy 4-column view. Narrow single-column mixes keep the incumbent fused kernel. The rewrite preserves the same reduction/softmax/apply ordering and is bit-exact.
+
+A/B 8×(ctl,cand,cand,ctl), both arms `INKWELL_NO_PW16=1` to isolate this from the rejected PW16 experiment: control `inkwell-joint-pw16`, candidate sha256 `78d655b220ff0aacf2dda0d3206d091ebebd5255fdc594c4fa1d16fc3a83001e` (`bin/inkwell-mixrework`). Result: `runs ctl=16 cand=16 ctl_med=26.952 cand_med=26.529 delta=-0.422 wins=14/16 md5=['5cbe8e06'] peak=5046`. Raw output: `/home/ash/.cache/inkwell-dec25/ab-mixrework/out`. Killswitches: `INKWELL_NO_MSG_BATCH=1` and `INKWELL_NO_MIX_V2=1`.
+
+## t3/decode-latency-25ms-1 — PW16 versus ch2nopless integration — REJECTED, obsolete
+
+A same-binary teacher-forced isolation first showed that the runtime-linked PW16 path is numerically sound when the expert ch2nopless module is disabled: rows 256, mean KLD **3.952868436e-05**, top-1 disagreement **0.781%**, target-perplexity delta **+0.0663%**, max logit difference **1.091**. With the module enabled the same binary was catastrophic (mean KLD **3.3746**, top-1 disagreement **73.8%**).
+
+Source inspection found an integration mismatch in `inkwell_exl3_gemv_moe_s`: the prologue used the PW16 activation permutation while the `ch2` dispatcher won whenever the driver module passed `pw16|1<<30`. A precedence-fix build made the module take the PW16 branch, but quality remained catastrophic (mean KLD **4.7530**, top-1 disagreement **94.1%**). A driver-level cubin isolation (`pw16diag/reasm_drv_pw16`) then split the fault exactly: the byte-patched-with-NOPs cubin was bitwise identical to the unpatched cubin for every K/shape, while the NOP-deleted cubin was wrong on every output for PW16-enabled K2/K2.5/K3/K4 (`badbits` 9216/9216 gu, 18432/18432 dn) and exact for K1.5/K3.5. Thus NOP deletion/reassembly, not the byte patch or the runtime-linked kernel, corrupts the PW16 path.
+
+The repair is not worth pursuing for decode-25: in the same harness the correct PW16 timing is about **0.075–0.089 ms** per expert-shape batch for K2/K2.5/K3/K4, while the existing scalar CH2 NOP-less timings in the ledger are about **0.0666–0.0778 ms**. PW16's old −1.07 ms/tok kernel gain was measured before ch2nopless and has been overtaken by the CH2 scalar core. The precedence experiment was reverted; PW16 remains opt-in and default-off, and should be treated as obsolete unless the NOP-less PW16 reassembly is deliberately repaired for another reason. Raw outputs: `/home/ash/.cache/inkwell-dec25/pw16-quality-nonp/metrics/p1.summary.json`, `/home/ash/.cache/inkwell-dec25/pw16-quality-fix/metrics/p1.summary.json`, `/home/ash/.cache/inkwell-dec25/pw16diag/timing.out`.
+
+## t3/decode-latency-25ms-1 — high-memory joint placement — REJECTED
+
+The exact kslot replay suggested that spending 40 MiB more device memory (`MEM4036`, resident `[0,3,6,7,10,11,12,14,16,17]`, cache 1,232 MiB) would cut miss traffic from 30.257 to 29.111 MiB/tok. A same-binary smoke was promising (`26.631` vs `26.323` ms/tok, exact md5, peak 5,086 MiB), but the registered 16-pair interleaved A/B did not reproduce it: `runs ctl=16 cand=16 ctl_med=26.517 cand_med=26.520 delta=+0.004 wins=9/16 md5=['5cbe8e06'] peak=5086`. The traffic reduction is real in replay but too small to overcome decode noise/end-to-end overlap, and it consumes most of the remaining hard VRAM margin. No source change was made. Raw output: `/home/ash/.cache/inkwell-dec25/ab-himem4036/out`; candidate env is recorded in `/home/ash/.cache/inkwell-dec25/himem_smoke.sh`.
+
+## t3/decode-latency-25ms-1 — final remaining-time analysis
+
+Final interleaved decode state is the mix-batched head at **26.529 ms/tok** (exact md5 `5cbe8e06`, peak 5,046 MiB), so the remaining gap to 25 ms/tok is **1.529 ms/tok**. No fresh nsys was taken after the last two exact placement/mix changes; the best remaining-time picture is the prior node profile adjusted only where an accepted mechanism directly applies:
+
+| component | prior ms/tok | post-change estimate | note |
+|---|---:|---:|---|
+| dense `gemv_sf_ch2` | 12.456 | ~12.456 | unchanged; 291.45 launches/tok, ~74.7 GB/s |
+| expert `gemv_moe_s` | 11.576 | ~11.576 | unchanged; 115 launches/tok, latency-bound at ~9.8 GB/s |
+| MoE miss copy `moe_ccopy` | 4.442 | ~3.87 upper-bound busy time | joint placement removes 12.9% replayed miss traffic, but much is overlapped; measured e2e gain was only 0.214 |
+| depth/message mix | 1.272 | ~0.85 | accepted batching gained 0.422 ms/tok e2e; exact residual not re-profiled |
+| host/launch idle | ~1.692 | reduced, unquantified | fragmented; some query-launch batching is included in the mix win |
+
+These components overlap, so their sum is not the critical path. The arithmetic target is nevertheless clear: 26.529 − 25.000 = **1.529 ms/tok**, equivalent to **6.4%** of the combined dense+expert GEMV busy time (`12.456+11.576=24.032`). A single small-kernel or cache-table tweak is unlikely to close it. The plausible routes are architectural: descriptor-batch or otherwise fuse independent dense GEMVs to reduce small-launch serialization; restructure hit/miss expert GEMV execution so the latency-bound expert kernel forms larger useful grids; or hide/reduce PCIe miss-copy traffic beyond the already accepted joint placement. PW16 is now explicitly excluded: correct but slower than ch2nopless, and its NOP-less cubin path is corrupted. High-memory placement is also excluded: exact but end-to-end neutral at peak 5,086 MiB.

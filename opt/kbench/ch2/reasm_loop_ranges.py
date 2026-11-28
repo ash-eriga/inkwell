@@ -37,7 +37,7 @@ for addr, op, full in ins:
     body = [x for x in ins if target <= x[0] <= addr]
     cnt = Counter(o for _, o, _ in body)
     psl = sum(1 for _, _, f in body if f.startswith("XMAD.PSL") and "0x83dc" in f)
-    if cnt["NOP"] != 32 or psl != 32:
+    if cnt["NOP"] != 32 or psl != 32 or cnt["SHFL"] == 0:
         continue
     shifts = []
     for _, o, f in body:
@@ -50,7 +50,7 @@ for addr, op, full in ins:
     if k == "unknown":
         if cnt["SHF"] == 24 and cnt["PRMT"] == 8:
             k = "K2"
-        elif cnt["SHF"] == 8 and cnt["PRMT"] == 20:
+        elif cnt["SHF"] == 8 and cnt["PRMT"] in (4, 20):
             k = "K4"
     rows.append({
         "start": target,
