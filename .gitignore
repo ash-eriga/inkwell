@@ -35,3 +35,7 @@ third_party/ggml/ggml-src/
 # local benchmark builds and run output
 .target-*/
 /*.log
+
+# kvq64 generated measurement output (logs, states, logit dumps, nsys traces)
+opt/kvq64/artifacts/
+opt/kvq64/*/artifacts/

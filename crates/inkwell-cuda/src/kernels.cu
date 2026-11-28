@@ -10,7 +10,12 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include "gpu_caps.cuh"
 #include "exl3_gemv_v2.cuh"
+
+extern "C" int inkwell_cuda_has_dp4a(void) {
+    return ink_gpu_has_dp4a() ? 1 : 0;
+}
 
 extern "C" {
 
@@ -2505,6 +2510,1473 @@ __global__ void inkwell_attn_decode_reduce_dyn(const float* __restrict__ part, c
     }
 }
 
+
+
+// ===== generic quantized KV cache formats (decode) =====
+static float* inkwell_attn_partbuf(size_t floats);
+static unsigned char* inkwell_kvq_qbuf() {
+    static unsigned char* p = nullptr;
+    if (!p && cudaMalloc((void**)&p, 8192) != cudaSuccess) return nullptr;
+    return p;
+}
+// Row-major per cache pass.  K/V rows contain all eight KV heads for one
+// token; metadata rows are 12 fp16 slots per head (96 B/token) when used.
+#define INK_KVQ_INT8 1
+#define INK_KVQ_FP8_E4M3 2
+#define INK_KVQ_K8V4 3
+#define INK_KVQ_K4V2 4
+#define INK_KVQ_FP8_E5M2 5
+#define INK_KVQ_K8V4G32 6
+#define INK_KVQ_K8V6 7
+#define INK_KVQ_K10V6 8
+
+template<int FMT> __host__ __device__ constexpr bool ink_kvq_k8v4fam() { return FMT == INK_KVQ_K8V4 || FMT == INK_KVQ_K8V4G32; }
+template<int FMT> __host__ __device__ constexpr bool ink_kvq_k8v6() { return FMT == INK_KVQ_K8V6; }
+template<int FMT> __host__ __device__ constexpr bool ink_kvq_k10v6() { return FMT == INK_KVQ_K10V6; }
+template<int FMT> __host__ __device__ constexpr bool ink_kvq_v6() { return ink_kvq_k8v6<FMT>() || ink_kvq_k10v6<FMT>(); }
+
+struct InkKvQSlot {
+    unsigned char* kq;
+    unsigned char* vq;
+    unsigned char* meta;
+    __half* khp;
+    __half* vhp;
+    int cap;
+    int hp_cap;
+    int swa;
+    int sinks;
+    int local;
+    int is_swa;
+    int fmt;
+    int krow;
+    int vrow;
+    int mrow;
+};
+
+__device__ __forceinline__ float ink_kvq_half_as_float(unsigned int x) {
+    return __half2float(__ushort_as_half((unsigned short)x));
+}
+
+__device__ __forceinline__ unsigned char ink_fp8_e4m3(float x) {
+    const unsigned int xb = __float_as_uint(x);
+    const unsigned int sign = (xb >> 24) & 0x80u;
+    float ax = fabsf(x);
+    if (!(ax < 448.f)) return (unsigned char)(sign | 0x7eu); // satfinite; NaN too
+    if (ax < 0.0009765625f) return (unsigned char)sign;      // below half min-subnormal
+    if (ax < 0.015625f) {
+        const int q = (int)nearbyintf(ax * 512.f);
+        return (unsigned char)(sign | (unsigned int)min(15, q));
+    }
+    unsigned int ib = __float_as_uint(ax);
+    int e = (int)((ib >> 23) & 0xffu) - 127 + 7;
+    int mant = (int)((ib >> 20) & 7u);
+    const unsigned int rb = (ib >> 19) & 1u;
+    mant += (int)rb;
+    if (mant == 8) { mant = 0; ++e; }
+    if (e >= 15) return (unsigned char)(sign | 0x7eu);
+    return (unsigned char)(sign | ((unsigned int)e << 3) | (unsigned int)mant);
+}
+
+__device__ __forceinline__ float ink_fp8_e4m3_f(unsigned char b) {
+    const float sign = (b & 0x80u) ? -1.f : 1.f;
+    const int e = (b >> 3) & 15;
+    const int m = b & 7;
+    if (e == 0) return sign * (float)m * 0.001953125f;
+    const int hb = ((b & 0x80u) << 8) | ((e + 8) << 10) | (m << 7);
+    return ink_kvq_half_as_float((unsigned int)hb);
+}
+
+__device__ __forceinline__ unsigned char ink_fp8_e5m2(float x) {
+    const unsigned int xb = __float_as_uint(x);
+    const unsigned int sign = (xb >> 24) & 0x80u;
+    float ax = fabsf(x);
+    if (!(ax < 57344.f)) return (unsigned char)(sign | 0x7bu); // finite max
+    if (ax < 0.00000762939453125f) return (unsigned char)sign;
+    if (ax < 0.00006103515625f) {
+        const int q = (int)nearbyintf(ax * 65536.f);
+        return (unsigned char)(sign | (unsigned int)min(3, q));
+    }
+    unsigned int ib = __float_as_uint(ax);
+    int e = (int)((ib >> 23) & 0xffu) - 127 + 15;
+    int mant = (int)((ib >> 21) & 3u);
+    mant += (int)((ib >> 20) & 1u);
+    if (mant == 4) { mant = 0; ++e; }
+    if (e >= 31) return (unsigned char)(sign | 0x7bu);
+    return (unsigned char)(sign | ((unsigned int)e << 2) | (unsigned int)mant);
+}
+
+__device__ __forceinline__ float ink_fp8_e5m2_f(unsigned char b) {
+    const int hb = ((b & 0x80u) << 8) | ((b & 0x7fu) << 8);
+    return ink_kvq_half_as_float((unsigned int)hb);
+}
+
+__device__ __forceinline__ unsigned char ink_fp8_quant(float x, int fmt) {
+    return fmt == INK_KVQ_FP8_E5M2 ? ink_fp8_e5m2(x) : ink_fp8_e4m3(x);
+}
+
+__device__ __forceinline__ float ink_fp8_dequant(unsigned char x, int fmt) {
+    return fmt == INK_KVQ_FP8_E5M2 ? ink_fp8_e5m2_f(x) : ink_fp8_e4m3_f(x);
+}
+
+// K8V4 decode-cache rows are stored head-major in 16-row tiles.  Inside a
+// tile, each 8-row stream pairs row s with row s+8 at 8-byte (K) or 4-byte
+// (V) granularity so the GQA row kernel can use one vector load for two rows.
+// The ordering remains a compact permutation even when the final tile is partial.
+__device__ __forceinline__ int ink_k8v4_tile_rem(int cap, int tile) {
+    return max(0, min(16, cap - tile * 16));
+}
+__device__ __forceinline__ int ink_k8v4_row_units(int rem, int s) {
+    return s < rem ? (s + 8 < rem ? 2 : 1) : 0;
+}
+__device__ __forceinline__ int ink_k8v4_units_before(int rem, int s) {
+    int u = 0;
+    #pragma unroll
+    for (int z = 0; z < 8; ++z) if (z < s) u += ink_k8v4_row_units(rem, z);
+    return u;
+}
+__device__ __forceinline__ int ink_k8v4_dim_unit(int cap, int qrow, int sl) {
+    const int tile = qrow >> 4;
+    const int t = qrow & 15;
+    const int rem = ink_k8v4_tile_rem(cap, tile);
+    const int s = t & 7;
+    const int half = t >> 3;
+    const int cnt = ink_k8v4_row_units(rem, s);
+    return ink_k8v4_units_before(rem, s) * 16 + sl * cnt + half;
+}
+__device__ __forceinline__ int ink_k8v4_row_unit(int cap, int qrow) {
+    const int tile = qrow >> 4;
+    const int t = qrow & 15;
+    const int rem = ink_k8v4_tile_rem(cap, tile);
+    return ink_k8v4_units_before(rem, t & 7) + (t >> 3);
+}
+__device__ __forceinline__ const unsigned char* ink_k8v4_kptr(const InkKvQSlot& slot, int qrow, int hk, int d) {
+    const int tile = qrow >> 4;
+    const int unit = ink_k8v4_dim_unit(slot.cap, qrow, d >> 3);
+    return slot.kq + (size_t)hk * slot.cap * 128 + (size_t)tile * 2048 + unit * 8 + (d & 7);
+}
+__device__ __forceinline__ const unsigned char* ink_k8v4_vptr(const InkKvQSlot& slot, int qrow, int hk, int d) {
+    const int tile = qrow >> 4;
+    const int unit = ink_k8v4_dim_unit(slot.cap, qrow, d >> 2);
+    return slot.vq + (size_t)hk * slot.cap * 64 + (size_t)tile * 1024 + unit * 4 + (d & 3);
+}
+__device__ __forceinline__ const unsigned char* ink_k8v4_mptr(const InkKvQSlot& slot, int qrow, int hk) {
+    const int tile = qrow >> 4;
+    return slot.meta + (size_t)hk * slot.cap * 12 + (size_t)tile * 192 + ink_k8v4_row_unit(slot.cap, qrow) * 12;
+}
+__device__ __forceinline__ unsigned char* ink_k8v4_kptr_mut(const InkKvQSlot& slot, int qrow, int hk, int d) {
+    return (unsigned char*)ink_k8v4_kptr(slot, qrow, hk, d);
+}
+__device__ __forceinline__ unsigned char* ink_k8v4_vptr_mut(const InkKvQSlot& slot, int qrow, int hk, int d) {
+    return (unsigned char*)ink_k8v4_vptr(slot, qrow, hk, d);
+}
+__device__ __forceinline__ unsigned char* ink_k8v4_mptr_mut(const InkKvQSlot& slot, int qrow, int hk) {
+    return (unsigned char*)ink_k8v4_mptr(slot, qrow, hk);
+}
+
+// Quantize one 128-dim K/V pair for head hk.  The block must have exactly
+// 128 threads.  Grouping is two 64-dim groups per head; fp16 scales/mins use
+// the first six fp16 slots of the 12-slot metadata row for compatibility with K4V2.
+__device__ void ink_kvq_store_quant(InkKvQSlot slot, int qrow, int hk, int d,
+                                    float ekv, float evv,
+                                    float* ek, float* ev, float* mn, float* mx,
+                                    unsigned char* qk, unsigned char* qv, unsigned char* qklo,
+                                    float* ksc_s, float* vsc_s, float* vmn_s) {
+    ek[d] = ekv;
+    ev[d] = evv;
+    __syncthreads();
+    mx[d] = fabsf(ek[d]);
+    __syncthreads();
+    for (int s = 32; s > 0; s >>= 1) {
+        const int r = d & 63;
+        if (r < s) mx[d] = fmaxf(mx[d], mx[d + s]);
+        __syncthreads();
+    }
+    if (d == 0 || d == 64) {
+        const float den = slot.fmt == INK_KVQ_K4V2 ? __fdiv_rn(mx[d], 7.f) : (slot.fmt == INK_KVQ_K10V6 ? __fdiv_rn(mx[d], 511.f) : __fdiv_rn(mx[d], 127.f));
+        ksc_s[d >> 6] = ink_kvq_half_as_float((unsigned int)__half_as_ushort(__float2half_rn(den)));
+    }
+    __syncthreads();
+
+    if (slot.fmt == INK_KVQ_K8V4 || slot.fmt == INK_KVQ_K8V4G32 || slot.fmt == INK_KVQ_K8V6 || slot.fmt == INK_KVQ_K10V6 || slot.fmt == INK_KVQ_K4V2) {
+        mn[d] = ev[d];
+        mx[d] = ev[d];
+        __syncthreads();
+        const int vgs = (slot.fmt == INK_KVQ_K8V4G32) ? 32 : 64;
+        for (int st = vgs >> 1; st > 0; st >>= 1) {
+            const int r = d & (vgs - 1);
+            if (r < st) {
+                mn[d] = fminf(mn[d], mn[d + st]);
+                mx[d] = fmaxf(mx[d], mx[d + st]);
+            }
+            __syncthreads();
+        }
+        if ((d & (vgs - 1)) == 0) {
+            const float div = slot.fmt == INK_KVQ_K4V2 ? 3.f : ((slot.fmt == INK_KVQ_K8V6 || slot.fmt == INK_KVQ_K10V6) ? 63.f : 15.f);
+            const int vg = d / vgs;
+            vsc_s[vg] = ink_kvq_half_as_float((unsigned int)__half_as_ushort(__float2half_rn(__fdiv_rn(mx[d] - mn[d], div))));
+            vmn_s[vg] = ink_kvq_half_as_float((unsigned int)__half_as_ushort(__float2half_rn(mn[d])));
+        }
+    } else {
+        mx[d] = fabsf(ev[d]);
+        __syncthreads();
+        for (int s = 32; s > 0; s >>= 1) {
+            const int r = d & 63;
+            if (r < s) mx[d] = fmaxf(mx[d], mx[d + s]);
+            __syncthreads();
+        }
+        if (d == 0 || d == 64) {
+            vsc_s[d >> 6] = ink_kvq_half_as_float((unsigned int)__half_as_ushort(__float2half_rn(__fdiv_rn(mx[d], 127.f))));
+        }
+    }
+    __syncthreads();
+
+    const int kg = d >> 6;
+    const int vg = slot.fmt == INK_KVQ_K8V4G32 ? d >> 5 : d >> 6;
+    if (slot.fmt == INK_KVQ_INT8 || slot.fmt == INK_KVQ_K8V4 || slot.fmt == INK_KVQ_K8V4G32 || slot.fmt == INK_KVQ_K8V6 || slot.fmt == INK_KVQ_K10V6) {
+        const float den = ksc_s[kg] == 0.f ? 1.f : ksc_s[kg];
+        int q = (int)nearbyintf(__fdiv_rn(ek[d], den));
+        if (slot.fmt == INK_KVQ_K10V6) {
+            q = min(511, max(-511, q));
+            qk[d] = (unsigned char)((q >> 2) & 0xff);
+            qklo[d] = (unsigned char)(q & 3);
+        } else {
+            q = min(127, max(-127, q));
+            qk[d] = (unsigned char)(q & 0xff);
+        }
+    } else if (slot.fmt == INK_KVQ_K4V2) {
+        const float den = ksc_s[kg] == 0.f ? 1.f : ksc_s[kg];
+        int q = (int)nearbyintf(__fdiv_rn(ek[d], den));
+        q = min(7, max(-7, q));
+        qk[d] = (unsigned char)(q & 15);
+    } else {
+        qk[d] = ink_fp8_quant(ek[d], slot.fmt);
+    }
+
+    if (slot.fmt == INK_KVQ_K4V2 || slot.fmt == INK_KVQ_K8V4 || slot.fmt == INK_KVQ_K8V4G32 || slot.fmt == INK_KVQ_K8V6 || slot.fmt == INK_KVQ_K10V6) {
+        const int levels = slot.fmt == INK_KVQ_K4V2 ? 3 : ((slot.fmt == INK_KVQ_K8V6 || slot.fmt == INK_KVQ_K10V6) ? 63 : 15);
+        const float den = vsc_s[vg] == 0.f ? 1.f : vsc_s[vg];
+        int q = (int)nearbyintf(__fdiv_rn(ev[d] - vmn_s[vg], den));
+        q = min(levels, max(0, q));
+        qv[d] = (unsigned char)q;
+    } else if (slot.fmt == INK_KVQ_INT8) {
+        const float den = vsc_s[kg] == 0.f ? 1.f : vsc_s[kg];
+        int q = (int)nearbyintf(__fdiv_rn(ev[d], den));
+        q = min(127, max(-127, q));
+        qv[d] = (unsigned char)(q & 0xff);
+    } else {
+        qv[d] = ink_fp8_quant(ev[d], slot.fmt);
+    }
+    __syncthreads();
+
+    unsigned char* krow = slot.kq + (size_t)qrow * slot.krow;
+    unsigned char* vrow = slot.vq + (size_t)qrow * slot.vrow;
+    if (slot.fmt == INK_KVQ_INT8 || slot.fmt == INK_KVQ_FP8_E4M3 || slot.fmt == INK_KVQ_FP8_E5M2) {
+        krow[hk * 128 + d] = qk[d];
+        vrow[hk * 128 + d] = qv[d];
+    } else if (slot.fmt == INK_KVQ_K8V4 || slot.fmt == INK_KVQ_K8V4G32) {
+        if (slot.fmt == INK_KVQ_K8V4) {
+            ink_k8v4_kptr_mut(slot, qrow, hk, d)[0] = qk[d];
+            if (d < 64) ink_k8v4_vptr_mut(slot, qrow, hk, d)[0] = (unsigned char)(qv[2 * d] | (qv[2 * d + 1] << 4));
+        } else {
+            krow[hk * 128 + d] = qk[d];
+            if (d < 64) vrow[hk * 64 + d] = (unsigned char)(qv[2 * d] | (qv[2 * d + 1] << 4));
+        }
+    } else if (slot.fmt == INK_KVQ_K8V6) {
+        krow[hk * 128 + d] = qk[d];
+        if (d < 64) {
+            vrow[hk * 96 + d] = (unsigned char)((qv[2 * d] & 15) | ((qv[2 * d + 1] & 15) << 4));
+        } else if (d < 96) {
+            const int b = d - 64;
+            vrow[hk * 96 + 64 + b] = (unsigned char)(((qv[4 * b] >> 4) & 3) | (((qv[4 * b + 1] >> 4) & 3) << 2) |
+                (((qv[4 * b + 2] >> 4) & 3) << 4) | (((qv[4 * b + 3] >> 4) & 3) << 6));
+        }
+    } else if (slot.fmt == INK_KVQ_K10V6) {
+        krow[hk * 160 + d] = qk[d];
+        if (d < 32) {
+            krow[hk * 160 + 128 + d] = (unsigned char)(qklo[4 * d] | (qklo[4 * d + 1] << 2) | (qklo[4 * d + 2] << 4) | (qklo[4 * d + 3] << 6));
+        }
+        if (d < 64) {
+            vrow[hk * 96 + d] = (unsigned char)((qv[2 * d] & 15) | ((qv[2 * d + 1] & 15) << 4));
+        } else if (d < 96) {
+            const int b = d - 64;
+            vrow[hk * 96 + 64 + b] = (unsigned char)(((qv[4 * b] >> 4) & 3) | (((qv[4 * b + 1] >> 4) & 3) << 2) |
+                (((qv[4 * b + 2] >> 4) & 3) << 4) | (((qv[4 * b + 3] >> 4) & 3) << 6));
+        }
+    } else {
+        if (d < 64) krow[hk * 64 + d] = (unsigned char)(qk[2 * d] | (qk[2 * d + 1] << 4));
+        else if (d < 96) {
+            const int b = d - 64;
+            vrow[hk * 32 + b] = (unsigned char)(qv[4 * b] | (qv[4 * b + 1] << 2) | (qv[4 * b + 2] << 4) | (qv[4 * b + 3] << 6));
+        }
+    }
+    if (d == 127 && slot.meta) {
+        __half* mh = (__half*)(slot.fmt == INK_KVQ_K8V4 ? ink_k8v4_mptr_mut(slot, qrow, hk) :
+            (slot.meta + (size_t)qrow * slot.mrow + hk * ((slot.fmt == INK_KVQ_K8V4G32) ? 24 : 12)));
+        mh[0] = __float2half_rn(ksc_s[0]);
+        mh[1] = __float2half_rn(ksc_s[1]);
+        const int nvg = (slot.fmt == INK_KVQ_K8V4G32) ? 4 : 2;
+        #pragma unroll
+        for (int z = 0; z < 4; ++z) {
+            if (z < nvg) {
+                mh[2 + 2 * z] = __float2half_rn(vsc_s[z]);
+                mh[3 + 2 * z] = __float2half_rn(vmn_s[z]);
+            }
+        }
+    }
+    __syncthreads();
+}
+
+__global__ void inkwell_kvq_append(const float* __restrict__ kcur, const float* __restrict__ vcur,
+                                   const int* __restrict__ posp, InkKvQSlot slot, float* __restrict__ dep) {
+    __shared__ float ek[128], ev[128], mn[128], mx[128];
+    __shared__ unsigned char qk[128], qv[128], qklo[128];
+    __shared__ float ksc_s[2], vsc_s[4], vmn_s[4];
+    const int hk = blockIdx.x;
+    const int d = threadIdx.x;
+    const int pos = posp[0];
+    if (slot.hp_cap > 0) {
+        const int hp_idx = pos < slot.sinks ? pos : slot.sinks + (pos - slot.sinks) % slot.local;
+        const int evict = pos - slot.local;
+        const bool do_evict = evict >= slot.sinks;
+        const size_t hp_off = ((size_t)hk * slot.hp_cap + hp_idx) * 128 + d;
+        float kk = kcur[hk * 128 + d], vv = vcur[hk * 128 + d];
+        if (do_evict) {
+            const int ev_hp = slot.sinks + (evict - slot.sinks) % slot.local;
+            const size_t eo = ((size_t)hk * slot.hp_cap + ev_hp) * 128 + d;
+            const float qk0 = __half2float(slot.khp[eo]);
+            const float qv0 = __half2float(slot.vhp[eo]);
+            const int qrow = slot.is_swa ? evict % slot.cap : evict;
+            ink_kvq_store_quant(slot, qrow, hk, d, qk0, qv0, ek, ev, mn, mx, qk, qv, qklo, ksc_s, vsc_s, vmn_s);
+        }
+        slot.khp[hp_off] = __float2half_rn(kk);
+        slot.vhp[hp_off] = __float2half_rn(vv);
+    } else {
+        const int qrow = slot.is_swa ? pos % slot.cap : pos;
+        ink_kvq_store_quant(slot, qrow, hk, d, kcur[hk * 128 + d], vcur[hk * 128 + d],
+                            ek, ev, mn, mx, qk, qv, qklo, ksc_s, vsc_s, vmn_s);
+    }
+    if (hk == 0 && d == 0) dep[0] = 1.f;
+}
+
+// Batched prefill writer.  Input rows are [token][head*128+d]; one 128-thread
+// block per (head,token), reproducing the decode ring/eviction ordering exactly.
+__global__ void inkwell_kvq_write_batch(const float* __restrict__ k, const float* __restrict__ v,
+                                        InkKvQSlot slot, int C, int pos0) {
+    __shared__ float ek[128], ev[128], mn[128], mx[128];
+    __shared__ unsigned char qk[128], qv[128], qklo[128];
+    __shared__ float ksc_s[2], vsc_s[4], vmn_s[4];
+    const int hk = blockIdx.x;
+    const int d = threadIdx.x;
+    // Each head walks positions in order.  This preserves the dependencies of
+    // the high-precision ring: a token can evict the row that previously held
+    // the same ring slot.  There is no cross-head dependency, so heads remain parallel.
+    for (int t = 0; t < C; ++t) {
+        const int pos = pos0 + t;
+        const size_t src = (size_t)t * 1024 + hk * 128 + d;
+        const float kk = k[src], vv = v[src];
+        if (slot.hp_cap > 0) {
+            const int hp_idx = pos < slot.sinks ? pos : slot.sinks + (pos - slot.sinks) % slot.local;
+            const int evict = pos - slot.local;
+            const bool do_evict = evict >= slot.sinks;
+            const size_t hp_off = ((size_t)hk * slot.hp_cap + hp_idx) * 128 + d;
+            if (do_evict) {
+                const int ev_hp = slot.sinks + (evict - slot.sinks) % slot.local;
+                const size_t eo = ((size_t)hk * slot.hp_cap + ev_hp) * 128 + d;
+                const float qk0 = __half2float(slot.khp[eo]);
+                const float qv0 = __half2float(slot.vhp[eo]);
+                const int qrow = slot.is_swa ? evict % slot.cap : evict;
+                ink_kvq_store_quant(slot, qrow, hk, d, qk0, qv0, ek, ev, mn, mx, qk, qv, qklo, ksc_s, vsc_s, vmn_s);
+            }
+            slot.khp[hp_off] = __float2half_rn(kk);
+            slot.vhp[hp_off] = __float2half_rn(vv);
+        } else {
+            const int qrow = slot.is_swa ? pos % slot.cap : pos;
+            ink_kvq_store_quant(slot, qrow, hk, d, kk, vv, ek, ev, mn, mx, qk, qv, qklo, ksc_s, vsc_s, vmn_s);
+        }
+        __syncthreads();
+    }
+}
+
+struct InkKvqRaw4 {
+    unsigned int kb, vb, kscw, vw, v6w, kblo;
+};
+
+template<int FMT>
+__device__ __forceinline__ InkKvqRaw4 ink_kvq_load4(const InkKvQSlot& slot, int qrow, int hk, int lane) {
+    InkKvqRaw4 r{};
+    const int d0 = lane * 4;
+    const int grp = d0 >> 6;
+    const int vgrp = (FMT == INK_KVQ_K8V4G32) ? d0 >> 5 : grp;
+    if (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2) {
+        const unsigned char* mp = FMT == INK_KVQ_K8V4 ? ink_k8v4_mptr(slot, qrow, hk) :
+            (slot.meta + (size_t)qrow * slot.mrow + hk * ((FMT == INK_KVQ_K8V4G32) ? 24 : 12));
+        r.kscw = __ldg((const unsigned short*)mp + grp);
+        r.vw = __ldg((const unsigned int*)(mp + 4) + vgrp);
+    }
+    const unsigned char* krow = slot.kq + (size_t)qrow * slot.krow + hk * ((FMT == INK_KVQ_K4V2) ? 64 : (ink_kvq_k10v6<FMT>() ? 160 : 128));
+    const unsigned char* vrow = slot.vq + (size_t)qrow * slot.vrow;
+    if (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        r.kb = __ldcs((const unsigned int*)(krow + d0));
+        r.vb = __ldcs((const unsigned int*)(vrow + hk * 128 + d0));
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        if constexpr (FMT == INK_KVQ_K8V4) {
+            r.kb = __ldcs((const unsigned int*)ink_k8v4_kptr(slot, qrow, hk, d0));
+            r.vb = *(const unsigned short*)ink_k8v4_vptr(slot, qrow, hk, lane * 2);
+        } else {
+            r.kb = __ldcs((const unsigned int*)(krow + d0));
+            r.vb = *(const unsigned short*)(vrow + hk * 64 + lane * 2);
+        }
+    } else if (ink_kvq_k8v6<FMT>()) {
+        const unsigned char* vp = vrow + hk * 96;
+        r.kb = __ldcs((const unsigned int*)(krow + d0));
+        r.vb = *(const unsigned short*)(vp + lane * 2);
+        r.v6w = vp[64 + lane];
+    } else if (ink_kvq_k10v6<FMT>()) {
+        const unsigned char* vp = vrow + hk * 96;
+        r.kb = __ldcs((const unsigned int*)(krow + d0));
+        r.kblo = krow[128 + lane];
+        r.vb = *(const unsigned short*)(vp + lane * 2);
+        r.v6w = vp[64 + lane];
+    } else {
+        r.kb = *(const unsigned short*)(krow + lane * 2);
+        r.vb = vrow[hk * 32 + lane];
+    }
+    return r;
+}
+
+template<int FMT, bool SCALEK, bool SCALEV>
+__device__ __forceinline__ float ink_kvq_decode4_impl(const InkKvqRaw4& r, float kval[4], float vval[4]) {
+    const float ksc = ink_kvq_half_as_float(r.kscw);
+    const float vsc = ink_kvq_half_as_float(r.vw & 0xffffu);
+    const float vmn = ink_kvq_half_as_float(r.vw >> 16);
+    if (FMT == INK_KVQ_INT8) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            int kq = (int)(r.kb << (24 - 8 * f)) >> 24;
+            int vq = (int)(r.vb << (24 - 8 * f)) >> 24;
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)vq * vsc : (float)vq;
+        }
+    } else if (FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            kval[f] = ink_fp8_dequant((unsigned char)((r.kb >> (8 * f)) & 0xffu), FMT);
+            vval[f] = ink_fp8_dequant((unsigned char)((r.vb >> (8 * f)) & 0xffu), FMT);
+        }
+    } else if (ink_kvq_k10v6<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            const int hi = (int)(r.kb << (24 - 8 * f)) >> 24;
+            const int kq = hi * 4 + (int)((r.kblo >> (2 * f)) & 3u);
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            const unsigned int x = ((r.vb >> (4 * f)) & 15u) | (((r.v6w >> (2 * f)) & 3u) << 4);
+            vval[f] = SCALEV ? (float)x * vsc + vmn : (float)x;
+        }
+    } else if (ink_kvq_k8v6<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            int kq = (int)(r.kb << (24 - 8 * f)) >> 24;
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            const unsigned int x = ((r.vb >> (4 * f)) & 15u) | (((r.v6w >> (2 * f)) & 3u) << 4);
+            vval[f] = SCALEV ? (float)x * vsc + vmn : (float)x;
+        }
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            int kq = (int)(r.kb << (24 - 8 * f)) >> 24;
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)((r.vb >> (4 * f)) & 15u) * vsc + vmn : (float)((r.vb >> (4 * f)) & 15u);
+        }
+    } else {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            int kq = (int)(r.kb << (28 - 4 * f)) >> 28;
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)((r.vb >> (2 * f)) & 3u) * vsc + vmn : (float)((r.vb >> (2 * f)) & 3u);
+        }
+    }
+    return ksc;
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_decode4(const InkKvqRaw4& r, float kval[4], float vval[4]) {
+    ink_kvq_decode4_impl<FMT, true, true>(r, kval, vval);
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_decode4_v(const InkKvqRaw4& r, float vval[4]) {
+    const float vsc = ink_kvq_half_as_float(r.vw & 0xffffu);
+    const float vmn = ink_kvq_half_as_float(r.vw >> 16);
+    if (FMT == INK_KVQ_INT8) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            const int vq = (int)(r.vb << (24 - 8 * f)) >> 24;
+            vval[f] = (float)vq * vsc;
+        }
+    } else if (FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) vval[f] = ink_fp8_dequant((unsigned char)((r.vb >> (8 * f)) & 0xffu), FMT);
+    } else if (ink_kvq_v6<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            const unsigned int x = ((r.vb >> (4 * f)) & 15u) | (((r.v6w >> (2 * f)) & 3u) << 4);
+            vval[f] = (float)x * vsc + vmn;
+        }
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) vval[f] = (float)((r.vb >> (4 * f)) & 15u) * vsc + vmn;
+    } else {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) vval[f] = (float)((r.vb >> (2 * f)) & 3u) * vsc + vmn;
+    }
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_unpack4(const InkKvQSlot& slot, int qrow, int hk, int lane,
+                                                float kval[4], float vval[4]) {
+    ink_kvq_decode4<FMT>(ink_kvq_load4<FMT>(slot, qrow, hk, lane), kval, vval);
+}
+
+
+struct InkKvqRaw8 {
+    uint2 kb2, vb2;
+    unsigned int kb32, vb32, kscw, vw;
+    unsigned short vb16, v6a, v6b, v6c, kblo;
+};
+
+template<int FMT>
+__device__ __forceinline__ InkKvqRaw8 ink_kvq_load8(const InkKvQSlot& slot, int qrow, int hk, int sl) {
+    InkKvqRaw8 r{};
+    const int d0 = sl * 8;
+    const int grp = d0 >> 6;
+    const int vgrp = (FMT == INK_KVQ_K8V4G32) ? d0 >> 5 : grp;
+    if (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2) {
+        const unsigned char* mp = FMT == INK_KVQ_K8V4 ? ink_k8v4_mptr(slot, qrow, hk) :
+            (slot.meta + (size_t)qrow * slot.mrow + hk * ((FMT == INK_KVQ_K8V4G32) ? 24 : 12));
+        r.kscw = __ldg((const unsigned short*)mp + grp);
+        r.vw = __ldg((const unsigned int*)(mp + 4) + vgrp);
+    }
+    const unsigned char* krow = slot.kq + (size_t)qrow * slot.krow + hk * ((FMT == INK_KVQ_K4V2) ? 64 : (ink_kvq_k10v6<FMT>() ? 160 : 128));
+    const unsigned char* vrow = slot.vq + (size_t)qrow * slot.vrow;
+    if (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        r.kb2 = __ldg((const uint2*)(krow + d0));
+        r.vb2 = __ldg((const uint2*)(vrow + hk * 128 + d0));
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        if constexpr (FMT == INK_KVQ_K8V4) {
+            r.kb2 = __ldg((const uint2*)ink_k8v4_kptr(slot, qrow, hk, d0));
+            r.vb32 = __ldg((const unsigned int*)ink_k8v4_vptr(slot, qrow, hk, sl * 4));
+        } else {
+            r.kb2 = __ldg((const uint2*)(krow + d0));
+            r.vb32 = __ldg((const unsigned int*)(vrow + hk * 64 + sl * 4));
+        }
+    } else if (ink_kvq_k8v6<FMT>()) {
+        const unsigned char* vp = vrow + hk * 96;
+        r.kb2 = __ldg((const uint2*)(krow + d0));
+        r.vb32 = __ldg((const unsigned int*)(vp + sl * 4));
+        r.vb16 = __ldg((const unsigned short*)(vp + 64 + sl * 2));
+    } else if (ink_kvq_k10v6<FMT>()) {
+        const unsigned char* vp = vrow + hk * 96;
+        r.kb2 = __ldg((const uint2*)(krow + d0));
+        r.kblo = __ldg((const unsigned short*)(krow + 128 + sl * 2));
+        r.vb32 = __ldg((const unsigned int*)(vp + sl * 4));
+        r.vb16 = __ldg((const unsigned short*)(vp + 64 + sl * 2));
+    } else {
+        r.kb32 = __ldg((const unsigned int*)(krow + sl * 4));
+        r.vb16 = __ldg((const unsigned short*)(vrow + hk * 32 + sl * 2));
+    }
+    return r;
+}
+
+template<int FMT>
+struct InkKvqPtr8 {
+    const unsigned char* kp;
+    const unsigned char* vp;
+    const unsigned char* mp;
+    const unsigned char* kq;
+    const unsigned char* vq;
+    const unsigned char* meta;
+    int row, hk, sl, cap;
+};
+
+template<int FMT>
+__device__ __forceinline__ InkKvqPtr8<FMT> ink_kvq_ptr8(const InkKvQSlot& slot, int qrow, int hk, int sl) {
+    constexpr int KR = (FMT == INK_KVQ_K4V2) ? 512 : (ink_kvq_k10v6<FMT>() ? 1280 : 1024);
+    constexpr int VR = (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) ? 1024 :
+                       ink_kvq_k8v4fam<FMT>() ? 512 : (ink_kvq_v6<FMT>() ? 768 : 256);
+    constexpr int KHB = (FMT == INK_KVQ_K4V2) ? 64 : (ink_kvq_k10v6<FMT>() ? 160 : 128);
+    constexpr bool HAS_META = (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2);
+    const int d0 = sl * 8;
+    InkKvqPtr8<FMT> p{};
+    if constexpr (FMT == INK_KVQ_K8V4) {
+        p.kp = ink_k8v4_kptr(slot, qrow, hk, d0);
+        p.vp = ink_k8v4_vptr(slot, qrow, hk, sl * 4);
+        p.mp = ink_k8v4_mptr(slot, qrow, hk);
+        p.kq = slot.kq; p.vq = slot.vq; p.meta = slot.meta;
+        p.row = qrow; p.hk = hk; p.sl = sl; p.cap = slot.cap;
+    } else {
+        p.kp = slot.kq + (size_t)qrow * KR + hk * KHB + ((FMT == INK_KVQ_K4V2) ? sl * 4 : (ink_kvq_k10v6<FMT>() ? 0 : d0));
+        if (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+            p.vp = slot.vq + (size_t)qrow * VR + hk * 128 + d0;
+        } else if (ink_kvq_k8v4fam<FMT>()) {
+            p.vp = slot.vq + (size_t)qrow * VR + hk * 64 + sl * 4;
+        } else if (ink_kvq_v6<FMT>()) {
+            p.vp = slot.vq + (size_t)qrow * VR + hk * 96;
+        } else {
+            p.vp = slot.vq + (size_t)qrow * VR + hk * 32 + sl * 2;
+        }
+        if (HAS_META) p.mp = slot.meta + (size_t)qrow * ((FMT == INK_KVQ_K8V4G32) ? 192 : 96) + hk * ((FMT == INK_KVQ_K8V4G32) ? 24 : 12);
+    }
+    return p;
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_ptr8_step(InkKvqPtr8<FMT>& p, int rows) {
+    constexpr int KR = (FMT == INK_KVQ_K4V2) ? 512 : (ink_kvq_k10v6<FMT>() ? 1280 : 1024);
+    constexpr int VR = (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) ? 1024 :
+                       ink_kvq_k8v4fam<FMT>() ? 512 : (ink_kvq_v6<FMT>() ? 768 : 256);
+    constexpr bool HAS_META = (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2);
+    if constexpr (FMT == INK_KVQ_K8V4) {
+        p.row += rows;
+        InkKvQSlot slot{};
+        slot.kq = (unsigned char*)p.kq; slot.vq = (unsigned char*)p.vq; slot.meta = (unsigned char*)p.meta; slot.cap = p.cap;
+        p.kp = ink_k8v4_kptr(slot, p.row, p.hk, p.sl * 8);
+        p.vp = ink_k8v4_vptr(slot, p.row, p.hk, p.sl * 4);
+        p.mp = ink_k8v4_mptr(slot, p.row, p.hk);
+    } else {
+        p.kp += (size_t)rows * KR;
+        p.vp += (size_t)rows * VR;
+        if (HAS_META) p.mp += (size_t)rows * ((FMT == INK_KVQ_K8V4G32) ? 192 : 96);
+    }
+}
+
+template<int FMT>
+__device__ __forceinline__ InkKvqRaw8 ink_kvq_load8_ptr(const InkKvqPtr8<FMT>& p, int sl) {
+    InkKvqRaw8 r{};
+    const int grp = (sl * 8) >> 6;
+    const int vgrp = (FMT == INK_KVQ_K8V4G32) ? (sl * 8) >> 5 : grp;
+    if (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2) {
+        r.kscw = __ldg((const unsigned short*)p.mp + grp);
+        r.vw = __ldg((const unsigned int*)(p.mp + 4) + vgrp);
+    }
+    if (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        r.kb2 = __ldg((const uint2*)p.kp);
+        r.vb2 = __ldg((const uint2*)p.vp);
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        r.kb2 = __ldg((const uint2*)p.kp);
+        r.vb32 = __ldg((const unsigned int*)p.vp);
+    } else if (ink_kvq_k8v6<FMT>()) {
+        r.kb2 = __ldg((const uint2*)p.kp);
+        r.vb32 = __ldg((const unsigned int*)(p.vp + sl * 4));
+        r.vb16 = __ldg((const unsigned short*)(p.vp + 64 + sl * 2));
+    } else if (ink_kvq_k10v6<FMT>()) {
+        r.kb2 = __ldg((const uint2*)(p.kp + sl * 8));
+        r.kblo = __ldg((const unsigned short*)(p.kp + 128 + sl * 2));
+        r.vb32 = __ldg((const unsigned int*)(p.vp + sl * 4));
+        r.vb16 = __ldg((const unsigned short*)(p.vp + 64 + sl * 2));
+    } else {
+        r.kb32 = __ldg((const unsigned int*)p.kp);
+        r.vb16 = __ldg((const unsigned short*)p.vp);
+    }
+    return r;
+}
+
+template<int FMT>
+struct InkKvqPtr4 {
+    const unsigned char* kp;
+    const unsigned char* vp;
+    const unsigned char* mp;
+    const unsigned char* kq;
+    const unsigned char* vq;
+    const unsigned char* meta;
+    int row, hk, lane, cap;
+};
+
+template<int FMT>
+__device__ __forceinline__ InkKvqPtr4<FMT> ink_kvq_ptr4(const InkKvQSlot& slot, int qrow, int hk, int lane) {
+    constexpr int KR = (FMT == INK_KVQ_K4V2) ? 512 : (ink_kvq_k10v6<FMT>() ? 1280 : 1024);
+    constexpr int VR = (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) ? 1024 :
+                       ink_kvq_k8v4fam<FMT>() ? 512 : (ink_kvq_v6<FMT>() ? 768 : 256);
+    constexpr bool HAS_META = (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2);
+    InkKvqPtr4<FMT> p{};
+    if constexpr (FMT == INK_KVQ_K8V4) {
+        p.kp = ink_k8v4_kptr(slot, qrow, hk, lane * 4);
+        p.vp = ink_k8v4_vptr(slot, qrow, hk, lane * 2);
+        p.mp = ink_k8v4_mptr(slot, qrow, hk);
+        p.kq = slot.kq; p.vq = slot.vq; p.meta = slot.meta;
+        p.row = qrow; p.hk = hk; p.lane = lane; p.cap = slot.cap;
+    } else {
+        if (FMT == INK_KVQ_K4V2) {
+            p.kp = slot.kq + (size_t)qrow * KR + hk * 64 + lane * 2;
+            p.vp = slot.vq + (size_t)qrow * VR + hk * 32 + lane;
+        } else {
+            if (ink_kvq_k10v6<FMT>()) p.kp = slot.kq + (size_t)qrow * KR + hk * 160;
+            else p.kp = slot.kq + (size_t)qrow * KR + hk * 128 + lane * 4;
+            if (ink_kvq_k8v4fam<FMT>()) p.vp = slot.vq + (size_t)qrow * VR + hk * 64 + lane * 2;
+            else if (ink_kvq_v6<FMT>()) p.vp = slot.vq + (size_t)qrow * VR + hk * 96;
+            else p.vp = slot.vq + (size_t)qrow * VR + hk * 128 + lane * 4;
+        }
+        if (HAS_META) p.mp = slot.meta + (size_t)qrow * ((FMT == INK_KVQ_K8V4G32) ? 192 : 96) + hk * ((FMT == INK_KVQ_K8V4G32) ? 24 : 12);
+    }
+    return p;
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_ptr4_step(InkKvqPtr4<FMT>& p, int rows) {
+    constexpr int KR = (FMT == INK_KVQ_K4V2) ? 512 : (ink_kvq_k10v6<FMT>() ? 1280 : 1024);
+    constexpr int VR = (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) ? 1024 :
+                       ink_kvq_k8v4fam<FMT>() ? 512 : (ink_kvq_v6<FMT>() ? 768 : 256);
+    constexpr bool HAS_META = (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2);
+    if constexpr (FMT == INK_KVQ_K8V4) {
+        p.row += rows;
+        InkKvQSlot slot{};
+        slot.kq = (unsigned char*)p.kq; slot.vq = (unsigned char*)p.vq; slot.meta = (unsigned char*)p.meta; slot.cap = p.cap;
+        p.kp = ink_k8v4_kptr(slot, p.row, p.hk, p.lane * 4);
+        p.vp = ink_k8v4_vptr(slot, p.row, p.hk, p.lane * 2);
+        p.mp = ink_k8v4_mptr(slot, p.row, p.hk);
+    } else {
+        p.kp += (size_t)rows * KR;
+        p.vp += (size_t)rows * VR;
+        if (HAS_META) p.mp += (size_t)rows * ((FMT == INK_KVQ_K8V4G32) ? 192 : 96);
+    }
+}
+
+template<int FMT>
+__device__ __forceinline__ InkKvqRaw4 ink_kvq_load4_ptr(const InkKvqPtr4<FMT>& p, int lane) {
+    InkKvqRaw4 r{};
+    const int grp = (lane * 4) >> 6;
+    const int vgrp = (FMT == INK_KVQ_K8V4G32) ? (lane * 4) >> 5 : grp;
+    if (FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2) {
+        r.kscw = __ldg((const unsigned short*)p.mp + grp);
+        r.vw = __ldg((const unsigned int*)(p.mp + 4) + vgrp);
+    }
+    if (FMT == INK_KVQ_INT8 || FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        r.kb = __ldg((const unsigned int*)p.kp);
+        r.vb = __ldg((const unsigned int*)p.vp);
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        r.kb = __ldg((const unsigned int*)p.kp);
+        r.vb = __ldg((const unsigned short*)p.vp);
+    } else if (ink_kvq_k8v6<FMT>()) {
+        r.kb = __ldg((const unsigned int*)p.kp);
+        r.vb = __ldg((const unsigned short*)(p.vp + lane * 2));
+        r.v6w = __ldg(p.vp + 64 + lane);
+    } else if (ink_kvq_k10v6<FMT>()) {
+        r.kb = __ldg((const unsigned int*)(p.kp + lane * 4));
+        r.kblo = __ldg(p.kp + 128 + lane);
+        r.vb = __ldg((const unsigned short*)(p.vp + lane * 2));
+        r.v6w = __ldg(p.vp + 64 + lane);
+    } else {
+        r.kb = __ldg((const unsigned short*)p.kp);
+        r.vb = __ldg((const unsigned char*)p.vp);
+    }
+    return r;
+}
+
+template<int FMT, bool SCALEK, bool SCALEV>
+__device__ __forceinline__ float ink_kvq_decode8_impl(const InkKvqRaw8& r, float kval[8], float vval[8]) {
+    const float ksc = ink_kvq_half_as_float(r.kscw);
+    const float vsc = ink_kvq_half_as_float(r.vw & 0xffffu);
+    const float vmn = ink_kvq_half_as_float(r.vw >> 16);
+    if (FMT == INK_KVQ_INT8) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int kw = f < 4 ? r.kb2.x : r.kb2.y;
+            const unsigned int vw = f < 4 ? r.vb2.x : r.vb2.y;
+            const int sh = 24 - 8 * (f & 3);
+            int kq = (int)(kw << sh) >> 24;
+            int vq = (int)(vw << sh) >> 24;
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)vq * vsc : (float)vq;
+        }
+    } else if (FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int kw = f < 4 ? r.kb2.x : r.kb2.y;
+            const unsigned int vw = f < 4 ? r.vb2.x : r.vb2.y;
+            const int sh = 8 * (f & 3);
+            kval[f] = ink_fp8_dequant((unsigned char)((kw >> sh) & 0xffu), FMT);
+            vval[f] = ink_fp8_dequant((unsigned char)((vw >> sh) & 0xffu), FMT);
+        }
+    } else if (ink_kvq_k10v6<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int kw = f < 4 ? r.kb2.x : r.kb2.y;
+            const int sh = 24 - 8 * (f & 3);
+            const int hi = (int)(kw << sh) >> 24;
+            const int kq = hi * 4 + (int)((r.kblo >> (2 * f)) & 3u);
+            const unsigned int x = ((r.vb32 >> (4 * f)) & 15u) | (((r.vb16 >> (2 * f)) & 3u) << 4);
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)x * vsc + vmn : (float)x;
+        }
+    } else if (ink_kvq_k8v6<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int kw = f < 4 ? r.kb2.x : r.kb2.y;
+            const int sh = 24 - 8 * (f & 3);
+            int kq = (int)(kw << sh) >> 24;
+            const unsigned int x = ((r.vb32 >> (4 * f)) & 15u) | (((r.vb16 >> (2 * f)) & 3u) << 4);
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)x * vsc + vmn : (float)x;
+        }
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int kw = f < 4 ? r.kb2.x : r.kb2.y;
+            const int sh = 24 - 8 * (f & 3);
+            int kq = (int)(kw << sh) >> 24;
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)((r.vb32 >> (4 * f)) & 15u) * vsc + vmn : (float)((r.vb32 >> (4 * f)) & 15u);
+        }
+    } else {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            int kq = (int)(r.kb32 << (28 - 4 * f)) >> 28;
+            kval[f] = SCALEK ? (float)kq * ksc : (float)kq;
+            vval[f] = SCALEV ? (float)(((unsigned int)r.vb16 >> (2 * f)) & 3u) * vsc + vmn : (float)(((unsigned int)r.vb16 >> (2 * f)) & 3u);
+        }
+    }
+    return ksc;
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_decode8(const InkKvqRaw8& r, float kval[8], float vval[8]) {
+    ink_kvq_decode8_impl<FMT, true, true>(r, kval, vval);
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_unpack8(const InkKvQSlot& slot, int qrow, int hk, int sl,
+                                                float kval[8], float vval[8]) {
+    ink_kvq_decode8<FMT>(ink_kvq_load8<FMT>(slot, qrow, hk, sl), kval, vval);
+}
+
+__device__ __forceinline__ float ink_attn_bias_value(const float* __restrict__ bias,
+        int j, int qbase, int b_s2, int pos, int n_kv, int bias_mode, int swa, int rel_extent) {
+    if (bias_mode < 0) return bias[j + qbase * b_s2];
+    int rp;
+    if (bias_mode == 1) {
+        const int dpos = pos - j;
+        if (pos < swa) rp = dpos;
+        else if ((swa & (swa - 1)) == 0) rp = dpos & (swa - 1);
+        else { rp = dpos % swa; if (rp < 0) rp += swa; }
+    } else if (bias_mode == 2) {
+        rp = n_kv - 1 - j;
+    } else {
+        rp = pos - j;
+    }
+    rp = min(rp, rel_extent);
+    return bias[rp + qbase * b_s2];
+}
+
+// Quantize decode queries to signed int8, one warp per head.  The first
+// 4096 bytes of qbuf are 32 packed heads x 128 bytes; fp32 scales follow.
+__global__ void inkwell_kvq_quantq(const float* __restrict__ Q, int q_s2, int nh,
+                                   unsigned char* __restrict__ qbuf, int mode) {
+    const int h = blockIdx.x;
+    const int lane = threadIdx.x;
+    if (h >= nh || lane >= 32) return;
+    const float* qp = Q + (size_t)h * q_s2 + lane * 4;
+    float x0 = qp[0], x1 = qp[1], x2 = qp[2], x3 = qp[3];
+    float mx = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+    if (mode == 3) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+    } else if (mode != 4) {
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    }
+    const float qs = __fdiv_rn(mx, 127.f);
+    const float den = qs == 0.f ? 1.f : qs;
+    int q0 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(x0, den))));
+    int q1 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(x1, den))));
+    int q2 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(x2, den))));
+    int q3 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(x3, den))));
+    unsigned int pack = (unsigned int)(q0 & 0xff) | ((unsigned int)(q1 & 0xff) << 8) |
+                        ((unsigned int)(q2 & 0xff) << 16) | ((unsigned int)(q3 & 0xff) << 24);
+    ((unsigned int*)(qbuf + h * 128))[lane] = pack;
+    if (mode == 2) {
+        const float ls = qs * 0.0078125f;
+        const float lden = ls == 0.f ? 1.f : ls;
+        const float r0 = x0 - (float)q0 * qs, r1 = x1 - (float)q1 * qs;
+        const float r2 = x2 - (float)q2 * qs, r3 = x3 - (float)q3 * qs;
+        int l0 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(r0, lden))));
+        int l1 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(r1, lden))));
+        int l2 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(r2, lden))));
+        int l3 = min(127, max(-127, (int)nearbyintf(__fdiv_rn(r3, lden))));
+        unsigned int lp = (unsigned int)(l0 & 0xff) | ((unsigned int)(l1 & 0xff) << 8) |
+                          ((unsigned int)(l2 & 0xff) << 16) | ((unsigned int)(l3 & 0xff) << 24);
+        ((unsigned int*)(qbuf + 3072 + h * 128))[lane] = lp;
+    }
+    if (mode == 3) {
+        if ((lane & 1) == 0) ((float*)(qbuf + 3072))[h * 16 + (lane >> 1)] = qs;
+    } else if (mode == 4) {
+        ((float*)(qbuf + 4096))[h * 32 + lane] = qs;
+    } else if (lane == 0) ((float*)(qbuf + 7168))[h] = qs;
+}
+
+template<int FMT>
+__device__ __forceinline__ void ink_kvq_decode8_v(const InkKvqRaw8& r, float vval[8]) {
+    const float vsc = ink_kvq_half_as_float(r.vw & 0xffffu);
+    const float vmn = ink_kvq_half_as_float(r.vw >> 16);
+    if (FMT == INK_KVQ_INT8) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int vw = f < 4 ? r.vb2.x : r.vb2.y;
+            const int sh = 24 - 8 * (f & 3);
+            int vq = (int)(vw << sh) >> 24;
+            vval[f] = (float)vq * vsc;
+        }
+    } else if (FMT == INK_KVQ_FP8_E4M3 || FMT == INK_KVQ_FP8_E5M2) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int vw = f < 4 ? r.vb2.x : r.vb2.y;
+            const int sh = 8 * (f & 3);
+            vval[f] = ink_fp8_dequant((unsigned char)((vw >> sh) & 0xffu), FMT);
+        }
+    } else if (ink_kvq_v6<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const unsigned int x = ((r.vb32 >> (4 * f)) & 15u) | (((r.vb16 >> (2 * f)) & 3u) << 4);
+            vval[f] = (float)x * vsc + vmn;
+        }
+    } else if (ink_kvq_k8v4fam<FMT>()) {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            vval[f] = (float)((r.vb32 >> (4 * f)) & 15u) * vsc + vmn;
+        }
+    } else {
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            vval[f] = (float)(((unsigned int)r.vb16 >> (2 * f)) & 3u) * vsc + vmn;
+        }
+    }
+}
+
+template<int FMT, bool HP, int DP4A>
+__global__ void inkwell_attn_kvq_splitw(InkKvQSlot slot, const int* __restrict__ posp,
+                                        const float* __restrict__ Q, const float* __restrict__ bias,
+                                        const float* __restrict__ mask, float* __restrict__ part,
+                                        int nh, const int* __restrict__ d_nkv, int q_s2, int b_s2, float scale,
+                                        int chunk_len, int qper, int nsub, int mask_zero,
+                                        int bias_mode, int swa, int rel_extent,
+                                        const unsigned char* __restrict__ qpacks,
+                                        const float* __restrict__ qscales) {
+    extern __shared__ float sw[];
+    float* sacc = sw;
+    float* smm = sacc + INKWELL_ATTN_MAX_QG * 128;
+    float* sml = smm + INKWELL_ATTN_MAX_QG;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int sl = lane & 15;
+    const int rw = lane >> 4;
+    const int w = tid >> 5;
+    const int x = blockIdx.x;
+    const int chunk = x / nsub;
+    const int sg = x - chunk * nsub;
+    const int hk = blockIdx.y;
+    const int ratio = nh / 8;
+    const int qbase = hk * ratio + sg;
+    const int n_kv = min(d_nkv[0], slot.cap);
+    const int j0 = chunk * chunk_len;
+    if (j0 >= n_kv || sg >= ratio) return;
+    const int j1 = min(n_kv, j0 + chunk_len);
+    const int d0 = sl * 8;
+    const int pos = posp[0];
+
+    float qr[8] = {};
+    float acc[8] = {};
+    float mst = -1e30f, lst = 0.f;
+    uint2 qpack{}, qpackl{};
+    float qscale = 0.f, qscale2 = 0.f;
+    if constexpr (DP4A) {
+        qpack = __ldg((const uint2*)(qpacks + qbase * 128 + d0));
+        if constexpr (DP4A == 2) qpackl = __ldg((const uint2*)(qpacks + 3072 + qbase * 128 + d0));
+        qscale = DP4A == 3 ? __ldg(qscales + qbase * 16 + sl) :
+                 DP4A == 4 ? __ldg(qscales + qbase * 32 + sl * 2) : __ldg(qscales + qbase);
+        qscale2 = DP4A == 4 ? __ldg(qscales + qbase * 32 + sl * 2 + 1) : qscale;
+        if constexpr (HP) {
+            const float* qfp = Q + (size_t)qbase * q_s2 + d0;
+            #pragma unroll
+            for (int f = 0; f < 8; ++f) qr[f] = qfp[f];
+        }
+    } else {
+        const float* qp = Q + (size_t)qbase * q_s2 + d0;
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) qr[f] = qp[f];
+    }
+
+    InkKvqRaw8 qcur{}, qnext{};
+    float bcur = 0.f, bnext = 0.f, mcur = 0.f, mnext = 0.f;
+    constexpr int rstep = 4; // two warps, two row-halfwarps each
+    const int jb0 = j0 + w * 2;
+    InkKvqPtr8<FMT> qp = ink_kvq_ptr8<FMT>(slot, jb0 + rw, hk, sl);
+    if (jb0 + rw < j1) {
+        qcur = ink_kvq_load8_ptr<FMT>(qp, sl);
+        bcur = ink_attn_bias_value(bias, jb0 + rw, qbase, b_s2, pos, n_kv, bias_mode, swa, rel_extent);
+        mcur = mask_zero ? 0.f : mask[jb0 + rw];
+    }
+    for (int jb = jb0; jb < j1; jb += rstep) {
+        const int j = jb + rw;
+        const bool valid = j < j1;
+        float kval[8] = {}, vval[8] = {};
+        {
+            const int jn = jb + rstep + rw;
+            ink_kvq_ptr8_step<FMT>(qp, rstep);
+            if (jn < j1) {
+                qnext = ink_kvq_load8_ptr<FMT>(qp, sl);
+                bnext = ink_attn_bias_value(bias, jn, qbase, b_s2, pos, n_kv, bias_mode, swa, rel_extent);
+                mnext = mask_zero ? 0.f : mask[jn];
+            }
+            if constexpr (DP4A) ink_kvq_decode8_v<FMT>(qcur, vval);
+            else ink_kvq_decode8<FMT>(qcur, kval, vval);
+        }
+        bool hp_row = false;
+        if (HP && valid && slot.hp_cap > 0) {
+            int apos = j;
+            if (slot.is_swa && pos >= slot.cap) {
+                int age = (pos - j) % slot.cap;
+                if (age < 0) age += slot.cap;
+                apos = pos - age;
+            }
+            const bool hp = slot.hp_cap > 0 && (apos < slot.sinks || apos >= pos - slot.local + 1);
+            hp_row = hp;
+            if (hp) {
+                const int hp_idx = apos < slot.sinks ? apos : slot.sinks + (apos - slot.sinks) % slot.local;
+                const size_t ho = ((size_t)hk * slot.hp_cap + hp_idx) * 128 + d0;
+                const uint4 k16 = __ldcs((const uint4*)(slot.khp + ho));
+                const uint4 v16 = __ldcs((const uint4*)(slot.vhp + ho));
+                const __half2 k01 = *(const __half2*)&k16.x;
+                const __half2 k23 = *(const __half2*)&k16.y;
+                const __half2 k45 = *(const __half2*)&k16.z;
+                const __half2 k67 = *(const __half2*)&k16.w;
+                const __half2 v01 = *(const __half2*)&v16.x;
+                const __half2 v23 = *(const __half2*)&v16.y;
+                const __half2 v45 = *(const __half2*)&v16.z;
+                const __half2 v67 = *(const __half2*)&v16.w;
+                kval[0] = __low2float(k01); kval[1] = __high2float(k01);
+                kval[2] = __low2float(k23); kval[3] = __high2float(k23);
+                kval[4] = __low2float(k45); kval[5] = __high2float(k45);
+                kval[6] = __low2float(k67); kval[7] = __high2float(k67);
+                vval[0] = __low2float(v01); vval[1] = __high2float(v01);
+                vval[2] = __low2float(v23); vval[3] = __high2float(v23);
+                vval[4] = __low2float(v45); vval[5] = __high2float(v45);
+                vval[6] = __low2float(v67); vval[7] = __high2float(v67);
+            }
+        }
+
+        {
+            float a;
+            if constexpr (DP4A) {
+              if (HP && hp_row) {
+                a = qr[0] * kval[0];
+                #pragma unroll
+                for (int f = 1; f < 8; ++f) a += qr[f] * kval[f];
+              } else {
+                int hx = __dp4a((int)qpack.x, (int)qcur.kb2.x, 0);
+                int hy = __dp4a((int)qpack.y, (int)qcur.kb2.y, 0);
+                unsigned int lox = 0, loy = 0;
+                if constexpr (ink_kvq_k10v6<FMT>()) {
+                    lox = (qcur.kblo & 3u) | (((qcur.kblo >> 2) & 3u) << 8) |
+                          (((qcur.kblo >> 4) & 3u) << 16) | (((qcur.kblo >> 6) & 3u) << 24);
+                    loy = ((qcur.kblo >> 8) & 3u) | (((qcur.kblo >> 10) & 3u) << 8) |
+                          (((qcur.kblo >> 12) & 3u) << 16) | (((qcur.kblo >> 14) & 3u) << 24);
+                    hx = (hx << 2) + __dp4a((int)qpack.x, (int)lox, 0);
+                    hy = (hy << 2) + __dp4a((int)qpack.y, (int)loy, 0);
+                }
+                float dot;
+                if constexpr (DP4A == 4) {
+                    const float kscv = ink_kvq_half_as_float(qcur.kscw);
+                    a = (float)hx * kscv * qscale + (float)hy * kscv * qscale2;
+                } else {
+                    dot = (float)(hx + hy);
+                }
+                if constexpr (DP4A == 2) {
+                    int lsum = __dp4a((int)qpackl.x, (int)qcur.kb2.x, 0);
+                    lsum = __dp4a((int)qpackl.y, (int)qcur.kb2.y, lsum);
+                    if constexpr (ink_kvq_k10v6<FMT>()) {
+                        const int hlo = lsum;
+                        int rlo = __dp4a((int)qpackl.x, (int)lox, 0);
+                        rlo = __dp4a((int)qpackl.y, (int)loy, rlo);
+                        lsum = (hlo << 2) + rlo;
+                    }
+                    dot += (float)lsum * 0.0078125f;
+                }
+                if constexpr (DP4A != 4) a = dot * ink_kvq_half_as_float(qcur.kscw) * qscale;
+              }
+            } else {
+                a = qr[0] * kval[0];
+                #pragma unroll
+                for (int f = 1; f < 8; ++f) a += qr[f] * kval[f];
+            }
+            for (int o = 8; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            if (valid) {
+                const float sc = a * scale + bcur + mcur;
+                const float mold = mst;
+                if (sc > mold) {
+                    const float c = __expf(mold - sc);
+                    mst = sc;
+                    lst = lst * c + 1.f;
+                    #pragma unroll
+                    for (int f = 0; f < 8; ++f) acc[f] = acc[f] * c + vval[f];
+                } else {
+                    const float p = __expf(sc - mold);
+                    lst += p;
+                    #pragma unroll
+                    for (int f = 0; f < 8; ++f) acc[f] += p * vval[f];
+                }
+            }
+        }
+        qcur = qnext;
+        bcur = bnext;
+        mcur = mnext;
+    }
+
+    {
+        const float mo = __shfl_xor_sync(0xffffffffu, mst, 16);
+        const float lo = __shfl_xor_sync(0xffffffffu, lst, 16);
+        const float mx = fmaxf(mst, mo);
+        const float wc = __expf(mst - mx);
+        const float wo = __expf(mo - mx);
+        mst = mx;
+        lst = lst * wc + lo * wo;
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) {
+            const float ao = __shfl_xor_sync(0xffffffffu, acc[f], 16);
+            acc[f] = acc[f] * wc + ao * wo;
+        }
+    }
+
+    if (w == 0 && rw == 0) {
+        if (sl == 0) { smm[0] = mst; sml[0] = lst; }
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) sacc[d0 + f] = acc[f];
+    }
+    __syncthreads();
+    if (w == 1 && rw == 0) {
+        float* pb = part + ((size_t)chunk * nh + qbase) * (128 + 2);
+        const float mx = fmaxf(smm[0], mst);
+        const float w0 = __expf(smm[0] - mx);
+        const float w1 = __expf(mst - mx);
+        if (sl == 0) { pb[0] = mx; pb[1] = sml[0] * w0 + lst * w1; }
+        #pragma unroll
+        for (int f = 0; f < 8; ++f) pb[2 + d0 + f] = sacc[d0 + f] * w0 + acc[f] * w1;
+    }
+}
+
+
+// Grouped-query variant for ratio-3 no-HP caches: each warp owns one row at a
+// time and shares one quantized load/decode across all three query heads.
+template<int FMT, int DP4A>
+__global__ void inkwell_attn_kvq_qg3(InkKvQSlot slot, const int* __restrict__ posp,
+                                     const float* __restrict__ Q, const float* __restrict__ bias,
+                                     const float* __restrict__ mask, float* __restrict__ part,
+                                     int nh, const int* __restrict__ d_nkv, int q_s2, int b_s2, float scale,
+                                     int chunk_len, int mask_zero,
+                                     int bias_mode, int swa, int rel_extent,
+                                     const unsigned char* __restrict__ qpacks,
+                                     const float* __restrict__ qscales) {
+    extern __shared__ float sw[];
+    float* sacc = sw;
+    float* smm = sacc + INKWELL_ATTN_MAX_QG * 128;
+    float* sml = smm + INKWELL_ATTN_MAX_QG;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int w = tid >> 5;
+    const int chunk = blockIdx.x;
+    const int hk = blockIdx.y;
+    const int ratio = nh / 8;
+    if (ratio != 3) return;
+    const int qbase = hk * ratio;
+    const int n_kv = min(d_nkv[0], slot.cap);
+    const int j0 = chunk * chunk_len;
+    if (j0 >= n_kv) return;
+    const int j1 = min(n_kv, j0 + chunk_len);
+    const int d0 = lane * 4;
+    const int pos = posp[0];
+
+    float qr[3][4] = {};
+    unsigned int qpk[3] = {}, qpkl[3] = {};
+    float qsc[3] = {};
+    float acc[3][4] = {};
+    float mst[3], lst[3];
+    #pragma unroll
+    for (int g = 0; g < 3; ++g) {
+        mst[g] = -1e30f;
+        lst[g] = 0.f;
+        if constexpr (DP4A) {
+            qpk[g] = __ldg((const unsigned int*)(qpacks + (qbase + g) * 128 + d0));
+            if constexpr (DP4A == 2) qpkl[g] = __ldg((const unsigned int*)(qpacks + 3072 + (qbase + g) * 128 + d0));
+            qsc[g] = DP4A == 3 ? __ldg(qscales + (qbase + g) * 16 + (lane >> 1)) :
+                     DP4A == 4 ? __ldg(qscales + (qbase + g) * 32 + lane) : __ldg(qscales + qbase + g);
+        } else {
+            const float* qptr = Q + (size_t)(qbase + g) * q_s2 + d0;
+            #pragma unroll
+            for (int f = 0; f < 4; ++f) qr[g][f] = qptr[f];
+        }
+    }
+
+    InkKvqRaw4 qcur{}, qnext{};
+    const int jr0 = j0 + w;
+    InkKvqPtr4<FMT> qp = ink_kvq_ptr4<FMT>(slot, jr0, hk, lane);
+    if (jr0 < j1) qcur = ink_kvq_load4_ptr<FMT>(qp, lane);
+    for (int j = jr0; j < j1; j += 2) {
+        const int jn = j + 2;
+        ink_kvq_ptr4_step<FMT>(qp, 2);
+        if (jn < j1) qnext = ink_kvq_load4_ptr<FMT>(qp, lane);
+        float kval[4] = {}, vval[4] = {};
+        constexpr bool DK = FMT == INK_KVQ_INT8 || ink_kvq_k8v4fam<FMT>() || ink_kvq_v6<FMT>() || FMT == INK_KVQ_K4V2;
+        float kscale = 1.f;
+        if constexpr (DP4A) {
+            ink_kvq_decode4_v<FMT>(qcur, vval);
+        } else {
+            if constexpr (DK) kscale = ink_kvq_decode4_impl<FMT, false, true>(qcur, kval, vval);
+            else ink_kvq_decode4<FMT>(qcur, kval, vval);
+        }
+        const float qkscale = scale;
+
+        float a[3];
+        if constexpr (DP4A) {
+            unsigned int lo = 0;
+            if constexpr (ink_kvq_k10v6<FMT>()) {
+                lo = (qcur.kblo & 3u) | (((qcur.kblo >> 2) & 3u) << 8) |
+                     (((qcur.kblo >> 4) & 3u) << 16) | (((qcur.kblo >> 6) & 3u) << 24);
+            }
+            const float kscv = ink_kvq_half_as_float(qcur.kscw);
+            #pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                int hi = __dp4a((int)qpk[g], (int)qcur.kb, 0);
+                if constexpr (ink_kvq_k10v6<FMT>()) hi = (hi << 2) + __dp4a((int)qpk[g], (int)lo, 0);
+                float dot = (float)hi;
+                if constexpr (DP4A == 2) {
+                    int rl = __dp4a((int)qpkl[g], (int)qcur.kb, 0);
+                    if constexpr (ink_kvq_k10v6<FMT>()) rl = (rl << 2) + __dp4a((int)qpkl[g], (int)lo, 0);
+                    dot += (float)rl * 0.0078125f;
+                }
+                a[g] = dot * kscv * qsc[g];
+            }
+        } else {
+            #pragma unroll
+            for (int g = 0; g < 3; ++g) {
+                a[g] = qr[g][0] * kval[0];
+                #pragma unroll
+                for (int f = 1; f < 4; ++f) a[g] += qr[g][f] * kval[f];
+            }
+            #pragma unroll
+            for (int g = 0; g < 3; ++g) a[g] *= kscale;
+        }
+        #pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            for (int o = 16; o > 0; o >>= 1) a[g] += __shfl_xor_sync(0xffffffffu, a[g], o);
+        }
+
+        const float mk = mask_zero ? 0.f : mask[j];
+        #pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            float bv;
+            const int h = qbase + g;
+            if (bias_mode < 0) {
+                bv = bias[j + h * b_s2];
+            } else {
+                int rp;
+                if (bias_mode == 1) {
+                    const int dpos = pos - j;
+                    if (pos < swa) rp = dpos;
+                    else if ((swa & (swa - 1)) == 0) rp = dpos & (swa - 1);
+                    else { rp = dpos % swa; if (rp < 0) rp += swa; }
+                } else if (bias_mode == 2) {
+                    rp = n_kv - 1 - j;
+                } else {
+                    rp = pos - j;
+                }
+                rp = min(rp, rel_extent);
+                bv = bias[rp + h * b_s2];
+            }
+            const float sc = a[g] * qkscale + bv + mk;
+            const float mold = mst[g];
+            const bool newmax = sc > mold;
+            const float e = __expf(-fabsf(sc - mold));
+            const float c = newmax ? e : 1.f;
+            const float p = newmax ? 1.f : e;
+            mst[g] = newmax ? sc : mold;
+            lst[g] = lst[g] * c + p;
+            #pragma unroll
+            for (int f = 0; f < 4; ++f) acc[g][f] = acc[g][f] * c + p * vval[f];
+        }
+        qcur = qnext;
+    }
+
+    if (w == 0) {
+        #pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            if (lane == 0) { smm[g] = mst[g]; sml[g] = lst[g]; }
+            #pragma unroll
+            for (int f = 0; f < 4; ++f) sacc[g * 128 + d0 + f] = acc[g][f];
+        }
+    }
+    __syncthreads();
+    if (w == 1) {
+        #pragma unroll
+        for (int g = 0; g < 3; ++g) {
+            float* pb = part + ((size_t)chunk * nh + qbase + g) * (128 + 2);
+            const float mx = fmaxf(smm[g], mst[g]);
+            const float w0 = __expf(smm[g] - mx);
+            const float w1 = __expf(mst[g] - mx);
+            if (lane == 0) { pb[0] = mx; pb[1] = sml[g] * w0 + lst[g] * w1; }
+            #pragma unroll
+            for (int f = 0; f < 4; ++f) pb[2 + d0 + f] = sacc[g * 128 + d0 + f] * w0 + acc[g][f] * w1;
+        }
+    }
+}
+
+extern "C" void ink_launch_kvq_append(const float* kcur, const float* vcur, const int* pos,
+                                      const InkKvQSlot* slot, float* dep, void* stream) {
+    inkwell_kvq_append<<<dim3(8), dim3(128), 0, (cudaStream_t)stream>>>(kcur, vcur, pos, *slot, dep);
+}
+
+extern "C" void ink_launch_kvq_write_batch(const float* k, const float* v, const InkKvQSlot* slot,
+                                           int C, int pos0, void* stream) {
+    inkwell_kvq_write_batch<<<dim3(8), dim3(128), 0, (cudaStream_t)stream>>>(k, v, *slot, C, pos0);
+}
+
+#include "attn_kvq_gqa3.cuh"
+
+extern "C" int ink_launch_attn_kvq_dyn(const InkKvQSlot* slot, const int* pos, const int* d_nkv,
+                                       const void* Q, const void* bias, const void* mask, void* out,
+                                       long long nh, long long cap, long long q_s2, long long b_s2,
+                                       float scale, int chunk_len, int mask_zero,
+                                       int bias_mode, int swa, int rel_extent, void* stream) {
+    int max_chunks = (int)((cap + chunk_len - 1) / chunk_len);
+    if (max_chunks > INKWELL_ATTN_MAX_SPLIT) return 0;
+    float* part = inkwell_attn_partbuf((size_t)INKWELL_ATTN_MAX_SPLIT * nh * (128 + 2));
+    if (!part) return 0;
+    const int qper = 1;
+    const int nsub = 3;
+    const bool use_qg3 = slot->hp_cap == 0 && nh / 8 == 3 && getenv("INKWELL_KVQ_QG3") != nullptr;
+    const bool fmt_dp4a = (slot->fmt == INK_KVQ_INT8 || slot->fmt == INK_KVQ_K8V4 || slot->fmt == INK_KVQ_K8V4G32 || slot->fmt == INK_KVQ_K8V6 || slot->fmt == INK_KVQ_K10V6);
+    const int use_dp4a = ink_kvq_dp4a_mode(fmt_dp4a);
+    bool use_gqa3 = slot->hp_cap == 0 && nh / 8 == 3 && use_dp4a == 2 &&
+        (slot->fmt == INK_KVQ_K8V4 || slot->fmt == INK_KVQ_K8V4G32) && getenv("INKWELL_NO_KVQ_GQA3") == nullptr &&
+        (slot->fmt != INK_KVQ_K8V4 || (slot->cap & 15) == 0);
+    const char* gqa3_chunk_env = getenv("INKWELL_KVQ_GQA3_CHUNK");
+    if (use_gqa3 && gqa3_chunk_env) {
+        const int gc = atoi(gqa3_chunk_env);
+        if (gc >= 32 && gc <= 1024) {
+            chunk_len = gc;
+            max_chunks = (int)((cap + chunk_len - 1) / chunk_len);
+            if (max_chunks > INKWELL_ATTN_MAX_SPLIT) return 0;
+        }
+    }
+    if (use_gqa3 && slot->fmt == INK_KVQ_K8V4 && (chunk_len & 15) != 0) use_gqa3 = false;
+    unsigned char* qbuf = nullptr;
+    float* qscales = nullptr;
+    if (use_dp4a) {
+        qbuf = inkwell_kvq_qbuf();
+        if (!qbuf) return 0;
+        qscales = (float*)(qbuf + (use_dp4a == 3 ? 3072 : (use_dp4a == 4 ? 4096 : 7168)));
+        inkwell_kvq_quantq<<<dim3((unsigned)nh), 32, 0, (cudaStream_t)stream>>>(
+            (const float*)Q, (int)q_s2, (int)nh, qbuf, use_dp4a);
+    }
+    const dim3 gp((unsigned)(max_chunks * ((use_qg3 || use_gqa3) ? 1 : nsub)), 8);
+    const size_t smw = (INKWELL_ATTN_MAX_QG * 128 + 2 * INKWELL_ATTN_MAX_QG) * 4;
+    #define INK_LAUNCH_KVQ_SPLIT(FMTV) \
+        if (use_gqa3) { \
+            const size_t smg = (size_t)(4 * 3 * 128 + 4 * 3 * 2 + 4 * 3 * 16) * 4; \
+            inkwell_attn_kvq_gqa3_v2_row<FMTV, 8><<<gp, dim3(128), smg, (cudaStream_t)stream>>>( \
+                *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, mask_zero, \
+                bias_mode, swa, rel_extent, qbuf, qscales); \
+        } else if (slot->hp_cap > 0) { \
+            if (use_dp4a == 2) { \
+                inkwell_attn_kvq_splitw<FMTV, true, 2><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else if (use_dp4a == 3) { \
+                inkwell_attn_kvq_splitw<FMTV, true, 3><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else if (use_dp4a == 4) { \
+                inkwell_attn_kvq_splitw<FMTV, true, 4><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else if (use_dp4a) { \
+                inkwell_attn_kvq_splitw<FMTV, true, 1><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else { \
+                inkwell_attn_kvq_splitw<FMTV, true, 0><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                    bias_mode, swa, rel_extent, nullptr, nullptr); \
+            } \
+        } else if (use_qg3) { \
+            if (use_dp4a == 2) { \
+                inkwell_attn_kvq_qg3<FMTV, 2><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else if (use_dp4a == 3) { \
+                inkwell_attn_kvq_qg3<FMTV, 3><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else if (use_dp4a == 4) { \
+                inkwell_attn_kvq_qg3<FMTV, 4><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else if (use_dp4a) { \
+                inkwell_attn_kvq_qg3<FMTV, 1><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, mask_zero, \
+                    bias_mode, swa, rel_extent, qbuf, qscales); \
+            } else { \
+                inkwell_attn_kvq_qg3<FMTV, 0><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                    *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                    (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, mask_zero, \
+                    bias_mode, swa, rel_extent, nullptr, nullptr); \
+            } \
+        } else if (use_dp4a == 3) { \
+            inkwell_attn_kvq_splitw<FMTV, false, 3><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                bias_mode, swa, rel_extent, qbuf, qscales); \
+        } else if (use_dp4a == 4) { \
+            inkwell_attn_kvq_splitw<FMTV, false, 4><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                bias_mode, swa, rel_extent, qbuf, qscales); \
+        } else if (use_dp4a == 2) { \
+            inkwell_attn_kvq_splitw<FMTV, false, 2><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                bias_mode, swa, rel_extent, qbuf, qscales); \
+        } else if (use_dp4a) { \
+            inkwell_attn_kvq_splitw<FMTV, false, 1><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                bias_mode, swa, rel_extent, qbuf, qscales); \
+        } else { \
+            inkwell_attn_kvq_splitw<FMTV, false, 0><<<gp, dim3(64), smw, (cudaStream_t)stream>>>( \
+                *slot, pos, (const float*)Q, (const float*)bias, (const float*)mask, part, \
+                (int)nh, d_nkv, (int)q_s2, (int)b_s2, scale, chunk_len, qper, nsub, mask_zero, \
+                bias_mode, swa, rel_extent, nullptr, nullptr); \
+        }
+    switch (slot->fmt) {
+        case INK_KVQ_INT8: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_INT8); break;
+        case INK_KVQ_FP8_E4M3: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_FP8_E4M3); break;
+        case INK_KVQ_K8V4: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_K8V4); break;
+        case INK_KVQ_K8V4G32: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_K8V4G32); break;
+        case INK_KVQ_K8V6: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_K8V6); break;
+        case INK_KVQ_K10V6: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_K10V6); break;
+        case INK_KVQ_K4V2: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_K4V2); break;
+        case INK_KVQ_FP8_E5M2: INK_LAUNCH_KVQ_SPLIT(INK_KVQ_FP8_E5M2); break;
+        default: return 0;
+    }
+    #undef INK_LAUNCH_KVQ_SPLIT
+    inkwell_attn_decode_reduce_dyn<<<dim3((unsigned)nh), 128, 0, (cudaStream_t)stream>>>(
+        part, (const float*)mask, (float*)out, (int)nh, d_nkv, 128, chunk_len);
+    return 1;
+}
 
 extern "C" void ink_launch_attn_decode_old(const void* K, const void* V, const void* Q,
                                            const void* bias, const void* mask, void* out,
@@ -7874,6 +9346,84 @@ __global__ void inkwell_sink_relbias_fused(
         acc = fmaf(ink_bf16_hi(q1.w), r3.w, acc);
         kq_b[(size_t)h * y_stride + j] = __fsub_rn(acc, sk);
     }
+}
+
+// Compact variant of the fused sink/relative-bias computation. The gathered
+// decode bias depends only on the clipped relative position, so compute that
+// small table once per token instead of recomputing it for every key.
+__global__ void inkwell_sink_relbias_table(
+        const __nv_bfloat16* __restrict__ w_sink,
+        const float* __restrict__ inp0,
+        const __nv_bfloat16* __restrict__ rel_bias,
+        const float* __restrict__ r,
+        float* __restrict__ table,
+        int ncols2, int rel_extent) {
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float buf_iw[32];
+    __shared__ float s_sink;
+    __shared__ float sr[16];
+    if (tid < 32) buf_iw[tid] = 0.0f;
+    if (tid < 16) sr[tid] = r[h * 16 + tid];
+    __syncthreads();
+
+    const __nv_bfloat162* x2 = (const __nv_bfloat162*)(w_sink + (size_t)h * (ncols2 * 2));
+    const float2* y2 = (const float2*)inp0;
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += 256) {
+        const __nv_bfloat162 tmpx = x2[col2];
+        const float2 tmpy = __ldg(&y2[col2]);
+        sumf += __bfloat162float(tmpx.x) * tmpy.x;
+        sumf += __bfloat162float(tmpx.y) * tmpy.y;
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) sumf += __shfl_xor_sync(0xffffffffu, sumf, m);
+    buf_iw[tid >> 5] = sumf;
+    __syncthreads();
+    if (tid < 32) {
+        sumf = buf_iw[tid];
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) sumf += __shfl_xor_sync(0xffffffffu, sumf, m);
+        if (tid == 0) s_sink = sumf;
+    }
+    __syncthreads();
+
+    const float sk = s_sink;
+    const float4 r0 = ((const float4*)sr)[0];
+    const float4 r1 = ((const float4*)sr)[1];
+    const float4 r2 = ((const float4*)sr)[2];
+    const float4 r3 = ((const float4*)sr)[3];
+    for (int rp = tid; rp <= rel_extent; rp += 256) {
+        const uint4* rb = (const uint4*)(rel_bias + (size_t)rp * 16);
+        const uint4 q0 = __ldg(&rb[0]);
+        const uint4 q1 = __ldg(&rb[1]);
+        float acc = 0.0f;
+        acc = fmaf(ink_bf16_lo(q0.x), r0.x, acc);
+        acc = fmaf(ink_bf16_hi(q0.x), r0.y, acc);
+        acc = fmaf(ink_bf16_lo(q0.y), r0.z, acc);
+        acc = fmaf(ink_bf16_hi(q0.y), r0.w, acc);
+        acc = fmaf(ink_bf16_lo(q0.z), r1.x, acc);
+        acc = fmaf(ink_bf16_hi(q0.z), r1.y, acc);
+        acc = fmaf(ink_bf16_lo(q0.w), r1.z, acc);
+        acc = fmaf(ink_bf16_hi(q0.w), r1.w, acc);
+        acc = fmaf(ink_bf16_lo(q1.x), r2.x, acc);
+        acc = fmaf(ink_bf16_hi(q1.x), r2.y, acc);
+        acc = fmaf(ink_bf16_lo(q1.y), r2.z, acc);
+        acc = fmaf(ink_bf16_hi(q1.y), r2.w, acc);
+        acc = fmaf(ink_bf16_lo(q1.z), r3.x, acc);
+        acc = fmaf(ink_bf16_hi(q1.z), r3.y, acc);
+        acc = fmaf(ink_bf16_lo(q1.w), r3.z, acc);
+        acc = fmaf(ink_bf16_hi(q1.w), r3.w, acc);
+        table[(size_t)h * (rel_extent + 1) + rp] = __fsub_rn(acc, sk);
+    }
+}
+
+extern "C" void ink_launch_sink_relbias_table(const void* w_sink, const float* inp0,
+        const void* rel_bias, const float* r, float* table, int nh, int ncols2,
+        int rel_extent, void* stream) {
+    inkwell_sink_relbias_table<<<dim3((unsigned)nh), 256, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)w_sink, inp0, (const __nv_bfloat16*)rel_bias, r,
+        table, ncols2, rel_extent);
 }
 
 extern "C" void ink_launch_sink_relbias_fused(const void* w_sink, const float* inp0,

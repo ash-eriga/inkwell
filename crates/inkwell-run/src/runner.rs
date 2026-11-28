@@ -96,6 +96,162 @@ fn attn_chunk_len(regime: u8) -> i32 {
     i32::try_from(v).expect("attention chunk length fits i32")
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvFormat {
+    F16,
+    Int8,
+    Fp8E4m3,
+    Fp8E5m2,
+    K8V4,
+    K8V4G32,
+    K8V6,
+    K10V6,
+    K4V2,
+}
+
+impl KvFormat {
+    fn from_env(max_ctx: i64) -> Self {
+        let v = std::env::var("INKWELL_KV").unwrap_or_default().to_ascii_lowercase();
+        match v.as_str() {
+            "" | "auto" => {
+                if max_ctx > 8192 && dyn_nkv_enabled() {
+                    Self::K8V4
+                } else {
+                    Self::F16
+                }
+            }
+            "f16" | "fp16" => Self::F16,
+            "int8" | "k8v8" => Self::Int8,
+            "fp8" | "e4m3" | "fp8e4m3" => {
+                if std::env::var("INKWELL_FP8").is_ok_and(|x| x.eq_ignore_ascii_case("e5m2")) { Self::Fp8E5m2 } else { Self::Fp8E4m3 }
+            }
+            "fp8e5m2" | "e5m2" => Self::Fp8E5m2,
+            "k8v4" => Self::K8V4,
+            "k8v4g32" | "k8v4v32" => Self::K8V4G32,
+            "k8v6" | "k8v6g64" => Self::K8V6,
+            "k10v6" => Self::K10V6,
+            "k4v2" => Self::K4V2,
+            other => panic!("unknown INKWELL_KV={other}; expected auto|f16|int8|fp8|k8v4|k8v4g32|k8v6|k10v6|k4v2"),
+        }
+    }
+    fn code(self) -> i32 {
+        match self { Self::Int8 => 1, Self::Fp8E4m3 => 2, Self::K8V4 => 3, Self::K4V2 => 4, Self::Fp8E5m2 => 5, Self::K8V4G32 => 6, Self::K8V6 => 7, Self::K10V6 => 8, Self::F16 => 0 }
+    }
+    fn rows(self) -> (usize, usize, usize) {
+        match self {
+            Self::Int8 | Self::Fp8E4m3 | Self::Fp8E5m2 => (1024, 1024, if self == Self::Int8 { 96 } else { 0 }),
+            Self::K8V4 => (1024, 512, 96),
+            Self::K8V4G32 => (1024, 512, 192),
+            Self::K8V6 => (1024, 768, 96),
+            Self::K10V6 => (1280, 768, 96),
+            Self::K4V2 => (512, 256, 96),
+            Self::F16 => (0, 0, 0),
+        }
+    }
+    fn quantized(self) -> bool { self != Self::F16 }
+}
+
+#[derive(Debug)]
+struct KvQPass {
+    buf: inkwell_cuda::DevBuf,
+    desc: inkwell_cuda::KvQSlot,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct KvQ {
+    passes: Vec<Option<Box<KvQPass>>>,
+    quant_bytes: usize,
+    hp_bytes: usize,
+    format: KvFormat,
+    sinks: i32,
+    local: i32,
+}
+
+impl KvQ {
+    fn format_enabled(max_ctx: i64) -> KvFormat { KvFormat::from_env(max_ctx) }
+
+    fn slot_enabled(fmt: KvFormat, slot_is_swa: bool) -> bool {
+        if !fmt.quantized() { return false; }
+        match std::env::var("INKWELL_KV_SCOPE").as_deref() {
+            Ok("full") | Ok("global") => !slot_is_swa,
+            Ok("swa") => slot_is_swa,
+            _ => true,
+        }
+    }
+
+    fn hp_sizes(fmt: KvFormat) -> (i32, i32) {
+        if let Ok(v) = std::env::var("INKWELL_KV_HP") {
+            let mut it = v.split(':');
+            let s = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            let l = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            return (s.clamp(0, 1024), l.clamp(0, 1024));
+        }
+        if fmt == KvFormat::K4V2 {
+            let sinks = std::env::var("INKWELL_K4V2_SINKS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).clamp(4, 8);
+            let local = std::env::var("INKWELL_K4V2_LOCAL").ok().and_then(|v| v.parse().ok()).unwrap_or(56).clamp(32, 1024);
+            (sinks, local)
+        } else { (0, 0) }
+    }
+
+    fn new_pass(fmt: KvFormat, cap: i64, is_swa: bool, sinks: i32, local: i32, swa: i64) -> Box<KvQPass> {
+        let (krow, vrow, mrow) = fmt.rows();
+        let hp_cap = if local > 0 { sinks + local } else { 0 };
+        let qbytes = cap as usize * (krow + vrow + mrow);
+        let hp_one = 8 * hp_cap as usize * 128 * 2;
+        let total = qbytes + 2 * hp_one + 512;
+        let buf = inkwell_cuda::DevBuf::new_bytes(total);
+        buf.zero();
+        let base = buf.dev_ptr() as usize;
+        let mut off = 0usize;
+        let kq = base; off += cap as usize * krow;
+        let vq = base + off; off += cap as usize * vrow;
+        let meta = base + off; off += cap as usize * mrow;
+        off = (off + 255) & !255;
+        let khp = base + off; off += hp_one;
+        off = (off + 255) & !255;
+        let vhp = base + off;
+        Box::new(KvQPass { buf, bytes: total, desc: inkwell_cuda::KvQSlot {
+            kq: kq as *mut u8, vq: vq as *mut u8, meta: if mrow == 0 { std::ptr::null_mut() } else { meta as *mut u8 },
+            khp: if hp_cap == 0 { std::ptr::null_mut() } else { khp as *mut u8 }, vhp: if hp_cap == 0 { std::ptr::null_mut() } else { vhp as *mut u8 },
+            cap: cap as i32, hp_cap, swa: swa as i32, sinks, local, is_swa: i32::from(is_swa), fmt: fmt.code(),
+            krow: krow as i32, vrow: vrow as i32, mrow: mrow as i32,
+        }})
+    }
+
+    fn new(fmt: KvFormat, slots: &[(i64, bool, bool)]) -> Self {
+        let (sinks, local) = Self::hp_sizes(fmt);
+        let mut passes = Vec::new();
+        let (mut quant_bytes, mut hp_bytes) = (0usize, 0usize);
+        for &(cap, is_swa, enabled) in slots {
+            if enabled {
+                let p = Self::new_pass(fmt, cap, is_swa, sinks, local, if is_swa { cap } else { 0 });
+                let (kr, vr, mr) = fmt.rows();
+                quant_bytes += cap as usize * (kr + vr + mr);
+                hp_bytes += p.bytes - cap as usize * (kr + vr + mr);
+                passes.push(Some(p));
+            } else { passes.push(None); }
+        }
+        Self { passes, quant_bytes, hp_bytes, format: fmt, sinks, local }
+    }
+
+    fn active(&self, slot: usize) -> bool { self.passes.get(slot).is_some_and(|p| p.is_some()) }
+}
+
+/// Quantized KV launches a fixed-capacity worst-case chunk grid before reading exact n_kv.
+fn kvq_chunk_len(regime: u8, cap: i64) -> i32 {
+    attn_chunk_len(regime).max(i32::try_from((cap + 511) / 512).expect("attention capacity fits i32"))
+}
+
+/// SWA windows are small enough that 32-row split chunks spend a large share of
+/// their time in split reduction. Use 256 rows by default there; an explicit
+/// INKWELL_ATTNSPLIT_CHUNK override still controls both SWA and full attention.
+fn kvq_swa_chunk_len(regime: u8, cap: i64) -> i32 {
+    let base = kvq_chunk_len(regime, cap);
+    if attn_split_cfg().2 == 0 { base.max(256) } else { base }
+}
+
 /// per-layer weight handles resolved by name
 #[derive(Debug, Default)]
 struct L {
@@ -167,6 +323,8 @@ pub struct Runner {
     out_head: Option<(inkwell_cuda::DevBuf, inkwell_cuda::DevBuf, inkwell_cuda::DevBuf)>,
     // per-visit KV arenas + conv states (visit → tensors)
     k_arena: Vec<Ptr>, v_arena: Vec<Ptr>, conv_state: Vec<Ptr>,
+    /// quantized KV cache state (opt-in `INKWELL_KV`)
+    kvq: Option<KvQ>,
     /// per-position conv snapshots for spec rollback: [slot][NT][3*n_sconv].
     conv_snap: Vec<inkwell_cuda::DevBuf>,
     /// DSpark ctx taps captured by step_block: [NT][4][n_embd] f32
@@ -505,7 +663,7 @@ unsafe extern "C" fn kv_sconv_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i3
     unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
     let t = |i: i32| unsafe { inkwell_ggml::ink_tensor_src(dst, i) };
     let d = |i: i32| unsafe { inkwell_ggml::ink_tensor_data(t(i)) };
-    let wk = unsafe { t(0) };
+    let wk = t(0);
     let nrows = unsafe { inkwell_ggml::ink_tensor_ne(wk, 1) } as i32;
     let ncols2 = (unsafe { inkwell_ggml::ink_tensor_ne(wk, 0) } / 2) as i32;
     let out = unsafe { inkwell_ggml::ink_tensor_data(dst) as *mut f32 };
@@ -652,7 +810,7 @@ unsafe extern "C" fn sink_relbias_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth
     unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
     let t = |i: i32| unsafe { inkwell_ggml::ink_tensor_src(dst, i) };
     let d = |i: i32| unsafe { inkwell_ggml::ink_tensor_data(t(i)) };
-    let ws = unsafe { t(0) };
+    let ws = t(0);
     let nh = unsafe { inkwell_ggml::ink_tensor_ne(ws, 1) } as i32;
     let ncols2 = (unsafe { inkwell_ggml::ink_tensor_ne(ws, 0) } / 2) as i32;
     let y_stride = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32;
@@ -661,6 +819,22 @@ unsafe extern "C" fn sink_relbias_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth
         inkwell_cuda::sink_relbias_fused_async(d(0), d(1).cast(), d(2), d(3).cast(),
             d(4), d_nkv, inkwell_ggml::ink_tensor_data(dst).cast(), y_stride, nh,
             y_stride, ncols2, a.mode, a.swa, a.rel_extent)
+    };
+}
+
+/// `ggml_custom_op_t`: fused BF16 sink projection + compact rel-bias table.
+/// srcs = [sink weight, input, BF16 padded rel-bias, r].
+unsafe extern "C" fn sink_relbias_table_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, _ud: *mut std::ffi::c_void) {
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let t = |i: i32| unsafe { inkwell_ggml::ink_tensor_src(dst, i) };
+    let d = |i: i32| unsafe { inkwell_ggml::ink_tensor_data(t(i)) };
+    let ws = t(0);
+    let nh = unsafe { inkwell_ggml::ink_tensor_ne(ws, 1) } as i32;
+    let ncols2 = (unsafe { inkwell_ggml::ink_tensor_ne(ws, 0) } / 2) as i32;
+    let rel_extent = unsafe { inkwell_ggml::ink_tensor_ne(dst, 0) } as i32 - 1;
+    unsafe {
+        inkwell_cuda::sink_relbias_table_async(d(0), d(1).cast(), d(2), d(3).cast(),
+            inkwell_ggml::ink_tensor_data(dst).cast(), nh, ncols2, rel_extent)
     };
 }
 
@@ -878,8 +1052,8 @@ unsafe fn bf16_to_f32_avx2(d: &[u8], out: &mut [u8]) {
     let mut i = 0usize;
     while i + 8 <= n {
         let x = unsafe { _mm_loadu_si128(d.as_ptr().add(i * 2).cast()) };
-        let wide = unsafe { _mm256_cvtepu16_epi32(x) };
-        let shifted = unsafe { _mm256_slli_epi32(wide, 16) };
+        let wide = _mm256_cvtepu16_epi32(x);
+        let shifted = _mm256_slli_epi32(wide, 16);
         unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(i * 4).cast(), shifted) };
         i += 8;
     }
@@ -943,7 +1117,7 @@ impl Runner {
 
         // classify + create tensors
         let mut dev_bytes = 0usize;
-        let mut cpu_bytes = 2304 * 4 + 256; // embd_row tensor
+        let cpu_bytes = 2304 * 4 + 256; // embd_row tensor
         let mut plan: Vec<(&String, &inkwell_gguf::TensorInfo, bool, bool, bool)> = Vec::new();
         for (name, ti) in &gg.tensors {
             let expert = name.contains("exps") && !name.contains("probs") && !name.contains("scale");
@@ -1206,20 +1380,31 @@ impl Runner {
         for (il, _slot) in visits.iter() {
             let _ = il;
         }
+        let kvfmt = KvQ::format_enabled(max_ctx);
+        assert!(!kvfmt.quantized() || dyn_nkv_enabled(), "INKWELL_KV quantized formats require dynamic n_kv");
+        let mut kvq_slots = Vec::new();
         for slot in 0..n_slots {
             let il_phys = if slot < nphys { slot } else { start + (slot - nphys) % (end - start) };
             let full = il_phys % 6 == 5;
             let cap = if full { max_ctx } else { swa_cap };
-            k_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
-            v_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
+            let use_q = KvQ::slot_enabled(kvfmt, !full);
+            kvq_slots.push((cap, !full, use_q));
+            if use_q {
+                k_arena.push(Ptr(std::ptr::null_mut()));
+                v_arena.push(Ptr(std::ptr::null_mut()));
+            } else {
+                k_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
+                v_arena.push(t::new(rt.ctx(), F32, &[hd, cap, hkv]));
+            }
             conv_state.push(t::new(rt.ctx(), F32, &[3, n_sconv as i64]));
         }
+        let kvq = kvfmt.quantized().then(|| KvQ::new(kvfmt, &kvq_slots));
         // allocate KV + conv in one extra device buffer
-        let kv_bytes: usize = k_arena.iter().chain(v_arena.iter()).map(|x| t::nbytes(*x) + 256).sum::<usize>()
+        let kv_bytes: usize = k_arena.iter().chain(v_arena.iter()).filter(|x| !x.is_null()).map(|x| t::nbytes(*x) + 256).sum::<usize>()
             + conv_state.iter().map(|x| t::nbytes(*x) + 256).sum::<usize>();
         let kv_buf = rt.buf(buft_dev, kv_bytes);
         let mut o = 0usize;
-        for x in k_arena.iter().chain(v_arena.iter()).chain(conv_state.iter()) {
+        for x in k_arena.iter().chain(v_arena.iter()).chain(conv_state.iter()).filter(|x| !x.is_null()) {
             o = (o + 127) & !127;
             kv_buf.assign(*x, o);
             o += t::nbytes(*x);
@@ -1239,7 +1424,7 @@ impl Runner {
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query,
             msg_query_packed: Ptr(std::ptr::null_mut()), out_head,
-            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits,
+            k_arena, v_arena, conv_state, kvq, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits,
             n_full, step_gcache: None, sid: None,
         }
     }
@@ -1855,26 +2040,44 @@ impl Runner {
         let mut v_arena = Vec::new();
         let mut conv_state = Vec::new();
         let n_sconv = (2 * hd * hkv + 2 * 2304) as usize;
+        let kvfmt = KvQ::format_enabled(max_ctx);
+        assert!(!kvfmt.quantized() || dyn_nkv_enabled(), "INKWELL_KV quantized formats require dynamic n_kv; unset INKWELL_NO_DYN_NKV/INKWELL_NO_RELGATHER/INKWELL_ATTN_DUMP_DIR");
+        let mut kvq_slots = Vec::new();
         for slot in 0..n_slots {
             let il_phys = if slot < nphys { slot } else { start + (slot - nphys) % (end - start) };
             let full = il_phys % 6 == 5;
             let cap = if full { max_ctx } else { swa_cap };
-            k_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
-            v_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
+            let use_q = KvQ::slot_enabled(kvfmt, !full);
+            kvq_slots.push((cap, !full, use_q));
+            if use_q {
+                k_arena.push(Ptr(std::ptr::null_mut()));
+                v_arena.push(Ptr(std::ptr::null_mut()));
+            } else {
+                k_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
+                v_arena.push(t::new(rt.ctx(), F16, &[hd, cap, hkv]));
+            }
             conv_state.push(t::new(rt.ctx(), F32, &[3, n_sconv as i64]));
         }
+        let kvq = kvfmt.quantized().then(|| KvQ::new(kvfmt, &kvq_slots));
         let _g_kv = crate::prof::guard("kv_arena");
-        let kv_bytes: usize = k_arena.iter().chain(v_arena.iter()).map(|x| t::nbytes(*x) + 256).sum::<usize>()
+        let kv_bytes: usize = k_arena.iter().chain(v_arena.iter()).filter(|x| !x.is_null()).map(|x| t::nbytes(*x) + 256).sum::<usize>()
             + conv_state.iter().map(|x| t::nbytes(*x) + 256).sum::<usize>();
         let kv_buf = rt.buf(buft_dev, kv_bytes);
         let mut o = 0usize;
-        for x in k_arena.iter().chain(v_arena.iter()).chain(conv_state.iter()) {
+        for x in k_arena.iter().chain(v_arena.iter()).chain(conv_state.iter()).filter(|x| !x.is_null()) {
             o = (o + 127) & !127;
             kv_buf.assign(*x, o);
             o += t::nbytes(*x);
         }
+        let kv_total = kv_bytes + kvq.as_ref().map_or(0, |q| q.quant_bytes + q.hp_bytes);
+        if let Some(q) = &kvq {
+            eprintln!("kvq: format={:?} quant={}MiB hp={}MiB sinks={} local={} scope={} hw_dp4a={}",
+                q.format, q.quant_bytes >> 20, q.hp_bytes >> 20, q.sinks, q.local,
+                std::env::var("INKWELL_KV_SCOPE").unwrap_or_else(|_| "all".into()),
+                inkwell_cuda::cuda_has_dp4a());
+        }
         vlog!("bufs: dev={}MiB kv={}MiB hd={hd} hkv={hkv} swa={swa} n_slots={n_slots}",
-            dev_bytes >> 20, kv_bytes >> 20);
+            dev_bytes >> 20, kv_total >> 20);
         std::mem::forget(kv_buf);
         drop(_g_kv);
 
@@ -2175,7 +2378,7 @@ impl Runner {
             cfg: cfg.clone(), layers,
             tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query,
             msg_query_packed, out_head,
-            k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits, n_full,
+            k_arena, v_arena, conv_state, kvq, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits, n_full,
             step_gcache: None, sid: None,
         }
     }
@@ -2506,6 +2709,27 @@ impl Runner {
         t::add(c, residual, self.convolve(x_in, w, dynamic, slot, region_off, stores, snap))
     }
 
+    fn kvq_append_op(&self, c: Ptr, k: Ptr, v: Ptr, pos: Ptr, slot: usize) -> Ptr {
+        let pass = self.kvq.as_ref().expect("kvq").passes[slot].as_ref().expect("kvq slot");
+        let mut args = vec![k.0, v.0, pos.0];
+        Ptr(unsafe {
+            inkwell_ggml::custom_4d(c.0, F32, [1, 1, 1, 1], &mut args,
+                kvq_append_cb as *const () as usize, (&pass.desc as *const inkwell_cuda::KvQSlot).cast_mut().cast())
+        })
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn kvq_attn_op(&self, c: Ptr, q3: Ptr, kq_b: Ptr, kq_mask: Ptr, pos: Ptr, nkv: Ptr, dep: Ptr, slot: usize, hd: i64, nh: i64, chunk_len: i32, mask_zero: i32, key_cap: i32, bias_mode: i32) -> Ptr {
+        let pass = self.kvq.as_ref().expect("kvq").passes[slot].as_ref().expect("kvq slot");
+        let ud = Box::leak(Box::new(KvQAttnArgs { desc: &pass.desc, chunk_len, mask_zero, key_cap, bias_mode,
+            swa: self.swa as i32, rel_extent: self.cfg.rel_extent as i32 }));
+        let mut args = vec![q3.0, kq_b.0, kq_mask.0, pos.0, nkv.0, dep.0];
+        Ptr(unsafe {
+            inkwell_ggml::custom_4d(c.0, F32, [hd * nh, 1, 1, 1], &mut args,
+                kvq_attn_cb as *const () as usize, (ud as *mut KvQAttnArgs).cast())
+        })
+    }
+
     /// device ptr into `conv_snap[slot]` for verify position `j`.
     fn snap_ptr(&self, slot: usize, j: usize) -> *mut f32 {
         if self.conv_snap.len() <= slot { return std::ptr::null_mut(); }
@@ -2676,13 +2900,13 @@ impl Runner {
 
     /// one layer; returns (new cur, attn_out push or add). messages present on loop passes>0.
     #[expect(clippy::too_many_arguments)]
-    fn layer(&self, il: usize, ip: usize, slot: usize, pass: usize, mut cur: Ptr, blocks: &mut Vec<Ptr>,
+    fn layer(&self, il: usize, ip: usize, slot: usize, pass: usize, cur: Ptr, blocks: &mut Vec<Ptr>,
              messages: Option<Ptr>, l: &L, step: &Step, stores: &mut Vec<Ptr>) -> Ptr {
         let c = self.cur_ctx;
         let is_swa = self.is_swa_layer(il);
         let (n_embd, hd, nh, hkv, n_rel) =
             (self.cfg.n_embd as i64, 128i64, 24i64, 8i64, self.cfg.n_rel as i64);
-        let n_rep = nh / hkv;
+        let _n_rep = nh / hkv;
         let inp_sa = cur;
 
         // attention inputs
@@ -2887,11 +3111,17 @@ impl Runner {
             step.n_kv_full_pad
         };
         let kv_idx = if is_swa { step.kv_idx_swa } else { step.kv_idx_full };
-        // set_rows wants b [hd, n_idx, hkv]: permute [hd,hkv,1] -> [hd,1,hkv]
-        let k_rows = t::permute(c, k, 0, 2, 1, 3);
-        let v_rows = t::permute(c, v, 0, 2, 1, 3);
-        let k_upd = t::set_rows(c, self.k_arena[slot], k_rows, kv_idx);
-        let v_upd = t::set_rows(c, self.v_arena[slot], v_rows, kv_idx);
+        let use_kvq = self.kvq.as_ref().is_some_and(|q| q.active(slot));
+        let (k_upd, v_upd, kvq_dep) = if use_kvq {
+            let dep = self.kvq_append_op(c, k, v, step.pos, slot);
+            (Ptr(std::ptr::null_mut()), Ptr(std::ptr::null_mut()), Some(dep))
+        } else {
+            // set_rows wants b [hd, n_idx, hkv]: permute [hd,hkv,1] -> [hd,1,hkv]
+            let k_rows = t::permute(c, k, 0, 2, 1, 3);
+            let v_rows = t::permute(c, v, 0, 2, 1, 3);
+            (t::set_rows(c, self.k_arena[slot], k_rows, kv_idx),
+             t::set_rows(c, self.v_arena[slot], v_rows, kv_idx), None)
+        };
 
         // tau scale on full layers
         let mut q = q;
@@ -2910,7 +3140,14 @@ impl Runner {
                 && inkwell_ggml::ink_tensor_type(rel_w.0) == BF16
                 && inkwell_ggml::ink_tensor_ne(rel_w.0, 0) == n_rel
         };
-        let (kq_b, table_dbg) = if fuse_sink_relbias {
+        let compact_bias = fuse_sink_relbias && use_kvq && step.direct_relbias;
+        let (kq_b, table_dbg) = if compact_bias {
+            let mut args = [sink_w.0, inputs[0].0, rel_w.0, r.0];
+            let out = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32,
+                [self.cfg.rel_extent as i64 + 1, 1, nh, 1], &mut args,
+                sink_relbias_table_cb as *const () as usize, std::ptr::null_mut()) });
+            (out, None)
+        } else if fuse_sink_relbias {
             let (mode, pos_src, nkv_src, dynamic) = if step.dyn_nkv {
                 let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
                 if step.direct_relbias {
@@ -2975,11 +3212,20 @@ impl Runner {
         self.sr_dump(il, pass, step.pos_val, "kqb", kq_b);
 
         // Fused decode attention (replaces kq GEMV + softmax + V GEMV chain)
-        let k_view = t::view3(c, k_upd, hd, n_kv, hkv, t::nb(k_upd, 1), t::nb(k_upd, 2), 0);
         let q3 = t::permute(c, q, 0, 2, 1, 3); // [hd, 1, nh]
         let kq_mask = if is_swa { step.mask_swa } else { step.mask_full };
-        let v_view = t::view3(c, v_upd, hd, n_kv, hkv, t::nb(v_upd, 1), t::nb(v_upd, 2), 0);
         let pow2_ctx = (step.pos_val + 1) & step.pos_val == 0;
+        let out = if let Some(dep) = kvq_dep {
+            let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
+            let regime = if is_swa { step.attn_regime_swa } else { step.attn_regime_full };
+            let chunk_len = if is_swa { kvq_swa_chunk_len(regime, n_kv) } else { kvq_chunk_len(regime, n_kv) };
+            self.kvq_attn_op(c, q3, kq_b, kq_mask, step.pos, nkv_dev, dep, slot, hd, nh, chunk_len,
+                i32::from(!is_swa || step.direct_relbias),
+                if is_swa { step.cap_swa as i32 } else { step.cap_full as i32 },
+                if compact_bias { if !is_swa { 0 } else if self.swa_legacy_min { 2 } else { 1 } } else { -1 })
+        } else {
+        let k_view = t::view3(c, k_upd, hd, n_kv, hkv, t::nb(k_upd, 1), t::nb(k_upd, 2), 0);
+        let v_view = t::view3(c, v_upd, hd, n_kv, hkv, t::nb(v_upd, 1), t::nb(v_upd, 2), 0);
         if !is_swa && pow2_ctx && (1024..=32768).contains(&(step.pos_val + 1))
             && Self::attn_dump_enabled(il, pass, step.pos_val + 1) {
             self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_k", step.pos_val), t::cont(c, k_view));
@@ -2988,7 +3234,7 @@ impl Runner {
             self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_bias", step.pos_val), kq_b);
             self.dump_attn_bin(format!("attn_pos{}_l{il}p{pass}_mask", step.pos_val), kq_mask);
         }
-        let out = if step.dyn_nkv {
+        if step.dyn_nkv {
             let nkv_dev = if is_swa { step.n_kv_swa_dev } else { step.n_kv_full_dev }.expect("dyn n_kv scalar");
             let (regime, allow_gqa) = if is_swa {
                 (step.attn_regime_swa, step.attn_allow_gqa_swa)
@@ -3003,6 +3249,7 @@ impl Runner {
                 (ud as *mut AttnDynArgs).cast())
         } else {
             t::attn_fused(c, k_view, v_view, q3, kq_b, kq_mask, hd, nh)
+        }
         }; // [hd*nh, 1]
 
         let mut cur = out;
@@ -3211,7 +3458,7 @@ impl Runner {
         self.conv_arg_idx.set(0);
         let c = self.cur_ctx;
         let n_embd = self.cfg.n_embd as i64;
-        let (hd, nh, hkv) = (128i64, 24i64, 8i64);
+        let (_hd, nh, hkv) = (128i64, 24i64, 8i64);
         let n_rep = nh / hkv;
 
         // --- inputs ---
@@ -3988,7 +4235,7 @@ impl Runner {
         let tp7 = std::time::Instant::now();
         if self.out_head.is_some() {
             // own-head needs host launches: sync then take the slow read path
-            unsafe { inkwell_cuda::DevBuf::sync() };
+            inkwell_cuda::DevBuf::sync();
             let token = self.read_argmax(gc);
             self.dump_head_record(pos, token, gc.head_in, gc.out, None);
             return token;
@@ -4126,13 +4373,13 @@ impl Runner {
     /// block forward of one layer-visit: `cur`/`blocks`/`messages` are `[n, NT]` tensors;
     /// stateful ops (conv state, KV write, attention, MoE) run per token on slices.
     #[expect(clippy::too_many_arguments)]
-    fn layer_blk(&self, il: usize, ip: usize, slot: usize, pass: usize, mut cur: Ptr, blocks: &mut Vec<Ptr>,
+    fn layer_blk(&self, il: usize, ip: usize, slot: usize, pass: usize, cur: Ptr, blocks: &mut Vec<Ptr>,
              messages: Option<Ptr>, l: &L, step: &StepBlk) -> Ptr {
         let c = self.cur_ctx;
         let is_swa = self.is_swa_layer(il);
         let (n_embd, hd, nh, hkv, n_rel) =
             (self.cfg.n_embd as i64, 128i64, 24i64, 8i64, self.cfg.n_rel as i64);
-        let n_rep = nh / hkv;
+        let _n_rep = nh / hkv;
         let gqa = (hd * hkv) as i64;
         let inp_sa = cur;
 
@@ -4354,13 +4601,15 @@ impl Runner {
         self.max_ctx
     }
 
-    /// Save all persistent decode state tensors (KV arenas + conv states).
+    /// Save all persistent decode state tensors (KV arenas/cache + conv states).
     pub fn save_state(&self, path: &str) {
-        let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter()).copied().collect();
+        let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter())
+            .copied().filter(|x| !x.is_null()).collect();
+        let qpasses: Vec<&KvQPass> = self.kvq.as_ref().map_or_else(Vec::new, |q| q.passes.iter().flatten().map(|p| &**p).collect());
         let mut f = std::fs::File::create(path).expect("create state snapshot");
         use std::io::Write as _;
-        f.write_all(b"INKWST02").expect("write state magic");
-        f.write_all(&(tensors.len() as u64).to_le_bytes()).expect("write state count");
+        f.write_all(b"INKWST03").expect("write state magic");
+        f.write_all(&((tensors.len() + qpasses.len()) as u64).to_le_bytes()).expect("write state count");
         for x in tensors {
             let n = t::nbytes(x);
             let mut v = vec![0u8; n];
@@ -4368,19 +4617,33 @@ impl Runner {
             f.write_all(&(n as u64).to_le_bytes()).expect("write state length");
             f.write_all(&v).expect("write state tensor");
         }
+        for q in qpasses {
+            f.write_all(&(q.bytes as u64).to_le_bytes()).expect("write quantized state length");
+            let mut v = vec![0u8; q.bytes];
+            unsafe { inkwell_cuda::memcpy_d2h_sync(v.as_mut_ptr().cast(), q.buf.dev_ptr().cast_const().cast(), q.bytes) };
+            f.write_all(&v).expect("write quantized state");
+        }
     }
 
     /// Load state written by [`Runner::save_state`].
     pub fn load_state(&self, path: &str) {
-        let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter()).copied().collect();
+        let tensors: Vec<Ptr> = self.k_arena.iter().chain(self.v_arena.iter()).chain(self.conv_state.iter())
+            .copied().filter(|x| !x.is_null()).collect();
+        let qpasses: Vec<&KvQPass> = self.kvq.as_ref().map_or_else(Vec::new, |q| q.passes.iter().flatten().map(|p| &**p).collect());
         let mut f = std::fs::File::open(path).expect("open state snapshot");
         use std::io::Read as _;
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic).expect("read state magic");
-        assert_eq!(&magic, b"INKWST02", "state snapshot magic");
+        let has_k8v4 = self.kvq.as_ref().is_some_and(|q| q.format == KvFormat::K8V4 && !qpasses.is_empty());
+        if &magic == b"INKWST02" {
+            assert!(!has_k8v4,
+                "state snapshot uses legacy INKWST02 token-major K8V4 layout; re-capture or convert to INKWST03 with opt/kvq64/front4e/transpose_state.py");
+        } else {
+            assert_eq!(&magic, b"INKWST03", "state snapshot magic");
+        }
         let mut u64b = [0u8; 8];
         f.read_exact(&mut u64b).expect("read state count");
-        assert_eq!(u64::from_le_bytes(u64b) as usize, tensors.len(), "state tensor count");
+        assert_eq!(u64::from_le_bytes(u64b) as usize, tensors.len() + qpasses.len(), "state tensor count");
         for x in tensors {
             f.read_exact(&mut u64b).expect("read state length");
             let n = u64::from_le_bytes(u64b) as usize;
@@ -4388,6 +4651,14 @@ impl Runner {
             let mut v = vec![0u8; n];
             f.read_exact(&mut v).expect("read state tensor");
             unsafe { t::set(x, v.as_ptr(), 0, n) };
+        }
+        for q in qpasses {
+            f.read_exact(&mut u64b).expect("read quantized state length");
+            let n = u64::from_le_bytes(u64b) as usize;
+            assert_eq!(n, q.bytes, "quantized state byte length");
+            let mut v = vec![0u8; n];
+            f.read_exact(&mut v).expect("read quantized state");
+            unsafe { inkwell_cuda::memcpy_h2d_async(q.buf.dev_ptr(), v.as_ptr().cast(), n) };
         }
     }
 
@@ -4400,6 +4671,7 @@ impl Runner {
     /// On graph/alloc/compute failure.
     pub fn step_block(&mut self, ids: &[u32; NT], pos: i64) -> Vec<f32> {
         self.check_ctx_span(pos, NT as i64, "speculative decode");
+        assert!(self.kvq.is_none(), "quantized KV formats do not yet support step_block/speculative verification");
         if self.block_feats.is_none() {
             self.block_feats = Some(inkwell_cuda::DevBuf::new_bytes(4 * NT * 2304 * 4));
         }
@@ -4430,7 +4702,7 @@ impl Runner {
         let n_kv_swa = kv_bucket(n_kv_swa_raw, self.swa_capacity());
 
         // per-token input tensors
-        let mk_i32 = |v: &[i32]| -> Ptr {
+        let mk_i32 = |_v: &[i32]| -> Ptr {
             let t0 = t::new(c, I32, &[1]);
             unsafe { inkwell_ggml::ink_set_input(t0.0) };
             t0
@@ -4618,6 +4890,65 @@ impl Runner {
         logits
     }
 }
+struct KvQAttnArgs {
+    desc: *const inkwell_cuda::KvQSlot,
+    chunk_len: i32,
+    mask_zero: i32,
+    key_cap: i32,
+    bias_mode: i32,
+    swa: i32,
+    rel_extent: i32,
+}
+
+unsafe extern "C" fn kvq_append_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    unsafe {
+        inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+        let k_t = inkwell_ggml::ink_tensor_src(dst, 0);
+        let v_t = inkwell_ggml::ink_tensor_src(dst, 1);
+        let pos_t = inkwell_ggml::ink_tensor_src(dst, 2);
+        inkwell_cuda::kvq_append_async(
+            inkwell_ggml::ink_tensor_data(k_t).cast(),
+            inkwell_ggml::ink_tensor_data(v_t).cast(),
+            inkwell_ggml::ink_tensor_data(pos_t).cast(),
+            ud.cast(),
+            inkwell_ggml::ink_tensor_data(dst).cast(),
+        );
+    }
+}
+
+unsafe extern "C" fn kvq_attn_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    unsafe {
+        inkwell_cuda::set_stream(inkwell_ggml::cuda_stream());
+        let a = &*ud.cast::<KvQAttnArgs>();
+        let q_t = inkwell_ggml::ink_tensor_src(dst, 0);
+        let b_t = inkwell_ggml::ink_tensor_src(dst, 1);
+        let m_t = inkwell_ggml::ink_tensor_src(dst, 2);
+        let pos_t = inkwell_ggml::ink_tensor_src(dst, 3);
+        let nkv_t = inkwell_ggml::ink_tensor_src(dst, 4);
+        let nh = inkwell_ggml::ink_tensor_ne(q_t, 2);
+        let _cap = inkwell_ggml::ink_tensor_ne(b_t, 0);
+        let rc = inkwell_cuda::attn_kvq_dyn_async(
+            a.desc,
+            inkwell_ggml::ink_tensor_data(pos_t).cast(),
+            inkwell_ggml::ink_tensor_data(nkv_t).cast(),
+            inkwell_ggml::ink_tensor_data(q_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(b_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(m_t).cast_const(),
+            inkwell_ggml::ink_tensor_data(dst).cast(),
+            nh, i64::from(a.key_cap),
+            inkwell_ggml::ink_tensor_nb(q_t, 2) / 4,
+            inkwell_ggml::ink_tensor_nb(b_t, 2) / 4,
+            1.0 / 128f32.sqrt(),
+            a.chunk_len,
+            a.mask_zero,
+            a.bias_mode,
+            a.swa,
+            a.rel_extent,
+        );
+        assert_ne!(rc, 0, "quantized KV attention launch");
+    }
+}
+
 /// `ggml_custom_op_t` for fused decode attention: src[0]=K view, src[1]=V view,
 /// src[2]=q3 [hd,1,nh], src[3]=bias [n_kv,1,nh], src[4]=mask [n_kv+1]; dst=[hd*nh].
 pub fn attn_cb_addr() -> usize { attn_cb as *const () as usize }
@@ -5182,12 +5513,12 @@ impl Runner {
         } else {
             self.pf_dense(gate.cast_const(), l.ctrl_gain[ctrl].expect("ctrl_gain"), gain, c, n, 64);
             self.pf_dense(gate.cast_const(), l.ctrl_forget[ctrl].expect("ctrl_forget"), unsafe{gain.add(c*n)}, c, n, 64);
-            unsafe { inkwell_cuda::pf_ctrl_apply_async(gain.cast_const(), unsafe{gain.add(c*n)}.cast_const(), cur, msg, (h) as i64) };
+            unsafe { inkwell_cuda::pf_ctrl_apply_async(gain.cast_const(), gain.add(c*n).cast_const(), cur, msg, (h) as i64) };
         }
     }
 
     #[expect(clippy::too_many_arguments)]
-    fn pf_layer(&self, a: &PfArena, il: usize, ip: usize, slot: usize, pass: usize,
+    fn pf_layer(&self, a: &PfArena, il: usize, ip: usize, slot: usize, _pass: usize,
         blocks: &mut Vec<usize>, cur_name: &'static str, messages: bool, pos0: i64,
         moe_descs: Option<PfMoeDescs>, mut micro_stage: Option<&mut PfMicroStage>, next_host: Option<usize>) {
         let c = a.c;
@@ -5278,8 +5609,7 @@ impl Runner {
             } else {
                 inkwell_cuda::pf_expand_rel_async(tdata(rb).cast_const(), a.ptr("rel"));
             }
-            let kd = inkwell_ggml::ink_tensor_data(self.k_arena[slot].0);
-            let vd = inkwell_ggml::ink_tensor_data(self.v_arena[slot].0);
+            let useq = self.kvq.as_ref().is_some_and(|x| x.active(slot));
             let cap = if is_swa { self.swa_capacity() } else { self.max_ctx };
             let swa = if is_swa { self.swa as i32 } else { 0 };
             let (snap_start, snap_len) = if is_swa {
@@ -5287,20 +5617,36 @@ impl Runner {
                 let end = pos0 as i32 + c as i32 - swa;
                 (start, (end - start).max(0))
             } else { (0, 0) };
-            if snap_len > 0 {
-                inkwell_cuda::pf_snapshot_kv_async(kd.cast_const(), vd.cast_const(), a.ptr("ksnap").cast(), a.ptr("vsnap").cast(),
-                    snap_start, snap_len, cap as i32, swa);
-            }
-            inkwell_cuda::pf_write_kv_async(a.ptr("kout").cast_const(), a.ptr("vout").cast_const(), kd, vd, c as i32, pos0 as i32, cap as i32, swa);
-            if let Some(ws) = a.exact_attn_ws.as_ref().filter(|_| pf_exact_attn_enabled()) {
-                inkwell_cuda::pf_exact_attn_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
-                    a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), ws.dev_ptr().cast::<f32>(),
-                    self.max_ctx as i32, c as i32, pos0 as i32, cap as i32, swa, 1.0 / (128f32).sqrt(),
-                    a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
-            } else {
-                inkwell_cuda::flash_prefill_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+            if useq {
+                let pass = self.kvq.as_ref().expect("kvq").passes[slot].as_ref().expect("kvq slot");
+                let qdesc = &pass.desc as *const inkwell_cuda::KvQSlot;
+                if snap_len > 0 {
+                    inkwell_cuda::pf_snapshot_kvq_async(qdesc, a.ptr("ksnap").cast(), a.ptr("vsnap").cast(),
+                        snap_start, snap_len, cap as i32, swa, pos0 as i32 - 1);
+                }
+                inkwell_cuda::kvq_write_batch_async(a.ptr("kout").cast_const(), a.ptr("vout").cast_const(), qdesc, c as i32, pos0 as i32);
+                assert!(!(a.exact_attn_ws.is_some() && pf_exact_attn_enabled()), "quantized KV does not yet support INKWELL_PF_EXACT_ATTN");
+                inkwell_cuda::flash_prefill_gqa3_snap_kvq_async(qdesc, q.cast_const(), r.cast_const(),
                     a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), c as i32, pos0 as i32,
                     cap as i32, swa, 1.0 / (128f32).sqrt(), a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+            } else {
+                let kd = inkwell_ggml::ink_tensor_data(self.k_arena[slot].0);
+                let vd = inkwell_ggml::ink_tensor_data(self.v_arena[slot].0);
+                if snap_len > 0 {
+                    inkwell_cuda::pf_snapshot_kv_async(kd.cast_const(), vd.cast_const(), a.ptr("ksnap").cast(), a.ptr("vsnap").cast(),
+                        snap_start, snap_len, cap as i32, swa);
+                }
+                inkwell_cuda::pf_write_kv_async(a.ptr("kout").cast_const(), a.ptr("vout").cast_const(), kd, vd, c as i32, pos0 as i32, cap as i32, swa);
+                if let Some(ws) = a.exact_attn_ws.as_ref().filter(|_| pf_exact_attn_enabled()) {
+                    inkwell_cuda::pf_exact_attn_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+                        a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), ws.dev_ptr().cast::<f32>(),
+                        self.max_ctx as i32, c as i32, pos0 as i32, cap as i32, swa, 1.0 / (128f32).sqrt(),
+                        a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+                } else {
+                    inkwell_cuda::flash_prefill_gqa3_snap_async(kd.cast_const(), vd.cast_const(), q.cast_const(), r.cast_const(),
+                        a.ptr("rel").cast_const(), a.ptr("sink").cast_const(), a.ptr("attn"), c as i32, pos0 as i32,
+                        cap as i32, swa, 1.0 / (128f32).sqrt(), a.ptr("ksnap").cast::<std::ffi::c_void>().cast_const(), a.ptr("vsnap").cast::<std::ffi::c_void>().cast_const(), snap_start, snap_len);
+                }
             }
             if il == 0 { pf_dbg("kqv_out-0", a.ptr("attn"), 8); }
             inkwell_cuda::pf_mul_sigmoid_async(a.ptr("attn"), gate.cast_const(), (c * 3072) as i64);
