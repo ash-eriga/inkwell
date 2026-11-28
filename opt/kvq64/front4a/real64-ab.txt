@@ -1,0 +1,8 @@
+decode_rc=0 ms=40.191 peak=5160 md5=8dafdd6e precache=4544 budget=588 table=568
+decode_rc=0 ms=39.166 peak=5156 md5=8dafdd6e precache=4544 budget=588 table=568
+decode_rc=0 ms=39.151 peak=5156 md5=8dafdd6e precache=4544 budget=588 table=568
+decode_rc=0 ms=40.038 peak=5160 md5=8dafdd6e precache=4544 budget=588 table=568
+decode_rc=0 ms=40.182 peak=5160 md5=8dafdd6e precache=4544 budget=588 table=568
+decode_rc=0 ms=39.082 peak=5156 md5=8dafdd6e precache=4544 budget=588 table=568
+decode_rc=0 ms=39.062 peak=5156 md5=8dafdd6e precache=4544 budget=588 table=568
+decode_rc=0 ms=40.292 peak=5160 md5=8dafdd6e precache=4544 budget=588 table=568

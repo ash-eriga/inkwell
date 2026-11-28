@@ -4065,9 +4065,14 @@ __global__ void inkwell_exl3_gemv_moe(const uint64_t* __restrict__ descs,
 // align into a 64-bit register stream, then 1 SHF + XMAD-mul16 + IDP/I2F/FFMA
 // per window. No smem ring, no __syncthreads in the loop; Σx over the block's
 // k-range is precomputed in the prologue. Same affine out as inkwell_exl3_gemv_moe.
+__device__ __forceinline__ uint32_t ch2_mul16_lo(uint32_t U) {
+    uint32_t r;
+    asm("{\n\t.reg .u16 lo, hi;\n\t.reg .u32 t, p;\n\tmov.b32 {lo, hi}, %1;\n\tmul.wide.u16 t, lo, 0xd12d;\n\tmul.wide.u16 p, lo, 0x83dc;\n\tmov.b32 p, {0, p};\n\tadd.u32 %0, p, t;\n\t}"
+        : "=r"(r) : "r"(U));
+    return r;
+}
 __device__ __forceinline__ uint32_t sgemv_mul16(uint32_t w) {   // (w & 0xffff) * 0x83DCD12D mod 2^32
-    const uint32_t h = w & 0xffffu;
-    return h * 0xD12Du + ((h * 0x83DCu) << 16);
+    return ch2_mul16_lo(w);
 }
 // window j (16 bits, MSB-first) out of the 64-bit stream hi:lo; offset compile-time
 template <int D> __device__ __forceinline__ uint32_t sgemv_win(uint32_t hi, uint32_t lo) {
@@ -4195,10 +4200,10 @@ __device__ __forceinline__ void ch2_run_impl(const uint32_t* __restrict__ tb, in
             pp[1] = ch2_mul16_hi(p15);
             pp[2] = ch2_mul16_hi(u26);
             pp[3] = ch2_mul16_hi(W1);
-            pp[4] = ch2_mul16_hi(__byte_perm(u04, 0u, 0x1000u));
-            pp[5] = ch2_mul16_hi(__byte_perm(p15, 0u, 0x1000u));
-            pp[6] = ch2_mul16_hi(__byte_perm(u26, 0u, 0x1000u));
-            pp[7] = ch2_mul16_hi(__byte_perm(W1, 0u, 0x1000u));
+            pp[4] = ch2_mul16_lo(u04);
+            pp[5] = ch2_mul16_lo(p15);
+            pp[6] = ch2_mul16_lo(u26);
+            pp[7] = ch2_mul16_lo(W1);
             CH2_ACCUM8();
         }
     } else {
@@ -4366,6 +4371,129 @@ __global__ void __launch_bounds__(256) inkwell_exl3_gemv_sf_ch2(
             __syncthreads();
         }
         if (live && c < n) y[c] = strip[threadIdx.x] * 0.08838834764831845f
+                                * __half2float(__ushort_as_half(svh[c]));
+    }
+}
+
+// Multi-projection dense fused GEMV.  Every projection keeps its own
+// split-K factor/chunking and its own scratch/counters, so each output is
+// bit-identical to a separate inkwell_exl3_gemv_sf_ch2 launch; the launch
+// itself is shared to fill the small-projection occupancy tails.
+#define GEMV_SF_BATCH_MAXP 8
+#define GEMV_SF_BATCH_MAXB 512
+struct GemvSfBatchProj {
+    const uint32_t* trel;
+    const float* xh;
+    const uint16_t* svh;
+    float* y;
+    float* t;
+    int* ctr;
+    int tk, tn, ka, halfk, nky, nb;
+};
+struct GemvSfBatchArgs {
+    GemvSfBatchProj p[GEMV_SF_BATCH_MAXP];
+    unsigned int map[GEMV_SF_BATCH_MAXB];   // proj<<20 | ky<<16 | local_bx
+    int np, total;
+};
+__global__ void __launch_bounds__(256) inkwell_exl3_gemv_batchf(const GemvSfBatchArgs a) {
+    if (blockIdx.x >= (unsigned)a.total) return;
+    const unsigned int m = a.map[blockIdx.x];
+    const int pi = (int)(m >> 20), ky = (int)((m >> 16) & 15), bx = (int)(m & 0xffff);
+    const GemvSfBatchProj pr = a.p[pi];
+    const uint32_t* __restrict__ trel = pr.trel;
+    const float* __restrict__ xh = pr.xh;
+    const uint16_t* __restrict__ svh = pr.svh;
+    float* __restrict__ y = pr.y;
+    float* __restrict__ t = pr.t;
+    int* __restrict__ ctr = pr.ctr;
+    const int tk = pr.tk, tn = pr.tn, ka = pr.ka, halfk = pr.halfk, nky = pr.nky;
+    const int n = tn * 16;
+    const int tkc = (tk + nky - 1) / nky;
+    const int tk_lo = ky * tkc;
+    const int tk_hi = min(tk_lo + tkc, tk);
+    const int kk = ka * 2 + halfk;
+    __shared__ __align__(16) float xs[SGEMV_DENSE_MAXK];
+    __shared__ float red[8];
+    __shared__ unsigned int ticket;
+    __shared__ float strip[128];
+    const int e_lo = tk_lo * 16, e_hi = tk_hi * 16;
+    float sxl = 0.f;
+    for (int e = e_lo + threadIdx.x; e < e_hi; e += 256) {
+        const float v = xh[e];
+        sxl += v;
+        if (kk >= 6 && kk != 10) { const int r = e & 15; xs[(e & ~15) + ((r & 7) >> 1) * 4 + (r & 1) + ((r & 8) ? 2 : 0)] = v; }
+        else xs[e] = v;
+    }
+#pragma unroll
+    for (int s = 16; s; s >>= 1) sxl += __shfl_xor_sync(0xffffffffu, sxl, s);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sxl;
+    __syncthreads();
+    float sx = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sx += red[i];
+    const int tn_i = bx * 8 + (threadIdx.x >> 5);
+    const bool live = tn_i < tn;
+    float a0 = 0.f, a1 = 0.f;
+    if (tk_hi > tk_lo && live) {
+        switch (kk) {
+            case 3:  sgemv_run<1, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 4:  sgemv_run<2, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 5:  sgemv_run<2, 1>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 6:  ch2_run_impl<3, 0, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 7:  ch2_run_impl<3, 1, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 8:  ch2_run_impl<4, 0, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            case 10: sgemv_run<5, 0>(trel, tn, tn_i, tk_lo, tk_hi, xs, a0, a1); break;
+            default: __trap();
+        }
+    }
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 1); a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+    a0 += __shfl_xor_sync(0xffffffffu, a0, 2); a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+    const int lane = threadIdx.x & 31;
+    const float KINV = __half2float(__ushort_as_half(0x1eee));
+    const float KOFF = 1024.f * KINV + __half2float(__ushort_as_half(0xc931));
+    const float off = KOFF * sx;
+    const bool wr = live && ((lane & 3) == 0);
+    const int scol = (threadIdx.x >> 5) * 16 + (lane >> 2);
+    if (nky == 1) {
+        if (threadIdx.x < 128) strip[threadIdx.x] = 0.f;
+        __syncthreads();
+        if (wr) {
+            strip[scol]     = fmaf(KINV, a0, off);
+            strip[scol + 8] = fmaf(KINV, a1, off);
+        }
+        __syncthreads();
+    } else {
+        if (wr) {
+            float* dst = &t[(size_t)ky * n + bx * 128 + scol];
+            dst[0] = fmaf(KINV, a0, off); dst[8] = fmaf(KINV, a1, off);
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) ticket = atomicAdd(&ctr[bx], 1u);
+        __syncthreads();
+        if (ticket != (unsigned)nky - 1) return;
+        __threadfence();
+        if (threadIdx.x == 0) ctr[bx] = 0;
+        const int c = bx * 128 + threadIdx.x;
+        if (threadIdx.x < 128) {
+            float v = 0.f;
+            if (c < n) for (int z = 0; z < nky; ++z) v += __ldcg(&t[(size_t)z * n + c]);
+            strip[threadIdx.x] = v;
+        }
+        __syncthreads();
+    }
+    {
+        const int c = bx * 128 + threadIdx.x;
+        const bool live128 = threadIdx.x < 128;
+        for (int s = 1; s < 128; s <<= 1) {
+            const float u = !live128 ? 0.f
+                          : (threadIdx.x & s) ? strip[threadIdx.x - s] - strip[threadIdx.x]
+                                              : strip[threadIdx.x] + strip[threadIdx.x + s];
+            __syncthreads();
+            if (live128) strip[threadIdx.x] = u;
+            __syncthreads();
+        }
+        if (live128 && c < n) y[c] = strip[threadIdx.x] * 0.08838834764831845f
                                 * __half2float(__ushort_as_half(svh[c]));
     }
 }
@@ -4748,6 +4876,7 @@ static void launch_moe_s(dim3 grid, cudaStream_t st,
 struct Ch2DenseState {
     CUmodule mod = nullptr;
     CUfunction fn = nullptr;
+    CUfunction fn_batch = nullptr;
     int state = 0;
     size_t bytes = 0;
     double selftest_ms = 0.0;
@@ -4768,6 +4897,12 @@ static CUresult ch2dense_driver_launch(CUfunction f, dim3 grid,
                                        cudaStream_t stream) {
     void* args[] = {&trel, &xh, &svh, &y, &t, &ctr, &tk, &tn, &ka, &halfk, &pw16};
     return cuLaunchKernel(f, grid.x, grid.y, grid.z, 256, 1, 1, 0, (CUstream)stream, args, nullptr);
+}
+
+static CUresult ch2dense_batch_driver_launch(CUfunction f, unsigned int blocks,
+                                             const GemvSfBatchArgs* ba, cudaStream_t stream) {
+    void* args[] = {(void*)ba};
+    return cuLaunchKernel(f, blocks, 1, 1, 256, 1, 1, 0, (CUstream)stream, args, nullptr);
 }
 
 // Bitwise startup gate for every dense K in the model.  K=5 intentionally
@@ -4823,6 +4958,96 @@ done:
     return ok;
 }
 
+// Bitwise gate for the production mixed-shape batch: K3/nky2, K3.5/nky4
+// and scalar-fallback K5/nky8 in one launch, compared against three separate
+// shipped streaming-GEMV launches.
+static bool ch2dense_batch_selftest(CUfunction f, CUfunction fref) {
+    constexpr int NC = 5, TK = 144, K = TK * 16;
+    const int tn[NC] = {192, 192, 64, 64, 24}, ka[NC] = {3, 3, 3, 3, 5}, hk[NC] = {0, 0, 1, 1, 0}, nkyv[NC] = {2, 2, 4, 4, 8};
+    size_t woff[NC + 1] = {}, soff2[NC + 1] = {}, yoff[NC + 1] = {};
+    for (int i = 0; i < NC; ++i) {
+        const int nw = 8 * ka[i] + 4 * hk[i];
+        woff[i + 1] = woff[i] + (size_t)TK * tn[i] * nw;
+        const int n = tn[i] * 16;
+        soff2[i + 1] = soff2[i] + (size_t)K + 8 * n + 512;
+        yoff[i + 1] = yoff[i] + n;
+    }
+    static uint32_t hw[1982000];
+    static float hx[NC * K], ha[8576], hb[8576];
+    static uint16_t hs[8576];
+    uint32_t* trel = nullptr;
+    float *scr = nullptr, *yr = nullptr, *yb = nullptr;
+    uint16_t* svh = nullptr;
+    bool ok = false;
+    GemvSfBatchArgs ba = {};
+    int maxnb = 0, total = 0;
+    if ((size_t)8576 < yoff[NC]) goto done;
+    if (cudaMalloc((void**)&trel, woff[NC] * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&scr, soff2[NC] * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&svh, yoff[NC] * 2) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&yr, yoff[NC] * 4) != cudaSuccess) goto done;
+    if (cudaMalloc((void**)&yb, yoff[NC] * 4) != cudaSuccess) goto done;
+    if (cudaMemset(scr, 0, soff2[NC] * 4) != cudaSuccess) goto done;
+    for (size_t i = 0; i < woff[NC]; ++i) hw[i] = ch2np_rnd();
+    for (int i = 0; i < NC * K; ++i) hx[i] = ((int)(ch2np_rnd() % 2001) - 1000) / 512.f;
+    for (size_t i = 0; i < yoff[NC]; ++i) hs[i] = (uint16_t)(0x3c00 + (ch2np_rnd() & 63));
+    if (cudaMemcpy(trel, hw, woff[NC] * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+    if (cudaMemcpy(svh, hs, yoff[NC] * 2, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+    for (int z = 0; z < NC; ++z) {
+        const int n = tn[z] * 16, nb = (tn[z] + 7) / 8;
+        float* sz = scr + soff2[z];
+        if (cudaMemcpy(sz, hx + z * K, K * 4, cudaMemcpyHostToDevice) != cudaSuccess) goto done;
+        GemvSfBatchProj* pr = &ba.p[z];
+        pr->trel = trel + woff[z]; pr->xh = sz;
+        pr->svh = svh + yoff[z]; pr->y = yb + yoff[z];
+        pr->t = sz + K; pr->ctr = (int*)(sz + K + 8 * n);
+        pr->tk = TK; pr->tn = tn[z]; pr->ka = ka[z]; pr->halfk = hk[z];
+        pr->nky = nkyv[z]; pr->nb = nb;
+        maxnb = maxnb < nb ? nb : maxnb;
+        dim3 grid(nb, nkyv[z], 1);
+        if (ch2dense_driver_launch(fref, grid, trel + woff[z], sz, svh + yoff[z],
+                                   yr + yoff[z], sz + K, (int*)(sz + K + 8 * n),
+                                   TK, tn[z], ka[z], hk[z], 0, nullptr) != CUDA_SUCCESS) goto done;
+    }
+    total = 0;
+    for (int ky = 0; ky < 8; ++ky) {
+        bool any = false;
+        for (int bx = 0; bx < maxnb; ++bx) for (int z = 0; z < NC; ++z) {
+            if (bx < ba.p[z].nb && ky < ba.p[z].nky) {
+                ba.map[total++] = (unsigned)(z << 20) | (unsigned)(ky << 16) | (unsigned)bx;
+                any = true;
+            }
+        }
+        if (!any) break;
+    }
+    ba.np = NC; ba.total = total;
+    if (total != 184) goto done;
+    if (ch2dense_batch_driver_launch(f, (unsigned)total, &ba, nullptr) != CUDA_SUCCESS) goto done;
+    if (cudaDeviceSynchronize() != cudaSuccess) goto done;
+    if (cudaMemcpy(ha, yr, yoff[NC] * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+    if (cudaMemcpy(hb, yb, yoff[NC] * 4, cudaMemcpyDeviceToHost) != cudaSuccess) goto done;
+    if (memcmp(ha, hb, yoff[NC] * 4) != 0) {
+        int bad = 0;
+        for (size_t i = 0; i < yoff[NC]; ++i) {
+            if (((const uint32_t*)ha)[i] != ((const uint32_t*)hb)[i]) {
+                if (bad < 8) fprintf(stderr, "ch2dense batch selftest mismatch i=%zu ref=%08x got=%08x\n",
+                                     i, ((const uint32_t*)ha)[i], ((const uint32_t*)hb)[i]);
+                ++bad;
+            }
+        }
+        fprintf(stderr, "ch2dense batch selftest mismatches=%d/%zu\n", bad, yoff[NC]);
+        goto done;
+    }
+    ok = cudaGetLastError() == cudaSuccess;
+done:
+    if (trel) cudaFree(trel);
+    if (scr) cudaFree(scr);
+    if (svh) cudaFree(svh);
+    if (yr) cudaFree(yr);
+    if (yb) cudaFree(yb);
+    return ok;
+}
+
 extern "C" int ink_ch2dense_startup() {
     if (g_ch2dense.state) return g_ch2dense.state == 1;
     g_ch2dense.state = 2;
@@ -4846,9 +5071,19 @@ extern "C" int ink_ch2dense_startup() {
         g_ch2dense.mod = nullptr;
         return 0;
     }
+    static const char* batch_name = "_Z24inkwell_exl3_gemv_batchf15GemvSfBatchArgs";
+    r = cuModuleGetFunction(&g_ch2dense.fn_batch, g_ch2dense.mod, batch_name);
+    if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "ch2dense: disabled: batch cuModuleGetFunction error %d\n", (int)r);
+        cuModuleUnload(g_ch2dense.mod);
+        g_ch2dense.mod = nullptr;
+        g_ch2dense.fn = nullptr;
+        return 0;
+    }
     timespec ts0{}, ts1{};
     clock_gettime(CLOCK_MONOTONIC, &ts0);
     const bool exact = ch2dense_selftest(g_ch2dense.fn);
+    const bool exact_batch = exact && ch2dense_batch_selftest(g_ch2dense.fn_batch, g_ch2dense.fn);
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     g_ch2dense.selftest_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
     g_ch2dense.bytes = bytes;
@@ -4858,6 +5093,10 @@ extern "C" int ink_ch2dense_startup() {
         g_ch2dense.mod = nullptr;
         g_ch2dense.fn = nullptr;
         return 0;
+    }
+    if (!exact_batch) {
+        fprintf(stderr, "ch2dense: batch disabled: bitwise self-test failed\n");
+        g_ch2dense.fn_batch = nullptr;
     }
     g_ch2dense.state = 1;
     fprintf(stderr, "ch2dense: enabled cubin=%zu bytes selftest=%.2f ms\n", bytes, g_ch2dense.selftest_ms);
@@ -4879,6 +5118,20 @@ static bool ch2dense_try_launch(dim3 grid, cudaStream_t stream,
         tk, tn, ka, halfk, pw16, stream);
     if (r == CUDA_SUCCESS) return true;
     fprintf(stderr, "ch2dense: disabled: cuLaunchKernel error %d\n", (int)r);
+    g_ch2dense.state = 2;
+    return false;
+}
+
+static bool ch2dense_batch_try_launch(unsigned int blocks, const GemvSfBatchArgs* ba, cudaStream_t stream) {
+    if (g_ch2dense.state == 0) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone)
+            ink_ch2dense_startup();
+    }
+    if (g_ch2dense.state != 1 || !g_ch2dense.fn_batch) return false;
+    const CUresult r = ch2dense_batch_driver_launch(g_ch2dense.fn_batch, blocks, ba, stream);
+    if (r == CUDA_SUCCESS) return true;
+    fprintf(stderr, "ch2dense: disabled: batch cuLaunchKernel error %d\n", (int)r);
     g_ch2dense.state = 2;
     return false;
 }
@@ -5605,9 +5858,11 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
                                        uint64_t* __restrict__ sdescs_d,
                                        int mode, const int* __restrict__ pnexp,
                                        const uint64_t* __restrict__ soff) {
-    const int slot = blockIdx.x / 3;
+    // modes 1/2/3 use the historical packed (slot,proj) grid.  Mode 4 is
+    // G+U only (block x = slot*2+proj); mode 5 is D only (block x = slot).
+    const int slot = mode == 4 ? blockIdx.x / 2 : (mode == 5 ? blockIdx.x : blockIdx.x / 3);
     if (pnexp && slot >= *pnexp) return;
-    const int proj = blockIdx.x % 3;
+    const int proj = mode == 4 ? blockIdx.x % 2 : (mode == 5 ? 2 : blockIdx.x % 3);
     const int part = blockIdx.y, nparts = gridDim.y;
     const uint64_t* src = (proj == 0 ? descs_g : (proj == 1 ? descs_u : descs_d));
     uint64_t* sd = (proj == 0 ? sdescs_g : (proj == 1 ? sdescs_u : sdescs_d));
@@ -5650,9 +5905,9 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
     const uint4* s0 = (const uint4*)(uintptr_t)d[0];
     uint4* t0 = (uint4*)dst;
     // mode 1: meta + suh + svh tail (small, main stream — had_in needs suh);
-    // mode 2: trel prefix only (bulk, side stream — gemv joins on it).
+    // modes 2/4/5: trel prefix only (bulk, side stream — gemv joins on it).
     const int lo_lim = (mode == 1) ? trel_b / 16 : 0;
-    const int hi_lim = (mode == 2) ? trel_b / 16 : (trel_b + suh_b + svh_b) / 16;
+    const int hi_lim = (mode != 1) ? trel_b / 16 : (trel_b + suh_b + svh_b) / 16;
     const int n0 = hi_lim - lo_lim;
     const int chunk = (n0 + nparts - 1) / nparts;
     const int lo = lo_lim + part * chunk, hi = min(hi_lim, lo + chunk);
@@ -5661,9 +5916,21 @@ __global__ void inkwell_exl3_moe_ccopy(const uint64_t* __restrict__ descs_g,
 
 // Bulk ccopy (side stream) grid parts per (slot, proj). The copy is PCIe-bound;
 // a wide grid occupies every SM and delays the hit GEMV running beside it.
-// Default 2 (scan of 1/2/4/8/16 on master 438eb48: 2 best, ~0.66 ms/tok under 16).
-// INKWELL_CCOPY_PARTS overrides (1..64); 16 restores the old grid.
+// The ntok path keeps its original default of 4. The cached decode path uses
+// 2 parts with 256 copy threads: narrower grids reduce SM contention while
+// wider blocks keep PCIe reads in flight.
 static int ink_ccopy_parts() {
+    static int p = -1;
+    if (p < 0) {
+        const char* e = getenv("INKWELL_CCOPY_PARTS");
+        p = e ? atoi(e) : 4;
+        if (p < 1) p = 1;
+        if (p > 64) p = 64;
+    }
+    return p;
+}
+
+static int ink_ccopy_parts_cached() {
     static int p = -1;
     if (p < 0) {
         const char* e = getenv("INKWELL_CCOPY_PARTS");
@@ -5927,14 +6194,21 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
             (const int*)ptag, (const int*)pready, pf_hit, nullptr, 0,
             getenv("INKWELL_RESOLVE_DIRECT") ? 1 : 0, hm);
     }
-    static cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
+    static cudaEvent_t ev_fork = nullptr, ev_join = nullptr, ev_join_gu = nullptr, ev_join_d = nullptr;
     static cudaStream_t ss = nullptr;
+    static int no_splitd = -1;
+    if (no_splitd < 0) {
+        const char* e = getenv("INKWELL_NO_CCOPY_SPLITD");
+        no_splitd = (e && atoi(e)) ? 1 : 0;
+    }
     {
         // meta on the main stream (sdescs only, ~µs); bulk trel copies on the
         // side stream so they overlap the had_in + their join delays gemv only.
         if (!ev_fork) {
             cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming);
             cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&ev_join_gu, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&ev_join_d, cudaEventDisableTiming);
             cudaStreamCreateWithFlags(&ss, cudaStreamNonBlocking);
         }
         inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, 1), 32, 0, st>>>(
@@ -5944,12 +6218,27 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
             (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 1, nullptr, soff);
         cudaEventRecord(ev_fork, st);
         cudaStreamWaitEvent(ss, ev_fork, 0);
-        inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, ink_ccopy_parts()), 128, 0, ss>>>(
-            (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
-            ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
-            (uint8_t*)bank, slot_proj,
-            (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, nullptr, soff);
-        cudaEventRecord(ev_join, ss);
+        if (no_splitd || skip_cc) {
+            inkwell_exl3_moe_ccopy<<<dim3(nslots * 3, ink_ccopy_parts_cached()), 256, 0, ss>>>(
+                (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+                ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
+                (uint8_t*)bank, slot_proj,
+                (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, skip_cc ? 3 : 2, nullptr, soff);
+            cudaEventRecord(ev_join, ss);
+        } else {
+            inkwell_exl3_moe_ccopy<<<dim3(nslots * 2, ink_ccopy_parts_cached()), 256, 0, ss>>>(
+                (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+                ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
+                (uint8_t*)bank, slot_proj,
+                (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 4, nullptr, soff);
+            cudaEventRecord(ev_join_gu, ss);
+            inkwell_exl3_moe_ccopy<<<dim3(nslots, ink_ccopy_parts_cached()), 256, 0, ss>>>(
+                (const uint64_t*)descs_g, (const uint64_t*)descs_u, (const uint64_t*)descs_d,
+                ids, (uint8_t*)cache, (const int*)map, (const int*)miss,
+                (uint8_t*)bank, slot_proj,
+                (uint64_t*)sdescs_g, (uint64_t*)sdescs_u, (uint64_t*)sdescs_d, 5, nullptr, soff);
+            cudaEventRecord(ev_join_d, ss);
+        }
     }
     const uint64_t* G = (const uint64_t*)sdescs_g;
     const uint64_t* U = (const uint64_t*)sdescs_u;
@@ -5987,9 +6276,9 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     // the missed experts on the side stream; miss slots run right after.
     dim3 gin(hadvec ? (KG + 255) / 256 : (KG + 511) / 512, nslots, 2);
     if (hadvec) inkwell_exl3_had_in_moe_vec<<<gin, 64, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
-                                                (const int*)miss, 1);
+                                                (const int*)miss, 0);
     else inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
-                                                (const int*)miss, 1, nullptr, nullptr);
+                                                (const int*)miss, 0, nullptr, nullptr);
     if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     // GU stays fp32
     if (sg) {
@@ -6006,11 +6295,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
                                                  (float*)dn, ND, NG, KG / 16, NG / 16, KG, ND, nky,
                                                  (const int*)miss, 1);
     }
-    cudaStreamWaitEvent(st, ev_join, 0);
-    if (hadvec) inkwell_exl3_had_in_moe_vec<<<gin, 64, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
-                                                (const int*)miss, 2);
-    else inkwell_exl3_had_in_moe<<<gin, 128, 0, st>>>(G, U, ids, x, xh, (float*)gu, 2 * NG, KG,
-                                                (const int*)miss, 2, nullptr, nullptr);
+    cudaStreamWaitEvent(st, (no_splitd || skip_cc) ? ev_join : ev_join_gu, 0);
     if (sg) {
         dim3 gg((NG / 16 + 7) / 8, nslots, 2 * nky_s);
         launch_moe_s(gg, st, G, U, ids, xh, (const float*)gu, 2 * NG,
@@ -6037,6 +6322,7 @@ extern "C" void ink_launch_exl3_moe_cached(const void* descs_g, const void* desc
     }
     if (nky_eff > 1) cudaMemsetAsync(dn, 0, nslots * ND * 4, st);
     if (d4) inkwell_exl3_quant_x_i8p<<<dim3(nslots, KD / 16), 16, 0, st>>>(xh, xq8c, xqs8c, KD);
+    if (!no_splitd && !skip_cc) cudaStreamWaitEvent(st, ev_join_d, 0);
     if (sg) {
         dim3 gd((ND / 16 + 7) / 8, nslots, nky_s);
         launch_moe_s(gd, st, D, nullptr, ids, xh, nullptr, 0,
@@ -6790,6 +7076,60 @@ extern "C" void ink_launch_exl3_gemv_mz(
         cudaEventCreateWithFlags(&mz_ev[8], cudaEventDisableTiming);
     }
     cudaStream_t st = (cudaStream_t)stream;
+    // One fused main-stream launch pair for the small same-K projection set.
+    // This is bit-exact because each member retains its own baseline nky,
+    // trellis, scales, output, partials and atomic strip counters.
+    { static int fuse = -1; if (fuse < 0) {
+          fuse = !(getenv("INKWELL_NO_DENSE_FUSE") || getenv("INKWELL_NO_SGEMV_DENSE") || getenv("INKWELL_NO_SGEMV_FUSE"));
+      }
+      if (fuse && nz > 1 && nz <= GEMV_SF_BATCH_MAXP && ink_pw16_mask() == 0) {
+          static int tgt = -1; if (tgt < 0) { const char* e = getenv("INKWELL_SGEMV_DENSE_TGT"); tgt = e ? atoi(e) : 32; }
+          GemvSfBatchArgs ba = {};
+          bool ok = true;
+          int maxnb = 0;
+          for (int z = 0; z < nz; ++z) {
+              if (k[z] != k[0] || k[z] > SGEMV_DENSE_MAXK || (n[z] & 15) || n[z] <= 0) { ok = false; break; }
+              const int tk = (int)(k[z] / 16), tn = (int)(n[z] / 16);
+              const int nb = (tn + 7) / 8;
+              int nky = 1;
+              while (nb * nky < tgt && nky < 8 && nky * 2 <= tk) nky *= 2;
+              if (nb > 512 || nb * nky <= 0) { ok = false; break; }
+              GemvSfBatchProj* pr = &ba.p[z];
+              pr->trel = (const uint32_t*)trel[z]; pr->xh = scr[z];
+              pr->svh = (const uint16_t*)svh[z]; pr->y = y + (size_t)z * ystride;
+              pr->t = scr[z] + k[z]; pr->ctr = (int*)(scr[z] + k[z] + 8 * n[z]);
+              pr->tk = tk; pr->tn = tn; pr->ka = (int)ka[z]; pr->halfk = (int)halfk[z];
+              pr->nky = nky; pr->nb = nb;
+              maxnb = maxnb < nb ? nb : maxnb;
+          }
+          if (ok) {
+              int total = 0;
+              for (int ky = 0; ky < 8 && total < GEMV_SF_BATCH_MAXB; ++ky) {
+                  bool any = false;
+                  for (int bx = 0; bx < maxnb; ++bx) {
+                      for (int z = 0; z < nz; ++z) {
+                          if (bx < ba.p[z].nb && ky < ba.p[z].nky) {
+                              if (total >= GEMV_SF_BATCH_MAXB) { ok = false; break; }
+                              ba.map[total++] = (unsigned)(z << 20) | (unsigned)(ky << 16) | (unsigned)bx;
+                              any = true;
+                          }
+                      }
+                      if (!ok) break;
+                  }
+                  if (!ok || !any) break;
+              }
+              ba.np = nz; ba.total = total;
+              if (ok && total > 0) {
+                  HadNArgs ha; ha.n = 0; ha.k = (int)k[0];
+                  for (int z = 0; z < nz; ++z) {
+                      ha.x[ha.n] = x[z]; ha.suh[ha.n] = (const uint16_t*)suh[z];
+                      ha.xh[ha.n] = scr[z]; ++ha.n;
+                  }
+                  inkwell_exl3_had_in_n<<<dim3((unsigned)(ha.k / 128), (unsigned)ha.n), 128, 512, st>>>(ha);
+                  if (ch2dense_batch_try_launch((unsigned)total, &ba, st)) return;
+              }
+          }
+      } }
     { static int hm = -1; if (hm < 0) { hm = getenv("INKWELL_NO_HADMERGE") ? 0 : 1; }
       if (hm && nz > 1) {
           // group zs by identical (x, k); the group leader's stream runs one
@@ -7194,10 +7534,102 @@ __global__ void __launch_bounds__(256) inkwell_mix_fused(const float* __restrict
     out[(size_t)qc * embd + e] = a;
 }
 
+// Wide multi-column mix v2 limits. Narrow production mixes keep the incumbent
+// fused kernel: end-to-end gates showed the new variants were slower there.
+#define MIX_V2_MAX_ROWS 8
+#define MIX_V2_MAX_QCOLS 64
+#define MIX_V2_SCRATCH_QMAX 64
+
+// Candidate Item-1B/1C: stream-ordered reduce/apply split. The scratch layout
+// is rms[0..rows) then dp[j][qc] with a fixed stride. Successive launches in
+// the same stream (including captured CUDA graphs) are fully ordered, so the
+// scratch needs no atomics or spin synchronization.
+__device__ float inkwell_mix_scratch[MIX_V2_MAX_ROWS + MIX_V2_MAX_ROWS * MIX_V2_SCRATCH_QMAX];
+
+__global__ void __launch_bounds__(256) inkwell_mix_reduce_v2(const float* __restrict__ st,
+                                const float* __restrict__ q,
+                                int embd, int rows, int qcols) {
+    __shared__ float s_col[32 * MIX_NPL];
+    __shared__ float s_rms;
+    const int j = blockIdx.x;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float4* col4 = (const float4*)(st + (size_t)j * embd);
+    float4* s_col4 = (float4*)s_col;
+    for (int i = threadIdx.x; i < embd / 4; i += (int)blockDim.x) s_col4[i] = col4[i];
+    __syncthreads();
+    if (w == 0) {
+        float ss = 0.f;
+#pragma unroll
+        for (int t = 0; t < MIX_NPL; ++t) ss += s_col[lane + 32 * t] * s_col[lane + 32 * t];
+        for (int m = 16; m; m >>= 1) ss += __shfl_xor_sync(~0u, ss, m);
+        const float rms = sqrtf(ss / (float)embd + 1e-6f);
+        if (lane == 0) { s_rms = rms; inkwell_mix_scratch[j] = rms; }
+    }
+    __syncthreads();
+    const float rms = s_rms;
+    for (int qc = w; qc < qcols; qc += 8) {
+        const float* qcol = q + (size_t)qc * embd;
+        float dp = 0.f;
+#pragma unroll
+        for (int t = 0; t < MIX_NPL; ++t) dp += s_col[lane + 32 * t] / rms * qcol[lane + 32 * t];
+        for (int m = 16; m; m >>= 1) dp += __shfl_xor_sync(~0u, dp, m);
+        if (lane == 0) inkwell_mix_scratch[MIX_V2_MAX_ROWS + j * MIX_V2_SCRATCH_QMAX + qc] = dp;
+    }
+}
+
+__global__ void __launch_bounds__(256) inkwell_mix_apply_v2(const float* __restrict__ st,
+                                float* __restrict__ out,
+                                int embd, int rows, int qcols, float scale) {
+    __shared__ float s_rms[MIX_V2_MAX_ROWS];
+    __shared__ float s_p[MIX_V2_MAX_ROWS * 8];
+    const int qg = blockIdx.y * 8;
+    const int nqc = min(8, qcols - qg);
+    if (threadIdx.x < rows) s_rms[threadIdx.x] = inkwell_mix_scratch[threadIdx.x];
+    for (int i = threadIdx.x; i < rows * nqc; i += (int)blockDim.x) {
+        const int j = i / nqc, qc = i - j * nqc;
+        s_p[j * 8 + qc] = inkwell_mix_scratch[MIX_V2_MAX_ROWS + j * MIX_V2_SCRATCH_QMAX + qg + qc];
+    }
+    __syncthreads();
+    if (threadIdx.x < nqc) {
+        const int qc = threadIdx.x;
+        float mx = -INFINITY;
+        for (int j = 0; j < rows; ++j) { s_p[j * 8 + qc] *= scale; mx = fmaxf(mx, s_p[j * 8 + qc]); }
+        float d = 0.f;
+        for (int j = 0; j < rows; ++j) { s_p[j * 8 + qc] = __expf(s_p[j * 8 + qc] - mx); d += s_p[j * 8 + qc]; }
+        for (int j = 0; j < rows; ++j) s_p[j * 8 + qc] /= d;
+    }
+    __syncthreads();
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= embd) return;
+    for (int j0 = 0; j0 < rows; j0 += 8) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = (j0 + u < rows) ? st[(size_t)(j0 + u) * embd + e] : 0.f;
+        for (int qc = 0; qc < nqc; ++qc) {
+            float a = 0.f;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) if (j0 + u < rows) a += v[u] / s_rms[j0 + u] * s_p[(j0 + u) * 8 + qc];
+            out[(size_t)(qg + qc) * embd + e] = a;
+        }
+    }
+}
+
+#include "decode_fuse.cuh"
+
 extern "C" void ink_launch_mix(const void* st, const void* q, void* out,
                                int embd, int rows, int qcols, float scale, void* stream) {
+    static int v2 = -1;
+    if (v2 < 0) v2 = getenv("INKWELL_NO_MIX_V2") ? 0 : 1;
     static int mb = -1;
     if (mb < 0) mb = getenv("INKWELL_NO_MIXMB") ? 0 : 1;
+    if (v2 && embd == 32 * MIX_NPL && rows >= 1 && rows <= MIX_V2_MAX_ROWS && qcols > 8 && qcols <= MIX_V2_MAX_QCOLS) {
+        cudaStream_t cs = (cudaStream_t)stream;
+        inkwell_mix_reduce_v2<<<rows, 256, 0, cs>>>(
+            (const float*)st, (const float*)q, embd, rows, qcols);
+        inkwell_mix_apply_v2<<<dim3((embd + 255) / 256, (qcols + 7) / 8), 256, 0, cs>>>(
+            (const float*)st, (float*)out, embd, rows, qcols, scale);
+        return;
+    }
     if (mb && embd == 32 * MIX_NPL && rows >= 1 && rows <= 64 && qcols >= 1 && qcols <= 8) {
         inkwell_mix_fused<<<dim3((embd + 255) / 256, qcols), 256, 0, (cudaStream_t)stream>>>(
             (const float*)st, (const float*)q, (float*)out, embd, rows, scale);

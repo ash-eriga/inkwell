@@ -67,6 +67,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed={}", prefill_src.display());
     println!("cargo:rerun-if-changed=src/gpu_caps.cuh");
+    println!("cargo:rerun-if-changed=src/decode_fuse.cuh");
     println!("cargo:rerun-if-changed={}", ch2dir.join("build_nopless.py").display());
     println!("cargo:rerun-if-changed={}", ch2dir.join("patch_sass.py").display());
     println!("cargo:rerun-if-changed={}", ch2dir.join("reasm_remove_loop_nops.py").display());

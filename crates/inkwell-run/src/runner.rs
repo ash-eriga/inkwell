@@ -161,6 +161,8 @@ pub struct Runner {
     layers: Vec<L>,
     // globals
     tok_embd: Ptr, embd_src: (*const u8, i32, usize), embd_dev: *mut std::ffi::c_void, embd_row: Ptr, tok_norm: Ptr, output: Ptr, output_norm: Ptr, output_res_query: Ptr,
+    /// packed middle-cycle msg queries [n_embd, 48] (zero-copy per-layer views)
+    msg_query_packed: Ptr,
     // own lm_head path: device ptr to output.weight + work buffers (Some iff type==IQ4_XS)
     out_head: Option<(inkwell_cuda::DevBuf, inkwell_cuda::DevBuf, inkwell_cuda::DevBuf)>,
     // per-visit KV arenas + conv states (visit → tensors)
@@ -411,6 +413,57 @@ unsafe extern "C" fn mix_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud
     let q = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, 1)) as *const f32 };
     unsafe { inkwell_cuda::mix_async(st.cast(), q.cast(),
         inkwell_ggml::ink_tensor_data(dst).cast(), a.embd, a.rows, a.qcols, a.scale) };
+}
+
+struct MixPtrsArgs { embd: i32, rows: i32, qcols: i32, scale: f32 }
+
+unsafe extern "C" fn mix_ptrs_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*(ud as *const MixPtrsArgs) };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let nrows = a.rows as usize;
+    let mut rows = [std::ptr::null::<f32>(); 9];
+    for (j, rp) in rows.iter_mut().enumerate().take(nrows) {
+        *rp = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, j as i32)) as *const f32 };
+    }
+    let q = unsafe { inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, a.rows)) as *const f32 };
+    unsafe { inkwell_cuda::mix_ptrs_async(rows.as_ptr(), q,
+        inkwell_ggml::ink_tensor_data(dst).cast(), a.embd, a.rows, a.qcols, a.scale) };
+}
+
+struct QkvrPrepArgs {
+    state: *mut f32,
+    k_region_off: i32,
+    v_region_off: i32,
+    nmax: i32,
+    hd: i32,
+    nh: i32,
+    hkv: i32,
+    nrel: i32,
+    conv_scale: f32,
+    qk_thr: f32,
+    rel_thr: f32,
+    dyn_src: i32,
+    kw_src: i32,
+    vw_src: i32,
+    qw_src: i32,
+    rw_src: i32,
+    tau_src: i32,
+}
+
+unsafe extern "C" fn qkvr_prep_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*(ud as *const QkvrPrepArgs) };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let src = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let opt_src = |i: i32| if i >= 0 { src(i) } else { std::ptr::null() };
+    unsafe {
+        inkwell_cuda::attn_qkvr_prep_async(src(0), a.nmax, opt_src(a.dyn_src),
+            src(a.kw_src), src(a.vw_src), opt_src(a.qw_src), opt_src(a.rw_src), opt_src(a.tau_src),
+            a.state, a.k_region_off, a.v_region_off,
+            inkwell_ggml::ink_tensor_data(dst).cast(), a.hd, a.nh, a.hkv, a.nrel,
+            a.conv_scale, a.qk_thr, a.rel_thr)
+    };
 }
 
 /// `ggml_custom_op_t`: loop-controller tail —
@@ -672,6 +725,21 @@ unsafe extern "C" fn conv_step_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i
     let dyn_p = if a.n_heads > 0 { src(2) } else { std::ptr::null() };
     unsafe {
         inkwell_cuda::conv_step_async(src(0), a.state, a.region_off, src(1), dyn_p,
+            a.ch, a.n_heads, a.scale,
+            inkwell_ggml::ink_tensor_data(dst).cast(), a.snap);
+    }
+}
+
+unsafe extern "C" fn conv_step_add_cb(dst: *mut std::ffi::c_void, _ith: i32, _nth: i32, ud: *mut std::ffi::c_void) {
+    let a = unsafe { &*ud.cast::<ConvStepArgs>() };
+    unsafe { inkwell_cuda::set_stream(inkwell_ggml::cuda_stream()) };
+    let src = |i: i32| unsafe {
+        inkwell_ggml::ink_tensor_data(inkwell_ggml::ink_tensor_src(dst, i)) as *const f32
+    };
+    let dyn_p = if a.n_heads > 0 { src(2) } else { std::ptr::null() };
+    let residual = src(if a.n_heads > 0 { 3 } else { 2 });
+    unsafe {
+        inkwell_cuda::conv_step_add_async(src(0), a.state, a.region_off, src(1), dyn_p, residual,
             a.ch, a.n_heads, a.scale,
             inkwell_ggml::ink_tensor_data(dst).cast(), a.snap);
     }
@@ -1169,7 +1237,8 @@ impl Runner {
             rt, sched, dev_buf, cpu_buf, w, pinned, expert_dev: Vec::new(), moe_args,
             exl3_w: Vec::new(), exl3_blk: Vec::new(), moe_args_exl3: Vec::new(), output_exl3: None,
             cfg: cfg.clone(), layers,
-            tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
+            tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query,
+            msg_query_packed: Ptr(std::ptr::null_mut()), out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits,
             n_full, step_gcache: None, sid: None,
         }
@@ -1378,7 +1447,15 @@ impl Runner {
             }
             let mut plan = vec![false; 24];
             let mut budget = None;
-            if let Ok(spec) = std::env::var("INKWELL_DEV_LAYERS") {
+            let joint_default = std::env::var_os("INKWELL_NO_JOINTPLACE").is_none()
+                && std::env::var("INKWELL_DEV_LAYERS").is_err()
+                && std::env::var("INKWELL_DEV_EXPERT_MB").is_err();
+            if joint_default {
+                // Joint placement/cache optimum replayed on the short-context
+                // routing trace: keeping these layers resident frees more cache
+                // bytes than it costs, and lowers miss traffic by ~13% without reducing resident expert bytes.
+                for il in [3usize, 6, 7, 8, 10, 11, 12, 14, 16, 17] { plan[il] = true; }
+            } else if let Ok(spec) = std::env::var("INKWELL_DEV_LAYERS") {
                 for tok in spec.split(',') {
                     let t = tok.trim();
                     if t.is_empty() { continue }
@@ -1411,8 +1488,24 @@ impl Runner {
             Some(plan)
         };
 
+        let joint_place_active = place_plan.as_ref().map_or(false, |p| {
+            [3usize, 6, 7, 8, 10, 11, 12, 14, 16, 17].iter().all(|&i| p[i])
+                && std::env::var_os("INKWELL_NO_JOINTPLACE").is_none()
+                && std::env::var("INKWELL_DEV_LAYERS").is_err()
+                && std::env::var("INKWELL_DEV_EXPERT_MB").is_err()
+        });
+
         // ---- per-layer ----
         let mut layers = Vec::with_capacity(24);
+        // One packed [2304, 48] query tensor backs all 12 middle layers'
+        // zero-copy [2304, 4] views. The packed tensor also lets passes 1/2
+        // evaluate all 48 queries in one mix launch group.
+        let msg_query_packed = t::new(rt.ctx(), F32, &[2304, 48]);
+        {
+            let o = (off_dev + 127) & !127;
+            dev_buf.assign(msg_query_packed, o);
+            off_dev = o + t::nbytes(msg_query_packed);
+        }
         let mut pinned_bytes = 0usize;
         let mut expert_dev: Vec<inkwell_cuda::DevBuf> = Vec::new();
         let mut moe_args_exl3: Vec<Box<crate::moe::MoeArgsExl3>> = Vec::new();
@@ -1497,18 +1590,15 @@ impl Runner {
                 ffn_res_query: Some(dense!(&format!("model.llm.attn_res.mlp_queries.{il}"))),
                 msg_query: (il >= 6 && il < 18).then(|| {
                     let i = il - 6;
-                    let ten = t::new(rt.ctx(), F32, &[2304, 4]);
-                    let o = (off_dev + 127) & !127;
-                    dev_buf.assign(ten, o);
                     // cols [q[2i], kv[2i], kv[2i+1], q[2i+1]] contiguous col-major
                     let mut buf = Vec::with_capacity(4 * 2304 * 4);
                     buf.extend_from_slice(row(mcq, 2 * i));
                     buf.extend_from_slice(row(mckv, 2 * i));
                     buf.extend_from_slice(row(mckv, 2 * i + 1));
                     buf.extend_from_slice(row(mcq, 2 * i + 1));
-                    unsafe { t::set(ten, buf.as_ptr(), 0, buf.len()) };
-                    off_dev = o + t::nbytes(ten);
-                    ten
+                    let off = i * 4 * 2304 * 4;
+                    unsafe { t::set(msg_query_packed, buf.as_ptr(), off, buf.len()) };
+                    t::view2(rt.ctx(), msg_query_packed, 2304, 4, t::nb(msg_query_packed, 1), off as i64)
                 }),
                 ..Default::default()
             };
@@ -1837,13 +1927,76 @@ impl Runner {
             static T1400: [usize; 24] = [
                 104, 100, 84, 100, 108, 108, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 176, 164, 68, 80, 80, 72, 68, 80];
+            // Joint-placement-aware tables for resident set
+            // [3,6,7,8,10,11,12,14,16,17], replayed through the exact kslot
+            // policy. They are one nested greedy allocation ladder truncated at
+            // each size, so every layer's bytes are monotonic in the budget and
+            // streamed loop layers L9/L13/L15 are never starved.
+            static T192J: [usize; 24] = [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0, 48, 0, 48,
+                0, 0, 12, 12, 12, 8, 12, 4];
+            static T256J: [usize; 24] = [
+                0, 0, 0, 0, 4, 0, 0, 0, 0, 48, 0, 0, 0, 52, 0, 72,
+                0, 0, 12, 24, 16, 8, 12, 8];
+            static T300J: [usize; 24] = [
+                0, 4, 0, 0, 4, 0, 0, 0, 0, 48, 0, 0, 0, 56, 0, 72,
+                0, 0, 24, 24, 24, 24, 12, 8];
+            static T384J: [usize; 24] = [
+                0, 8, 0, 0, 8, 12, 0, 0, 0, 48, 0, 0, 0, 56, 0, 72,
+                0, 0, 24, 24, 24, 36, 32, 40];
+            static T400J: [usize; 24] = [
+                0, 8, 0, 0, 8, 12, 0, 0, 0, 48, 0, 0, 0, 56, 0, 80,
+                0, 0, 24, 24, 28, 40, 32, 40];
+            static T432J: [usize; 24] = [
+                0, 8, 32, 0, 8, 12, 0, 0, 0, 48, 0, 0, 0, 56, 0, 80,
+                0, 0, 24, 24, 28, 40, 32, 40];
+            static T464J: [usize; 24] = [
+                8, 8, 32, 0, 28, 12, 0, 0, 0, 48, 0, 0, 0, 56, 0, 80,
+                0, 0, 24, 24, 32, 40, 32, 40];
+            static T512J: [usize; 24] = [
+                8, 32, 40, 0, 32, 12, 0, 0, 0, 48, 0, 0, 0, 56, 0, 80,
+                0, 0, 24, 36, 32, 40, 32, 40];
+            static T532J: [usize; 24] = [
+                8, 48, 40, 0, 32, 12, 0, 0, 0, 48, 0, 0, 0, 56, 0, 80,
+                0, 0, 24, 36, 32, 40, 36, 40];
+            // Real-text 64K routing replay, exact per-layer knapsack over the
+            // kslot policy (opt/kvq64/front4b/kslot_dp_alloc.py). Unlike the
+            // 68-token ctx512 greedy table, every small arena holds at least
+            // one full 8-expert visit and loop layer L9 is weighted correctly.
+            static T568J: [usize; 24] = [
+                36, 24, 20, 0, 24, 40, 0, 0, 0, 112, 0, 0, 0, 80, 0, 72,
+                0, 0, 28, 24, 20, 36, 28, 24];
+            static T600J: [usize; 24] = [
+                8, 48, 40, 0, 32, 12, 0, 0, 0, 64, 0, 0, 0, 72, 0, 100,
+                0, 0, 32, 36, 32, 40, 44, 40];
+            static T768J: [usize; 24] = [
+                64, 64, 40, 0, 36, 60, 0, 0, 0, 64, 0, 0, 0, 84, 0, 100,
+                0, 0, 44, 36, 36, 40, 48, 52];
+            static T940J: [usize; 24] = [
+                72, 68, 64, 0, 68, 76, 0, 0, 0, 88, 0, 0, 0, 100, 0, 100,
+                0, 0, 52, 36, 52, 52, 48, 64];
+            static T1024J: [usize; 24] = [
+                76, 76, 68, 0, 68, 88, 0, 0, 0, 104, 0, 0, 0, 100, 0, 100,
+                0, 0, 52, 44, 52, 64, 64, 68];
+            static T1164J: [usize; 24] = [
+                100, 88, 68, 0, 84, 96, 0, 0, 0, 112, 0, 0, 0, 108, 0, 128,
+                0, 0, 52, 48, 64, 72, 68, 76];
+            static T1200J: [usize; 24] = [
+                104, 96, 68, 0, 84, 96, 0, 0, 0, 112, 0, 0, 0, 112, 0, 128,
+                0, 0, 64, 48, 72, 72, 68, 76];
+            static T1232J: [usize; 24] = [
+                104, 96, 84, 0, 84, 100, 0, 0, 0, 112, 0, 0, 0, 124, 0, 128,
+                0, 0, 64, 48, 72, 72, 68, 76];
+            static T1264J: [usize; 24] = [
+                104, 100, 84, 0, 92, 108, 0, 0, 0, 112, 0, 0, 0, 124, 0, 128,
+                0, 0, 68, 48, 80, 72, 68, 76];
 
             let vramcap = std::env::var_os("INKWELL_NO_VRAMCAP").is_none();
             let budgeted = std::env::var_os("INKWELL_NO_CACHE_BUDGET").is_none();
             let target_mib: usize = std::env::var("INKWELL_VRAM_CAP_MB").ok()
                 .and_then(|v| v.parse().ok()).unwrap_or(5080);
             let reserve_mib: usize = std::env::var("INKWELL_RUNTIME_RESERVE_MB").ok()
-                .and_then(|v| v.parse().ok()).unwrap_or(96);
+                .and_then(|v| v.parse().ok()).unwrap_or(if target_mib > 5080 { 48 } else { 96 });
             let (pre_cache_used, vram_src) = process_vram_bytes(vram_baseline_free);
             let target_bytes = target_mib << 20;
             let reserve_bytes = reserve_mib << 20;
@@ -1851,13 +2004,26 @@ impl Runner {
                 .saturating_sub(pre_cache_used)
                 .saturating_sub(reserve_bytes) >> 20;
             let (table_mib, table): (usize, &[usize; 24]) = if vramcap && budgeted {
-                let tables: [(usize, &'static [usize; 24]); 8] = [
-                    (192, &T192), (256, &T256), (300, &T300), (384, &T384),
-                    (600, &T600), (940, &T940), (1200, &T1200), (1392, &T1400),
-                ];
                 let mut chosen: (usize, &'static [usize; 24]) = (0, &T0);
-                for (total, candidate) in tables {
-                    if total <= budget_mib { chosen = (total, candidate); }
+                if joint_place_active {
+                    let tables: [(usize, &'static [usize; 24]); 18] = [
+                        (192, &T192J), (256, &T256J), (300, &T300J), (384, &T384J),
+                        (400, &T400J), (432, &T432J), (464, &T464J), (512, &T512J),
+                        (532, &T532J), (568, &T568J), (600, &T600J), (768, &T768J), (940, &T940J),
+                        (1024, &T1024J), (1164, &T1164J), (1200, &T1200J), (1232, &T1232J),
+                        (1264, &T1264J),
+                    ];
+                    for (total, candidate) in tables {
+                        if total <= budget_mib { chosen = (total, candidate); }
+                    }
+                } else {
+                    let tables: [(usize, &'static [usize; 24]); 8] = [
+                        (192, &T192), (256, &T256), (300, &T300), (384, &T384),
+                        (600, &T600), (940, &T940), (1200, &T1200), (1392, &T1400),
+                    ];
+                    for (total, candidate) in tables {
+                        if total <= budget_mib { chosen = (total, candidate); }
+                    }
                 }
                 chosen
             } else {
@@ -2007,7 +2173,8 @@ impl Runner {
             w: HashMap::new(), pinned, expert_dev,
             moe_args: Vec::new(), exl3_w, exl3_blk, moe_args_exl3, output_exl3,
             cfg: cfg.clone(), layers,
-            tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query, out_head,
+            tok_embd, embd_src, embd_dev, embd_row, tok_norm, output, output_norm, output_res_query,
+            msg_query_packed, out_head,
             k_arena, v_arena, conv_state, conv_snap: Vec::new(), block_feats: None, feat_ud: std::cell::RefCell::new(Vec::new()), feat_ops: std::cell::RefCell::new(Vec::new()), max_ctx, swa, swa_oracle, swa_legacy_min, visits, n_full,
             step_gcache: None, sid: None,
         }
@@ -2208,6 +2375,24 @@ impl Runner {
     fn mix(&self, blocks: &[Ptr], cur: Ptr, query: Ptr) -> Ptr {
         let c = self.cur_ctx;
         let n_embd = self.cfg.n_embd as i64;
+        let q_cols = t::ne(query, 1);
+        let n_rows = blocks.len() as i64 + 1;
+        let zero_cat = std::env::var_os("INKWELL_NO_MIX_ZEROCAT").is_none()
+            && std::env::var_os("INKWELL_NO_MIXFUSE").is_none()
+            && n_embd == 2304 && n_rows <= 9 && q_cols <= 8
+            && unsafe { inkwell_ggml::ink_is_contiguous(cur.0) != 0 }
+            && unsafe { inkwell_ggml::ink_is_contiguous(query.0) != 0 }
+            && blocks.iter().all(|b| unsafe { inkwell_ggml::ink_is_contiguous(b.0) != 0 });
+        if zero_cat {
+            let mut margs: Vec<*mut std::ffi::c_void> = blocks.iter().rev().map(|b| b.0).collect();
+            margs.push(cur.0);
+            margs.push(query.0);
+            let ud = Box::leak(Box::new(MixPtrsArgs {
+                embd: n_embd as i32, rows: n_rows as i32, qcols: q_cols as i32,
+                scale: 1.0 / (n_embd as f32).sqrt() }));
+            return Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [n_embd, q_cols, 1, 1], &mut margs,
+                mix_ptrs_cb as usize, (ud as *mut MixPtrsArgs).cast()) });
+        }
         // same block stack is re-mixed ~4x per visit (res/ffn/msg/output):
         // cache the [b_n..b_1] prefix so only one concat adds `cur` per call
         let key = blocks.iter().fold(0usize, |a, b| a.wrapping_mul(31).wrapping_add(b.0 as usize));
@@ -2224,8 +2409,8 @@ impl Runner {
         };
         let states = if blocks.is_empty() { prefix } else { t::concat(c, prefix, t::reshape3(c, cur, n_embd, 1, 1), 1) };
         let n_rows = t::ne(states, 1);
-        let q_cols = t::ne(query, 1);
-        if n_rows <= 64 && q_cols <= 8 && std::env::var_os("INKWELL_NO_MIXFUSE").is_none() {
+        let wide_ok = n_rows <= 8 && q_cols <= 64 && std::env::var_os("INKWELL_NO_MIX_V2").is_none();
+        if ((n_rows <= 64 && q_cols <= 8) || wide_ok) && std::env::var_os("INKWELL_NO_MIXFUSE").is_none() {
             let mut margs = [states.0, query.0];
             let ud = Box::leak(Box::new(MixArgs {
                 embd: n_embd as i32, rows: n_rows as i32, qcols: q_cols as i32,
@@ -2286,6 +2471,39 @@ impl Runner {
             inkwell_ggml::custom_4d(c.0, F32, [ch, 1, 1, 1], &mut args,
                 conv_step_cb as usize, (arg as *const ConvStepArgs).cast_mut().cast())
         })
+    }
+
+    fn convolve_add(&self, x_in: Ptr, w: Ptr, dynamic: Option<Ptr>, slot: usize, region_off: i64, stores: &mut Vec<Ptr>, snap: *mut f32, residual: Ptr) -> Ptr {
+        let c = self.cur_ctx;
+        let contiguous = unsafe { inkwell_ggml::ink_is_contiguous(x_in.0) != 0 }
+            && unsafe { inkwell_ggml::ink_is_contiguous(residual.0) != 0 };
+        if contiguous && std::env::var_os("INKWELL_NO_CONV_ADD").is_none() {
+            let n_conv = 4i64;
+            let ch = t::ne(x_in, 0);
+            let n_heads = dynamic.map_or(0, |d| t::ne(d, 0) / n_conv) as i32;
+            let scale = 1.0 / ((if dynamic.is_some() { 2.0 } else { 1.0 }) * n_conv as f32 + 1.0).sqrt();
+            let idx = self.conv_arg_idx.get();
+            let pool = unsafe { &mut *self.conv_args.get() };
+            let fresh = ConvStepArgs {
+                state: unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0) }.cast(),
+                region_off: region_off as i32,
+                ch: ch as i32,
+                n_heads,
+                scale,
+                snap,
+            };
+            if idx >= pool.len() { pool.push(Box::new(fresh)); } else { *pool[idx] = fresh; }
+            let arg = &*pool[idx];
+            self.conv_arg_idx.set(idx + 1);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![x_in.0, w.0];
+            if let Some(d) = dynamic { args.push(d.0); }
+            args.push(residual.0);
+            return Ptr(unsafe {
+                inkwell_ggml::custom_4d(c.0, F32, [ch, 1, 1, 1], &mut args,
+                    conv_step_add_cb as usize, (arg as *const ConvStepArgs).cast_mut().cast())
+            });
+        }
+        t::add(c, residual, self.convolve(x_in, w, dynamic, slot, region_off, stores, snap))
     }
 
     /// device ptr into `conv_snap[slot]` for verify position `j`.
@@ -2513,6 +2731,7 @@ impl Runner {
         let mz_keys: [&'static str; 5] = ["wq", "gate", "rel", "wk", "wv"];
         let mz_ok = std::env::var_os("INKWELL_NO_MZ").is_none()
             && mz_keys.iter().all(|k| l.exl3.contains_key(*k));
+        let mut mz_nmax = 0i64;
         let (q, gate_lin, r_pre, wk_p, wv_p) = if mz_ok {
             let mut ws = [std::ptr::null::<Exl3W>(); 6];
             let mut n_max = 0i64;
@@ -2521,6 +2740,7 @@ impl Runner {
                 ws[z] = e;
                 n_max = n_max.max(e.n as i64);
             }
+            mz_nmax = n_max;
             let a: &'static mut Exl3MzArgs = Box::leak(Box::new(Exl3MzArgs {
                 ws, xidx: [0, 0, 0, 1, 2, 0], nz: 5 }));
             let mut args = [inputs[0].0, inputs[1].0, inputs[2].0];
@@ -2558,6 +2778,7 @@ impl Runner {
                 self.proj(c, l, "wk", l.wk, inputs[1]),
                 self.proj(c, l, "wv", l.wv, inputs[2]))
         };
+        let mut kv_dyn_batch = false;
         let (k_dyn, v_dyn) = if is_swa {
             (None, None)
         } else {
@@ -2568,6 +2789,7 @@ impl Runner {
                     && inkwell_ggml::ink_tensor_ne(wv.0, 0) == 2304 && inkwell_ggml::ink_tensor_ne(wv.0, 1) == 32
             };
             if batch {
+                kv_dyn_batch = true;
                 let mut args = [wk.0, inputs[1].0, wv.0, inputs[2].0];
                 let out = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [32, 2, 1, 1], &mut args,
                     kv_sconv_cb as *const () as usize, std::ptr::null_mut()) });
@@ -2577,10 +2799,67 @@ impl Runner {
                 (Some(t::mmq(c, wk, inputs[1])), Some(t::mmq(c, wv, inputs[2])))
             }
         };
-        let k = self.convolve(wk_p, l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores, std::ptr::null_mut());
         let gqa = (hd * hkv) as i64;
-        let v = self.convolve(wv_p, l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores, std::ptr::null_mut());
-        let r = r_pre;
+        let qkvr_active = std::env::var_os("INKWELL_NO_QKVR_FUSE").is_none()
+            && mz_ok && hd == 128 && nh == 24 && hkv == 8 && n_rel == 16 && mz_nmax > 0
+            && (is_swa || kv_dyn_batch)
+            && l.attn_q_clip.is_none_or(|x| unsafe { inkwell_ggml::ink_is_contiguous(x.0) != 0 })
+            && l.attn_rel_clip.is_none_or(|x| unsafe { inkwell_ggml::ink_is_contiguous(x.0) != 0 });
+        let (q, k, v, r, qkvr_fused) = if qkvr_active {
+            let total = hd * nh + 2 * hd * hkv + n_rel * nh;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![q.0];
+            let mut next = 1i32;
+            let mut take = |x: Ptr| { let v = next; args.push(x.0); next += 1; v };
+            let dyn_src = if is_swa { -1 } else { take(k_dyn.expect("k dyn")) };
+            let kw_src = take(l.attn_k_conv.expect("kconv"));
+            let vw_src = take(l.attn_v_conv.expect("vconv"));
+            let qw_src = l.attn_q_clip.map_or(-1, &mut take);
+            let rw_src = l.attn_rel_clip.map_or(-1, &mut take);
+            let tau_src = if is_swa { -1 } else { take(step_tau(step)) };
+            let conv_scale = 1.0 / ((if is_swa { 1.0 } else { 2.0 }) * 4.0f32 + 1.0).sqrt();
+            let ud = Box::leak(Box::new(QkvrPrepArgs {
+                state: unsafe { inkwell_ggml::ink_tensor_data(self.conv_state[slot].0) }.cast(),
+                k_region_off: 0,
+                v_region_off: gqa as i32,
+                nmax: mz_nmax as i32,
+                hd: hd as i32,
+                nh: nh as i32,
+                hkv: hkv as i32,
+                nrel: n_rel as i32,
+                conv_scale,
+                qk_thr: self.cfg.qk_clip,
+                rel_thr: self.cfg.rel_clip,
+                dyn_src,
+                kw_src,
+                vw_src,
+                qw_src,
+                rw_src,
+                tau_src,
+            }));
+            let packed = Ptr(unsafe { inkwell_ggml::custom_4d(c.0, F32, [total, 1, 1, 1], &mut args,
+                qkvr_prep_cb as usize, (ud as *mut QkvrPrepArgs).cast()) });
+            let koff = hd * nh * 4;
+            let voff = koff + hd * hkv * 4;
+            let roff = voff + hd * hkv * 4;
+            (
+                t::reshape3(c, t::view1(c, packed, hd * nh, 0), hd, nh, 1),
+                t::reshape3(c, t::view1(c, packed, hd * hkv, koff), hd, hkv, 1),
+                t::reshape3(c, t::view1(c, packed, hd * hkv, voff), hd, hkv, 1),
+                t::reshape3(c, t::view1(c, packed, n_rel * nh, roff), n_rel, nh, 1),
+                true,
+            )
+        } else {
+            let k = self.convolve(wk_p, l.attn_k_conv.expect("kconv"), k_dyn, slot, 0, stores, std::ptr::null_mut());
+            let v = self.convolve(wv_p, l.attn_v_conv.expect("vconv"), v_dyn, slot, gqa, stores, std::ptr::null_mut());
+            let r = r_pre;
+            (
+                self.clip(t::reshape3(c, q, hd, nh, 1), l.attn_q_clip, self.cfg.qk_clip),
+                self.clip(t::reshape3(c, k, hd, hkv, 1), None, self.cfg.qk_clip),
+                t::rms_norm(c, t::reshape3(c, v, hd, hkv, 1), 1e-6),
+                self.clip(t::reshape3(c, r, n_rel, nh, 1), l.attn_rel_clip, self.cfg.rel_clip),
+                false,
+            )
+        };
         if il == 0 {
             self.dump("rel_raw", r); self.dump("inputs0", inputs[0]);
             // weight raw bytes check (GGUF path only)
@@ -2592,10 +2871,6 @@ impl Runner {
             }
         }
 
-        let q = self.clip(t::reshape3(c, q, hd, nh, 1), l.attn_q_clip, self.cfg.qk_clip);
-        let k = self.clip(t::reshape3(c, k, hd, hkv, 1), None, self.cfg.qk_clip);
-        let v = t::rms_norm(c, t::reshape3(c, v, hd, hkv, 1), 1e-6);
-        let r = self.clip(t::reshape3(c, r, n_rel, nh, 1), l.attn_rel_clip, self.cfg.rel_clip);
         if il == 0 {
             self.dump("Qcur-0", q); self.dump("Kcur-0", k); self.dump("Vcur-0", v); self.dump("Rcur-0", r);
         }
@@ -2621,7 +2896,7 @@ impl Runner {
         // tau scale on full layers
         let mut q = q;
         let mut r = r;
-        if !is_swa {
+        if !is_swa && !qkvr_fused {
             q = t::mul(c, q, step_tau(step));
             r = t::mul(c, r, step_tau(step));
         }
@@ -2733,13 +3008,12 @@ impl Runner {
         let mut cur = out;
         cur = t::mul(c, cur, t::sigmoid(c, gate_lin));
         if il == 0 { self.dump("kqv_out-0", out); }
-        cur = self.convolve(self.proj(c, l, "wo", l.wo, cur), l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores, std::ptr::null_mut());
-
-        // residual / push block
+        let wo_in = self.proj(c, l, "wo", l.wo, cur);
         if ip % (self.cfg.attn_res_block_size as usize) == 0 {
+            cur = self.convolve(wo_in, l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores, std::ptr::null_mut());
             blocks.push(inp_sa);
         } else {
-            cur = t::add(c, inp_sa, cur);
+            cur = self.convolve_add(wo_in, l.attn_post_conv.expect("postconv"), None, slot, 2 * gqa, stores, std::ptr::null_mut(), inp_sa);
         }
         let ffn_inp = cur;
 
@@ -2803,9 +3077,9 @@ impl Runner {
             });
             // EXL3 experts are device-side (VRAM staging + pinned DMA): do NOT pin
             // ffn_out to CPU — that forced a backend split + host copies per layer.
-            let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores, std::ptr::null_mut());
+            let fcur = self.convolve_add(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores, std::ptr::null_mut(), ffn_inp);
             if il == 0 { self.dump("ffn_out-0", fcur); }
-            let out = t::add(c, ffn_inp, fcur);
+            let out = fcur;
             self.dump(&format!("s_lout{il}"), out);
             return out;
         }
@@ -2823,9 +3097,9 @@ impl Runner {
         });
         self.set_cpu(ffn_out);
 
-        let fcur = self.convolve(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores, std::ptr::null_mut());
+        let fcur = self.convolve_add(ffn_out, l.ffn_post_conv.expect("fpc"), None, slot, 2 * gqa + n_embd, stores, std::ptr::null_mut(), ffn_inp);
         if il == 0 { self.dump("ffn_out-0", fcur); }
-        let out2 = t::add(c, ffn_inp, fcur);
+        let out2 = fcur;
         self.dump(&format!("l_out-{slot}"), out2);
         out2
     }
@@ -3034,14 +3308,21 @@ impl Runner {
         }
         let prelude = cur;
         let prelude_blocks = blocks.clone();
+        let msg_batch = std::env::var_os("INKWELL_NO_MSG_BATCH").is_none()
+            && std::env::var_os("INKWELL_NO_MIX_V2").is_none()
+            && !self.msg_query_packed.is_null();
         for pass in 0..np {
             let mut bank: Vec<Ptr> = Vec::new();
             let mut bank_out = Ptr(std::ptr::null_mut());
+            let mut pass_msgs = Ptr(std::ptr::null_mut());
             if pass > 0 {
                 bank = blocks[prelude_blocks.len() + 1..].to_vec();
                 bank_out = cur;
                 cur = prelude;
                 blocks = prelude_blocks.clone();
+                if msg_batch {
+                    pass_msgs = self.mix(&bank, bank_out, self.msg_query_packed);
+                }
             }
             for ip in start..end {
                 let (il_v, slot) = self.visits[vi];
@@ -3050,7 +3331,12 @@ impl Runner {
                     cur = self.layer(ip, ip, slot, pass, cur, &mut blocks, None, &self.layers[ip], &step, &mut stores);
                 } else {
                     let l = &self.layers[ip];
-                    let msgs = self.mix(&bank, bank_out, l.msg_query.expect("msg_query"));
+                    let msgs = if pass_msgs.is_null() {
+                        self.mix(&bank, bank_out, l.msg_query.expect("msg_query"))
+                    } else {
+                        let off = (ip - start) as i64 * 4 * t::nb(pass_msgs, 1);
+                        t::view2(c, pass_msgs, n_embd, 4, t::nb(pass_msgs, 1), off)
+                    };
                     cur = self.layer(ip, ip, slot, pass, cur, &mut blocks, Some(msgs), l, &step, &mut stores);
                 }
                 vi += 1;
