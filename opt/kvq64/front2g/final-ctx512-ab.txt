@@ -1,0 +1,16 @@
+round=1 kind=ctl RUN f2g-final512-r1-ctl rc=0 TIME_MS_TOK=27.151 MD5=5cbe8e06 VRAM_PEAK_MIB=5046
+round=1 kind=cand RUN f2g-final512-r1-cand rc=0 TIME_MS_TOK=26.468 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=1 kind=cand RUN f2g-final512-r1-cand rc=0 TIME_MS_TOK=26.137 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=1 kind=ctl RUN f2g-final512-r1-ctl rc=0 TIME_MS_TOK=26.361 MD5=5cbe8e06 VRAM_PEAK_MIB=5046
+round=2 kind=ctl RUN f2g-final512-r2-ctl rc=0 TIME_MS_TOK=26.503 MD5=5cbe8e06 VRAM_PEAK_MIB=5046
+round=2 kind=cand RUN f2g-final512-r2-cand rc=0 TIME_MS_TOK=26.101 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=2 kind=cand RUN f2g-final512-r2-cand rc=0 TIME_MS_TOK=26.143 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=2 kind=ctl RUN f2g-final512-r2-ctl rc=0 TIME_MS_TOK=26.682 MD5=5cbe8e06 VRAM_PEAK_MIB=5046
+round=3 kind=ctl RUN f2g-final512-r3-ctl rc=0 TIME_MS_TOK=26.376 MD5=5cbe8e06 VRAM_PEAK_MIB=5046
+round=3 kind=cand RUN f2g-final512-r3-cand rc=0 TIME_MS_TOK=26.123 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=3 kind=cand RUN f2g-final512-r3-cand rc=0 TIME_MS_TOK=26.110 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=3 kind=ctl RUN f2g-final512-r3-ctl rc=0 TIME_MS_TOK=26.562 MD5=5cbe8e06 VRAM_PEAK_MIB=5046
+round=4 kind=ctl RUN f2g-final512-r4-ctl rc=0 TIME_MS_TOK=26.489 MD5=5cbe8e06 VRAM_PEAK_MIB=5046
+round=4 kind=cand RUN f2g-final512-r4-cand rc=0 TIME_MS_TOK=26.403 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=4 kind=cand RUN f2g-final512-r4-cand rc=0 TIME_MS_TOK=26.169 MD5=5cbe8e06 VRAM_PEAK_MIB=5050
+round=4 kind=ctl RUN f2g-final512-r4-ctl rc=0 TIME_MS_TOK=26.675 MD5=5cbe8e06 VRAM_PEAK_MIB=5046

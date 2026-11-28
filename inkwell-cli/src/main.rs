@@ -789,7 +789,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         eprintln!("state saved");
     }
     // last prompt token → first generated
-    let t1 = Instant::now();
+    let mut t1 = Instant::now();
     let mut id = ids[ids.len() - 1];
     let mut gen_ids = Vec::new();
     let n_gen: usize = std::env::var("INKWELL_GENS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
@@ -813,6 +813,11 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
     let stepdbg = std::env::var_os("INKWELL_STEPDBG").is_some() || vtest8;
     let mut logit_dump = std::env::var_os("INKWELL_LOGIT_DUMP")
         .map(|path| std::fs::File::create(path).expect("logit dump file"));
+    // Optional cache-warming generation rows: they execute normally but are
+    // excluded from the final decode timing. This matters for state-reload
+    // benchmarks because snapshots do not serialize expert-cache contents.
+    let warm_gen: usize = std::env::var("INKWELL_WARM_GENS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(0).min(n_gen);
     let dump_logits = logit_dump.is_some();
     // INKWELL_BTEST8: run one 8-token block at the current position and dump
     // its rows. Inputs are the final prompt token followed by force[0..7].
@@ -835,6 +840,7 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         return;
     }
     for g in 0..n_gen {
+        if g == warm_gen { t1 = Instant::now(); }
         if vtest8 { hist_snaps.push_back(r.snapshot_conv()); }
         let ts = Instant::now();
         let (best, fed_id);
@@ -911,6 +917,9 @@ fn run_e2e(gg: &inkwell_gguf::GgufFile, cfg: &inkwell_core::InklingConfig, path:
         .unwrap_or_else(|_| "<decode error>".into());
     eprintln!("generated text: {text:?}");
     eprintln!("decode 8 tok in {:?}", dec_t);
+    if warm_gen > 0 {
+        eprintln!("decode_timed {} tok in {:.6}s", n_gen - warm_gen, dec_t.as_secs_f64());
+    }
     inkwell_run::runner::stepprof_dump();
 
     if std::env::var_os("INKWELL_VTEST").is_some() {

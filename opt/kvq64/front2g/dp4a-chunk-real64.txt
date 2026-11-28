@@ -1,0 +1,5 @@
+dp4a1 decode_rc=0 ms=46.285 peak=5124 md5=8dafdd6e precache=4544 budget=540 table=532
+dp4a2 decode_rc=0 ms=45.999 peak=5124 md5=47e111fa precache=4544 budget=540 table=532
+chunk128 decode_rc=0 ms=47.135 peak=5124 md5=8dafdd6e precache=4544 budget=540 table=532
+chunk256 decode_rc=0 ms=45.842 peak=5124 md5=47e111fa precache=4544 budget=540 table=532
+chunk512 decode_rc=0 ms=46.232 peak=5124 md5=8dafdd6e precache=4544 budget=540 table=532

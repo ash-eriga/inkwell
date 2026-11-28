@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "inkwell-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-core",
  "inkwell-gguf",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "inkwell-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-gguf",
  "thiserror",
@@ -73,15 +73,15 @@ dependencies = [
 
 [[package]]
 name = "inkwell-cuda"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inkwell-ggml"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inkwell-gguf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "inkwell-ggml",
@@ -91,21 +91,21 @@ dependencies = [
 
 [[package]]
 name = "inkwell-graph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-core",
 ]
 
 [[package]]
 name = "inkwell-kv"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-core",
 ]
 
 [[package]]
 name = "inkwell-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-core",
  "inkwell-gguf",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "inkwell-pager"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-core",
  "inkwell-model",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "inkwell-run"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-core",
  "inkwell-cuda",
@@ -137,11 +137,11 @@ dependencies = [
 
 [[package]]
 name = "inkwell-sampler"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "inkwell-spec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inkwell-core",
  "inkwell-kv",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "inkwell-st"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "memmap2",
  "serde",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "inkwell-tokenizer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fancy-regex",
  "inkwell-gguf",

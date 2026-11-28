@@ -109,3 +109,7 @@ then lever 2 (one-line env first: INKWELL_DEV_MARGIN_MB sweep).
 - Lever 1 caveat: OPPROF is graphs-off; graphs already remove ~7.7 ms of launch
   cost, and fusion under graphs was ~neutral before (fused mix, ledger). Measure
   glue under graphs before investing.
+
+## STATUS — KV quantization 64K (2026-11-27, pre-final)
+
+Active branch `t3/kv-quant-formats-64k-decode` at commit b259032+. INKWELL_KV selector with int8/fp8(e4m3)/k8v4/k4v2 implemented; F16 default bit-identical: canonical gate MD5 5cbe8e06, peak 5,048 MiB, 27.297 ms/tok on final binary. Best 64K decode: K4V2 v13 qsplit+hppipe median 53.276 ms/tok, peak 4,774 MiB (gap 17.28 ms to the 36 ms target); K8V4 v10 median 55.488, peak 4,942. 4K teacher-forced quality on the final binary (64 rows): noise floor 1.07e-9 mean; INT8 0.00211, FP8 0.00367, K8V4 0.00718 mean KLD (all top-1 1.0); K4V2 0.06715 mean, top-1 0.9375. 16K quality, v13 warm speed matrix (4K/16K/32K) and nsys attention attribution are queued/running. See opt/ledger.md for the full experiment log.

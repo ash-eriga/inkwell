@@ -2121,24 +2121,201 @@ extern "C" void ink_launch_conv_prefill(const float* x, float* state, int region
         x, state, region_off, C, ch);
 }
 
+
+// ---------------- quantized-KV read support ----------------
+// Layout mirror of InkKvQSlot in kernels.cu.  Prefill uses it read-only; the
+// batched writer itself lives in kernels.cu.
+#define INK_KVQ_INT8 1
+#define INK_KVQ_FP8_E4M3 2
+#define INK_KVQ_K8V4 3
+#define INK_KVQ_K4V2 4
+#define INK_KVQ_FP8_E5M2 5
+#define INK_KVQ_K8V4G32 6
+#define INK_KVQ_K8V6 7
+#define INK_KVQ_K10V6 8
+struct PfKvQSlot {
+    unsigned char* kq;
+    unsigned char* vq;
+    unsigned char* meta;
+    __half* khp;
+    __half* vhp;
+    int cap;
+    int hp_cap;
+    int swa;
+    int sinks;
+    int local;
+    int is_swa;
+    int fmt;
+    int krow;
+    int vrow;
+    int mrow;
+};
+
+__device__ __forceinline__ float pf_fp8_e4m3_f(unsigned char b) {
+    const float sign = (b & 0x80u) ? -1.f : 1.f;
+    const int e = (b >> 3) & 15;
+    const int m = b & 7;
+    if (e == 0) return sign * (float)m * 0.001953125f;
+    const int hb = ((b & 0x80u) << 8) | ((e + 8) << 10) | (m << 7);
+    return __half2float(__ushort_as_half((unsigned short)hb));
+}
+__device__ __forceinline__ float pf_fp8_e5m2_f(unsigned char b) {
+    const int hb = ((b & 0x80u) << 8) | ((b & 0x7fu) << 8);
+    return __half2float(__ushort_as_half((unsigned short)hb));
+}
+__device__ __forceinline__ float pf_fp8_dequant(unsigned char x, int fmt) {
+    return fmt == INK_KVQ_FP8_E5M2 ? pf_fp8_e5m2_f(x) : pf_fp8_e4m3_f(x);
+}
+
+__device__ __forceinline__ int pf_k8v4_tile_rem(int cap, int tile) {
+    return max(0, min(16, cap - tile * 16));
+}
+__device__ __forceinline__ int pf_k8v4_row_units(int rem, int s) {
+    return s < rem ? (s + 8 < rem ? 2 : 1) : 0;
+}
+__device__ __forceinline__ int pf_k8v4_units_before(int rem, int s) {
+    int u = 0;
+    #pragma unroll
+    for (int z = 0; z < 8; ++z) if (z < s) u += pf_k8v4_row_units(rem, z);
+    return u;
+}
+__device__ __forceinline__ int pf_k8v4_dim_unit(int cap, int qrow, int sl) {
+    const int tile = qrow >> 4;
+    const int t = qrow & 15;
+    const int rem = pf_k8v4_tile_rem(cap, tile);
+    const int s = t & 7;
+    const int cnt = pf_k8v4_row_units(rem, s);
+    return pf_k8v4_units_before(rem, s) * 16 + sl * cnt + (t >> 3);
+}
+__device__ __forceinline__ size_t pf_k8v4_koff(const PfKvQSlot& q, int qrow, int hk, int d) {
+    const int tile = qrow >> 4;
+    return (size_t)hk * q.cap * 128 + (size_t)tile * 2048 + pf_k8v4_dim_unit(q.cap, qrow, d >> 3) * 8 + (d & 7);
+}
+__device__ __forceinline__ size_t pf_k8v4_voff(const PfKvQSlot& q, int qrow, int hk, int vb) {
+    const int tile = qrow >> 4;
+    return (size_t)hk * q.cap * 64 + (size_t)tile * 1024 + pf_k8v4_dim_unit(q.cap, qrow, vb >> 2) * 4 + (vb & 3);
+}
+__device__ __forceinline__ size_t pf_k8v4_moff(const PfKvQSlot& q, int qrow, int hk) {
+    const int tile = qrow >> 4;
+    const int t = qrow & 15;
+    const int rem = pf_k8v4_tile_rem(q.cap, tile);
+    const int ru = pf_k8v4_units_before(rem, t & 7) + (t >> 3);
+    return (size_t)hk * q.cap * 12 + (size_t)tile * 192 + ru * 12;
+}
+__device__ __forceinline__ bool pf_kvq_is_hp(const PfKvQSlot& q, int logical, int posref) {
+    return q.hp_cap > 0 && (logical < q.sinks || logical >= posref - q.local + 1);
+}
+__device__ __forceinline__ int pf_kvq_hp_idx(const PfKvQSlot& q, int logical) {
+    return logical < q.sinks ? logical : q.sinks + (logical - q.sinks) % q.local;
+}
+__device__ __forceinline__ float pf_kvq_meta_h(const PfKvQSlot& q, int qrow, int hk, int idx) {
+    const unsigned char* mp = q.fmt == INK_KVQ_K8V4 ? q.meta + pf_k8v4_moff(q, qrow, hk) :
+        (q.meta + (size_t)qrow * q.mrow + hk * ((q.fmt == INK_KVQ_K8V4G32) ? 24 : 12));
+    const __half* mh = (const __half*)mp;
+    return __half2float(mh[idx]);
+}
+__device__ __forceinline__ float pf_kvq_read_k(const PfKvQSlot& q, int logical, int qrow, int hk, int d, int posref) {
+    if (pf_kvq_is_hp(q, logical, posref)) {
+        const int hi = pf_kvq_hp_idx(q, logical);
+        return __half2float(q.khp[((size_t)hk * q.hp_cap + hi) * 128 + d]);
+    }
+    const int grp = d >> 6;
+    if (q.fmt == INK_KVQ_INT8 || q.fmt == INK_KVQ_K8V4 || q.fmt == INK_KVQ_K8V4G32 || q.fmt == INK_KVQ_K8V6) {
+        const size_t off = q.fmt == INK_KVQ_K8V4 ? pf_k8v4_koff(q, qrow, hk, d) : ((size_t)qrow * q.krow + hk * 128 + d);
+        int x = (int)(signed char)q.kq[off];
+        return (float)x * pf_kvq_meta_h(q, qrow, hk, grp);
+    }
+    if (q.fmt == INK_KVQ_K10V6) {
+        const unsigned char* kp = q.kq + (size_t)qrow * q.krow + hk * 160;
+        const int hi = (int)(signed char)kp[d];
+        const int lo = (kp[128 + (d >> 2)] >> ((d & 3) * 2)) & 3;
+        const int x = hi * 4 + lo;
+        return (float)x * pf_kvq_meta_h(q, qrow, hk, grp);
+    }
+    if (q.fmt == INK_KVQ_K4V2) {
+        const unsigned char b = q.kq[(size_t)qrow * q.krow + hk * 64 + (d >> 1)];
+        int x = (b >> ((d & 1) * 4)) & 15;
+        if (x >= 8) x -= 16;
+        return (float)x * pf_kvq_meta_h(q, qrow, hk, grp);
+    }
+    return pf_fp8_dequant(q.kq[(size_t)qrow * q.krow + hk * 128 + d], q.fmt);
+}
+__device__ __forceinline__ float pf_kvq_read_v(const PfKvQSlot& q, int logical, int qrow, int hk, int d, int posref) {
+    if (pf_kvq_is_hp(q, logical, posref)) {
+        const int hi = pf_kvq_hp_idx(q, logical);
+        return __half2float(q.vhp[((size_t)hk * q.hp_cap + hi) * 128 + d]);
+    }
+    const int grp = d >> 6;
+    if (q.fmt == INK_KVQ_INT8) {
+        int x = (int)(signed char)q.vq[(size_t)qrow * q.vrow + hk * 128 + d];
+        return (float)x * pf_kvq_meta_h(q, qrow, hk, 2 + grp * 2);
+    }
+    if (q.fmt == INK_KVQ_K8V4 || q.fmt == INK_KVQ_K8V4G32) {
+        const size_t off = q.fmt == INK_KVQ_K8V4 ? pf_k8v4_voff(q, qrow, hk, d >> 1) : ((size_t)qrow * q.vrow + hk * 64 + (d >> 1));
+        const unsigned char b = q.vq[off];
+        const int x = (b >> ((d & 1) * 4)) & 15;
+        const int vgrp = q.fmt == INK_KVQ_K8V4G32 ? d >> 5 : grp;
+        return (float)x * pf_kvq_meta_h(q, qrow, hk, 2 + vgrp * 2) + pf_kvq_meta_h(q, qrow, hk, 3 + vgrp * 2);
+    }
+    if (q.fmt == INK_KVQ_K8V6 || q.fmt == INK_KVQ_K10V6) {
+        const unsigned char* vp = q.vq + (size_t)qrow * q.vrow + hk * 96;
+        const int lo = (vp[d >> 1] >> ((d & 1) * 4)) & 15;
+        const int hi = (vp[64 + (d >> 2)] >> ((d & 3) * 2)) & 3;
+        const int x = lo | (hi << 4);
+        return (float)x * pf_kvq_meta_h(q, qrow, hk, 2 + grp * 2) + pf_kvq_meta_h(q, qrow, hk, 3 + grp * 2);
+    }
+    if (q.fmt == INK_KVQ_K4V2) {
+        const unsigned char b = q.vq[(size_t)qrow * q.vrow + hk * 32 + (d >> 2)];
+        const int x = (b >> ((d & 3) * 2)) & 3;
+        return (float)x * pf_kvq_meta_h(q, qrow, hk, 2 + grp * 2) + pf_kvq_meta_h(q, qrow, hk, 3 + grp * 2);
+    }
+    return pf_fp8_dequant(q.vq[(size_t)qrow * q.vrow + hk * 128 + d], q.fmt);
+}
+
+// Snapshot rows that a SWA write is about to overwrite, dequantizing them to
+// the same fp16 layout as the ordinary snapshot path.
+extern "C" __global__ void inkwell_pf_snapshot_kvq(PfKvQSlot qslot,
+        void* __restrict__ ks, void* __restrict__ vs,
+        int snap_start, int snap_len, int cap, int swa, int posref) {
+    const int row = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= snap_len || i >= 1024) return;
+    const int h = i >> 7, d = i & 127;
+    const int logical = snap_start + row;
+    const int slot = logical % swa;
+    const size_t dst = ((size_t)h * snap_len + row) * 128 + d;
+    ((__half*)ks)[dst] = __float2half_rn(pf_kvq_read_k(qslot, logical, slot, h, d, posref));
+    ((__half*)vs)[dst] = __float2half_rn(pf_kvq_read_v(qslot, logical, slot, h, d, posref));
+}
+extern "C" void ink_launch_pf_snapshot_kvq(const PfKvQSlot* qslot, void* ks, void* vs,
+        int snap_start, int snap_len, int cap, int swa, int posref, void* stream) {
+    dim3 g(4, snap_len);
+    inkwell_pf_snapshot_kvq<<<g, 256, 0, (cudaStream_t)stream>>>(*qslot, ks, vs,
+        snap_start, snap_len, cap, swa, posref);
+}
+
 // ---------------- GQA-3 flash prefill attention ----------------
 // Correctness-first GQA-3 kernel.  One CTA owns a 32-query tile and one KV
 // head; K/V tiles are loaded once and reused for all three query heads.
 // rel_w layout is [nh][1025][16]; r layout is [C,nh,16].  sinks is [C,nh].
 // The effective key bias is dot(r[q,h], rel_w[h][dist]) - sinks[q,h]; the
 // sink column is the fixed zero reference.  SWA physical slot = logical_pos % swa_win.
-extern "C" __global__ void __launch_bounds__(128) inkwell_flash_prefill_gqa3(
+// USE_Q is compile-time so the F16 instantiation carries no quantized-read branch.
+template <int USE_Q>
+__global__ void __launch_bounds__(128) inkwell_flash_prefill_gqa3(
         const __half* __restrict__ K, const __half* __restrict__ V,
         const float* __restrict__ Q, const float* __restrict__ r,
         const float* __restrict__ rel_w, const float* __restrict__ sinks,
         float* __restrict__ out, int C, int pos0, int kv_cap, int swa_win, float scale,
-        const __half* __restrict__ KS, const __half* __restrict__ VS, int snap_start, int snap_len) {
+        const __half* __restrict__ KS, const __half* __restrict__ VS, int snap_start, int snap_len,
+        PfKvQSlot qslot) {
     // Register-tiled flash attention.  One CTA owns BQ=32 queries for one KV
     // head and reuses every BK=32 K/V tile for the three GQA query heads.
     // QK uses a 4x4 register tile on 64 threads (two shared-memory loads per
     // four FMAs); PV uses a 4x8 register tile on all 128 threads with bank-
     // conflict-free strided columns.  Kf/Vf share one smem allocation.
     constexpr int BQ = 32, BK = 32;
+    const int posref = pos0 + C - 1;
     const int q0 = blockIdx.x * BQ;
     const int hk = blockIdx.y;
     const int tid = threadIdx.x;
@@ -2183,13 +2360,20 @@ extern "C" __global__ void __launch_bounds__(128) inkwell_flash_prefill_gqa3(
                 const int logical = k0 + kr;
                 const int slot = (swa_win > 0) ? (logical % swa_win) : logical;
                 const bool osnap = KS && logical >= snap_start && logical < snap_start + snap_len;
-                const __half* kbase = osnap ? KS + (size_t)hk * snap_len * 128 : Kh;
-                const size_t krow = osnap ? (size_t)(logical - snap_start) : (size_t)slot;
-                const uint2 packed = *(const uint2*)(kbase + krow * 128 + d);
-                KVh[d][kr] = __ushort_as_half((unsigned short)(packed.x & 0xffffu));
-                KVh[d + 1][kr] = __ushort_as_half((unsigned short)(packed.x >> 16));
-                KVh[d + 2][kr] = __ushort_as_half((unsigned short)(packed.y & 0xffffu));
-                KVh[d + 3][kr] = __ushort_as_half((unsigned short)(packed.y >> 16));
+                if (USE_Q && !osnap) {
+                    KVh[d][kr] = __float2half_rn(pf_kvq_read_k(qslot, logical, slot, hk, d, posref));
+                    KVh[d + 1][kr] = __float2half_rn(pf_kvq_read_k(qslot, logical, slot, hk, d + 1, posref));
+                    KVh[d + 2][kr] = __float2half_rn(pf_kvq_read_k(qslot, logical, slot, hk, d + 2, posref));
+                    KVh[d + 3][kr] = __float2half_rn(pf_kvq_read_k(qslot, logical, slot, hk, d + 3, posref));
+                } else {
+                    const __half* kbase = osnap ? KS + (size_t)hk * snap_len * 128 : Kh;
+                    const size_t krow = osnap ? (size_t)(logical - snap_start) : (size_t)slot;
+                    const uint2 packed = *(const uint2*)(kbase + krow * 128 + d);
+                    KVh[d][kr] = __ushort_as_half((unsigned short)(packed.x & 0xffffu));
+                    KVh[d + 1][kr] = __ushort_as_half((unsigned short)(packed.x >> 16));
+                    KVh[d + 2][kr] = __ushort_as_half((unsigned short)(packed.y & 0xffffu));
+                    KVh[d + 3][kr] = __ushort_as_half((unsigned short)(packed.y >> 16));
+                }
             }
             __syncthreads();
 
@@ -2290,13 +2474,20 @@ extern "C" __global__ void __launch_bounds__(128) inkwell_flash_prefill_gqa3(
                 const int logical = k0 + kr;
                 const int slot = (swa_win > 0) ? (logical % swa_win) : logical;
                 const bool vsnap = VS && logical >= snap_start && logical < snap_start + snap_len;
-                const __half* vbase = vsnap ? VS + (size_t)hk * snap_len * 128 : Vh;
-                const size_t vrow = vsnap ? (size_t)(logical - snap_start) : (size_t)slot;
-                const uint2 packed = *(const uint2*)(vbase + vrow * 128 + d);
-                KVh[d][kr] = __ushort_as_half((unsigned short)(packed.x & 0xffffu));
-                KVh[d + 1][kr] = __ushort_as_half((unsigned short)(packed.x >> 16));
-                KVh[d + 2][kr] = __ushort_as_half((unsigned short)(packed.y & 0xffffu));
-                KVh[d + 3][kr] = __ushort_as_half((unsigned short)(packed.y >> 16));
+                if (USE_Q && !vsnap) {
+                    KVh[d][kr] = __float2half_rn(pf_kvq_read_v(qslot, logical, slot, hk, d, posref));
+                    KVh[d + 1][kr] = __float2half_rn(pf_kvq_read_v(qslot, logical, slot, hk, d + 1, posref));
+                    KVh[d + 2][kr] = __float2half_rn(pf_kvq_read_v(qslot, logical, slot, hk, d + 2, posref));
+                    KVh[d + 3][kr] = __float2half_rn(pf_kvq_read_v(qslot, logical, slot, hk, d + 3, posref));
+                } else {
+                    const __half* vbase = vsnap ? VS + (size_t)hk * snap_len * 128 : Vh;
+                    const size_t vrow = vsnap ? (size_t)(logical - snap_start) : (size_t)slot;
+                    const uint2 packed = *(const uint2*)(vbase + vrow * 128 + d);
+                    KVh[d][kr] = __ushort_as_half((unsigned short)(packed.x & 0xffffu));
+                    KVh[d + 1][kr] = __ushort_as_half((unsigned short)(packed.x >> 16));
+                    KVh[d + 2][kr] = __ushort_as_half((unsigned short)(packed.y & 0xffffu));
+                    KVh[d + 3][kr] = __ushort_as_half((unsigned short)(packed.y >> 16));
+                }
             }
             __syncthreads();
 
@@ -2388,9 +2579,9 @@ extern "C" void ink_launch_flash_prefill_gqa3(const void* K, const void* V, cons
         const float* r, const float* rel_w, const float* sinks, float* out,
         int C, int pos0, int kv_cap, int swa_win, float scale, void* stream) {
     dim3 g((C + 31) / 32, 8);
-    inkwell_flash_prefill_gqa3<<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)K,
+    inkwell_flash_prefill_gqa3<0><<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)K,
         (const __half*)V, Q, r, rel_w, sinks, out, C, pos0, kv_cap, swa_win, scale,
-        nullptr, nullptr, 0, 0);
+        nullptr, nullptr, 0, 0, PfKvQSlot{});
 }
 
 extern "C" void ink_launch_flash_prefill_gqa3_snap(const void* K, const void* V, const float* Q,
@@ -2398,9 +2589,19 @@ extern "C" void ink_launch_flash_prefill_gqa3_snap(const void* K, const void* V,
         int C, int pos0, int kv_cap, int swa_win, float scale,
         const void* KS, const void* VS, int snap_start, int snap_len, void* stream) {
     dim3 g((C + 31) / 32, 8);
-    inkwell_flash_prefill_gqa3<<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)K,
+    inkwell_flash_prefill_gqa3<0><<<g, 128, 0, (cudaStream_t)stream>>>((const __half*)K,
         (const __half*)V, Q, r, rel_w, sinks, out, C, pos0, kv_cap, swa_win, scale,
-        (const __half*)KS, (const __half*)VS, snap_start, snap_len);
+        (const __half*)KS, (const __half*)VS, snap_start, snap_len, PfKvQSlot{});
+}
+
+extern "C" void ink_launch_flash_prefill_gqa3_snap_kvq(const PfKvQSlot* qslot, const float* Q,
+        const float* r, const float* rel_w, const float* sinks, float* out,
+        int C, int pos0, int kv_cap, int swa_win, float scale,
+        const void* KS, const void* VS, int snap_start, int snap_len, void* stream) {
+    dim3 g((C + 31) / 32, 8);
+    inkwell_flash_prefill_gqa3<1><<<g, 128, 0, (cudaStream_t)stream>>>(nullptr,
+        nullptr, Q, r, rel_w, sinks, out, C, pos0, kv_cap, swa_win, scale,
+        (const __half*)KS, (const __half*)VS, snap_start, snap_len, *qslot);
 }
 
 // Exact-reference attention for one query token.  This follows the non-split

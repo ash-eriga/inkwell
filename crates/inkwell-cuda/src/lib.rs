@@ -43,6 +43,27 @@ extern "C" {
     fn nvmlDeviceGetComputeRunningProcesses_v2(device: *mut c_void, count: *mut u32, infos: *mut NvmlProcessInfo) -> i32;
 }
 
+/// Device layout for one quantized KV cache pass. Must match `InkKvQSlot` in kernels.cu.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct KvQSlot {
+    pub kq: *mut u8,
+    pub vq: *mut u8,
+    pub meta: *mut u8,
+    pub khp: *mut u8,
+    pub vhp: *mut u8,
+    pub cap: i32,
+    pub hp_cap: i32,
+    pub swa: i32,
+    pub sinks: i32,
+    pub local: i32,
+    pub is_swa: i32,
+    pub fmt: i32,
+    pub krow: i32,
+    pub vrow: i32,
+    pub mrow: i32,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct NvmlProcessInfo {
@@ -68,6 +89,9 @@ extern "C" {
     fn ink_launch_mmvq_q6_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
     fn ink_launch_attn_decode(K: *const c_void, V: *const c_void, Q: *const f32, bias: *const f32, mask: *const f32, out: *mut f32, nh: i64, hkv: i64, n_kv: i64, hd: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, kv16: i32, stream: *mut c_void);
     fn ink_launch_attn_decode_dyn(K: *const c_void, V: *const c_void, Q: *const f32, bias: *const f32, mask: *const f32, out: *mut f32, nh: i64, hkv: i64, d_nkv: *const i32, hd: i64, cap: i64, k_s1: i64, k_s2: i64, v_s1: i64, v_s2: i64, q_s2: i64, b_s2: i64, scale: f32, kv16: i32, use_split: i32, allow_gqa: i32, chunk_len: i32, split_min: i64, stream: *mut c_void);
+    fn ink_launch_kvq_append(kcur: *const f32, vcur: *const f32, pos: *const i32, slot: *const KvQSlot, dep: *mut f32, stream: *mut c_void);
+    fn ink_launch_kvq_write_batch(k: *const f32, v: *const f32, slot: *const KvQSlot, c: i32, pos0: i32, stream: *mut c_void);
+    fn ink_launch_attn_kvq_dyn(slot: *const KvQSlot, pos: *const i32, d_nkv: *const i32, q: *const c_void, bias: *const c_void, mask: *const c_void, out: *mut c_void, nh: i64, cap: i64, q_s2: i64, b_s2: i64, scale: f32, chunk_len: i32, mask_zero: i32, bias_mode: i32, swa: i32, rel_extent: i32, stream: *mut c_void) -> i32;
     fn ink_launch_mmvq_iq2_s_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_iq2_xs_moe_i8(wp: *const *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, x_stride: i64, nslots: i32, stream: *mut c_void);
     fn ink_launch_mmvq_q5_k_i8(w: *const c_void, x: *const f32, y: *mut f32, nrows: i64, ncols: i64, stream: *mut c_void);
@@ -113,6 +137,7 @@ extern "C" {
     fn ink_launch_relbias_gather_dyn(mm: *const f32, sinks: *const f32, rel_pos: *const c_void, d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32, stream: *mut c_void);
     fn ink_launch_relbias_gather_dynpos(mm: *const f32, sinks: *const f32, d_pos: *const i32, d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, ext: i32, mode: i32, swa: i32, rel_extent: i32, stream: *mut c_void);
     fn ink_launch_sink_relbias_fused(w_sink: *const c_void, inp0: *const f32, rel_bias: *const c_void, r: *const f32, pos_data: *const c_void, d_nkv: *const i32, y: *mut f32, y_stride: i32, nh: i32, nkv_static: i32, ncols2: i32, mode: i32, swa: i32, rel_extent: i32, stream: *mut c_void);
+    fn ink_launch_sink_relbias_table(w_sink: *const c_void, inp0: *const f32, rel_bias: *const c_void, r: *const f32, table: *mut f32, nh: i32, ncols2: i32, rel_extent: i32, stream: *mut c_void);
     fn ink_launch_clip_l2(x: *const f32, w: *const f32, y: *mut f32, d: i32, h: i32, thr: f32, stream: *mut c_void);
     fn ink_launch_attn_qkvr_prep(proj: *const f32, nmax: i32, dynkv: *const f32,
         kw: *const f32, vw: *const f32, qw: *const f32, rw: *const f32,
@@ -619,6 +644,31 @@ pub unsafe fn attn_decode_async(k: *const c_void, v: *const c_void, q: *const c_
     unsafe { ink_launch_attn_decode(k.cast(), v.cast(), q.cast(), bias.cast(), mask.cast(), out, nh, hkv, n_kv, hd, k_s1, k_s2, v_s1, v_s2, q_s2, b_s2, scale, i32::from(kv16), stream()) };
 }
 
+/// Append one token to a quantized KV cache pass.
+///
+/// # Safety
+/// Device pointers must belong to the cache layout in `slot`.
+pub unsafe fn kvq_append_async(kcur: *const f32, vcur: *const f32, pos: *const i32, slot: *const KvQSlot, dep: *mut f32) {
+    unsafe { ink_launch_kvq_append(kcur, vcur, pos, slot, dep, stream()) };
+}
+
+/// Batch-write prefill rows to a quantized KV cache pass.
+///
+/// # Safety
+/// Device pointers must remain live for the stream operation.
+pub unsafe fn kvq_write_batch_async(k: *const f32, v: *const f32, slot: *const KvQSlot, c: i32, pos0: i32) {
+    unsafe { ink_launch_kvq_write_batch(k, v, slot, c, pos0, stream()) };
+}
+
+/// Dynamic-n_kv split-K decode attention over quantized KV.
+///
+/// # Safety
+/// Device pointers must remain live for the stream operation.
+#[expect(clippy::too_many_arguments)]
+pub unsafe fn attn_kvq_dyn_async(slot: *const KvQSlot, pos: *const i32, d_nkv: *const i32, q: *const c_void, bias: *const c_void, mask: *const c_void, out: *mut f32, nh: i64, cap: i64, q_s2: i64, b_s2: i64, scale: f32, chunk_len: i32, mask_zero: i32, bias_mode: i32, swa: i32, rel_extent: i32) -> i32 {
+    unsafe { ink_launch_attn_kvq_dyn(slot, pos, d_nkv, q, bias, mask, out.cast(), nh, cap, q_s2, b_s2, scale, chunk_len, mask_zero, bias_mode, swa, rel_extent, stream()) }
+}
+
 /// Dynamic-n_kv fused decode attention. The topology flags are fixed at graph
 /// build time; only the exact KV length is read from `d_nkv` on device.
 ///
@@ -1036,6 +1086,16 @@ pub unsafe fn sink_relbias_fused_async(w_sink: *const c_void, inp0: *const f32,
     mode: i32, swa: i32, rel_extent: i32) {
     unsafe { ink_launch_sink_relbias_fused(w_sink, inp0, rel_bias, r, pos_data, d_nkv,
         y, y_stride, nh, nkv_static, ncols2, mode, swa, rel_extent, stream()) };
+}
+
+/// Compact per-relative-position fused BF16 sink projection and rel-bias table.
+///
+/// # Safety
+/// Device pointers must remain live for the stream operation.
+#[expect(clippy::too_many_arguments)]
+pub unsafe fn sink_relbias_table_async(w_sink: *const c_void, inp0: *const f32,
+    rel_bias: *const c_void, r: *const f32, table: *mut f32, nh: i32, ncols2: i32, rel_extent: i32) {
+    unsafe { ink_launch_sink_relbias_table(w_sink, inp0, rel_bias, r, table, nh, ncols2, rel_extent, stream()) };
 }
 /// Multi-projection EXL3 gemv: `nz` independent projections on parallel side streams.
 ///
@@ -1600,6 +1660,12 @@ extern "C" {
         ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32, stream: *mut c_void);
     fn ink_launch_pf_snapshot_kv(kd: *const c_void, vd: *const c_void, ks: *mut c_void, vs: *mut c_void,
         snap_start: i32, snap_len: i32, cap: i32, swa: i32, stream: *mut c_void);
+    fn ink_launch_flash_prefill_gqa3_snap_kvq(qslot: *const KvQSlot, q: *const f32,
+        r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+        c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32,
+        ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32, stream: *mut c_void);
+    fn ink_launch_pf_snapshot_kvq(qslot: *const KvQSlot, ks: *mut c_void, vs: *mut c_void,
+        snap_start: i32, snap_len: i32, cap: i32, swa: i32, posref: i32, stream: *mut c_void);
 }
 
 /// Flash prefill attention with a snapshot of ring rows overwritten by this chunk.
@@ -1634,6 +1700,31 @@ pub unsafe fn pf_exact_attn_gqa3_snap_async(k: *const c_void, v: *const c_void, 
     }
 }
 
+/// Flash prefill attention over a quantized KV cache.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_prefill_gqa3_snap_kvq_async(qslot: *const KvQSlot, q: *const f32,
+    r: *const f32, rel_w: *const f32, sinks: *const f32, out: *mut f32,
+    c: i32, pos0: i32, kv_cap: i32, swa_win: i32, scale: f32,
+    ks: *const c_void, vs: *const c_void, snap_start: i32, snap_len: i32) {
+    unsafe {
+        ink_launch_flash_prefill_gqa3_snap_kvq(qslot, q, r, rel_w, sinks, out, c, pos0, kv_cap,
+            swa_win, scale, ks, vs, snap_start, snap_len, stream());
+    }
+}
+
+/// Snapshot quantized SWA ring rows before a chunk overwrite.
+///
+/// # Safety
+/// Raw device pointers must be valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn pf_snapshot_kvq_async(qslot: *const KvQSlot, ks: *mut c_void, vs: *mut c_void,
+    snap_start: i32, snap_len: i32, cap: i32, swa: i32, posref: i32) {
+    unsafe { ink_launch_pf_snapshot_kvq(qslot, ks, vs, snap_start, snap_len, cap, swa, posref, stream()) };
+}
+
 /// Snapshot SWA ring rows before a chunk overwrite.
 ///
 /// # Safety
@@ -1641,4 +1732,15 @@ pub unsafe fn pf_exact_attn_gqa3_snap_async(k: *const c_void, v: *const c_void, 
 pub unsafe fn pf_snapshot_kv_async(kd: *const c_void, vd: *const c_void, ks: *mut c_void, vs: *mut c_void,
     snap_start: i32, snap_len: i32, cap: i32, swa: i32) {
     unsafe { ink_launch_pf_snapshot_kv(kd, vd, ks, vs, snap_start, snap_len, cap, swa, stream()) };
+}
+
+extern "C" {
+    fn inkwell_cuda_has_dp4a() -> i32;
+}
+
+/// Returns `true` when the active CUDA device has hardware `dp4a` / INT8
+/// dot-product support (`sm_61` or `sm_70+`).
+#[must_use]
+pub fn cuda_has_dp4a() -> bool {
+    unsafe { inkwell_cuda_has_dp4a() != 0 }
 }

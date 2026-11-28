@@ -1,0 +1,14 @@
+mode=real chunk=512 layers=8 nkv=65536
+ctl_row128 ms=6.603 maxabs=0 relL2=0 delta=+0.000
+hm_row64 ms=6.010 maxabs=1.91e-06 relL2=4.25e-07 delta=-0.593
+hm_row128 ms=5.980 maxabs=0 relL2=0 delta=-0.623
+hm_row256 ms=6.880 maxabs=2.38e-06 relL2=3.44e-07 delta=+0.277
+hm_m16 ms=6.090 maxabs=0 relL2=0 delta=-0.513
+hm_pack ms=5.876 maxabs=0 relL2=0 delta=-0.727
+hm_vec2 ms=5.696 maxabs=0 relL2=0 delta=-0.906
+hm_dp4a1 ms=5.958 maxabs=0.0571 relL2=0.00832 delta=-0.645
+mem_tm ms=6.008 delta=-0.594
+mem_hm ms=4.941 delta=-1.662
+mem_vec2 ms=4.886 delta=-1.717
+mem_seqread ms=4.834 delta=-1.769
+bytes=855638016 attention_bw_ctl=120.7GBs memhm_bw=161.3GBs seq_bw=164.8GBs

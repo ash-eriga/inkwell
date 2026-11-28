@@ -1,0 +1,8 @@
+round=1 kind=ctl decode_rc=0 ms=46.556 peak=5124 md5=47e111fa precache=4544 budget=540 table=532
+round=1 kind=cand decode_rc=0 ms=45.796 peak=5128 md5=47e111fa precache=4544 budget=540 table=532
+round=1 kind=cand decode_rc=0 ms=45.983 peak=5128 md5=47e111fa precache=4544 budget=540 table=532
+round=1 kind=ctl decode_rc=0 ms=47.111 peak=5124 md5=47e111fa precache=4544 budget=540 table=532
+round=2 kind=ctl decode_rc=0 ms=45.847 peak=5124 md5=47e111fa precache=4544 budget=540 table=532
+round=2 kind=cand decode_rc=0 ms=44.871 peak=5128 md5=47e111fa precache=4544 budget=540 table=532
+round=2 kind=cand decode_rc=0 ms=45.241 peak=5128 md5=47e111fa precache=4544 budget=540 table=532
+round=2 kind=ctl decode_rc=0 ms=45.743 peak=5124 md5=47e111fa precache=4544 budget=540 table=532
